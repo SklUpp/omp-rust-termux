@@ -111,6 +111,10 @@ pub struct InternalResource {
 	pub notes:         Option<Vec<String>>,
 	pub immutable:     bool,
 	pub is_directory:  bool,
+	/// Whether the scheme handler behind this resource accepts writes. Set by
+	/// the router from [`ProtocolHandler::writable`]; a handler never grants
+	/// this by returning a physical `source_path`.
+	pub writable:      bool,
 }
 
 impl InternalResource {
@@ -125,6 +129,7 @@ impl InternalResource {
 			notes: None,
 			immutable: false,
 			is_directory: false,
+			writable: false,
 		}
 	}
 }
@@ -339,6 +344,9 @@ impl InternalUrlRouter {
 			resource.url = url.href;
 		}
 		resource.immutable = resource.immutable || handler.immutable();
+		// Capability comes from the mounted handler, never from a resource
+		// payload that happens to carry a physical path.
+		resource.writable = handler.writable();
 		if resource.size == 0 && !resource.content.is_empty() {
 			resource.size = resource.content.len();
 		}

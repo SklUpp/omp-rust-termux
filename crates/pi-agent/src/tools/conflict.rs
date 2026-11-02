@@ -58,6 +58,11 @@ pub struct ConflictEntry {
 	pub absolute_path: PathBuf,
 	pub display_path:  String,
 	pub block:         ConflictBlock,
+	/// Whether the source that surfaced this block grants write authority.
+	/// A `local://` artifact read has a physical `absolute_path` for snapshots
+	/// but its handler is read-only, so `conflict://` must not become a write
+	/// capability the source URL never had.
+	pub writable:      bool,
 }
 
 impl ConflictEntry {
@@ -104,12 +109,14 @@ impl ConflictHistory {
 	}
 
 	/// Register a block, reusing the id of an entry recorded at the same
-	/// absolute path and start line.
+	/// absolute path and start line. `writable` carries the source's mutation
+	/// capability; a physical path alone never confers it.
 	pub fn register(
 		&self,
 		absolute_path: &Path,
 		display_path: impl Into<String>,
 		block: ConflictBlock,
+		writable: bool,
 	) -> ConflictEntry {
 		let mut inner = self.inner.lock().unwrap_or_else(|poison| poison.into_inner());
 		let existing = inner
@@ -132,6 +139,7 @@ impl ConflictHistory {
 			absolute_path: absolute_path.to_path_buf(),
 			display_path: display_path.into(),
 			block,
+			writable,
 		};
 		inner.entries.insert(id, entry.clone());
 		entry
@@ -1088,8 +1096,10 @@ mod tests {
 				start_line: 2,
 				..block_2way()
 			},
+			true,
 		);
-		let splice = splice_conflict(original, &entry, "@ours").expect("splice");
+		let expanded = expand_content_tokens("@ours", &entry).expect("expand");
+		let splice = splice_conflict(original, &entry, &expanded).expect("splice");
 		assert_eq!(splice.text, "top\r\na\r\nb\r\nbottom\r\n");
 	}
 
@@ -1097,14 +1107,14 @@ mod tests {
 	fn splice_refuses_altered_region() {
 		let original = "<<<<<<< HEAD\nCHANGED\n=======\nc\n>>>>>>> feature\n";
 		let mut history = ConflictHistory::new();
-		let entry = history.register(Path::new("/tmp/f.txt"), "f.txt", block_2way());
+		let entry = history.register(Path::new("/tmp/f.txt"), "f.txt", block_2way(), true);
 		assert!(splice_conflict(original, &entry, "@ours").is_err());
 	}
 
 	#[test]
 	fn tokens_expand_and_base_requires_diff3() {
 		let mut history = ConflictHistory::new();
-		let entry = history.register(Path::new("/tmp/f.txt"), "f.txt", block_2way());
+		let entry = history.register(Path::new("/tmp/f.txt"), "f.txt", block_2way(), true);
 		assert_eq!(
 			expand_content_tokens("// keep\n@ours\n@both", &entry).unwrap(),
 			"// keep\na\nb\na\nb\nc"
@@ -1142,15 +1152,16 @@ mod tests {
 	fn splice_tolerates_shifted_line_numbers() {
 		let original = "header\nmore\ntop\n<<<<<<< HEAD\na\nb\n=======\nc\n>>>>>>> feature\nbottom\n";
 		let mut history = ConflictHistory::new();
-		let entry = history.register(Path::new("/tmp/f.txt"), "f.txt", block_2way());
-		let splice = splice_conflict(original, &entry, "@ours").expect("shifted match");
+		let entry = history.register(Path::new("/tmp/f.txt"), "f.txt", block_2way(), true);
+		let expanded = expand_content_tokens("@ours", &entry).expect("expand");
+		let splice = splice_conflict(original, &entry, &expanded).expect("shifted match");
 		assert_eq!(splice.text, "header\nmore\ntop\na\nb\nbottom\n");
 	}
 
 	#[test]
 	fn scoped_base_requires_a_diff3_block() {
 		let mut history = ConflictHistory::new();
-		let entry = history.register(Path::new("/tmp/f.txt"), "f.txt", block_2way());
+		let entry = history.register(Path::new("/tmp/f.txt"), "f.txt", block_2way(), true);
 		assert!(render_conflict_region(&entry, Some(ConflictScope::Base)).is_err());
 		assert!(render_conflict_region(&entry, Some(ConflictScope::Ours)).is_ok());
 	}

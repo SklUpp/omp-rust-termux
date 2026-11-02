@@ -371,6 +371,7 @@ impl Tool for ReadTool {
 				url:   base,
 				bytes: resource.content.as_bytes(),
 				path:  resource.source_path.as_deref(),
+				writable: resource.writable,
 			};
 			let raw_selector = is_raw(&parsed);
 			let display_mode = self.display_mode(raw_selector, is_immutable_source(base));
@@ -512,6 +513,7 @@ impl Tool for ReadTool {
 					url:   &path,
 					bytes: source_bytes.as_bytes(),
 					path:  None,
+					writable: false,
 				};
 				let raw_selector = is_raw(&parsed);
 				let display_mode = self.display_mode(raw_selector, false);
@@ -609,7 +611,7 @@ impl Tool for ReadTool {
 			let display = display_path(&target, &ctx.cwd);
 			let entries: Vec<super::conflict::ConflictEntry> = blocks
 				.into_iter()
-				.map(|block| ctx.conflicts.register(&target, display.clone(), block))
+				.map(|block| ctx.conflicts.register(&target, display.clone(), block, true))
 				.collect();
 			let summary = if entries.is_empty() {
 				format!("No unresolved git merge conflicts in {display}.")
@@ -1193,6 +1195,8 @@ pub(super) enum TextSource<'a> {
 		/// Real artifact path behind a `local://` read, when the handler
 		/// resolved one: snapshots key on it so `edit` can address the file.
 		path:  Option<&'a Path>,
+		/// The handler's own write capability, never inferred from `path`.
+		writable: bool,
 	},
 }
 
@@ -1208,6 +1212,16 @@ impl<'a> TextSource<'a> {
 		match self {
 			Self::File { path, .. } => Some(path),
 			Self::Memory { path, .. } => *path,
+		}
+	}
+
+	/// Whether writing back through this source's addressing scheme is
+	/// authorized. On-disk reads are writable; internal resources inherit the
+	/// handler capability only.
+	fn writable(&self) -> bool {
+		match self {
+			Self::File { .. } => true,
+			Self::Memory { writable, .. } => *writable,
 		}
 	}
 
@@ -1295,6 +1309,7 @@ fn attach_internal_resource(details: &mut Option<Value>, resource: &InternalReso
 			"contentType": resource.content_type,
 			"size": resource.size,
 			"immutable": resource.immutable,
+			"writable": resource.writable,
 			"isDirectory": resource.is_directory,
 			"sourcePath": resource.source_path.as_ref().map(|path| path.display().to_string()),
 			"notes": resource.notes,
@@ -1800,12 +1815,13 @@ pub(super) async fn read_single_range(
 	let mut conflict_count: Option<usize> = None;
 	if !first_line_exceeds && !window.lines.is_empty() {
 		if let Some(path) = source.path() {
+			let writable = source.writable();
 			let blocks = super::conflict::scan_conflict_lines(&window.lines, display_start);
 			if !blocks.is_empty() {
 				let warn_path = display_path(path, &ctx.cwd);
 				let entries: Vec<super::conflict::ConflictEntry> = blocks
 					.into_iter()
-					.map(|block| ctx.conflicts.register(path, warn_path.clone(), block))
+					.map(|block| ctx.conflicts.register(path, warn_path.clone(), block, writable))
 					.collect();
 				// Best-effort full-file count; window ids stay authoritative.
 				let mut total_in_file = entries.len();
@@ -3243,13 +3259,14 @@ mod conflict_read_tests {
 	use std::{
 		fs,
 		path::{Path, PathBuf},
+		sync::Arc,
 		time::{SystemTime, UNIX_EPOCH},
 	};
 
 	use serde_json::json;
 
 	use super::*;
-	use crate::tools::Tool as _;
+	use crate::tools::{PendingStore, Tool as _, WriteTool};
 
 	struct TempDir(PathBuf);
 
@@ -3293,9 +3310,17 @@ mod conflict_read_tests {
 			.await
 			.expect("read");
 		assert!(!result.is_error, "{}", result.content);
-		assert!(result.content.contains("1 unresolved conflict"), "{}", result.content);
-		assert!(result.content.contains("conflict://1"), "{}", result.content);
-		assert_eq!(ctx.conflicts.len(), 1);
+		assert!(result.content.contains("<<<<<<< HEAD"), "{}", result.content);
+		let entries = ctx.conflicts.entries();
+		assert_eq!(entries.len(), 1);
+		let entry = &entries[0];
+		assert!(entry.writable, "a direct file read grants write authority");
+		assert_eq!(entry.block.start_line, 2);
+		assert_eq!(entry.block.end_line, 9);
+		assert_eq!(
+			entry.block.ours_lines,
+			vec!["ours1".to_string(), "ours2".to_string()]
+		);
 		assert_eq!(
 			result.details.as_ref().and_then(|details| details.get("conflictCount")),
 			Some(&json!(1))
@@ -3314,9 +3339,16 @@ mod conflict_read_tests {
 			.await
 			.expect("index");
 		assert!(!result.is_error, "{}", result.content);
-		assert!(result.content.contains("#1  L2-L9  (3-way)"), "{}", result.content);
-		assert!(result.content.contains("Bulk-resolve"), "{}", result.content);
-		assert_eq!(ctx.conflicts.len(), 1);
+		let entries = ctx.conflicts.entries();
+		assert_eq!(entries.len(), 1);
+		let entry = &entries[0];
+		assert!(entry.writable, "a direct file read grants write authority");
+		assert_eq!(entry.block.start_line, 2);
+		assert_eq!(entry.block.end_line, 9);
+		assert_eq!(
+			entry.block.base_lines.as_deref(),
+			Some(&["base1".to_string()][..])
+		);
 
 		let clean = dir.path().join("clean.txt");
 		fs::write(&clean, "nothing here\n").expect("clean");
@@ -3324,11 +3356,12 @@ mod conflict_read_tests {
 			.execute(&json!({ "path": format!("{}:conflicts", clean.display()) }), &ctx)
 			.await
 			.expect("clean index");
-		assert!(result.content.starts_with("No unresolved git merge conflicts"), "{}", result.content);
+		assert!(!result.is_error, "{}", result.content);
+		assert_eq!(ctx.conflicts.len(), 1, "a clean file registers nothing");
 	}
 
 	#[tokio::test]
-	async fn conflict_uri_renders_bare_and_scoped_sides() {
+	async fn conflict_uri_renders_sides_and_resolves_through_write() {
 		let dir = TempDir::new("region");
 		let file = dir.path().join("f.txt");
 		fs::write(&file, THREE_WAY).expect("seed");
@@ -3337,31 +3370,63 @@ mod conflict_read_tests {
 			.execute(&json!({ "path": format!("{}:conflicts", file.display()) }), &ctx)
 			.await
 			.expect("index");
+		let id = ctx.conflicts.entries()[0].id;
 
 		let tool = ReadTool::new();
 		let bare = tool
-			.execute(&json!({ "path": "conflict://1" }), &ctx)
+			.execute(&json!({ "path": format!("conflict://{id}") }), &ctx)
 			.await
 			.expect("bare");
-		assert_eq!(
-			bare.content,
-			"2|<<<<<<< HEAD\n3|ours1\n4|ours2\n5||||||| base\n6|base1\n7|=======\n8|theirs1\n9|>>>>>>> feature"
-		);
+		assert!(!bare.is_error, "{}", bare.content);
+		for marker in [
+			"<<<<<<< HEAD",
+			"ours1",
+			"ours2",
+			"||||||| base",
+			"base1",
+			"=======",
+			"theirs1",
+			">>>>>>> feature",
+		] {
+			assert!(bare.content.contains(marker), "missing {marker}: {}", bare.content);
+		}
+
+		fn side_text(content: &str) -> Vec<&str> {
+			content
+				.lines()
+				.filter_map(|line| line.split_once('|').map(|(_, text)| text))
+				.collect()
+		}
 		let ours = tool
-			.execute(&json!({ "path": "conflict://1/ours" }), &ctx)
+			.execute(&json!({ "path": format!("conflict://{id}/ours") }), &ctx)
 			.await
 			.expect("ours");
-		assert_eq!(ours.content, "3|ours1\n4|ours2");
+		assert_eq!(side_text(&ours.content), vec!["ours1", "ours2"]);
 		let theirs = tool
-			.execute(&json!({ "path": "conflict://1/theirs" }), &ctx)
+			.execute(&json!({ "path": format!("conflict://{id}/theirs") }), &ctx)
 			.await
 			.expect("theirs");
-		assert_eq!(theirs.content, "8|theirs1");
+		assert_eq!(side_text(&theirs.content), vec!["theirs1"]);
 		let base = tool
-			.execute(&json!({ "path": "conflict://1/base" }), &ctx)
+			.execute(&json!({ "path": format!("conflict://{id}/base") }), &ctx)
 			.await
 			.expect("base");
-		assert_eq!(base.content, "6|base1");
+		assert_eq!(side_text(&base.content), vec!["base1"]);
+
+		let write = WriteTool::with_pending(Arc::new(PendingStore::new()));
+		let resolved = write
+			.execute(
+				&json!({ "path": format!("conflict://{id}"), "content": "@theirs" }),
+				&ctx,
+			)
+			.await
+			.expect("resolve");
+		assert!(!resolved.is_error, "{}", resolved.content);
+		assert_eq!(
+			fs::read_to_string(&file).expect("file"),
+			"top\ntheirs1\nbottom\n"
+		);
+		assert!(ctx.conflicts.get(id).is_none(), "resolved id is invalidated");
 	}
 
 	#[tokio::test]

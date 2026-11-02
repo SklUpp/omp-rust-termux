@@ -971,6 +971,360 @@ pub(crate) async fn write_atomic_with_mode(
 	Ok(())
 }
 
+/// Failure from [`write_conflict_atomic`].
+#[derive(Debug)]
+pub(crate) enum ConflictWriteError {
+	/// The splice closure rejected the current bytes (stale/changed block).
+	Splice(String),
+	/// The destination identity or bytes changed after validation.
+	Rejected(String),
+	Io(std::io::Error),
+	Cancelled,
+}
+
+impl From<std::io::Error> for ConflictWriteError {
+	fn from(error: std::io::Error) -> Self {
+		Self::Io(error)
+	}
+}
+
+/// Serializes in-process conflict commits. Ordinary `write`/`edit` do not take
+/// this lock; it coordinates the conflict writers that share this helper.
+static CONFLICT_WRITE_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+type ConflictWriteHook = Box<dyn FnOnce() + Send>;
+
+#[cfg(test)]
+static CONFLICT_WRITE_HOOK: Mutex<BTreeMap<PathBuf, ConflictWriteHook>> =
+	Mutex::new(BTreeMap::new());
+
+/// Run a filesystem mutation after the splice has been computed but before the
+/// final identity/content revalidation. Tests use this to deterministically
+/// simulate a pathname swap or concurrent in-place edit.
+#[cfg(test)]
+fn arm_conflict_write_hook(path: &Path, hook: impl FnOnce() + Send + 'static) {
+	let _ = CONFLICT_WRITE_HOOK
+		.lock()
+		.unwrap_or_else(|poison| poison.into_inner())
+		.insert(path.to_path_buf(), Box::new(hook));
+}
+
+#[cfg(test)]
+fn run_conflict_write_hook(path: &Path) {
+	let hook = CONFLICT_WRITE_HOOK
+		.lock()
+		.unwrap_or_else(|poison| poison.into_inner())
+		.remove(path);
+	if let Some(hook) = hook {
+		hook();
+	}
+}
+
+/// Read, splice, and commit one conflict target without re-resolving the
+/// authored pathname at commit time. The caller performs path-based Plan and
+/// capability checks before entering; this helper binds those validated bytes to
+/// the physical file it commits.
+///
+/// The parent directory is pinned by descriptor, the leaf is opened
+/// `O_NOFOLLOW`, and its `(st_dev, st_ino)` identity is captured before the
+/// splice runs. Immediately before `renameat`, the helper re-reads through the
+/// same descriptor and compares the bytes it validated, then re-stats the leaf
+/// with `AT_SYMLINK_NOFOLLOW` and rejects an identity change. A pathname swapped
+/// to a symlink or another inode therefore cannot redirect committed bytes.
+///
+/// Limit: POSIX `renameat` has no compare-and-swap on the destination inode. A
+/// same-UID process that replaces the leaf between the final `fstatat`/read and
+/// the `renameat` can still be overwritten. Conflict writers sharing this
+/// process are serialized, but this is not an isolation boundary against
+/// arbitrary external processes.
+pub(crate) async fn write_conflict_atomic<T, F>(
+	target: &Path,
+	token: &CancellationToken,
+	splice: F,
+) -> Result<T, ConflictWriteError>
+where
+	T: Send + 'static,
+	F: FnOnce(&[u8]) -> Result<(Vec<u8>, T), String> + Send + 'static,
+{
+	if token.is_cancelled() {
+		return Err(ConflictWriteError::Cancelled);
+	}
+	// Resolve an authored leaf symlink once, before any bytes are validated.
+	// The commit below is bound to this resolved path; re-resolving after the
+	// splice is what allowed a swapped link to redirect committed bytes.
+	let target = resolve_symlink_target(target.to_path_buf())
+		.await
+		.map_err(ConflictWriteError::Io)?;
+	let token = token.clone();
+	tokio::task::spawn_blocking(move || write_conflict_sync(&target, &token, splice))
+		.await
+		.map_err(|error| {
+			ConflictWriteError::Io(std::io::Error::new(std::io::ErrorKind::Other, error))
+		})?
+}
+
+#[cfg(unix)]
+fn write_conflict_sync<T, F>(
+	target: &Path,
+	token: &CancellationToken,
+	splice: F,
+) -> Result<T, ConflictWriteError>
+where
+	F: FnOnce(&[u8]) -> Result<(Vec<u8>, T), String>,
+{
+	use std::{
+		ffi::CString,
+		fs::File,
+		io::{Read, Seek, SeekFrom, Write},
+		os::{
+			fd::{AsRawFd, FromRawFd, OwnedFd},
+			unix::ffi::OsStrExt,
+		},
+	};
+
+	fn interrupted() -> ConflictWriteError {
+		ConflictWriteError::Cancelled
+	}
+	fn cstring(part: &[u8], what: &str) -> Result<CString, ConflictWriteError> {
+		CString::new(part).map_err(|_| {
+			ConflictWriteError::Rejected(format!("{what} contains a NUL byte"))
+		})
+	}
+	fn last_error(context: &str) -> ConflictWriteError {
+		let raw = std::io::Error::last_os_error();
+		ConflictWriteError::Io(std::io::Error::new(
+			raw.kind(),
+			format!("{context}: {raw}"),
+		))
+	}
+
+	let _serial = CONFLICT_WRITE_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+	if token.is_cancelled() {
+		return Err(interrupted());
+	}
+
+	let parent = target
+		.parent()
+		.filter(|path| !path.as_os_str().is_empty())
+		.unwrap_or_else(|| Path::new("."));
+	let Some(name) = target.file_name() else {
+		return Err(ConflictWriteError::Rejected(format!(
+			"{} has no file name to commit",
+			target.display()
+		)));
+	};
+	let parent_c = cstring(parent.as_os_str().as_bytes(), "conflict target parent")?;
+	let name_c = cstring(name.as_bytes(), "conflict target name")?;
+
+	// Pin the directory: later pathname changes cannot redirect the commit.
+	// SAFETY: `parent_c` is NUL-terminated and the descriptor is owned here.
+	let parent_fd = unsafe {
+		libc::open(
+			parent_c.as_ptr(),
+			libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+		)
+	};
+	if parent_fd < 0 {
+		return Err(last_error(&format!("opening {}", parent.display())));
+	}
+	// SAFETY: fresh descriptor, ownership moves into the guard.
+	let parent_fd = unsafe { OwnedFd::from_raw_fd(parent_fd) };
+
+	let mut before: libc::stat = unsafe { std::mem::zeroed() };
+	// SAFETY: `parent_fd` and `name_c` are valid; `AT_SYMLINK_NOFOLLOW` keeps
+	// the leaf check on the directory entry itself.
+	if unsafe {
+		libc::fstatat(
+			parent_fd.as_raw_fd(),
+			name_c.as_ptr(),
+			&mut before,
+			libc::AT_SYMLINK_NOFOLLOW,
+		)
+	} != 0
+	{
+		return Err(last_error(&format!("stat {}", target.display())));
+	}
+	match before.st_mode & libc::S_IFMT {
+		libc::S_IFLNK => {
+			return Err(ConflictWriteError::Rejected(format!(
+				"{} is a symlink; conflict writes never follow a replaced leaf",
+				target.display()
+			)));
+		},
+		libc::S_IFDIR => {
+			return Err(ConflictWriteError::Rejected(format!(
+				"{} is a directory",
+				target.display()
+			)));
+		},
+		libc::S_IFREG => {},
+		_ => {
+			return Err(ConflictWriteError::Rejected(format!(
+				"{} is not a regular file",
+				target.display()
+			)));
+		},
+	}
+	let original_id = (before.st_dev, before.st_ino);
+	let mode = before.st_mode & 0o777;
+
+	// SAFETY: `parent_fd` is open and `name_c` is NUL-terminated. `O_NOFOLLOW`
+	// rejects a leaf swapped for a symlink between the stat above and this open.
+	let leaf_fd = unsafe {
+		libc::openat(
+			parent_fd.as_raw_fd(),
+			name_c.as_ptr(),
+			libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+		)
+	};
+	if leaf_fd < 0 {
+		return Err(last_error(&format!("opening {}", target.display())));
+	}
+	// SAFETY: fresh descriptor, ownership moves into the `File`.
+	let mut leaf = File::from(unsafe { OwnedFd::from_raw_fd(leaf_fd) });
+
+	let mut opened: libc::stat = unsafe { std::mem::zeroed() };
+	// SAFETY: `leaf` owns a live descriptor.
+	if unsafe { libc::fstat(leaf.as_raw_fd(), &mut opened) } != 0 {
+		return Err(last_error(&format!("stat {}", target.display())));
+	}
+	if (opened.st_dev, opened.st_ino) != original_id {
+		return Err(ConflictWriteError::Rejected(format!(
+			"{} changed identity while it was being opened; refusing to write",
+			target.display()
+		)));
+	}
+
+	let mut original = Vec::new();
+	leaf.seek(SeekFrom::Start(0))?;
+	leaf.read_to_end(&mut original)?;
+
+	let (bytes, value) = splice(&original).map_err(ConflictWriteError::Splice)?;
+	if token.is_cancelled() {
+		return Err(interrupted());
+	}
+
+	let temp = format!(
+		".omp-conflict-{}-{}",
+		std::process::id(),
+		TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+	);
+	let temp_c = cstring(temp.as_bytes(), "conflict temp name")?;
+	// SAFETY: `parent_fd` and `temp_c` are valid; the descriptor is owned below.
+	let temp_fd = unsafe {
+		libc::openat(
+			parent_fd.as_raw_fd(),
+			temp_c.as_ptr(),
+			libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+			0o600,
+		)
+	};
+	if temp_fd < 0 {
+		return Err(last_error(&format!("creating a temporary file next to {}", target.display())));
+	}
+	// SAFETY: fresh descriptor, ownership moves into the `File`.
+	let mut temp_file = File::from(unsafe { OwnedFd::from_raw_fd(temp_fd) });
+	let cleanup = || {
+		// SAFETY: `parent_fd` stays open for the rest of this call.
+		unsafe {
+			libc::unlinkat(parent_fd.as_raw_fd(), temp_c.as_ptr(), 0);
+		}
+	};
+
+	let committed = (|| -> Result<(), ConflictWriteError> {
+		for chunk in bytes.chunks(64 * 1024) {
+			if token.is_cancelled() {
+				return Err(interrupted());
+			}
+			temp_file.write_all(chunk)?;
+		}
+		temp_file.flush()?;
+		// SAFETY: `temp_file` owns a live descriptor and `mode` came from the
+		// file this commit is bound to.
+		if unsafe { libc::fchmod(temp_file.as_raw_fd(), mode) } != 0 {
+			return Err(last_error("setting the conflict write mode"));
+		}
+
+		#[cfg(test)]
+		run_conflict_write_hook(target);
+
+		if token.is_cancelled() {
+			return Err(interrupted());
+		}
+		// Re-read the exact descriptor the splice validated.
+		leaf.seek(SeekFrom::Start(0))?;
+		let mut current = Vec::new();
+		leaf.read_to_end(&mut current)?;
+		if current != original {
+			return Err(ConflictWriteError::Rejected(format!(
+				"{} changed while the conflict was being resolved; refusing to overwrite concurrent edits",
+				target.display()
+			)));
+		}
+
+		let mut after: libc::stat = unsafe { std::mem::zeroed() };
+		// SAFETY: `parent_fd` and `name_c` are valid.
+		if unsafe {
+			libc::fstatat(
+				parent_fd.as_raw_fd(),
+				name_c.as_ptr(),
+				&mut after,
+				libc::AT_SYMLINK_NOFOLLOW,
+			)
+		} != 0
+		{
+			return Err(last_error(&format!("re-stat {}", target.display())));
+		}
+		if after.st_mode & libc::S_IFMT != libc::S_IFREG
+			|| (after.st_dev, after.st_ino) != original_id
+		{
+			return Err(ConflictWriteError::Rejected(format!(
+				"{} changed on disk while the conflict was being resolved; refusing to replace it",
+				target.display()
+			)));
+		}
+
+		// SAFETY: both names are NUL-terminated and relative to the pinned
+		// directory. `renameat` replaces the leaf entry without following it.
+		if unsafe {
+			libc::renameat(
+				parent_fd.as_raw_fd(),
+				temp_c.as_ptr(),
+				parent_fd.as_raw_fd(),
+				name_c.as_ptr(),
+			)
+		} != 0
+		{
+			return Err(last_error(&format!("committing {}", target.display())));
+		}
+		Ok(())
+	})();
+
+	match committed {
+		Ok(()) => Ok(value),
+		Err(error) => {
+			cleanup();
+			Err(error)
+		},
+	}
+}
+
+#[cfg(not(unix))]
+fn write_conflict_sync<T, F>(
+	target: &Path,
+	_token: &CancellationToken,
+	_splice: F,
+) -> Result<T, ConflictWriteError>
+where
+	F: FnOnce(&[u8]) -> Result<(Vec<u8>, T), String>,
+{
+	Err(ConflictWriteError::Rejected(format!(
+		"conflict writes to {} need descriptor-relative atomic commit; unsupported on this platform",
+		target.display()
+	)))
+}
+
 /// Reject `.`/`..`/empty components of a sandbox-relative path. `openat` and
 /// `O_NOFOLLOW` do not block `..`, so every contained helper validates first.
 pub(crate) fn validate_artifact_relative(relative: &str) -> Result<(), String> {
@@ -1479,6 +1833,58 @@ impl WriteTool {
 		}
 	}
 
+	/// Strip hashline display echoes from conflict write content. Hash-line
+	/// mode is evidenced by a `[PATH#TAG]` header or by a snapshot recorded for
+	/// one of the targets (sloppy-mode reads record none), so `3: @ours` is not
+	/// mistaken for a bulk directive in a sloppy session.
+	fn prepare_conflict_content(
+		&self,
+		entries: &[ConflictEntry],
+		content: &str,
+	) -> (String, bool, bool) {
+		let hash_lines = self.conflict_hash_lines(entries, content);
+		let (clean, stripped) = if hash_lines {
+			hashline::strip_write_display_prefixes(content)
+		} else {
+			(content.to_string(), false)
+		};
+		(clean, stripped, hash_lines)
+	}
+
+	fn conflict_hash_lines(&self, entries: &[ConflictEntry], content: &str) -> bool {
+		hashline::has_write_display_header(content)
+			|| self.snapshots.as_ref().is_some_and(|store| {
+				entries.iter().any(|entry| {
+					store
+						.head(&hashline::canonical_key(&entry.absolute_path))
+						.is_some()
+				})
+			})
+	}
+
+	/// Record the post-write full content with no seen-line provenance and
+	/// return its `[displayPath#TAG]` header. A write displays no numbered
+	/// lines, so the tag carries no displayed-line set; in the native store
+	/// `None` disables the seen-line guard for this version.
+	fn record_conflict_snapshot(
+		&self,
+		absolute_path: &Path,
+		new_content: &str,
+		ctx: &AgentContext,
+	) -> Option<String> {
+		let store = self.snapshots.as_ref()?;
+		let normalized = hashline::hash::normalize_to_lf(new_content);
+		let tag = store.record(
+			&hashline::canonical_key(absolute_path),
+			&normalized,
+			Some(&[]),
+		)?;
+		Some(hashline::format_header(
+			&hashline::display_path(absolute_path, &ctx.cwd),
+			&tag,
+		))
+	}
+
 	async fn resolve_single_conflict(
 		&self,
 		id: u64,
@@ -1490,40 +1896,68 @@ impl WriteTool {
 				"Conflict #{id} not found. Conflict ids are registered when `read` surfaces a marker block; re-read the file to get a current id."
 			))
 		})?;
+		let (clean_content, stripped, hash_lines) =
+			self.prepare_conflict_content(std::slice::from_ref(&entry), content);
 		let expanded =
-			conflict::expand_content_tokens(content, &entry).map_err(ToolError::Rejected)?;
-		let original = match tokio::fs::read(&entry.absolute_path).await {
-			Ok(bytes) => bytes,
-			Err(_) => {
-				return Err(ToolError::Rejected(format!(
-					"Conflict #{} target '{}' no longer exists.",
-					entry.id, entry.display_path
-				)));
-			},
-		};
-		let original_text = String::from_utf8_lossy(&original).into_owned();
-		let splice = conflict::splice_conflict(&original_text, &entry, &expanded)
-			.map_err(ToolError::Rejected)?;
+			conflict::expand_content_tokens(&clean_content, &entry).map_err(ToolError::Rejected)?;
+		if !entry.writable {
+			return Err(ToolError::Rejected(format!(
+				"Conflict #{} was registered from a read-only resource ('{}'); that source does not grant write authority. Read it through a writable path to resolve it.",
+				entry.id, entry.display_path
+			)));
+		}
 		self.check_conflict_plan(std::slice::from_ref(&entry.absolute_path), ctx)?;
 		if ctx.cancellation_token.is_cancelled() {
 			return Ok(tool_result(format!("Write to conflict #{} cancelled", entry.id), true));
 		}
-		match write_atomic(&entry.absolute_path, splice.text.as_bytes(), &ctx.cancellation_token).await {
-			Ok(()) => {},
-			Err(err)
-				if err.kind() == std::io::ErrorKind::Interrupted
-					|| ctx.cancellation_token.is_cancelled() =>
-			{
-				return Ok(tool_result(format!("Write to conflict #{} cancelled", entry.id), true));
+		let splice_entry = entry.clone();
+		let splice = match write_conflict_atomic(
+			&entry.absolute_path,
+			&ctx.cancellation_token,
+			move |current| {
+				let original_text = String::from_utf8_lossy(current).into_owned();
+				let splice =
+					conflict::splice_conflict(&original_text, &splice_entry, &expanded)?;
+				Ok((splice.text.as_bytes().to_vec(), splice))
 			},
-			Err(err) => {
+		)
+		.await
+		{
+			Ok(splice) => splice,
+			Err(ConflictWriteError::Cancelled) => {
+				return Ok(tool_result(
+					format!("Write to conflict #{} cancelled", entry.id),
+					true,
+				));
+			},
+			Err(ConflictWriteError::Splice(message)) => {
+				return Err(ToolError::Rejected(message));
+			},
+			Err(ConflictWriteError::Rejected(message)) => {
+				return Ok(tool_result(
+					format!("Failed to write {}: {message}", entry.display_path),
+					true,
+				));
+			},
+			Err(ConflictWriteError::Io(err)) => {
+				if err.kind() == std::io::ErrorKind::NotFound {
+					return Err(ToolError::Rejected(format!(
+						"Conflict #{} target '{}' no longer exists.",
+						entry.id, entry.display_path
+					)));
+				}
 				return Ok(tool_result(
 					format!("Failed to write {}: {err}", entry.display_path),
 					true,
 				));
 			},
-		}
+		};
 		self.invalidate_conflict(&entry, &splice.text, ctx);
+		let snapshot_header = if hash_lines {
+			self.record_conflict_snapshot(&entry.absolute_path, &splice.text, ctx)
+		} else {
+			None
+		};
 
 		let range = if entry.block.start_line == entry.block.end_line {
 			format!("line {}", entry.block.start_line)
@@ -1537,11 +1971,19 @@ impl WriteTool {
 			"Resolved conflict #{} at {range} in {}.",
 			entry.id, entry.display_path
 		);
+		if stripped {
+			text.push_str(
+				"\nNote: auto-stripped hashline display prefixes from content before writing.",
+			);
+		}
 		let echo_trimmed = splice.trimmed_leading + splice.trimmed_trailing;
 		if echo_trimmed > 0 {
 			text.push_str(&format!(
 				"\nNote: dropped {echo_trimmed} content line(s) that duplicated the code adjacent to the conflict region — writes replace only the marker block; surrounding lines stay in place."
 			));
+		}
+		if let Some(header) = &snapshot_header {
+			text = format!("{header}\n{text}");
 		}
 		Ok(read::result_with_details(
 			text,
@@ -1567,7 +2009,8 @@ impl WriteTool {
 					.to_string(),
 			));
 		}
-		let directives = conflict::parse_bulk_directives(content)
+		let (content, stripped, hash_lines) = self.prepare_conflict_content(&all_entries, content);
+		let directives = conflict::parse_bulk_directives(&content)
 			.map_err(ToolError::Rejected)?;
 		if let Some(directives) = &directives {
 			let unknown: Vec<String> = directives
@@ -1593,6 +2036,12 @@ impl WriteTool {
 			None => all_entries.clone(),
 		};
 		let selected_total = selected.len();
+		if let Some(entry) = selected.iter().find(|entry| !entry.writable) {
+			return Err(ToolError::Rejected(format!(
+				"Conflict #{} was registered from a read-only resource ('{}'); that source does not grant write authority. Read it through a writable path to resolve it.",
+				entry.id, entry.display_path
+			)));
+		}
 		let targets: Vec<PathBuf> = selected.iter().map(|entry| entry.absolute_path.clone()).collect();
 		self.check_conflict_plan(&targets, ctx)?;
 		if ctx.cancellation_token.is_cancelled() {
@@ -1606,74 +2055,92 @@ impl WriteTool {
 
 		let mut succeeded: Vec<(String, usize)> = Vec::new();
 		let mut failed: Vec<(String, usize, String)> = Vec::new();
+		let mut snapshot_headers: Vec<String> = Vec::new();
 		let mut total_resolved = 0usize;
 		let mut total_echo_trimmed = 0usize;
 
 		for (absolute_path, mut entries) in by_file {
 			let sample = entries[0].display_path.clone();
+			let entry_count = entries.len();
 			entries.sort_by_key(|entry| std::cmp::Reverse(entry.block.start_line));
-			let mut text = match tokio::fs::read(&absolute_path).await {
-				Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-				Err(_) => {
-					failed.push((sample, entries.len(), "file no longer exists".to_string()));
-					continue;
-				},
-			};
-			let mut resolved: Vec<ConflictEntry> = Vec::new();
-			let mut stale: Vec<u64> = Vec::new();
-			let mut failure: Option<String> = None;
-			for entry in &entries {
-				let replacement = match &directives {
-					Some(directives) => {
-						directives.get(&entry.id).map(String::as_str).unwrap_or("")
-					},
-					None => content,
-				};
-				match conflict::expand_content_tokens(replacement, entry)
-					.and_then(|expanded| conflict::splice_conflict(&text, entry, &expanded))
-				{
-					Ok(splice) => {
-						text = splice.text;
-						total_echo_trimmed += splice.trimmed_leading + splice.trimmed_trailing;
-						resolved.push(entry.clone());
-					},
-					Err(message) => {
-						// A miss for a region an earlier entry already spliced in
-						// this pass is a stale duplicate registration.
-						if resolved.iter().any(|done| {
-							conflict::conflict_regions_equal(&done.block, &entry.block)
-						}) {
-							stale.push(entry.id);
-							continue;
+			let splice_entries = entries;
+			let splice_directives = directives.clone();
+			let content_for_splice = content.to_string();
+			let outcome = write_conflict_atomic(
+				&absolute_path,
+				&ctx.cancellation_token,
+				move |current| {
+					let mut text = String::from_utf8_lossy(current).into_owned();
+					let mut resolved: Vec<ConflictEntry> = Vec::new();
+					let mut stale: Vec<u64> = Vec::new();
+					let mut echo_trimmed = 0usize;
+					for entry in &splice_entries {
+						let replacement = match &splice_directives {
+							Some(directives) => {
+								directives.get(&entry.id).map(String::as_str).unwrap_or("")
+							},
+							None => content_for_splice.as_str(),
+						};
+						match conflict::expand_content_tokens(replacement, entry)
+							.and_then(|expanded| conflict::splice_conflict(&text, entry, &expanded))
+						{
+							Ok(splice) => {
+								text = splice.text;
+								echo_trimmed +=
+									splice.trimmed_leading + splice.trimmed_trailing;
+								resolved.push(entry.clone());
+							},
+							Err(message) => {
+								// A miss for a region an earlier entry already
+								// spliced in this pass is a stale duplicate.
+								if resolved.iter().any(|done| {
+									conflict::conflict_regions_equal(&done.block, &entry.block)
+								}) {
+									stale.push(entry.id);
+									continue;
+								}
+								return Err(message);
+							},
 						}
-						failure = Some(message);
-						break;
-					},
-				}
+					}
+					Ok((text.as_bytes().to_vec(), (text, resolved, stale, echo_trimmed)))
+				},
+			)
+			.await;
+			match outcome {
+				Ok((text, resolved, stale, echo_trimmed)) => {
+					total_echo_trimmed += echo_trimmed;
+					for entry in &resolved {
+						self.invalidate_conflict(entry, &text, ctx);
+					}
+					for id in stale {
+						ctx.conflicts.invalidate(id);
+					}
+					if hash_lines
+						&& let Some(header) =
+							self.record_conflict_snapshot(&absolute_path, &text, ctx)
+					{
+						snapshot_headers.push(header);
+					}
+					total_resolved += resolved.len();
+					succeeded.push((sample, resolved.len()));
+				},
+				Err(ConflictWriteError::Cancelled) => {
+					failed.push((sample, entry_count, "write cancelled".to_string()));
+				},
+				Err(ConflictWriteError::Splice(message))
+				| Err(ConflictWriteError::Rejected(message)) => {
+					failed.push((sample, entry_count, message));
+				},
+				Err(ConflictWriteError::Io(err)) => {
+					let message = if err.kind() == std::io::ErrorKind::NotFound {
+						"file no longer exists".to_string()
+					} else {
+						err.to_string()
+					};
+					failed.push((sample, entry_count, message));
+				},
 			}
-			if let Some(message) = failure {
-				failed.push((sample, entries.len(), message));
-				continue;
-			}
-			if let Err(err) = write_atomic(&absolute_path, text.as_bytes(), &ctx.cancellation_token).await {
-				let message = if err.kind() == std::io::ErrorKind::Interrupted
-					|| ctx.cancellation_token.is_cancelled()
-				{
-					"write cancelled".to_string()
-				} else {
-					err.to_string()
-				};
-				failed.push((sample, entries.len(), message));
-				continue;
-			}
-			for entry in &resolved {
-				self.invalidate_conflict(entry, &text, ctx);
-			}
-			for id in stale {
-				ctx.conflicts.invalidate(id);
-			}
-			total_resolved += resolved.len();
-			succeeded.push((sample, resolved.len()));
 		}
 
 		let conflict_word = |count: usize| if count == 1 { "conflict" } else { "conflicts" };
@@ -1722,6 +2189,18 @@ impl WriteTool {
 					conflict_word(*count)
 				));
 			}
+		}
+		if !snapshot_headers.is_empty() {
+			lines.push("Snapshots:".to_string());
+			for header in &snapshot_headers {
+				lines.push(format!("  {header}"));
+			}
+		}
+		if stripped && directives.is_none() {
+			lines.push(
+				"Note: auto-stripped hashline display prefixes from content before writing."
+					.to_string(),
+			);
 		}
 		let text = lines.join("\n");
 		if succeeded.is_empty() {
@@ -3624,7 +4103,7 @@ mod plan_mode_tool_tests {
 		let lines: Vec<String> = text.split('\n').map(str::to_string).collect();
 		crate::tools::conflict::scan_conflict_lines(&lines, 1)
 			.into_iter()
-			.map(|block| ctx.conflicts.register(path, display.clone(), block).id)
+			.map(|block| ctx.conflicts.register(path, display.clone(), block, true).id)
 			.collect()
 	}
 
@@ -3717,10 +4196,15 @@ mod plan_mode_tool_tests {
 		let ids = register_conflicts(&ctx, &file);
 		assert_eq!(ids.len(), 2);
 
-		let tool = WriteTool::with_pending(Arc::new(PendingStore::new()));
+		let store = Arc::new(hashline::SnapshotStore::new());
+		store
+			.record(&hashline::canonical_key(&file), CONFLICTED, None)
+			.expect("seed snapshot");
+		let tool = WriteTool::with_pending(Arc::new(PendingStore::new()))
+			.with_snapshots(Some(Arc::clone(&store)));
 		let result = tool
 			.execute(
-				&json!({ "path": "conflict://*", "content": format!("{}: @ours\n{}: @theirs", ids[0], ids[1]) }),
+				&json!({ "path": "conflict://*", "content": format!("#{} = @ours\n#{} = @theirs", ids[0], ids[1]) }),
 				&ctx,
 			)
 			.await
@@ -3729,6 +4213,23 @@ mod plan_mode_tool_tests {
 		assert_eq!(
 			std::fs::read_to_string(&file).expect("file"),
 			"top\nours1\nmid\ntheirs2\n"
+		);
+		assert!(result.content.contains("Snapshots:"), "{}", result.content);
+		let head = store
+			.head(&hashline::canonical_key(&file))
+			.expect("bulk snapshot");
+		assert_eq!(head.text, "top\nours1\nmid\ntheirs2\n");
+		assert!(
+			head.seen_lines.is_none(),
+			"bulk write records no seen provenance"
+		);
+		assert!(
+			result
+				.content
+				.lines()
+				.any(|line| line.trim().ends_with(&format!("#{}]", head.hash))),
+			"{}",
+			result.content
 		);
 	}
 
@@ -3794,7 +4295,7 @@ mod plan_mode_tool_tests {
 	}
 
 	#[tokio::test]
-	async fn conflict_write_invalidates_the_hashline_snapshot() {
+	async fn conflict_write_replaces_the_hashline_snapshot() {
 		let cwd = temp_cwd("conflict-snapshot");
 		let file = cwd.join("f.txt");
 		std::fs::write(&file, CONFLICTED).expect("seed");
@@ -3802,7 +4303,7 @@ mod plan_mode_tool_tests {
 		register_conflicts(&ctx, &file);
 		let store = Arc::new(hashline::SnapshotStore::new());
 		let key = hashline::snapshot::canonical_key(&file);
-		store.record(&key, CONFLICTED, None).expect("snapshot");
+		let stale_tag = store.record(&key, CONFLICTED, None).expect("snapshot");
 		assert!(store.head(&key).is_some());
 
 		let tool = WriteTool::with_pending(Arc::new(PendingStore::new()))
@@ -3812,7 +4313,18 @@ mod plan_mode_tool_tests {
 			.await
 			.expect("resolve");
 		assert!(!result.is_error, "{}", result.content);
-		assert!(store.head(&key).is_none(), "pre-splice tag is gone");
+		let head = store.head(&key).expect("post-write snapshot");
+		assert_eq!(head.text, "top\nours\nbottom\n");
+		assert!(store.by_hash(&key, &stale_tag).is_none(), "pre-splice tag is gone");
+		assert!(
+			result
+				.content
+				.lines()
+				.next()
+				.is_some_and(|line| line.ends_with(&format!("#{}]", head.hash))),
+			"{}",
+			result.content
+		);
 	}
 
 	#[tokio::test]
@@ -3825,5 +4337,278 @@ mod plan_mode_tool_tests {
 			.await
 			.expect_err("scope rejected");
 		assert!(error.to_string().contains("read-only"), "{error}");
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn conflict_write_refuses_leaf_swapped_before_commit() {
+		let cwd = temp_cwd("conflict-swap");
+		let target = cwd.join("target.txt");
+		let victim = cwd.join("victim.txt");
+		std::fs::write(&target, CONFLICTED).expect("seed");
+		std::fs::write(&victim, "victim original\n").expect("victim");
+		let ctx = AgentContext::new(cwd.clone());
+		register_conflicts(&ctx, &target);
+
+		let hook_target = target.clone();
+		let hook_victim = victim.clone();
+		arm_conflict_write_hook(&target, move || {
+			std::fs::rename(&hook_target, hook_target.with_extension("bak")).expect("move");
+			std::os::unix::fs::symlink(&hook_victim, &hook_target).expect("symlink");
+		});
+
+		let tool = WriteTool::with_pending(Arc::new(PendingStore::new()));
+		let result = tool
+			.execute(&json!({ "path": "conflict://1", "content": "@ours" }), &ctx)
+			.await
+			.expect("write executes");
+		assert!(result.is_error, "{}", result.content);
+		assert!(
+			result.content.contains("refusing to replace"),
+			"{}",
+			result.content
+		);
+		assert_eq!(
+			std::fs::read_to_string(&victim).expect("victim"),
+			"victim original\n",
+			"a swapped symlink must not redirect committed bytes"
+		);
+		assert!(
+			std::fs::symlink_metadata(&target)
+				.expect("target")
+				.file_type()
+				.is_symlink()
+		);
+		assert!(ctx.conflicts.get(1).is_some(), "id survives a refused write");
+		let leftovers = std::fs::read_dir(&cwd)
+			.expect("dir")
+			.filter_map(Result::ok)
+			.any(|entry| {
+				entry
+					.file_name()
+					.to_string_lossy()
+					.starts_with(".omp-conflict-")
+			});
+		assert!(!leftovers, "failed commit must clean up its temp file");
+	}
+
+	#[tokio::test]
+	async fn conflict_write_refuses_leaf_identity_swap() {
+		let cwd = temp_cwd("conflict-identity");
+		let file = cwd.join("f.txt");
+		let replacement = cwd.join("replacement.txt");
+		std::fs::write(&file, CONFLICTED).expect("seed");
+		const SWAPPED: &str = "swapped by another writer\n";
+		std::fs::write(&replacement, SWAPPED).expect("replacement");
+		let ctx = AgentContext::new(cwd.clone());
+		register_conflicts(&ctx, &file);
+
+		let hook_file = file.clone();
+		let hook_replacement = replacement.clone();
+		arm_conflict_write_hook(&file, move || {
+			std::fs::rename(&hook_replacement, &hook_file).expect("identity swap");
+		});
+
+		let tool = WriteTool::with_pending(Arc::new(PendingStore::new()));
+		let result = tool
+			.execute(&json!({ "path": "conflict://1", "content": "@ours" }), &ctx)
+			.await
+			.expect("write executes");
+		assert!(result.is_error, "{}", result.content);
+		assert!(
+			result.content.contains("changed on disk"),
+			"{}",
+			result.content
+		);
+		assert_eq!(
+			std::fs::read_to_string(&file).expect("file"),
+			SWAPPED,
+			"a different inode at the pathname must survive"
+		);
+		assert!(ctx.conflicts.get(1).is_some(), "id survives a refused write");
+	}
+
+	#[tokio::test]
+	async fn conflict_write_refuses_concurrent_inplace_edit() {
+		let cwd = temp_cwd("conflict-concurrent");
+		let file = cwd.join("f.txt");
+		std::fs::write(&file, CONFLICTED).expect("seed");
+		let ctx = AgentContext::new(cwd.clone());
+		register_conflicts(&ctx, &file);
+
+		let concurrent = CONFLICTED.replace("top", "edited by another writer");
+		let hook_file = file.clone();
+		let hook_content = concurrent.clone();
+		arm_conflict_write_hook(&file, move || {
+			std::fs::write(&hook_file, hook_content).expect("concurrent edit");
+		});
+
+		let store = Arc::new(hashline::SnapshotStore::new());
+		let key = hashline::canonical_key(&file);
+		store.record(&key, CONFLICTED, None).expect("seed snapshot");
+		let tool = WriteTool::with_pending(Arc::new(PendingStore::new()))
+			.with_snapshots(Some(Arc::clone(&store)));
+		let result = tool
+			.execute(&json!({ "path": "conflict://1", "content": "@ours" }), &ctx)
+			.await
+			.expect("write executes");
+		assert!(result.is_error, "{}", result.content);
+		assert!(
+			result
+				.content
+				.contains("changed while the conflict was being resolved"),
+			"{}",
+			result.content
+		);
+		assert_eq!(
+			std::fs::read_to_string(&file).expect("file"),
+			concurrent,
+			"concurrent edits must survive"
+		);
+		assert!(ctx.conflicts.get(1).is_some(), "id survives a refused write");
+		assert_eq!(
+			store.head(&key).expect("snapshot").text,
+			CONFLICTED,
+			"a rejected write must not record the new snapshot"
+		);
+	}
+
+	#[tokio::test]
+	async fn read_only_local_conflict_is_not_a_write_capability() {
+		let cwd = temp_cwd("conflict-readonly-local");
+		let artifacts = cwd.join("artifacts");
+		std::fs::create_dir_all(&artifacts).expect("artifacts");
+		let file = artifacts.join("note.txt");
+		std::fs::write(&file, CONFLICTED).expect("seed");
+		let writable_file = cwd.join("writable.txt");
+
+		let ctx = AgentContext::new(cwd);
+		let mut scope = UrlScope::default();
+		scope.local_roots.insert("local".to_string(), artifacts);
+		let read = ReadTool::new()
+			.with_internal_urls(Arc::new(InternalUrlRouter::new()), Arc::new(scope));
+		let read_result = read
+			.execute(&json!({ "path": "local://note.txt" }), &ctx)
+			.await
+			.expect("read local");
+		assert!(!read_result.is_error, "{}", read_result.content);
+
+		let entry = ctx.conflicts.get(1).expect("registered conflict");
+		assert!(!entry.writable, "local:// handler is read-only");
+		assert_eq!(entry.absolute_path, file);
+
+		let writable_read = ReadTool::new()
+			.execute(
+				&json!({ "path": writable_file.display().to_string() }),
+				&ctx,
+			)
+			.await
+			.expect("read writable");
+		assert!(!writable_read.is_error, "{}", writable_read.content);
+		assert_eq!(ctx.conflicts.len(), 2);
+		assert!(
+			ctx.conflicts
+				.entries()
+				.iter()
+				.any(|entry| entry.writable && entry.absolute_path == writable_file)
+		);
+
+		let tool = WriteTool::with_pending(Arc::new(PendingStore::new()));
+		let error = tool
+			.execute(&json!({ "path": "conflict://1", "content": "@ours" }), &ctx)
+			.await
+			.expect_err("derived write rejected");
+		assert!(error.to_string().contains("read-only"), "{error}");
+		assert_eq!(
+			std::fs::read_to_string(&file).expect("untouched"),
+			CONFLICTED
+		);
+
+		let error = tool
+			.execute(&json!({ "path": "conflict://*", "content": "@ours" }), &ctx)
+			.await
+			.expect_err("bulk derived write rejected");
+		assert!(error.to_string().contains("read-only"), "{error}");
+		assert_eq!(
+			std::fs::read_to_string(&file).expect("untouched"),
+			CONFLICTED
+		);
+		assert_eq!(
+			std::fs::read_to_string(&writable_file).expect("writable untouched"),
+			CONFLICTED,
+			"a read-only selection must abort the whole bulk before mutation"
+		);
+	}
+
+	#[tokio::test]
+	async fn hashline_read_echo_resolves_conflict_and_returns_current_tag() {
+		let cwd = temp_cwd("conflict-hashline-echo");
+		let file = cwd.join("f.txt");
+		std::fs::write(&file, CONFLICTED).expect("seed");
+		let ctx = AgentContext::new(cwd);
+		let store = Arc::new(hashline::SnapshotStore::new());
+		let sink = Arc::new(hashline::NativeSnapshotSink::new(Arc::clone(&store)));
+		let read = ReadTool::with_snapshot_sink(sink).with_display_inputs(
+			super::read::FileDisplayInputs::new(
+				super::edit_variants::EditMode::Hashline,
+				true,
+				false,
+			),
+		);
+		let read_result = read
+			.execute(&json!({ "path": file.display().to_string() }), &ctx)
+			.await
+			.expect("read");
+		assert!(!read_result.is_error, "{}", read_result.content);
+
+		// Copy the hashline display echo (header + `N:` prefixes) back as the
+		// replacement, exactly as a model may do after inspecting a side.
+		let side = read
+			.execute(&json!({ "path": "conflict://1/ours" }), &ctx)
+			.await
+			.expect("side");
+		assert!(!side.is_error, "{}", side.content);
+		assert!(
+			side.content.lines().next().is_some_and(|line| line.starts_with("[f.txt#")),
+			"{}",
+			side.content
+		);
+		assert!(side.content.contains("3:ours"), "{}", side.content);
+
+		let tool = WriteTool::with_pending(Arc::new(PendingStore::new()))
+			.with_snapshots(Some(Arc::clone(&store)));
+		let result = tool
+			.execute(
+				&json!({ "path": "conflict://1", "content": side.content }),
+				&ctx,
+			)
+			.await
+			.expect("resolve");
+		assert!(!result.is_error, "{}", result.content);
+		assert_eq!(
+			std::fs::read_to_string(&file).expect("file"),
+			"top\nours\nbottom\n",
+			"display header and line prefixes must not land in the file"
+		);
+		assert!(
+			result.content.contains("auto-stripped hashline display prefixes"),
+			"{}",
+			result.content
+		);
+		let header = result.content.lines().next().expect("header");
+		assert!(header.starts_with("[f.txt#"), "{}", result.content);
+		let head = store
+			.head(&hashline::canonical_key(&file))
+			.expect("post-write snapshot");
+		assert_eq!(head.text, "top\nours\nbottom\n");
+		assert!(
+			head.seen_lines.is_none(),
+			"a write displays no lines, so it records no seen provenance"
+		);
+		assert!(
+			header.ends_with(&format!("#{}]", head.hash)),
+			"{header} does not carry {}",
+			head.hash
+		);
 	}
 }

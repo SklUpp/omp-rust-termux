@@ -881,7 +881,14 @@ fn bodyless_message(target: &Target, had_colon: bool) -> Option<&'static str> {
 	}
 }
 
-fn strip_one_leading_prefix(line: &str) -> Option<&str> {
+/// Whether `line` is a hashline display header (`[PATH#TAG]`) with a tag.
+/// Reuses the section parser so write-content stripping follows the same
+/// header grammar as anchored edits.
+pub(crate) fn is_display_header(line: &str) -> bool {
+	parse_section_header(line).is_some_and(|header| header.file_hash.is_some())
+}
+
+pub(crate) fn strip_one_leading_prefix(line: &str) -> Option<&str> {
 	let bytes = line.as_bytes();
 	let end = bytes.len();
 	let mut index = skip_ws(bytes, 0, end);

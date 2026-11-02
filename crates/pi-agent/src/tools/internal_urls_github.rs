@@ -1341,6 +1341,7 @@ fn text_resource(
 		notes: Some(notes),
 		immutable: true,
 		is_directory: false,
+		writable: false,
 	}
 }
 

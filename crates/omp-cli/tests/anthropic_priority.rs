@@ -492,3 +492,53 @@ fn streamed_rejection_before_first_token_retries_without_fast_mode() {
 	assert_eq!(body_field(&retry_body, "speed"), None);
 	server.join().expect("server");
 }
+
+/// 70 usage-only `message_delta` records precede the first text: they are
+/// coalesced into one metadata chunk, so the terminal turn keeps the initial
+/// input/cache counters and the final output count instead of dropping them.
+#[test]
+fn many_metadata_records_coalesce_without_losing_usage() {
+	let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+	let addr = listener.local_addr().expect("addr");
+	let server = std::thread::spawn(move || {
+		let (mut socket, _) = listener.accept().expect("accept");
+		let _ = read_request(&mut socket);
+		let mut body = String::from(
+			"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"usage\":{\"input_tokens\":11,\"cache_read_input_tokens\":5,\"cache_creation_input_tokens\":3,\"output_tokens\":0}}}\n\n",
+		);
+		for count in 1..=70 {
+			body.push_str(&format!(
+				"event: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{}},\"usage\":{{\"output_tokens\":{count}}}}}\n\n"
+			));
+		}
+		body.push_str(concat!(
+			"event: content_block_start\n",
+			"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+			"event: content_block_delta\n",
+			"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"fast ok\"}}\n\n",
+			"event: content_block_stop\n",
+			"data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+			"event: message_delta\n",
+			"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":7}}\n\n",
+			"event: message_stop\n",
+			"data: {\"type\":\"message_stop\"}\n\n"
+		));
+		respond(&mut socket, "200 OK", "text/event-stream", &body);
+	});
+
+	let runner = PiAgentRunner::new().expect("runner");
+	let mut turn = None;
+	for event in runner.run(&request(catalog(addr), &[])).expect("stream") {
+		if let Ok(Event::MessageEnd { message, .. }) = event {
+			turn = Some(message);
+		}
+	}
+	let message = turn.expect("assistant turn");
+	assert_eq!(message.content, "fast ok");
+	let usage = message.usage.expect("usage survives the coalescing");
+	assert_eq!(usage.input, 11, "initial input tokens are preserved");
+	assert_eq!(usage.cache_read, 5, "initial cache read is preserved");
+	assert_eq!(usage.cache_write, 3, "initial cache write is preserved");
+	assert_eq!(usage.output, 7, "the final output count wins");
+	server.join().expect("server");
+}

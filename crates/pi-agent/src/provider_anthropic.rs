@@ -1821,17 +1821,14 @@ impl ModelProvider for AnthropicMessagesProvider {
 		// TS `firstTokenTime === undefined`: a fast-mode failure before any
 		// observable output (text, reasoning, tool delta, redacted/signature
 		// block or terminal stop) retries once without `speed` and the beta.
-		// Metadata-only chunks do not count as output.
-		let mut prelude: Vec<Result<StreamChunk, ProviderError>> = Vec::new();
-		// Metadata-only records are last-wins (usage deltas, stop reason): the
-		// provider controls how many precede output, so coalesce to a bounded
-		// newest tail instead of retaining every record while the idle deadline
-		// keeps refreshing.
-		const PRELUDE_LIMIT: usize = 64;
+		// Metadata-only records are coalesced into one aggregate chunk instead
+		// of being buffered one by one.
+		let mut metadata: Option<StreamChunk> = None;
+		let mut observable: Option<StreamChunk> = None;
 		loop {
 			match stream.next().await {
 				Some(Ok(chunk)) => {
-					let observable = chunk
+					let is_observable = chunk
 						.content
 						.as_deref()
 						.is_some_and(|text| !text.is_empty())
@@ -1846,13 +1843,13 @@ impl ModelProvider for AnthropicMessagesProvider {
 							.is_some_and(|data| !data.is_empty())
 						|| chunk.signature.is_some()
 						|| chunk.is_done;
-					prelude.push(Ok(chunk));
-					if observable {
+					if is_observable {
+						observable = Some(chunk);
 						break;
 					}
-					if prelude.len() > PRELUDE_LIMIT {
-						// Drop the oldest superseded metadata record.
-						prelude.remove(0);
+					match &mut metadata {
+						Some(aggregate) => merge_metadata(aggregate, chunk),
+						None => metadata = Some(chunk),
 					}
 				},
 				Some(Err(error)) => {
@@ -1892,13 +1889,20 @@ impl ModelProvider for AnthropicMessagesProvider {
 							Some(vec!["priority".to_string()]),
 						));
 					}
-					prelude.push(Err(error));
-					break;
+					return Ok(Box::pin(
+						futures::stream::iter(metadata.map(Ok))
+							.chain(futures::stream::iter([Err(error)]))
+							.chain(stream),
+					));
 				},
 				None => break,
 			}
 		}
-		Ok(Box::pin(futures::stream::iter(prelude).chain(stream)))
+		Ok(Box::pin(
+			futures::stream::iter(metadata.map(Ok))
+				.chain(futures::stream::iter(observable.map(Ok)))
+				.chain(stream),
+		))
 	}
 }
 
@@ -2681,6 +2685,27 @@ fn with_disabled_features(
 			chunk
 		})
 	}))
+}
+
+/// Metadata-only pre-output records are coalesced into one chunk: usage
+/// snapshots are cumulative, so the newest one wins whole; the remaining
+/// fields keep their latest present value. No record is dropped silently.
+fn merge_metadata(into: &mut StreamChunk, chunk: StreamChunk) {
+	if chunk.content_index.is_some() {
+		into.content_index = chunk.content_index;
+	}
+	if chunk.usage.is_some() {
+		into.usage = chunk.usage;
+	}
+	if chunk.stop_reason.is_some() {
+		into.stop_reason = chunk.stop_reason;
+	}
+	if chunk.error_message.is_some() {
+		into.error_message = chunk.error_message;
+	}
+	if chunk.disabled_features.is_some() {
+		into.disabled_features = chunk.disabled_features;
+	}
 }
 
 /// Fast-mode classification for a failure surfaced by the SSE stream rather

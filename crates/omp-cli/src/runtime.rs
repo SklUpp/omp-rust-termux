@@ -214,6 +214,7 @@ pub struct PiAgentRunner {
 /// registry is rebuilt for every prompt.
 struct RunnerSession {
 	snapshots: Arc<SnapshotStore>,
+	conflicts: Arc<pi_agent::tools::ConflictHistory>,
 	edit:      Arc<EditTool>,
 	pending:   Arc<PendingStore>,
 	/// Process-stable eval identity for in-memory sessions; replaced by the
@@ -268,6 +269,7 @@ impl RunnerSession {
 		let pending = Arc::new(PendingStore::new());
 		Self {
 			snapshots,
+			conflicts: Arc::new(pi_agent::tools::ConflictHistory::new()),
 			edit,
 			pending,
 			eval_session_id: Mutex::new(crate::output::session_id()),
@@ -1706,6 +1708,7 @@ impl AgentRunner for PiAgentRunner {
 		}
 		let mut agent = AgentLoop::with_approver(config, provider, registry, approvals)
 			.with_plan(request.plan_mode.guard.clone())
+			.with_conflicts(Some(Arc::clone(&session.conflicts)))
 			.with_continuation(request.continuation);
 		if let Some(ack) = &request.turn_ack {
 			agent = agent.with_turn_ack(Arc::clone(ack));
@@ -3031,6 +3034,7 @@ fn build_registry_with_display(
 			)),
 			"write" => {
 				let write = WriteTool::with_pending(Arc::clone(&pending))
+					.with_snapshots(Some(Arc::clone(&snapshots)))
 					.with_acp_bridge(acp_bridge.clone())
 					.with_propose(plan.propose.clone());
 				Arc::new(match &internal_urls {

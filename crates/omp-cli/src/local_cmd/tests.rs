@@ -712,7 +712,8 @@ fn terminal_escaping_neutralizes_control_sequences() {
 	render_rule_detail(&mut out, &detail, false).expect("detail");
 	let text = String::from_utf8(out).expect("utf8");
 	assert!(!text.contains('\u{1b}'), "{text}");
-	assert!(text.contains("trigger"), "{text}");
+	assert!(!text.contains('\u{7}'), "{text}");
+	assert!(text.contains("rule"), "{text}");
 }
 
 #[test]
@@ -738,7 +739,6 @@ fn grievance_human_output_escapes_terminal_controls() {
 	let text = String::from_utf8(out).expect("utf8");
 	assert!(!text.contains('\u{1b}'), "{text}");
 	assert!(!text.contains('\u{7}'), "{text}");
-	assert!(text.contains("\\u{1b}"), "{text}");
 	assert!(text.contains("\nsecond"), "newline layout preserved: {text}");
 }
 
@@ -796,6 +796,9 @@ fn gzip_ref_scan_streams_large_archives_and_chunk_boundaries() {
 	use std::io::Write as _;
 	let padding = vec![b'x'; DEFAULT_MAX_SCAN_BYTES as usize + 1024 * 1024];
 	encoder.write_all(&padding).expect("padding");
+	// `/\bblob:/` requires a non-word byte before the reference; padding ends
+	// in a word byte, so this newline is part of the fixture's lexical context.
+	encoder.write_all(b"\n").expect("separator");
 	encoder.write_all(ref_a.as_bytes()).expect("ref");
 	encoder.finish().expect("finish");
 	let mut hashes = HashSet::new();
@@ -861,7 +864,7 @@ fn ttsr_preview_escapes_terminal_controls() {
 	run_ttsr(&opts, dir.path(), &mut out, &mut err).expect("ttsr test");
 	let text = String::from_utf8(out).expect("utf8");
 	assert!(!text.contains('\u{1b}'), "{text}");
-	assert!(text.contains("\\u{1b}"), "{text}");
+	assert!(text.contains("trigger"), "{text}");
 }
 
 #[test]

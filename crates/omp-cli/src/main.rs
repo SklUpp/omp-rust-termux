@@ -1454,7 +1454,7 @@ impl Session<'_> {
 		// replayed, so a rewind/fork follows `self.history` with no reset hook.
 		let session_persisted = self.store.enabled() && !self.store.is_v1();
 		let todo_phases = if session_persisted {
-			self.store.latest_todo_phases()
+			self.store.branch_todo_phases()
 		} else {
 			runtime::latest_todo_phases_from_turns(&self.history)
 		};

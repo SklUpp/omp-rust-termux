@@ -456,7 +456,7 @@ fn take_from(state: &mut MailboxState, agent: &str, from: Option<&str>) -> Optio
 	let index = mailbox
 		.iter()
 		.position(|queued| from.is_none_or(|from| queued.message.from == from))?;
-	let message = mailbox.remove(index).message;
+	let message = mailbox.remove(index)?.message;
 	if mailbox.is_empty() {
 		state.mailboxes.remove(agent);
 	}

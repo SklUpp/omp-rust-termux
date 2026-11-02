@@ -1885,7 +1885,7 @@ impl RpcSession {
 			plan_mode: self.plan_mode.clone(),
 			continuation,
 			plan_context: None,
-			service_tier_by_family: std::collections::BTreeMap::new(),
+			service_tier_by_family: self.service_tier_by_family(),
 })
 	}
 

@@ -15,6 +15,7 @@
 //!   an error message.
 
 use std::{
+	sync::atomic::{AtomicBool, Ordering},
 	collections::{HashMap, VecDeque},
 	fmt::Display,
 	time::Duration,
@@ -37,6 +38,9 @@ pub const ANTHROPIC_VERSION: &str = "2023-06-01";
 pub const ANTHROPIC_OAUTH_BETA: &str = "oauth-2025-04-20";
 /// Context-management beta required by `clear_thinking_20251015`.
 pub const ANTHROPIC_CONTEXT_MANAGEMENT_BETA: &str = "context-management-2025-06-27";
+/// Fast mode (`serviceTier: "priority"` on the direct Anthropic provider).
+const FAST_MODE_BETA: &str = "fast-mode-2026-02-01";
+
 /// Interleaved-thinking beta for non-adaptive models.
 pub const ANTHROPIC_INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
 /// Adaptive-thinking effort beta.
@@ -253,6 +257,9 @@ pub struct AnthropicMessagesRequest {
 	pub top_k: Option<u32>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub stop_sequences: Option<Vec<String>>,
+	/// Anthropic fast mode (`serviceTier: "priority"`).
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub speed: Option<String>,
 	pub stream: bool,
 }
 
@@ -297,6 +304,12 @@ pub struct AnthropicMessagesProvider {
 	custom_headers: Vec<(String, String)>,
 	allow_anthropic_header_overrides: bool,
 	provider_id: Option<String>,
+	/// TS `options.serviceTier`; only `priority` is realized on direct Anthropic.
+	service_tier: Option<String>,
+	/// Per-request fast-mode downgrade latch: set once the server rejects
+	/// `speed`, so the retried request omits it and the terminal chunk reports
+	/// the drop. Never sticky across requests (the session owns that).
+	fast_mode_disabled: AtomicBool,
 	requires_tool_result_id: bool,
 	escape_builtin_tool_names: bool,
 	supports_mid_conversation_system: bool,
@@ -473,6 +486,8 @@ impl AnthropicMessagesProvider {
 			strict_tools: false,
 			disable_strict_tools: false,
 			request_max_tokens: None,
+			service_tier: None,
+			fast_mode_disabled: AtomicBool::new(false),
 		}
 	}
 
@@ -621,6 +636,25 @@ impl AnthropicMessagesProvider {
 	pub fn with_provider_id(mut self, provider_id: Option<String>) -> Self {
 		self.provider_id = provider_id.filter(|value| !value.trim().is_empty());
 		self
+	}
+
+	/// TS `options.serviceTier`: `priority` realizes fast mode on the direct
+	/// Anthropic provider (`speed: "fast"` plus [`FAST_MODE_BETA`]).
+	pub fn with_service_tier(mut self, service_tier: Option<String>) -> Self {
+		self.service_tier = service_tier.filter(|tier| !tier.trim().is_empty());
+		self
+	}
+
+	/// User asked for priority on a direct Anthropic route.
+	fn wants_priority(&self) -> bool {
+		self.service_tier.as_deref() == Some("priority")
+	}
+
+	/// TS `model.provider === "anthropic" && serviceTier === "priority"`.
+	fn fast_mode_active(&self) -> bool {
+		!self.fast_mode_disabled.load(Ordering::Relaxed)
+			&& self.provider_id.as_deref().unwrap_or("anthropic") == "anthropic"
+			&& self.wants_priority()
 	}
 
 	/// Z.AI-style gateways require `id` aliased to `tool_use_id` on tool results.
@@ -990,6 +1024,9 @@ impl AnthropicMessagesProvider {
 				betas.push("extended-cache-ttl-2025-04-11".to_string());
 			}
 		}
+		if self.fast_mode_active() {
+			betas.push(FAST_MODE_BETA.to_string());
+		}
 		betas.extend(self.extra_betas.iter().cloned());
 		dedupe(betas)
 	}
@@ -1105,6 +1142,7 @@ impl AnthropicMessagesProvider {
 			top_k,
 			stop_sequences: (!self.stop_sequences.is_empty())
 				.then(|| self.stop_sequences.clone()),
+			speed: self.fast_mode_active().then(|| "fast".to_string()),
 			stream,
 		})
 	}
@@ -1732,23 +1770,53 @@ impl ModelProvider for AnthropicMessagesProvider {
 			.await?;
 
 		let status = response.status();
-		if !status.is_success() {
+		let response = if status.is_success() {
+			response
+		} else {
 			let text = match read_body_bounded(response, ERROR_BODY_BYTES).await {
 				Ok(body) => self.redact_snippet(&body.text, body.truncated),
 				Err(err) => format!("<failed to read error body: {err}>"),
 			};
-			return Err(ProviderError::HttpStatus(status.as_u16(), text));
-		}
+			// TS `anthropic.ts:2764-2783`: only a priority request whose fast
+			// mode is still active retries, only before any output exists (the
+			// rejection is the whole response here), and only when the exact
+			// fast-mode classifier matches. The generic retry budget is not
+			// touched.
+			if !(self.fast_mode_active() && is_fast_mode_unsupported(status.as_u16(), &text)) {
+				return Err(ProviderError::HttpStatus(status.as_u16(), text));
+			}
+			self.fast_mode_disabled.store(true, Ordering::Relaxed);
+			let retry_body = self.build_request(messages, tools, tool_choice, true)?;
+			let retry = self
+				.send_with_retry(&retry_body, true, !tools.is_empty())
+				.await?;
+			let retry_status = retry.status();
+			if !retry_status.is_success() {
+				let retry_text = match read_body_bounded(retry, ERROR_BODY_BYTES).await {
+					Ok(body) => self.redact_snippet(&body.text, body.truncated),
+					Err(err) => format!("<failed to read error body: {err}>"),
+				};
+				return Err(ProviderError::HttpStatus(retry_status.as_u16(), retry_text));
+			}
+			retry
+		};
+
+		let disabled_features = (self.wants_priority()
+			&& self.fast_mode_disabled.load(Ordering::Relaxed))
+		.then(|| vec!["priority".to_string()]);
 
 		let secrets = self.credential_values();
 		let body = response
 			.bytes_stream()
 			.map(|item| item.map_err(|err| err.to_string()));
-		Ok(anthropic_sse_stream(
-			Box::pin(body),
-			secrets,
-			self.first_event_timeout,
-			self.idle_timeout,
+		Ok(with_disabled_features(
+			anthropic_sse_stream(
+				Box::pin(body),
+				secrets,
+				self.first_event_timeout,
+				self.idle_timeout,
+			),
+			disabled_features,
 		))
 	}
 }
@@ -2482,6 +2550,56 @@ fn insert_header(
 	})?;
 	headers.insert(name, value);
 	Ok(())
+}
+
+/// TS `matchesFastModeUnsupported` (`packages/ai/src/error/flags.ts`): a 400
+/// that rejects the `speed` parameter, or a 429 because the account lacks the
+/// fast-mode rate-limit entitlement.
+fn is_fast_mode_unsupported(status: u16, message: &str) -> bool {
+	let lower = message.to_ascii_lowercase();
+	if status == 400 {
+		return lower.contains("invalid_request_error")
+			&& contains_word(&lower, "speed")
+			&& lower.contains("not support");
+	}
+	status == 429 && lower.contains("rate_limit_error") && lower.contains("fast mode")
+}
+
+/// `\bspeed\b` over an already-lowercased message: never matches `speedy` or
+/// `speed_limit`.
+fn contains_word(text: &str, word: &str) -> bool {
+	let mut offset = 0;
+	while let Some(position) = text[offset..].find(word) {
+		let start = offset + position;
+		let end = start + word.len();
+		let before = text[..start].chars().next_back();
+		let after = text[end..].chars().next();
+		let boundary = |ch: Option<char>| ch.is_none_or(|ch| !ch.is_alphanumeric() && ch != '_');
+		if boundary(before) && boundary(after) {
+			return true;
+		}
+		offset = end;
+	}
+	false
+}
+
+/// Annotate the terminal chunk with the features this turn dropped. Errors and
+/// non-terminal chunks pass through untouched.
+fn with_disabled_features(
+	stream: ChunkStream,
+	features: Option<Vec<String>>,
+) -> ChunkStream {
+	let Some(features) = features else {
+		return stream;
+	};
+	Box::pin(stream.map(move |item| {
+		item.map(|mut chunk| {
+			if chunk.is_done {
+				chunk.disabled_features = Some(features.clone());
+			}
+			chunk
+		})
+	}))
 }
 
 fn should_retry_response(response: &reqwest::Response) -> bool {

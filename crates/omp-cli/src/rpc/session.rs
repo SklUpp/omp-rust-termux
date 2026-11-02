@@ -29,6 +29,7 @@ use pi_agent::{
 use serde_json::{Value, json};
 
 use crate::{
+	service_tier::{family as service_tier_family, realizes_priority, should_send_service_tier},
 	Error, Result,
 	agent::{AgentRunner, Event as AgentEvent, RunRequest},
 	approve::{ApprovalMode, Approvals},
@@ -2654,111 +2655,6 @@ impl RpcSession {
 			let _ = reply.send(decision);
 		}
 	}
-}
-
-fn is_openai_service_tier_api(api: Option<&str>) -> bool {
-	matches!(
-		api,
-		Some("openai-completions" | "openai-responses" | "openai-codex-responses")
-	)
-}
-
-/// Port of TS `isOpenAIModelId` (`packages/catalog/src/identity/family.ts`).
-///
-/// Boundary-delimited family prefixes only; a substring match such as
-/// `my-gpt-tool` is not an OpenAI model. This is a prefix test rather than the
-/// upstream regex, which is equivalent for catalog ids.
-fn is_openai_model_id(id: &str) -> bool {
-	let lower = id.to_ascii_lowercase();
-	if lower.contains("openai/") {
-		return true;
-	}
-	for segment in lower.split('/') {
-		for prefix in ["gpt-", "gpt.", "chatgpt-", "chatgpt.", "codex-", "codex."] {
-			if segment.starts_with(prefix) {
-				return true;
-			}
-		}
-		for sku in ["o1", "o3", "o4"] {
-			if segment == sku
-				|| segment.starts_with(&format!("{sku}-"))
-				|| segment.starts_with(&format!("{sku}."))
-			{
-				return true;
-			}
-		}
-	}
-	false
-}
-
-fn excludes_inferred_openai_service_tier(provider: &str) -> bool {
-	matches!(provider, "fireworks" | "github-copilot")
-}
-
-fn is_openai_service_tier_model(provider: &str, api: Option<&str>, id: &str) -> bool {
-	!excludes_inferred_openai_service_tier(provider)
-		&& is_openai_service_tier_api(api)
-		&& is_openai_model_id(id)
-}
-
-/// Port of TS `serviceTierFamily` (`packages/ai/src/types.ts`).
-fn service_tier_family(provider: &str, api: Option<&str>, id: &str) -> Option<&'static str> {
-	if provider == "openrouter" {
-		let lower = id.to_ascii_lowercase();
-		if lower.starts_with("anthropic/") {
-			return Some("anthropic");
-		}
-		if lower.starts_with("google/") {
-			return Some("google");
-		}
-		if lower.starts_with("openai/") {
-			return Some("openai");
-		}
-		return None;
-	}
-	if matches!(provider, "openai" | "openai-codex") {
-		return Some("openai");
-	}
-	if api == Some("anthropic-messages") {
-		return Some("anthropic");
-	}
-	if matches!(provider, "google" | "google-vertex") {
-		return Some("google");
-	}
-	if is_openai_service_tier_model(provider, api, id) {
-		return Some("openai");
-	}
-	None
-}
-
-fn should_send_service_tier(provider: &str, api: Option<&str>, id: &str) -> bool {
-	if matches!(provider, "openai" | "openai-codex") {
-		return true;
-	}
-	if provider == "openrouter" {
-		return true;
-	}
-	if is_openai_service_tier_model(provider, api, id) {
-		return true;
-	}
-	matches!(provider, "google" | "google-vertex" | "fireworks")
-}
-
-/// Port of TS `realizesPriorityServiceTier`: whether `priority` reaches the
-/// provider wire for this model. Bedrock/Vertex Claude and OpenRouter Anthropic
-/// models silently drop it, so they report inactive.
-fn realizes_priority(provider: &str, api: Option<&str>, id: &str) -> bool {
-	if provider == "anthropic" {
-		return true;
-	}
-	if provider == "openrouter" {
-		let family = service_tier_family(provider, api, id);
-		return matches!(family, Some("openai" | "google"));
-	}
-	if api == Some("anthropic-messages") {
-		return false;
-	}
-	should_send_service_tier(provider, api, id)
 }
 
 fn clean_title(name: &str) -> String {

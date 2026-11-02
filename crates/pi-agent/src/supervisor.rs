@@ -21,6 +21,7 @@ use crate::{
 	mailbox::Mailbox,
 	provider::ModelProvider,
 	state::{AcpClientBridge, Message, StagedPreviewPolicy, TokenUsage, ToolApprover},
+	task_persisted_revive::{init_path, tombstone_path, transcript_path},
 	tools::{
 		AstGrepTool, BashTool, EditTool, HubTool, PendingStore, TaskTool, ThinkTool, WriteTool,
 		YieldTool,
@@ -1653,7 +1654,24 @@ impl Supervisor {
 			if state.outstanding.len() >= MAX_OUTSTANDING_RESULTS {
 				return None;
 			}
-			let id = format!("task-{}", self.next_seq());
+			let mut seq = self.next_seq();
+			let mut id = format!("task-{seq}");
+			// A resumed session restores parked `task-N` rows from the stable
+			// child-session directory while `next_seq` restarts at 1. Reusing a
+			// live id would overwrite that child's contract and append to its
+			// transcript, so skip any id that already owns a file there.
+			if let Some(root) = self.child_session_root() {
+				loop {
+					let taken = transcript_path(&root, &id).exists()
+						|| init_path(&root, &id).exists()
+						|| tombstone_path(&root, &id).exists();
+					if !taken {
+						break;
+					}
+					seq = self.next_seq();
+					id = format!("task-{seq}");
+				}
+			}
 			let cancellation_token = CancellationToken::new();
 			let started_at = SystemTime::now()
 				.duration_since(UNIX_EPOCH)
@@ -1744,6 +1762,13 @@ impl Supervisor {
 	pub fn child_session_file(&self, id: &str) -> Option<PathBuf> {
 		let state = self.state.lock().unwrap();
 		state.records.get(id).and_then(|record| record.session_file.clone())
+	}
+
+	/// Parent agent id recorded for one child, if any.
+	#[must_use]
+	pub fn child_parent_id(&self, id: &str) -> Option<String> {
+		let state = self.state.lock().unwrap();
+		state.records.get(id).and_then(|record| record.parent_id.clone())
 	}
 
 	/// Append real child messages to that child's transcript log.

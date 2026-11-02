@@ -29,7 +29,7 @@ use crate::{
 	loop_module::{AgentError, AgentEvent, AgentLoop, SteeringEvent},
 	state::{AgentConfig, AgentContext, AgentState, Message, TokenUsage, ToolResult, TurnResult},
 	supervisor::{ChildGuard, ChildSpawn, Supervisor, cap_result_text},
-	task_persisted_revive::PersistedChildSession,
+	task_persisted_revive::{PersistedChildSession, turn_journal_messages},
 };
 
 #[derive(Clone)]
@@ -238,6 +238,28 @@ impl TaskTool {
 	pub fn with_model_factory(mut self, factory: Arc<dyn ChildModelFactory>) -> Self {
 		self.model_factory = Some(factory);
 		self
+	}
+
+	/// Rebuild the nested `task` tool for a cold-revived child.
+	///
+	/// Same depth, agent context, and effective allowlist the live child had, so
+	/// the self-spawn guard, spawn allowlist, and max-depth check behave exactly
+	/// as they did before parking. A root `TaskTool` here would permit spawning
+	/// past both guards.
+	#[must_use]
+	pub(crate) fn revived(
+		supervisor: Arc<Supervisor>,
+		depth: i32,
+		parent_id: String,
+		agent_name: String,
+		spawns: Option<Spawns>,
+		tools: BTreeSet<String>,
+	) -> Self {
+		Self::with_parent(supervisor, depth, Some(parent_id)).with_agent_context(
+			agent_name,
+			spawns,
+			Some(tools),
+		)
 	}
 
 	/// Snapshot the catalog and resolver for one invocation. A root tool reads
@@ -674,11 +696,14 @@ impl TaskTool {
 		};
 		// The eval bridge (`run_eval_agent`) spawns with `invocation_task = false`
 		// and must not leave revivable contracts: TS disables keep-alive there.
-		if invocation_task {
+		// An isolated child is merged and its worktree dies with the run, so a
+		// contract would only restore it into a stale workspace.
+		if invocation_task && isolation.is_none() {
 			persist_child_contract(
 				&self.supervisor,
 				&child_id,
 				&child_name,
+				child_ctx.depth + 1,
 				&item,
 				&child_config,
 				&child_registry,
@@ -818,9 +843,14 @@ impl TaskTool {
 		let mut terminal_mark = None;
 		let mut result = match outcome {
 			Ok(turn_results) => {
-				let messages: Vec<&Message> =
-					turn_results.iter().map(|turn| &turn.message).collect();
-				self.supervisor.append_child_transcript(&child_id, &messages);
+				// Journal the whole turn tail (assistant + tool results): a
+				// replay that omits the results emits dangling `tool_calls`
+				// and the revived child's first request is rejected.
+				let journaled = turn_journal_messages(&turn_results);
+				let journaled_refs: Vec<&Message> = journaled.iter().collect();
+				self
+					.supervisor
+					.append_child_transcript(&child_id, &journaled_refs);
 				let requests = turn_results.len();
 				let base_output = turn_results
 					.iter()
@@ -1068,7 +1098,12 @@ impl TaskTool {
 					self
 						.supervisor
 						.mark_aborted_with_usage(&outstanding_id, &reason, result.usage);
-					tombstone_aborted_child(&self.supervisor, &outstanding_id, &reason);
+					// Only lifecycle-managed task children write a tombstone; an
+					// eval child would leave a marker that later refuses a real
+					// child reusing this id.
+					if invocation_task {
+						tombstone_aborted_child(&self.supervisor, &outstanding_id, &reason);
+					}
 				},
 			}
 		}
@@ -1491,17 +1526,22 @@ async fn run_background_child(
 		system_prompt: child_system_prompt(&item.agent, prompt_schema.as_ref()),
 		cwd: child_cwd,
 	};
-	persist_child_contract(
-		&supervisor,
-		&child_id,
-		&item.name,
-		&item,
-		&child_config,
-		&child_registry,
-		child_active_model.as_deref(),
-		child_model_role.as_deref(),
-		prompt_schema.as_ref(),
-	);
+	// An isolated child is merged and its worktree is deleted after finalize,
+	// so a revivable contract would restore it into a stale workspace.
+	if isolation.is_none() {
+		persist_child_contract(
+			&supervisor,
+			&child_id,
+			&item.name,
+			child_ctx.depth + 1,
+			&item,
+			&child_config,
+			&child_registry,
+			child_active_model.as_deref(),
+			child_model_role.as_deref(),
+			prompt_schema.as_ref(),
+		);
+	}
 	let child_approver = supervisor.child_approver();
 	let assignment = if let Some(context) = &item.context {
 		format!("{context}\n\n{}", item.task)
@@ -1640,8 +1680,9 @@ fn settle_background_result(
 			isolation,
 			cancelled,
 		}) => {
-			let messages: Vec<&Message> = turns.iter().map(|turn| &turn.message).collect();
-			supervisor.append_child_transcript(&id, &messages);
+			let journaled = turn_journal_messages(&turns);
+			let journaled_refs: Vec<&Message> = journaled.iter().collect();
+			supervisor.append_child_transcript(&id, &journaled_refs);
 			if cancelled {
 				supervisor.mark_aborted(&id, "cancelled during isolation finalize");
 				tombstone_aborted_child(&supervisor, &id, "cancelled during isolation finalize");
@@ -2104,6 +2145,7 @@ fn persist_child_contract(
 	supervisor: &Arc<Supervisor>,
 	child_id: &str,
 	display_name: &str,
+	depth: i32,
 	item: &TaskItemSpec,
 	config: &AgentConfig,
 	registry: &ToolRegistry,
@@ -2120,6 +2162,7 @@ fn persist_child_contract(
 	else {
 		return;
 	};
+	let parent_id = supervisor.child_parent_id(child_id);
 	let tools = registry.names();
 	let spawns = item.agent.spawns.as_ref().map(Spawns::error_text);
 	let advisor = item.agent.advisor.as_ref().map(|advisor| match advisor {
@@ -2144,10 +2187,11 @@ fn persist_child_contract(
 		advisor,
 		read_only,
 		cwd:              config.cwd.clone(),
+		depth,
 		max_turns:        config.max_turns,
 		context_limit:    config.context_limit,
 		display_name:     Some(display_name.to_string()),
-		parent_id:        None,
+		parent_id,
 	};
 	if let Err(error) = contract.write(&root) {
 		eprintln!(
@@ -2182,6 +2226,11 @@ fn adopt_keep_alive_child(supervisor: &Arc<Supervisor>, child_id: &str, isolated
 /// A hard-aborted child is durable as a tombstone: its transcript stays
 /// readable through `history://`, but a restart must not rediscover the
 /// spawn-time contract as a revivable parked agent.
+///
+/// Only the real `task` tool reaches this: its foreground call is gated on
+/// `invocation_task`, and the detached background path is unreachable from the
+/// eval bridge (`run_eval_agent` runs the foreground path with
+/// `invocation_task = false`).
 fn tombstone_aborted_child(supervisor: &Arc<Supervisor>, child_id: &str, reason: &str) {
 	if let Some(manager) = crate::subagent_lifecycle::lookup(supervisor) {
 		manager.tombstone(child_id, reason);

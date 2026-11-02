@@ -13,6 +13,7 @@
 //! returns `None` in exactly those cases.
 
 use std::{
+	collections::{HashMap, HashSet},
 	fs,
 	io::{BufRead, BufReader, Write},
 	path::{Path, PathBuf},
@@ -26,10 +27,10 @@ use crate::{
 	loop_module::AgentLoop,
 	provider::ModelProvider,
 	state::{
-		AgentConfig, AgentState, Message, PlanModeGuard, Role, ToolApprover,
+		AgentConfig, AgentState, Message, PlanModeGuard, Role, ToolApprover, TurnResult,
 	},
 	supervisor::Supervisor,
-	tools::registry::ToolRegistry,
+	tools::{registry::ToolRegistry, task::TaskTool, task_catalog::Spawns},
 };
 
 /// Contract file suffix, next to the child transcript.
@@ -46,6 +47,12 @@ fn default_max_turns() -> usize {
 
 fn default_context_limit() -> usize {
 	DEFAULT_CONTEXT_LIMIT
+}
+
+/// Root children spawn at depth 1; a contract written before the field existed
+/// is therefore a first-level child.
+fn default_depth() -> i32 {
+	1
 }
 
 /// One child transcript path in `root`.
@@ -125,6 +132,11 @@ pub struct PersistedChildSession {
 	pub read_only: Option<bool>,
 	/// Recorded workspace. A gone directory makes the contract unusable.
 	pub cwd: PathBuf,
+	/// Spawn depth this child ran at (root children are depth 1). A revived
+	/// child is rebuilt at this depth so its own `task` tool obeys the same
+	/// `max_depth`, self-spawn, and spawn-allowlist guards as the live child.
+	#[serde(default = "default_depth")]
+	pub depth: i32,
 	#[serde(default = "default_max_turns")]
 	pub max_turns: usize,
 	#[serde(default = "default_context_limit")]
@@ -209,7 +221,100 @@ pub fn load_transcript(path: &Path) -> Result<Vec<Message>, String> {
 			messages.push(message);
 		}
 	}
-	Ok(messages)
+	Ok(sanitize_replay(messages))
+}
+
+/// Drop replay turns the provider would reject.
+///
+/// Old transcripts (and a crash-truncated tail) can contain assistant turns
+/// whose `tool_calls` have no matching `tool` message. Providers reject such a
+/// history (`tool_use` without `tool_result`), so a revive would fail on its
+/// first request. Unanswered calls are removed; an assistant turn left with no
+/// content and no calls is dropped, as is any orphan `tool` message.
+#[must_use]
+pub fn sanitize_replay(messages: Vec<Message>) -> Vec<Message> {
+	let mut kept: Vec<Message> = Vec::with_capacity(messages.len());
+	let mut index = 0;
+	while index < messages.len() {
+		let message = &messages[index];
+		if message.role == Role::Tool {
+			// A tool result before any call cannot be paired: drop it.
+			index += 1;
+			continue;
+		}
+		if message.role != Role::Assistant || message.tool_calls.is_empty() {
+			kept.push(message.clone());
+			index += 1;
+			continue;
+		}
+		let mut end = index + 1;
+		let mut answered = HashSet::new();
+		while end < messages.len() && messages[end].role == Role::Tool {
+			if let Some(id) = &messages[end].tool_call_id {
+				answered.insert(id.clone());
+			}
+			end += 1;
+		}
+		let calls: Vec<_> = message
+			.tool_calls
+			.iter()
+			.filter(|call| answered.contains(&call.id))
+			.cloned()
+			.collect();
+		if !calls.is_empty() || !message.content.trim().is_empty() {
+			let mut assistant = message.clone();
+			assistant.tool_calls = calls.clone();
+			kept.push(assistant);
+		}
+		for result in &messages[index + 1..end] {
+			if result
+				.tool_call_id
+				.as_ref()
+				.is_some_and(|id| calls.iter().any(|call| &call.id == id))
+			{
+				kept.push(result.clone());
+			}
+		}
+		index = end;
+	}
+	kept
+}
+
+/// Journal messages one finished turn contributes: the assistant message
+/// followed by one `tool` message per result.
+///
+/// The executor used to journal assistant messages only, so a replay carried
+/// `tool_calls` with no results and the revived child's first request was
+/// rejected. Pairing the results at write time keeps the JSONL a valid model
+/// conversation, so replay needs no reconstruction.
+///
+/// ponytail: tool image parts are not journaled (text results only); add them
+/// to the message when a revived child must keep vision context.
+#[must_use]
+pub fn turn_journal_messages(turns: &[TurnResult]) -> Vec<Message> {
+	let mut messages = Vec::new();
+	for turn in turns {
+		let names: HashMap<&str, &str> = turn
+			.message
+			.tool_calls
+			.iter()
+			.map(|call| (call.id.as_str(), call.name.as_str()))
+			.collect();
+		messages.push(turn.message.clone());
+		for result in &turn.tool_results {
+			let name = names
+				.get(result.tool_call_id.as_str())
+				.copied()
+				.unwrap_or("tool");
+			messages.push(Message::tool_with_status(
+				&result.tool_call_id,
+				name,
+				&result.content,
+				result.is_error,
+			));
+		}
+	}
+	messages
 }
 
 /// Append new messages to a child transcript in the executor's exact format.
@@ -248,8 +353,11 @@ pub struct RevivedChild {
 ///
 /// Provider/auth construction stays host-owned exactly as in the TypeScript
 /// reviver context: the factory receives the persisted contract so it can honor
-/// `modelRole`/`resolvedModel`; the default implementation uses the provider it
-/// was built with and applies the contract's tool grants.
+/// `modelRole`/`resolvedModel`. When a supervisor is passed, the default
+/// implementation resolves the child's model through the supervisor catalog and
+/// rebuilds a *child-bound* registry at the recorded depth (a root registry
+/// would silently drop `yield` and bypass the spawn guards); otherwise it falls
+/// back to its provider snapshot and template.
 pub trait PersistedChildReviverFactory: Send + Sync {
 	fn revive(
 		&self,
@@ -305,6 +413,101 @@ fn apply_contract_tools(registry: &mut ToolRegistry, contract: &PersistedChildSe
 	}
 }
 
+/// Parse the recorded `spawns` text back into the agent's spawn policy.
+///
+/// ponytail: reverse-parses `Spawns::error_text`; record a structured policy
+/// field if that format ever stops being the readable allowlist.
+fn spawns_from_contract(value: Option<&str>) -> Option<Spawns> {
+	let text = value?.trim();
+	if text.is_empty() {
+		return None;
+	}
+	if text == "*" {
+		return Some(Spawns::All);
+	}
+	if text.starts_with("none") {
+		return Some(Spawns::Only(Vec::new()));
+	}
+	Some(Spawns::Only(
+		text.split(',')
+			.map(str::trim)
+			.filter(|name| !name.is_empty())
+			.map(str::to_string)
+			.collect(),
+	))
+}
+
+/// Rebuild the registry a live child at `contract.depth` would have had:
+/// child-scoped session tools, `yield`, an owner-bound `hub`, and a nested
+/// `task` tool carrying the agent context and effective allowlist recorded at
+/// spawn. `rebind_session_tools` is the caller's job, after this returns.
+fn revived_child_registry(
+	supervisor: &Arc<Supervisor>,
+	contract: &PersistedChildSession,
+) -> ToolRegistry {
+	let mut registry = supervisor.child_registry_unbound(contract.depth, Some(contract.id.as_str()));
+	apply_contract_tools(&mut registry, contract);
+	if registry.get("task").is_some() {
+		registry.remove("task");
+		let agent_name = contract
+			.agent
+			.clone()
+			.unwrap_or_else(|| "task".to_string());
+		let tools = contract.tools.iter().cloned().collect();
+		registry.register(Arc::new(TaskTool::revived(
+			Arc::clone(supervisor),
+			contract.depth,
+			contract.id.clone(),
+			agent_name,
+			spawns_from_contract(contract.spawns.as_deref()),
+			tools,
+		)));
+	}
+	registry
+}
+
+/// Provider and active model for a revived child.
+///
+/// The per-agent model recorded at spawn wins when the supervisor's catalog can
+/// still resolve it (the same path a live spawn takes). Otherwise the recorded
+/// `resolvedModel`/`modelRole` is rebuilt through the catalog's model factory,
+/// and only as a last resort does the factory's provider snapshot apply.
+fn resolve_revived_provider(
+	supervisor: Option<&Arc<Supervisor>>,
+	contract: &PersistedChildSession,
+	fallback: &Arc<dyn ModelProvider>,
+) -> (Arc<dyn ModelProvider>, Option<String>) {
+	if let Some(supervisor) = supervisor
+		&& let Some(catalog) = supervisor.agent_catalog()
+	{
+		let factory = catalog.model_factory();
+		if let Some(factory) = factory.as_deref() {
+			if let Some(agent) = contract.agent.as_deref().and_then(|name| catalog.get(name))
+				&& let Ok(Some(model)) = catalog.resolve_provider(agent, None, Some(factory))
+			{
+				return (model.provider, Some(model.model));
+			}
+			// `resolvedModel` is the spawn-time expansion; `modelRole` the
+			// pre-expansion alias. Either can be rebuilt when the agent
+			// definition changed or vanished since.
+			for pattern in [
+				contract.resolved_model.as_deref(),
+				contract.model_role.as_deref(),
+			]
+			.into_iter()
+			.flatten()
+			{
+				if factory.can_resolve(pattern)
+					&& let Ok(model) = factory.resolve(pattern, None, None)
+				{
+					return (model.provider, Some(model.model));
+				}
+			}
+		}
+	}
+	(Arc::clone(fallback), contract.resolved_model.clone())
+}
+
 impl PersistedChildReviverFactory for DefaultPersistedReviverFactory {
 	fn revive(
 		&self,
@@ -321,8 +524,28 @@ impl PersistedChildReviverFactory for DefaultPersistedReviverFactory {
 				contract.id
 			));
 		}
-		let mut registry = self.registry.clone();
-		apply_contract_tools(&mut registry, contract);
+		let (provider, active_model) =
+			resolve_revived_provider(supervisor, contract, &self.provider);
+		let registry = match supervisor {
+			Some(supervisor) => {
+				let mut registry = revived_child_registry(supervisor, contract);
+				// Exactly like a live child: finish the session tools with the
+				// child's model, then bind eval's default completion to the
+				// provider that child actually runs on.
+				supervisor.rebind_session_tools(
+					&mut registry,
+					active_model.as_deref(),
+					Some(contract.id.as_str()),
+				);
+				supervisor.rebind_eval_provider(&mut registry, &contract.id, Arc::clone(&provider));
+				registry
+			},
+			None => {
+				let mut registry = self.registry.clone();
+				apply_contract_tools(&mut registry, contract);
+				registry
+			},
+		};
 		let replayed_turns = replayed.iter().filter(|m| m.role == Role::Assistant).count();
 		let config = AgentConfig {
 			max_turns:     contract.max_turns.saturating_add(replayed_turns),
@@ -337,11 +560,11 @@ impl PersistedChildReviverFactory for DefaultPersistedReviverFactory {
 		let mut agent_loop = match &self.approver {
 			Some(approver) => AgentLoop::with_approver(
 				config,
-				Arc::clone(&self.provider),
+				Arc::clone(&provider),
 				registry,
 				Arc::clone(approver),
 			),
-			None => AgentLoop::new(config, Arc::clone(&self.provider), registry),
+			None => AgentLoop::new(config, Arc::clone(&provider), registry),
 		};
 		if let Some(plan) = &self.plan {
 			agent_loop = agent_loop.with_plan(Some(Arc::clone(plan)));

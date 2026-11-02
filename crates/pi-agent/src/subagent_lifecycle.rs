@@ -108,6 +108,10 @@ struct Entry {
 	status:        LifecycleStatus,
 	session_file:  PathBuf,
 	contract:      Option<PersistedChildSession>,
+	/// True when this row was restored from disk, not adopted in-process. A
+	/// restored row is pinned to its transcript path: a later spawn that reuses
+	/// the bare `task-N` id must not replace it.
+	restored:      bool,
 	/// Invalidates stale timer/actor callbacks after a park or revive.
 	epoch:         u64,
 	last_activity: u64,
@@ -205,12 +209,21 @@ impl SubagentLifecycleManager {
 	}
 
 	/// Transcript path for `id`, including tombstoned ids (`history://`).
+	///
+	/// A row restored after a restart has no live entry when it was tombstoned,
+	/// so fall back to the on-disk transcript the same way the very first
+	/// `history://<id>` read does.
 	#[must_use]
 	pub fn transcript_path(&self, id: &str) -> Option<PathBuf> {
-		lock(&self.state)
+		let known = lock(&self.state)
 			.entries
 			.get(id)
-			.map(|entry| entry.session_file.clone())
+			.map(|entry| entry.session_file.clone());
+		if known.is_some() {
+			return known;
+		}
+		let path = transcript_path(self.root.as_deref()?, id);
+		path.is_file().then_some(path)
 	}
 
 	/// Roster rows, newest activity first within each status.
@@ -274,6 +287,44 @@ impl SubagentLifecycleManager {
 			.parent()
 			.map(Path::to_path_buf)
 			.ok_or_else(|| format!("transcript {} has no parent directory", session_file.display()))?;
+		// A resumed session restores `task-N` rows from disk while the fresh
+		// supervisor's `next_seq` restarts at 1. The executor skips ids whose
+		// transcript/contract already exist, so a collision should be
+		// impossible; this is the in-memory half of the same guard. A restored
+		// row is pinned to its transcript and contract and is never silently
+		// replaced by a different spawn.
+		let existing = {
+			let state = lock(&self.state);
+			if state.tombstones.contains(id) {
+				return Err(format!(
+					"Agent \"{id}\" was hard-aborted and cannot be adopted or revived."
+				));
+			}
+			state
+				.entries
+				.get(id)
+				.map(|entry| (entry.session_file.clone(), entry.restored, entry.contract.clone()))
+		};
+		if let Some((existing_file, restored, existing_contract)) = existing {
+			if existing_file != session_file {
+				return Err(format!(
+					"agent id \"{id}\" already names transcript {}; refusing to adopt {}",
+					existing_file.display(),
+					session_file.display()
+				));
+			}
+			if restored {
+				let incoming = contract
+					.clone()
+					.or_else(|| PersistedChildSession::load(&root, id));
+				if incoming.as_ref() != existing_contract.as_ref() {
+					return Err(format!(
+						"agent \"{id}\" is a restored parked session; refusing to replace it \
+						 with a different spawn"
+					));
+				}
+			}
+		}
 		let contract = match contract {
 			Some(contract) => {
 				if contract.id != id {
@@ -306,6 +357,7 @@ impl SubagentLifecycleManager {
 					status: LifecycleStatus::Idle,
 					session_file,
 					contract,
+					restored: false,
 					epoch,
 					last_activity: now_ms(),
 				},
@@ -589,6 +641,7 @@ impl SubagentLifecycleManager {
 					status: LifecycleStatus::Parked,
 					session_file: transcript_path(root, id),
 					contract: Some(contract),
+					restored: true,
 					epoch: 0,
 					last_activity: now_ms(),
 				},
@@ -623,15 +676,27 @@ async fn run_actor(
 		manager.note_running(&id, epoch);
 		let before = state.messages.len();
 		let had_system = state.messages.first().is_some_and(|m| m.role == Role::System);
-		let _ = agent_loop
+		let request = Message::user(text);
+		if let Err(error) = agent_loop
 			.run_dialog_message_with_cancel(
-				Message::user(text),
+				request.clone(),
 				&mut state,
 				None,
 				None,
 				cancel.child_token(),
 			)
-			.await;
+			.await
+		{
+			// The hub receipt already reported this session as `revived`.
+			// A failed turn is real information, not a silent success: report
+			// it instead of dropping the error. Drop the partial turn too (it
+			// can end in `tool_calls` without results, which the next provider
+			// request would reject) but keep the request so a later send can
+			// retry a valid conversation.
+			eprintln!("warning: revived agent \"{id}\" turn failed: {error}");
+			state.messages.truncate(before);
+			state.messages.push(request);
+		}
 		let start = if !had_system
 			&& state
 				.messages

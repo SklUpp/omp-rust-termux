@@ -15,13 +15,14 @@ use async_trait::async_trait;
 use pi_agent::{
 	CancellationToken,
 	provider::{ChunkStream, ModelProvider, ProviderError, ToolChoice},
-	state::{AgentContext, Message},
+	state::{AgentContext, Message, Role, ToolCall, ToolResult, TurnResult},
 	subagent_lifecycle::{
 		DEFAULT_AGENT_IDLE_TTL_MS, DeliveryOutcome, LifecycleStatus, attach,
 	},
 	supervisor::{ChildSpawn, DelegationLimits, Supervisor},
 	task_persisted_revive::{
 		DefaultPersistedReviverFactory, PersistedChildSession, load_transcript,
+		transcript_path, turn_journal_messages,
 	},
 	tools::{
 		Tool,
@@ -144,6 +145,7 @@ fn adoptable_child(supervisor: &Arc<Supervisor>, root: &PathBuf) -> (String, Per
 		advisor: None,
 		read_only: None,
 		cwd: root.clone(),
+		depth: 1,
 		max_turns: 20,
 		context_limit: 100_000,
 		display_name: Some("kept".to_string()),
@@ -382,3 +384,480 @@ async fn gone_workspace_is_transcript_only_and_refuses_revive() {
 	assert!(resource.content.contains("prior-answer"));
 }
 
+
+fn contract_for(
+	id: &str,
+	root: &PathBuf,
+	task: &str,
+	tools: Vec<String>,
+	agent: &str,
+	depth: i32,
+) -> PersistedChildSession {
+	PersistedChildSession {
+		id: id.to_string(),
+		agent: Some(agent.to_string()),
+		task: task.to_string(),
+		system_prompt: "child system prompt".to_string(),
+		tools,
+		model_role: None,
+		resolved_model: None,
+		output_schema: None,
+		output_schema_mode: None,
+		restrict_tool_names: Some(true),
+		spawns: Some("*".to_string()),
+		read_summarize: None,
+		advisor: None,
+		read_only: None,
+		cwd: root.clone(),
+		depth,
+		max_turns: 20,
+		context_limit: 100_000,
+		display_name: Some(id.to_string()),
+		parent_id: Some("Main".to_string()),
+	}
+}
+
+/// Replies from a fixed script; running out of replies fails the turn so a
+/// surprise extra request is visible instead of hanging.
+struct ScriptProvider {
+	replies: Mutex<Vec<Message>>,
+}
+
+impl ScriptProvider {
+	fn new(mut replies: Vec<Message>) -> Arc<Self> {
+		replies.reverse();
+		Arc::new(Self {
+			replies: Mutex::new(replies),
+		})
+	}
+}
+
+#[async_trait]
+impl ModelProvider for ScriptProvider {
+	async fn complete(
+		&self,
+		_messages: &[Message],
+		_tools: &[serde_json::Value],
+		_tool_choice: &ToolChoice,
+	) -> Result<Message, ProviderError> {
+		self.replies
+			.lock()
+			.expect("replies")
+			.pop()
+			.ok_or_else(|| ProviderError::Protocol("script exhausted".to_string()))
+	}
+
+	async fn stream(
+		&self,
+		_messages: &[Message],
+		_tools: &[serde_json::Value],
+		_tool_choice: &ToolChoice,
+	) -> Result<ChunkStream, ProviderError> {
+		Err(ProviderError::Protocol(
+			"revived runs use complete".to_string(),
+		))
+	}
+}
+
+/// Enforces the provider-side rule a broken replay violates: every assistant
+/// `tool_calls` id must be answered by the immediately following tool results.
+struct PairingProvider {
+	seen: Mutex<Vec<Message>>,
+}
+
+impl PairingProvider {
+	fn new() -> Arc<Self> {
+		Arc::new(Self {
+			seen: Mutex::new(Vec::new()),
+		})
+	}
+
+	fn saw(&self, body: &str) -> bool {
+		self.seen
+			.lock()
+			.expect("seen")
+			.iter()
+			.any(|message| message.content.contains(body))
+	}
+}
+
+#[async_trait]
+impl ModelProvider for PairingProvider {
+	async fn complete(
+		&self,
+		messages: &[Message],
+		_tools: &[serde_json::Value],
+		_tool_choice: &ToolChoice,
+	) -> Result<Message, ProviderError> {
+		for (index, message) in messages.iter().enumerate() {
+			if message.role != Role::Assistant || message.tool_calls.is_empty() {
+				continue;
+			}
+			for call in &message.tool_calls {
+				let answered = messages[index + 1..]
+					.iter()
+					.take_while(|next| next.role == Role::Tool)
+					.any(|next| next.tool_call_id.as_deref() == Some(call.id.as_str()));
+				if !answered {
+					return Err(ProviderError::Protocol(format!(
+						"tool_use {} without tool_result",
+						call.id
+					)));
+				}
+			}
+		}
+		self.seen
+			.lock()
+			.expect("seen")
+			.extend_from_slice(messages);
+		Ok(Message::assistant("revived-ok"))
+	}
+
+	async fn stream(
+		&self,
+		_messages: &[Message],
+		_tools: &[serde_json::Value],
+		_tool_choice: &ToolChoice,
+	) -> Result<ChunkStream, ProviderError> {
+		Err(ProviderError::Protocol(
+			"revived runs use complete".to_string(),
+		))
+	}
+}
+
+fn one_turn(provider: Arc<dyn ModelProvider>, depth_limit: i32) -> Arc<Supervisor> {
+	let supervisor = Supervisor::new(
+		ToolRegistry::with_builtins(),
+		provider,
+		None,
+		DelegationLimits {
+			max_depth: depth_limit,
+			max_concurrency: 32,
+		},
+	);
+	supervisor
+}
+
+fn reserve_in(supervisor: &Arc<Supervisor>, name: &str) -> String {
+	let (id, _token) = supervisor
+		.reserve_child_full(ChildSpawn {
+			name,
+			index: 1,
+			agent: "scout",
+			agent_source: "builtin",
+			task: "investigate",
+			parent_id: None,
+			parent_tool_call_id: Some("call-depth"),
+			detached: false,
+		})
+		.expect("reserve child");
+	id
+}
+
+fn task_call() -> Message {
+	Message::assistant_with_tools(
+		"",
+		vec![ToolCall {
+			id:     "call-task".to_string(),
+			name:   "task".to_string(),
+			arguments: json!({ "agent": "scout", "task": "nested" }),
+		}],
+	)
+}
+
+/// Blocker 1: a revived child must be rebuilt with the child-bound registry at
+/// its recorded depth, not from the root registry.
+#[tokio::test]
+async fn revived_child_is_bound_at_its_recorded_depth() {
+	// At max depth the child's registry has no `task` tool at all; a root
+	// registry would still register one.
+	let root = session_root("depth-max");
+	let provider = ScriptProvider::new(vec![task_call(), Message::assistant("done")]);
+	let supervisor = one_turn(provider.clone(), 1);
+	supervisor.set_child_session_root(Some(root.clone()));
+	let id = reserve_in(&supervisor, "depth-max");
+	supervisor.append_child_transcript(
+		&id,
+		&[&Message::user("prior"), &Message::assistant("ok")],
+	);
+	let contract = contract_for(
+		&id,
+		&root,
+		"investigate",
+		vec!["task".to_string(), "yield".to_string()],
+		"scout",
+		1,
+	);
+	contract.write(&root).expect("write contract");
+	let replayed = load_transcript(&transcript_path(&root, &id)).expect("transcript");
+	let mut revived = DefaultPersistedReviverFactory::new(provider, ToolRegistry::with_builtins())
+		.revive(&contract, replayed, Some(&supervisor))
+		.expect("revive");
+	let turns = revived
+		.agent_loop
+		.run_dialog_message(Message::user("go"), &mut revived.state, None, None)
+		.await
+		.expect("revived turn");
+	assert!(!turns.is_empty());
+	let result = &turns[0].tool_results[0];
+	assert!(result.is_error, "task must not run at max depth");
+	assert!(
+		result.content.contains("Tool not found: task"),
+		"a revived child at max depth keeps the depth guard: {}",
+		result.content
+	);
+
+	// Below max depth the nested `task` tool keeps the agent context, so the
+	// self-spawn guard fires instead of the root tool accepting the spawn.
+	let root = session_root("depth-agent");
+	let provider = ScriptProvider::new(vec![task_call(), Message::assistant("done")]);
+	let supervisor = one_turn(provider.clone(), 2);
+	supervisor.set_child_session_root(Some(root.clone()));
+	let id = reserve_in(&supervisor, "depth-agent");
+	supervisor.append_child_transcript(
+		&id,
+		&[&Message::user("prior"), &Message::assistant("ok")],
+	);
+	let contract = contract_for(
+		&id,
+		&root,
+		"investigate",
+		vec!["task".to_string(), "yield".to_string()],
+		"scout",
+		1,
+	);
+	let replayed = load_transcript(&transcript_path(&root, &id)).expect("transcript");
+	let mut revived = DefaultPersistedReviverFactory::new(provider, ToolRegistry::with_builtins())
+		.revive(&contract, replayed, Some(&supervisor))
+		.expect("revive");
+	let turns = revived
+		.agent_loop
+		.run_dialog_message(Message::user("go"), &mut revived.state, None, None)
+		.await
+		.expect("revived turn");
+	let result = &turns[0].tool_results[0];
+	assert!(
+		result.content.contains("from within itself"),
+		"the revived task tool must carry the child agent context: {}",
+		result.content
+	);
+}
+
+/// Blocker 1 (return channel): a revived child can actually call `yield`, the
+/// tool only a child-bound registry mounts.
+#[tokio::test]
+async fn revived_child_can_yield() {
+	let root = session_root("yield");
+	let provider = ScriptProvider::new(vec![
+		Message::assistant_with_tools(
+			"",
+			vec![ToolCall {
+				id:     "call-yield".to_string(),
+				name:   "yield".to_string(),
+				arguments: json!({ "result": { "data": "done" } }),
+			}],
+		),
+		Message::assistant("done"),
+	]);
+	let supervisor = one_turn(provider.clone(), 2);
+	supervisor.set_child_session_root(Some(root.clone()));
+	let id = reserve_in(&supervisor, "yield");
+	supervisor.append_child_transcript(
+		&id,
+		&[&Message::user("prior"), &Message::assistant("ok")],
+	);
+	let contract = contract_for(&id, &root, "investigate", vec!["yield".to_string()], "scout", 1);
+	let replayed = load_transcript(&transcript_path(&root, &id)).expect("transcript");
+	let mut revived = DefaultPersistedReviverFactory::new(provider, ToolRegistry::with_builtins())
+		.revive(&contract, replayed, Some(&supervisor))
+		.expect("revive");
+	let turns = revived
+		.agent_loop
+		.run_dialog_message(Message::user("go"), &mut revived.state, None, None)
+		.await
+		.expect("revived turn");
+	let result = &turns[0].tool_results[0];
+	assert!(!result.is_error, "yield must exist: {}", result.content);
+	assert!(result.terminate, "yield terminates the turn");
+}
+
+/// Blocker 2: the journal records tool results with their calls, and a legacy
+/// transcript with dangling calls is stripped so the first revived request is
+/// not rejected.
+#[tokio::test]
+async fn revived_replay_pairs_tool_calls_with_results() {
+	let root = session_root("replay");
+	let provider = PairingProvider::new();
+	let supervisor = one_turn(provider.clone(), 2);
+	supervisor.set_child_session_root(Some(root.clone()));
+	let id = reserve_in(&supervisor, "replay");
+	let journaled = turn_journal_messages(&[TurnResult {
+		message:       Message::assistant_with_tools(
+			"working",
+			vec![ToolCall {
+				id:     "call-read".to_string(),
+				name:   "read".to_string(),
+				arguments: json!({ "path": "a" }),
+			}],
+		),
+		tool_results:  vec![ToolResult {
+			tool_call_id: "call-read".to_string(),
+			content:      "file body".to_string(),
+			is_error:     false,
+			terminate:    false,
+			details:      None,
+		}],
+		is_completed:  false,
+	}]);
+	let journaled_refs: Vec<&Message> = journaled.iter().collect();
+	supervisor.append_child_transcript(&id, &journaled_refs);
+	// Legacy/truncated tail: an assistant call with no result on disk.
+	supervisor.append_child_transcript(
+		&id,
+		&[&Message::assistant_with_tools(
+			"legacy",
+			vec![ToolCall {
+				id:     "stale-call".to_string(),
+				name:   "read".to_string(),
+				arguments: json!({ "path": "b" }),
+			}],
+		)],
+	);
+
+	let replayed = load_transcript(&transcript_path(&root, &id)).expect("transcript");
+	assert!(
+		replayed
+			.iter()
+			.filter(|message| message.role == Role::Assistant)
+			.flat_map(|message| message.tool_calls.iter())
+			.all(|call| call.id != "stale-call"),
+		"an unanswered call must not be replayed"
+	);
+	assert!(
+		replayed
+			.iter()
+			.any(|message| message.role == Role::Tool && message.content == "file body"),
+		"the tool result is part of the journal"
+	);
+
+	let contract = contract_for(
+		&id,
+		&root,
+		"prior work",
+		vec!["read".to_string(), "yield".to_string()],
+		"scout",
+		1,
+	);
+	let mut revived = DefaultPersistedReviverFactory::new(provider.clone(), ToolRegistry::with_builtins())
+		.revive(&contract, replayed, Some(&supervisor))
+		.expect("revive");
+	let turns = revived
+		.agent_loop
+		.run_dialog_message(Message::user("go"), &mut revived.state, None, None)
+		.await
+		.expect("a revived tool-using child must not be rejected");
+	assert_eq!(turns.len(), 1);
+	assert!(
+		provider.saw("file body"),
+		"the revived child keeps its tool context"
+	);
+}
+
+/// Major 3: a restored parked `task-N` must never collide with a fresh spawn
+/// after the supervisor's sequence restarts.
+#[tokio::test]
+async fn resumed_parked_child_does_not_collide_with_a_fresh_spawn() {
+	let root = session_root("resume");
+	let provider = gated_provider("unused");
+	let supervisor = test_supervisor(&root, provider.clone());
+	let (id, contract) = adoptable_child(&supervisor, &root);
+	let manager = attach(
+		&supervisor,
+		DEFAULT_AGENT_IDLE_TTL_MS,
+		reviver_factory(provider),
+	);
+	// `attach` scanned the spawn-time contract as a restored parked row.
+	assert_eq!(manager.status(&id), Some(LifecycleStatus::Parked));
+
+	let mut different = contract.clone();
+	different.task = "a different spawn".to_string();
+	different.display_name = Some("different".to_string());
+	assert!(
+		manager.adopt(&id, Some(different)).is_err(),
+		"a different contract must not replace a restored parked row"
+	);
+	manager
+		.adopt(&id, Some(contract))
+		.expect("the same session may be re-adopted");
+	assert_eq!(manager.status(&id), Some(LifecycleStatus::Idle));
+	drop(manager);
+	drop(supervisor);
+
+	// A fresh supervisor on the same stable session directory restarts ids at 1.
+	let restarted_provider = gated_provider("unused-restart");
+	let restarted = test_supervisor(&root, restarted_provider.clone());
+	let restarted_manager = attach(
+		&restarted,
+		DEFAULT_AGENT_IDLE_TTL_MS,
+		reviver_factory(restarted_provider),
+	);
+	assert_eq!(
+		restarted_manager.status(&id),
+		Some(LifecycleStatus::Parked),
+		"the parked row is restored from disk"
+	);
+	let fresh_id = reserve_in(&restarted, "fresh");
+	assert_ne!(fresh_id, id, "a resumed parked id must never be reused");
+	restarted.append_child_transcript(
+		&fresh_id,
+		&[&Message::user("fresh work"), &Message::assistant("fresh-answer")],
+	);
+	let fresh_contract = contract_for(
+		&fresh_id,
+		&root,
+		"fresh work",
+		vec!["read".to_string()],
+		"scout",
+		1,
+	);
+	fresh_contract.write(&root).expect("fresh contract");
+	restarted.mark_completed(&fresh_id, 3, "fresh-answer");
+	restarted_manager
+		.adopt(&fresh_id, Some(fresh_contract))
+		.expect("adopt the fresh child");
+
+	let roster = restarted_manager.roster();
+	assert!(roster
+		.iter()
+		.any(|row| row.id == id && row.status == LifecycleStatus::Parked));
+	assert!(roster
+		.iter()
+		.any(|row| row.id == fresh_id && row.status == LifecycleStatus::Idle));
+	let restored = PersistedChildSession::load(&root, &id).expect("restored contract");
+	assert_eq!(
+		restored.task, "investigate the repo",
+		"the parked child's contract is untouched"
+	);
+
+	// Minor 4: a tombstone restored after a restart has no roster entry, yet
+	// `history://` must still find its transcript on disk.
+	assert!(restarted_manager.tombstone(&id, "hard kill"));
+	drop(restarted_manager);
+	drop(restarted);
+	let after_provider = gated_provider("unused-after");
+	let after = test_supervisor(&root, after_provider.clone());
+	let after_manager = attach(
+		&after,
+		DEFAULT_AGENT_IDLE_TTL_MS,
+		reviver_factory(after_provider),
+	);
+	assert_eq!(
+		after_manager.status(&id),
+		None,
+		"a tombstoned id has no roster row"
+	);
+	assert!(
+		after_manager.transcript_path(&id).is_some(),
+		"history:// falls back to the transcript on disk"
+	);
+}

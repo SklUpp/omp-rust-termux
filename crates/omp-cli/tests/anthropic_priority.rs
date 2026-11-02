@@ -193,9 +193,9 @@ fn run(request: RunRequest) -> (Vec<String>, Option<Vec<String>>) {
 	(stops, disabled)
 }
 
-fn body_field<'a>(body: &'a str, name: &str) -> Option<&'a serde_json::Value> {
+fn body_field(body: &str, name: &str) -> Option<serde_json::Value> {
 	let value: serde_json::Value = serde_json::from_str(body).expect("json body");
-	value.get(name)
+	value.get(name).cloned()
 }
 
 #[test]
@@ -238,7 +238,7 @@ fn rejected_priority_retries_without_fast_mode_and_reports_the_drop() {
 			.contains("anthropic-beta:") && reject_head.contains("fast-mode-2026-02-01"),
 		"the priority request carries the fast-mode beta: {reject_head}"
 	);
-	assert_eq!(body_field(&reject_body, "speed"), Some(&serde_json::json!("fast")));
+	assert_eq!(body_field(&reject_body, "speed"), Some(serde_json::json!("fast")));
 
 	let (retry_head, retry_body) = captured_rx.recv().expect("retry request");
 	let retry_lower = retry_head.to_ascii_lowercase();
@@ -247,7 +247,7 @@ fn rejected_priority_retries_without_fast_mode_and_reports_the_drop() {
 		"the retry drops the beta: {retry_head}"
 	);
 	assert_eq!(body_field(&retry_body, "speed"), None, "the retry drops `speed`");
-	assert_eq!(body_field(&retry_body, "stream"), Some(&serde_json::json!(true)));
+	assert_eq!(body_field(&retry_body, "stream"), Some(serde_json::json!(true)));
 
 	let follow = request(catalog(addr), &[]);
 	run(follow);
@@ -473,7 +473,7 @@ fn cli_priority_downgrade_reports_once_and_persists_the_reset() {
 
 	let (first_head, first_body) = captured_rx.recv().expect("first request");
 	assert!(first_head.to_ascii_lowercase().contains("anthropic-beta:"));
-	assert_eq!(body_field(&first_body, "speed"), Some(&serde_json::json!("fast")));
+	assert_eq!(body_field(&first_body, "speed"), Some(serde_json::json!("fast")));
 	let (retry_head, retry_body) = captured_rx.recv().expect("retry request");
 	assert!(!retry_head.to_ascii_lowercase().contains("fast-mode-2026-02-01"));
 	assert_eq!(body_field(&retry_body, "speed"), None);

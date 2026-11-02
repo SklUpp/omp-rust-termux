@@ -303,7 +303,7 @@ providers:
         requestModelId: qwen3-patch
         tokenizer: qwen3-v2
 "#);
-	let catalog = Catalog::load(Some(&json), Some(&yml)).expect("load catalog");
+	let catalog = Catalog::load_from(&[json], &yml).expect("load catalog");
 	let qwen = &catalog.providers["ollama"]["qwen3"];
 	assert_eq!(qwen.name.as_deref(), Some("Qwen3 bundled"), "an omitted field keeps the row value");
 	assert_eq!(qwen.request_model_id.as_deref(), Some("qwen3-patch"), "the patch wins");

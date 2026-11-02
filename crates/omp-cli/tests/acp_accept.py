@@ -53,6 +53,8 @@ class Provider:
         # cooperative release path only, never the forced-close watchdog.
         self.hang_continuation = False
         self.hang_seconds = 2.0
+        # Text returned when the request already contains a tool result.
+        self.tool_result_text = "tool done"
         self.continuation_started = threading.Event()
         self.lock = threading.Lock()
         provider = self
@@ -115,7 +117,7 @@ class Provider:
             return "data: " + json.dumps(payload)
 
         if tool_after_user:
-            yield chunk({"role": "assistant", "content": "tool done"})
+            yield chunk({"role": "assistant", "content": self.tool_result_text})
             yield chunk({}, "stop")
             yield "data: [DONE]"
             return
@@ -687,6 +689,9 @@ def run_prewalk(binary: str) -> None:
     root = Path(tempfile.mkdtemp(prefix="acp-prewalk."))
     root_provider = Provider()
     target_provider = Provider()
+    # The switch request carries the write result as context; the target still
+    # answers normally (no tool call is requested).
+    target_provider.tool_result_text = "hello from mock"
     root_provider.start()
     target_provider.start()
     client = Client(binary, root, root_provider, prewalk_target=target_provider)

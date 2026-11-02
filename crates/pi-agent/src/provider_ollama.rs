@@ -8,8 +8,25 @@
 use std::{
 	collections::{BTreeMap, HashMap, VecDeque},
 	fmt::Display,
-	time::Duration,
+	future::Future,
+	pin::Pin,
+	sync::{
+		Arc,
+		atomic::{AtomicU64, Ordering},
+	},
+	time::{Duration, Instant},
 };
+
+/// Boxed future alias for async callbacks and hooks without extra lifetime dependencies.
+pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// TS `onPayload?: (payload: unknown, model?: Model<Api>) => unknown | undefined | Promise<unknown | undefined>`.
+/// Receives the serialized request body and the target model id, returning an optional replacement body or an error.
+pub type OllamaPayloadHook = Arc<
+	dyn for<'a> Fn(&'a Value, &'a str) -> BoxFuture<'a, Result<Option<Value>, ProviderError>>
+		+ Send
+		+ Sync,
+>;
 
 use async_trait::async_trait;
 use futures::{Stream, StreamExt};
@@ -28,6 +45,20 @@ use crate::{
 
 /// TCP/TLS connect budget; a live NDJSON completion owns no total timeout.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Default fetch retry backoff schedule for transient Ollama errors (`ollama.ts:458`).
+pub const OLLAMA_RETRY_DELAYS_MS: [u64; 3] = [2000, 5000, 10000];
+/// Maximum HTTP request attempts for retryable statuses (`fetch-retry.ts:145`).
+pub const MAX_FETCH_ATTEMPTS: usize = 5;
+/// Maximum Retry-After delay honored before aborting retry loop (`fetch-retry.ts:167`).
+pub const MAX_RETRY_DELAY_MS: u64 = 60_000;
+/// Maximum attempts for benign empty completion retries (`empty-completion-retry.ts:18`).
+pub const MAX_EMPTY_COMPLETION_RETRIES: usize = 2;
+/// Base delay for empty completion retry backoff (`empty-completion-retry.ts:19`).
+pub const EMPTY_COMPLETION_BASE_DELAY_MS: u64 = 500;
+/// Default maximum gap between streamed NDJSON events before timeout (`idle-iterator.ts:14`).
+pub const DEFAULT_STREAM_IDLE_TIMEOUT_MS: u64 = 300_000;
+/// Default maximum wait for the first streamed event before timeout (`idle-iterator.ts:24`).
+pub const DEFAULT_STREAM_FIRST_EVENT_TIMEOUT_MS: u64 = 300_000;
 /// Maximum characters of an error body or malformed record kept for diagnostics.
 const ERROR_BODY_CHARS: usize = 2048;
 /// Hard ceiling on bytes read from an HTTP error body before diagnostics.
@@ -43,6 +74,22 @@ const EMPTY_OLLAMA_LENGTH_COMPLETION_MESSAGE: &str =
 	"Model returned no content: prompt filled the context window; raise Ollama num_ctx or shorten the prompt.";
 const EMPTY_OLLAMA_LOAD_COMPLETION_MESSAGE: &str =
 	"Ollama loaded the model but generated nothing (done_reason: load): the request contained no user-role message.";
+/// Resolve an optional duration from environment variable names (`idle-iterator.ts:32`).
+/// A value of 0 explicitly disables the timeout; missing/invalid uses default.
+pub fn resolve_env_timeout(env_vars: &[&str], default_ms: u64) -> Option<Duration> {
+	for var in env_vars {
+		if let Ok(val) = std::env::var(var) {
+			if let Ok(num) = val.trim().parse::<u64>() {
+				if num == 0 {
+					return None;
+				}
+				return Some(Duration::from_millis(num));
+			}
+		}
+	}
+	Some(Duration::from_millis(default_ms))
+}
+
 
 /// `normalizeBaseUrl`: blank means Ollama Cloud; one trailing slash and a
 /// trailing `/api` are both stripped so [`Self::endpoint`] can append once.
@@ -268,6 +315,7 @@ struct OllamaChunkFunction {
 /// Base URL, key and model are caller-supplied. The remaining knobs mirror the
 /// TS `Model<"ollama-chat">`/`OllamaChatOptions` fields that influence the wire
 /// body; the Rust [`ModelProvider`] trait has no per-request options.
+#[derive(Clone)]
 pub struct OllamaProvider {
 	http: reqwest::Client,
 	base_url: String,
@@ -294,6 +342,111 @@ pub struct OllamaProvider {
 	/// Configured gateway identity; overrides the `ollama`/`ollama-cloud` default
 	/// so custom providers are stamped and cross-model replays classify right.
 	provider_id: Option<String>,
+	/// Optional request payload replacement hook (`ollama.ts:577-580`).
+	on_payload: Option<OllamaPayloadHook>,
+	/// Pre-response and first-event stream budget (`idle-iterator.ts:24`).
+	first_event_timeout: Option<Duration>,
+	/// Idle gap budget between streamed stream chunks (`idle-iterator.ts:14`).
+	idle_timeout: Option<Duration>,
+}
+
+/// True when a tool call has empty or whitespace-only id or name (`transform-messages.ts:166-168`).
+pub fn is_malformed_tool_call(call: &crate::state::ToolCall) -> bool {
+	call.id.trim().is_empty() || call.name.trim().is_empty()
+}
+
+/// Strip malformed tool calls and their matching tool results (`transform-messages.ts:170-229`).
+pub fn sanitize_malformed_tool_calls(messages: &[Message]) -> Vec<Message> {
+	let mut drop_queue: Vec<String> = Vec::new();
+	let mut sanitized = Vec::with_capacity(messages.len());
+
+	for msg in messages {
+		match msg.role {
+			Role::Assistant => {
+				let mut new_parts = Vec::new();
+				let mut had_calls = false;
+				for part in &msg.content {
+					match part {
+						ContentPart::ToolCall(call) => {
+							had_calls = true;
+							if is_malformed_tool_call(call) {
+								if !call.id.trim().is_empty() {
+									drop_queue.push(call.id.clone());
+								}
+							} else {
+								new_parts.push(part.clone());
+							}
+						}
+						_ => new_parts.push(part.clone()),
+					}
+				}
+				if had_calls && new_parts.is_empty() {
+					continue;
+				}
+				let mut new_msg = msg.clone();
+				new_msg.content = new_parts;
+				sanitized.push(new_msg);
+			}
+			Role::Tool => {
+				if let Some(id) = &msg.tool_call_id {
+					if let Some(pos) = drop_queue.iter().position(|drop_id| drop_id == id) {
+						drop_queue.remove(pos);
+						continue;
+					}
+				}
+				sanitized.push(msg.clone());
+			}
+			_ => {
+				drop_queue.clear();
+				sanitized.push(msg.clone());
+			}
+		}
+	}
+	sanitized
+}
+
+pub fn preferred_dialect(model_id: &str) -> &'static str {
+	let lower = model_id.to_ascii_lowercase();
+	if lower.contains("claude") || lower.contains("anthropic") {
+		"anthropic"
+	} else if lower.contains("gemini") {
+		"gemini"
+	} else if lower.contains("gemma") {
+		"gemma"
+	} else if lower.contains("harmony") || lower.contains("gpt-oss") {
+		"harmony"
+	} else if lower.contains("deepseek") {
+		"deepseek"
+	} else if lower.contains("qwen") {
+		"qwen3"
+	} else if lower.contains("kimi") || lower.contains("moonshot") {
+		"kimi"
+	} else if lower.contains("glm") {
+		"glm"
+	} else if lower.contains("hermes") {
+		"hermes"
+	} else if lower.contains("minimax") {
+		"minimax"
+	} else {
+		"xml"
+	}
+}
+
+/// TS `renderDemotedThinking`: wrap reasoning text in the target model's dialect fences (`demotion.ts:30-41`).
+pub fn demote_thinking(model_id: &str, thinking: &str) -> String {
+	let dialect = preferred_dialect(model_id);
+	match dialect {
+		"anthropic" => thinking.to_string(),
+		"harmony" | "gemma" | "deepseek" | "glm" | "kimi" | "hermes" | "qwen3" => {
+			format!("<think>\n{thinking}\n</think>")
+		}
+		"gemini" => {
+			format!("```thinking\n{thinking}\n```")
+		}
+		"minimax" | "xml" | _ => {
+			format!("<thinking>{thinking}</thinking>")
+		}
+	}
 }
 
 impl OllamaProvider {
@@ -342,6 +495,21 @@ impl OllamaProvider {
 			temperature: None,
 			top_p: None,
 			provider_id: None,
+			on_payload: None,
+			first_event_timeout: resolve_env_timeout(
+				&[
+					"PI_STREAM_FIRST_EVENT_TIMEOUT_MS",
+					"PI_OPENAI_STREAM_FIRST_EVENT_TIMEOUT_MS",
+				],
+				DEFAULT_STREAM_FIRST_EVENT_TIMEOUT_MS,
+			),
+			idle_timeout: resolve_env_timeout(
+				&[
+					"PI_STREAM_IDLE_TIMEOUT_MS",
+					"PI_OPENAI_STREAM_IDLE_TIMEOUT_MS",
+				],
+				DEFAULT_STREAM_IDLE_TIMEOUT_MS,
+			),
 		}
 	}
 
@@ -414,6 +582,37 @@ impl OllamaProvider {
 		self.top_p = top_p;
 		self
 	}
+	/// Attach an asynchronous request payload replacement hook (`ollama.ts:577-580`).
+	pub fn with_on_payload(mut self, hook: OllamaPayloadHook) -> Self {
+		self.on_payload = Some(hook);
+		self
+	}
+
+	/// Override first-event and idle stream watchdog timeouts (`idle-iterator.ts`).
+	pub fn with_stream_timeouts(
+		mut self,
+		first_event_timeout: Option<Duration>,
+		idle_timeout: Option<Duration>,
+	) -> Self {
+		self.first_event_timeout = first_event_timeout;
+		self.idle_timeout = idle_timeout;
+		self
+	}
+
+	/// Effective first-event budget (floored at idle timeout per `idle-iterator.ts:90`).
+	fn effective_first_event_timeout(&self) -> Duration {
+		let idle = self.effective_idle_timeout();
+		self.first_event_timeout
+			.map(|to| to.max(idle))
+			.unwrap_or(idle)
+	}
+
+	/// Effective stream idle gap budget.
+	fn effective_idle_timeout(&self) -> Duration {
+		self.idle_timeout
+			.unwrap_or(Duration::from_millis(DEFAULT_STREAM_IDLE_TIMEOUT_MS))
+	}
+
 
 	/// `{normalized_base_url}/api/chat`.
 	pub fn endpoint(&self) -> String {
@@ -488,6 +687,183 @@ impl OllamaProvider {
 		}
 	}
 
+	/// Check whether a historical message originated from this exact provider, API and model.
+	fn is_same_model(&self, message: &Message) -> bool {
+		message.provider.as_deref() == self.provider()
+			&& message.api.as_deref() == self.api()
+			&& message.model.as_deref() == self.model()
+	}
+
+	/// Transform historical messages for Ollama (`transform-messages.ts:470-1083`):
+	/// 1. Demotes foreign/cross-model thinking to text using target dialect fences.
+	/// 2. Drops cross-model redacted thinking and whitespace-only thinking.
+	/// 3. Drops malformed tool calls and matched tool results.
+	/// 4. Ensures tool-call / tool-result pairing: synthesizes missing results
+	///    ("No result provided" or "aborted" for stop errors) and re-emits orphan
+	///    results as user-role `<stale-tool-result>` blocks.
+	fn transform_messages(&self, messages: &[Message]) -> Vec<Message> {
+		let sanitized = sanitize_malformed_tool_calls(messages);
+
+		// Pass 1: thinking demotion & filter truncated thinking-only assistant turns
+		let mut preprocessed = Vec::with_capacity(sanitized.len());
+		for msg in sanitized {
+			if msg.role == Role::Assistant {
+				let is_truncated = matches!(
+					msg.stop_reason,
+					Some(StopReason::Length) | Some(StopReason::Error) | Some(StopReason::Aborted)
+				);
+				let has_text_or_calls = msg.content.iter().any(|part| {
+					matches!(part, ContentPart::Text { text } if !text.trim().is_empty())
+						|| matches!(part, ContentPart::ToolCall(_))
+				});
+				if is_truncated && !has_text_or_calls {
+					continue;
+				}
+
+				if self.is_same_model(&msg) {
+					preprocessed.push(msg);
+				} else {
+					let mut new_parts = Vec::new();
+					for part in msg.content {
+						match part {
+							ContentPart::Thinking { thinking, .. } => {
+								let trimmed = thinking.trim();
+								if !trimmed.is_empty() {
+									let demoted = demote_thinking(&self.model, &thinking);
+									new_parts.push(ContentPart::Text { text: demoted });
+								}
+							}
+							ContentPart::RedactedThinking => {
+								// Dropped cross-model per transform-messages.ts:728-746
+							}
+							other => new_parts.push(other),
+						}
+					}
+					if let Some(ContentPart::Text { text }) = new_parts.last_mut() {
+						*text = text.trim_end().to_string();
+					}
+					if !new_parts.is_empty() {
+						let mut new_msg = msg;
+						new_msg.content = new_parts;
+						preprocessed.push(new_msg);
+					}
+				}
+			} else {
+				preprocessed.push(msg);
+			}
+		}
+
+		// Pass 2: tool-call and tool-result pairing (`transform-messages.ts:845-1083`)
+		let mut output = Vec::with_capacity(preprocessed.len());
+		let mut pending_calls: Vec<crate::state::ToolCall> = Vec::new();
+		let mut pending_stop_reason: Option<StopReason> = None;
+
+		for msg in preprocessed {
+			if msg.role == Role::Tool {
+				if let Some(id) = &msg.tool_call_id {
+					if let Some(pos) = pending_calls.iter().position(|c| &c.id == id) {
+						pending_calls.remove(pos);
+						output.push(msg);
+						continue;
+					}
+				}
+				// Orphan tool result:
+				if !pending_calls.is_empty() {
+					// Drop while inside a window with open pending calls
+					continue;
+				}
+				// Convert to Role::User stale-tool-result (Ollama developer->system rationale)
+				let tool_name = msg.tool_name.as_deref().unwrap_or("unknown");
+				let id = msg.tool_call_id.as_deref().unwrap_or("unknown");
+				let error_attr = if msg.is_error == Some(true) { " is-error=\"true\"" } else { "" };
+				let text_parts: String = msg
+					.content
+					.iter()
+					.filter_map(|p| match p {
+						ContentPart::Text { text } => Some(text.as_str()),
+						_ => None,
+					})
+					.collect::<Vec<_>>()
+					.join("\n");
+				let stale_text = format!(
+					"<stale-tool-result tool=\"{tool_name}\" id=\"{id}\"{error_attr}>\n{text_parts}\n</stale-tool-result>"
+				);
+				output.push(Message {
+					role: Role::User,
+					content: vec![ContentPart::Text { text: stale_text }],
+					timestamp: msg.timestamp,
+					tool_call_id: None,
+					tool_name: None,
+					is_error: None,
+					api: None,
+					provider: None,
+					model: None,
+					attribution: None,
+					stop_reason: None,
+				});
+			} else {
+				// Flush any pending tool calls before moving to next non-tool turn
+				if !pending_calls.is_empty() {
+					let is_aborted = matches!(
+						pending_stop_reason,
+						Some(StopReason::Error) | Some(StopReason::Aborted)
+					);
+					let synthetic_text = if is_aborted { "aborted" } else { "No result provided" };
+					for call in pending_calls.drain(..) {
+						output.push(Message {
+							role: Role::Tool,
+							content: vec![ContentPart::Text { text: synthetic_text.to_string() }],
+							timestamp: None,
+							tool_call_id: Some(call.id),
+							tool_name: Some(call.name),
+							is_error: Some(true),
+							api: None,
+							provider: None,
+							model: None,
+							attribution: None,
+							stop_reason: None,
+						});
+					}
+				}
+
+				if msg.role == Role::Assistant {
+					pending_stop_reason = msg.stop_reason;
+					for part in &msg.content {
+						if let ContentPart::ToolCall(call) = part {
+							pending_calls.push(call.clone());
+						}
+					}
+				}
+				output.push(msg);
+			}
+		}
+
+		// Flush trailing pending calls if any
+		if !pending_calls.is_empty() {
+			let is_aborted = matches!(
+				pending_stop_reason,
+				Some(StopReason::Error) | Some(StopReason::Aborted)
+			);
+			let synthetic_text = if is_aborted { "aborted" } else { "No result provided" };
+			for call in pending_calls.drain(..) {
+				output.push(Message {
+					role: Role::Tool,
+					content: vec![ContentPart::Text { text: synthetic_text.to_string() }],
+					timestamp: None,
+					tool_call_id: Some(call.id),
+					tool_name: Some(call.name),
+					is_error: Some(true),
+					api: None,
+					provider: None,
+					model: None,
+					attribution: None,
+					stop_reason: None,
+				});
+			}
+		}
+
+		output
+	}
 	fn request(
 		&self,
 		messages: &[Message],
@@ -514,7 +890,20 @@ impl OllamaProvider {
 		})
 	}
 
+	fn request_value(
+		&self,
+		messages: &[Message],
+		tools: &[Value],
+		tool_choice: &ToolChoice,
+		stream: bool,
+	) -> Result<Value, ProviderError> {
+		let req = self.request(messages, tools, tool_choice, stream)?;
+		serde_json::to_value(&req).map_err(|err| ProviderError::Protocol(err.to_string()))
+	}
+
 	fn convert_messages(&self, messages: &[Message]) -> Vec<OllamaWireMessage> {
+		let transformed = self.transform_messages(messages);
+		let messages = &transformed;
 		let call_names = tool_call_names(messages);
 		// The TS adapter receives system prompts separately and emits them first.
 		// Rust messages carry them inline, so a leading system-prompt run is the
@@ -564,6 +953,241 @@ impl OllamaProvider {
 			}
 		}
 		converted
+	}
+
+	async fn send_request_with_retry(
+		&self,
+		payload: &Value,
+	) -> Result<reqwest::Response, ProviderError> {
+		let pre_response_timeout = self.effective_first_event_timeout();
+		let max_attempts = MAX_FETCH_ATTEMPTS;
+		let secrets = credential_values(self.api_key.as_deref());
+
+		for attempt in 0..max_attempts {
+			let mut req = self.http.post(self.endpoint()).json(payload);
+			if let Some(api_key) = self.api_key.as_deref() {
+				req = req.bearer_auth(api_key);
+			}
+
+			let send_fut = req.send();
+			let response_result = tokio::time::timeout(pre_response_timeout, send_fut).await;
+
+			let response = match response_result {
+				Ok(Ok(resp)) => resp,
+				Ok(Err(err)) => {
+					if attempt + 1 < max_attempts {
+						let delay_ms = OLLAMA_RETRY_DELAYS_MS
+							.get(attempt)
+							.copied()
+							.unwrap_or(10_000);
+						tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+						continue;
+					}
+					return Err(network_error(err));
+				}
+				Err(_) => {
+					if attempt + 1 < max_attempts {
+						let delay_ms = OLLAMA_RETRY_DELAYS_MS
+							.get(attempt)
+							.copied()
+							.unwrap_or(10_000);
+						tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+						continue;
+					}
+					return Err(ProviderError::Network(format!(
+						"Ollama request timed out after {:?}",
+						pre_response_timeout
+					)));
+				}
+			};
+
+			let status = response.status();
+			if status.is_success() {
+				return Ok(response);
+			}
+
+			let headers = response.headers().clone();
+			let body_info = match read_body_bounded(response, ERROR_BODY_BYTES).await {
+				Ok(body) => body,
+				Err(err) => {
+					return Err(ProviderError::HttpStatus(
+						status.as_u16(),
+						format!("<failed to read error body: {err}>"),
+					));
+				}
+			};
+
+			let is_retryable = should_retry_ollama_response(status.as_u16(), &body_info.text);
+			if is_retryable && attempt + 1 < max_attempts {
+				let retry_hint = extract_retry_hint(&headers, &body_info.text);
+				let default_delay = Duration::from_millis(
+					OLLAMA_RETRY_DELAYS_MS
+						.get(attempt)
+						.copied()
+						.unwrap_or(10_000),
+				);
+				let delay = retry_hint
+					.map(|hint| hint.min(Duration::from_millis(MAX_RETRY_DELAY_MS)))
+					.unwrap_or(default_delay);
+				tokio::time::sleep(delay).await;
+				continue;
+			}
+
+			let redacted = bounded_redaction(&body_info.text, &secrets, body_info.truncated);
+			return Err(ProviderError::HttpStatus(status.as_u16(), redacted));
+		}
+
+		Err(ProviderError::Network("maximum retry attempts exceeded".to_string()))
+	}
+
+	async fn stream_once(
+		&self,
+		messages: &[Message],
+		tools: &[Value],
+		tool_choice: &ToolChoice,
+	) -> Result<ChunkStream, ProviderError> {
+		let mut payload = self.request_value(messages, tools, tool_choice, true)?;
+		if let Some(hook) = &self.on_payload {
+			if let Some(replaced) = hook(&payload, &self.model).await? {
+				payload = replaced;
+			}
+		}
+
+		let response = self.send_request_with_retry(&payload).await?;
+		let secrets = credential_values(self.api_key.as_deref());
+		let body = response
+			.bytes_stream()
+			.map(|item| item.map_err(|err| err.to_string()));
+
+		let raw_stream = ndjson_stream(body, secrets);
+		let pattern = get_stream_markup_healing_pattern(self.provider().unwrap_or(""), &self.model);
+		let healed_stream = with_markup_healing(raw_stream, pattern);
+		let watched_stream = with_stream_watchdog(
+			healed_stream,
+			Some(self.effective_first_event_timeout()),
+			Some(self.effective_idle_timeout()),
+		);
+		Ok(watched_stream)
+	}
+
+	async fn stream_with_empty_retry(
+		&self,
+		messages: &[Message],
+		tools: &[Value],
+		tool_choice: &ToolChoice,
+	) -> Result<ChunkStream, ProviderError> {
+		let provider = self.clone();
+		let messages = messages.to_vec();
+		let tools = tools.to_vec();
+		let tool_choice = tool_choice.clone();
+
+		struct RetryState {
+			provider: OllamaProvider,
+			messages: Vec<Message>,
+			tools: Vec<Value>,
+			tool_choice: ToolChoice,
+			current_stream: Option<ChunkStream>,
+			buffered: VecDeque<StreamChunk>,
+			committed: bool,
+			empty_retries: usize,
+			finished: bool,
+		}
+
+		let init_stream = provider.stream_once(&messages, &tools, &tool_choice).await?;
+
+		let state = RetryState {
+			provider,
+			messages,
+			tools,
+			tool_choice,
+			current_stream: Some(init_stream),
+			buffered: VecDeque::new(),
+			committed: false,
+			empty_retries: 0,
+			finished: false,
+		};
+
+		Ok(Box::pin(futures::stream::unfold(Some(state), |state| async move {
+			let mut state = state?;
+			loop {
+				if let Some(chunk) = state.buffered.pop_front() {
+					return Some((Ok(chunk), Some(state)));
+				}
+
+				if state.finished {
+					return None;
+				}
+
+				let Some(stream) = &mut state.current_stream else {
+					return None;
+				};
+
+				match stream.next().await {
+					Some(Ok(chunk)) => {
+						if state.committed {
+							return Some((Ok(chunk), Some(state)));
+						}
+
+						if is_meaningful_chunk(&chunk) {
+							state.committed = true;
+							state.buffered.push_back(chunk);
+							if let Some(c) = state.buffered.pop_front() {
+								return Some((Ok(c), Some(state)));
+							}
+							continue;
+						}
+
+						if chunk.is_done {
+							let output_tokens = chunk.usage.as_ref().and_then(|u| u.output).unwrap_or(0);
+							let is_stop = chunk.stop_reason == Some(StopReason::Stop);
+							let can_retry_empty = !state.committed
+								&& is_stop
+								&& chunk.error_message.is_none()
+								&& output_tokens <= 1
+								&& state.empty_retries < MAX_EMPTY_COMPLETION_RETRIES;
+
+							if can_retry_empty {
+								let delay_ms = EMPTY_COMPLETION_BASE_DELAY_MS * (1 << state.empty_retries);
+								tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+								state.empty_retries += 1;
+								state.buffered.clear();
+								match state
+									.provider
+									.stream_once(&state.messages, &state.tools, &state.tool_choice)
+									.await
+								{
+									Ok(new_stream) => {
+										state.current_stream = Some(new_stream);
+										continue;
+									}
+									Err(err) => {
+										state.finished = true;
+										return Some((Err(err), None));
+									}
+								}
+							}
+
+							state.buffered.push_back(chunk);
+							state.finished = true;
+							if let Some(c) = state.buffered.pop_front() {
+								return Some((Ok(c), Some(state)));
+							}
+							return None;
+						}
+
+						state.buffered.push_back(chunk);
+					}
+					Some(Err(err)) => {
+						state.finished = true;
+						return Some((Err(err), None));
+					}
+					None => {
+						state.finished = true;
+						return None;
+					}
+				}
+			}
+		})))
 	}
 }
 
@@ -951,6 +1575,1307 @@ fn sanitize_object(map: &Map<String, Value>, widening: &Value) -> Value {
 	Value::Object(output)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamMarkupHealingPattern {
+	Kimi,
+	Dsml,
+	Thinking,
+}
+
+pub fn model_may_leak_kimi_tool_calls(provider: &str, model_id: &str) -> bool {
+	if provider == "kimi-code" || provider == "moonshot" {
+		return true;
+	}
+	let lower = model_id.to_ascii_lowercase();
+	lower.contains("kimi")
+		&& (lower.contains("k2")
+			|| lower.contains("-k2")
+			|| lower.contains("_k2")
+			|| lower.contains(".k2")
+			|| lower.contains("/k2"))
+}
+
+pub fn model_may_leak_dsml_tool_calls(provider: &str, model_id: &str) -> bool {
+	let lower = model_id.to_ascii_lowercase();
+	if !lower.contains("deepseek") {
+		return false;
+	}
+	matches!(
+		provider,
+		"ollama"
+			| "ollama-cloud"
+			| "nvidia"
+			| "deepseek"
+			| "fireworks"
+			| "nanogpt"
+			| "opencode-go"
+			| "openrouter"
+	)
+}
+
+pub fn get_stream_markup_healing_pattern(
+	provider: &str,
+	model_id: &str,
+) -> StreamMarkupHealingPattern {
+	if model_may_leak_kimi_tool_calls(provider, model_id) {
+		StreamMarkupHealingPattern::Kimi
+	} else if model_may_leak_dsml_tool_calls(provider, model_id) {
+		StreamMarkupHealingPattern::Dsml
+	} else {
+		StreamMarkupHealingPattern::Thinking
+	}
+}
+
+pub fn normalize_kimi_function_name(raw_id: &str) -> String {
+	let before_index = raw_id.split(':').next().unwrap_or(raw_id);
+	let name = before_index.rsplit('.').next().unwrap_or(before_index).trim();
+	name.to_string()
+}
+
+fn partial_suffix_overlap(text: &str, tag: &str) -> usize {
+	let max_len = (text.len().saturating_sub(1)).min(tag.len().saturating_sub(1));
+	for len in (1..=max_len).rev() {
+		if text.ends_with(&tag[..len]) {
+			return len;
+		}
+	}
+	0
+}
+
+fn partial_suffix_overlap_any(text: &str, tags: &[&str]) -> usize {
+	let mut best = 0;
+	for tag in tags {
+		best = best.max(partial_suffix_overlap(text, tag));
+	}
+	best
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HealedToolCall {
+	pub id: String,
+	pub name: String,
+	pub arguments: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MarkupHealingEvent {
+	Text(String),
+	Thinking(String),
+	ToolCall(HealedToolCall),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InbandScanEvent {
+	Text(String),
+	ThinkingDelta(String),
+	ThinkingStart,
+	ThinkingEnd,
+	ToolCall {
+		id: String,
+		name: String,
+		arguments: String,
+	},
+}
+
+struct FencedThinkingResult {
+	thinking: String,
+	closed: bool,
+	rest: String,
+}
+
+#[derive(Default)]
+struct FencedThinkingScanner {
+	buffer: String,
+	inner: String,
+	emitted: usize,
+}
+
+impl FencedThinkingScanner {
+	fn feed(&mut self, text: &str, is_final: bool) -> FencedThinkingResult {
+		self.buffer.push_str(text);
+		let mut thinking = String::new();
+
+		loop {
+			let Some(nl) = self.buffer.find('\n') else {
+				break;
+			};
+			let line = &self.buffer[..nl];
+			if self.inner.is_empty() {
+				if let Some(close_rest) = self.close_rest(line) {
+					let rest = format!("{}{}", close_rest, &self.buffer[nl..]);
+					self.reset();
+					return FencedThinkingResult {
+						thinking,
+						closed: true,
+						rest,
+					};
+				}
+			}
+			thinking.push_str(&self.buffer[self.emitted..=nl]);
+			self.update_inner(line);
+			self.buffer = self.buffer[nl + 1..].to_string();
+			self.emitted = 0;
+		}
+
+		if !self.inner.is_empty() {
+			thinking.push_str(&self.buffer[self.emitted..]);
+			self.emitted = self.buffer.len();
+			return FencedThinkingResult {
+				thinking,
+				closed: false,
+				rest: String::new(),
+			};
+		}
+
+		if is_final {
+			if let Some(close) = self.close_rest_final(&self.buffer) {
+				let rest = close.to_string();
+				self.reset();
+				return FencedThinkingResult {
+					thinking,
+					closed: true,
+					rest,
+				};
+			}
+		} else {
+			if let Some(close) = self.close_rest_streaming_tail(&self.buffer) {
+				let rest = close.to_string();
+				self.reset();
+				return FencedThinkingResult {
+					thinking,
+					closed: true,
+					rest,
+				};
+			}
+			if self.must_hold(&self.buffer) {
+				return FencedThinkingResult {
+					thinking,
+					closed: false,
+					rest: String::new(),
+				};
+			}
+		}
+
+		thinking.push_str(&self.buffer[self.emitted..]);
+		if is_final {
+			self.reset();
+		} else {
+			self.emitted = self.buffer.len();
+		}
+		FencedThinkingResult {
+			thinking,
+			closed: false,
+			rest: String::new(),
+		}
+	}
+
+	fn parse_backtick_lead<'a>(&self, line: &'a str) -> Option<(usize, &'a str)> {
+		let spaces = line.chars().take_while(|c| *c == ' ').count();
+		if spaces > 3 {
+			return None;
+		}
+		let after_spaces = &line[spaces..];
+		let ticks = after_spaces.chars().take_while(|c| *c == '`').count();
+		if ticks < 3 {
+			return None;
+		}
+		Some((ticks, &after_spaces[ticks..]))
+	}
+
+	fn is_lang_token(s: &str) -> bool {
+		!s.is_empty()
+			&& s.chars()
+				.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '+' || c == '#' || c == '-')
+	}
+
+	fn close_rest<'a>(&self, line: &'a str) -> Option<&'a str> {
+		let (_, rest) = self.parse_backtick_lead(line)?;
+		let trimmed = rest.trim();
+		if trimmed.is_empty() {
+			return Some("");
+		}
+		if Self::is_lang_token(trimmed) {
+			return None;
+		}
+		Some(rest)
+	}
+
+	fn close_rest_final<'a>(&self, tail: &'a str) -> Option<&'a str> {
+		let (_, rest) = self.parse_backtick_lead(tail)?;
+		if rest.trim().is_empty() {
+			Some("")
+		} else {
+			Some(rest)
+		}
+	}
+
+	fn close_rest_streaming_tail<'a>(&self, tail: &'a str) -> Option<&'a str> {
+		let (_, rest) = self.parse_backtick_lead(tail)?;
+		let trimmed = rest.trim();
+		if trimmed.is_empty() || Self::is_lang_token(trimmed) {
+			return None;
+		}
+		Some(rest)
+	}
+
+	fn must_hold(&self, tail: &str) -> bool {
+		let spaces = tail.chars().take_while(|c| *c == ' ').count();
+		if spaces > 3 {
+			return false;
+		}
+		let after_spaces = &tail[spaces..];
+		let ticks = after_spaces.chars().take_while(|c| *c == '`').count();
+		let rest = &after_spaces[ticks..];
+		let trimmed = rest.trim();
+		if trimmed.is_empty() {
+			return ticks >= 1 || tail.len() <= 3;
+		}
+		ticks >= 3 && Self::is_lang_token(trimmed)
+	}
+
+	fn reset(&mut self) {
+		self.buffer.clear();
+		self.inner.clear();
+		self.emitted = 0;
+	}
+
+	fn update_inner(&mut self, line: &str) {
+		let spaces = line.chars().take_while(|c| *c == ' ').count();
+		if spaces > 3 {
+			return;
+		}
+		let after = &line[spaces..];
+		let char_to_check = after.chars().next();
+		let (ticks, fence_char) = match char_to_check {
+			Some('`') => (after.chars().take_while(|c| *c == '`').count(), '`'),
+			Some('~') => (after.chars().take_while(|c| *c == '~').count(), '~'),
+			_ => return,
+		};
+		if ticks < 3 {
+			return;
+		}
+		let info = after[ticks..].trim();
+		if self.inner.is_empty() {
+			self.inner = format!("{}{}", fence_char, ticks);
+		} else {
+			let inner_char = self.inner.chars().next().unwrap_or('`');
+			let inner_len = self.inner[1..].parse::<usize>().unwrap_or(3);
+			if inner_char == fence_char && ticks >= inner_len && info.is_empty() {
+				self.inner.clear();
+			}
+		}
+	}
+}
+
+struct TagDef {
+	open: &'static str,
+	close: &'static str,
+	fenced: bool,
+}
+
+const THINKING_TAGS: [TagDef; 7] = [
+	TagDef { open: "<think>", close: "</think>", fenced: false },
+	TagDef { open: "<thinking>", close: "</thinking>", fenced: false },
+	TagDef { open: "<scratchpad>", close: "</scratchpad>", fenced: false },
+	TagDef { open: "```thinking\n", close: "```", fenced: true },
+	TagDef { open: "<|channel>thought\n", close: "<channel|>", fenced: false },
+	TagDef {
+		open: "<|start|>assistant<|channel|>analysis<|message|>",
+		close: "<|end|>",
+		fenced: false,
+	},
+	TagDef { open: "<|channel|>analysis<|message|>", close: "<|end|>", fenced: false },
+];
+
+const THINKING_OPENS: [&str; 7] = [
+	"<think>",
+	"<thinking>",
+	"<scratchpad>",
+	"```thinking\n",
+	"<|channel>thought\n",
+	"<|start|>assistant<|channel|>analysis<|message|>",
+	"<|channel|>analysis<|message|>",
+];
+
+enum VisibleHit {
+	Tag { index: usize, tag: &'static TagDef },
+	Code { index: usize, ticks: usize },
+	Hold { index: usize },
+	None,
+}
+
+fn scan_visible(buffer: &str, final_: bool) -> VisibleHit {
+	for i in 0..buffer.len() {
+		let sub = &buffer[i..];
+		if let Some(tag) = THINKING_TAGS.iter().find(|t| sub.starts_with(t.open)) {
+			return VisibleHit::Tag { index: i, tag };
+		}
+		if !final_ {
+			if THINKING_OPENS.iter().any(|open| open.len() > sub.len() && open.starts_with(sub)) {
+				return VisibleHit::Hold { index: i };
+			}
+		}
+		if sub.starts_with('`') {
+			let ticks = sub.chars().take_while(|c| *c == '`').count();
+			if !final_ && i + ticks == buffer.len() {
+				return VisibleHit::Hold { index: i };
+			}
+			return VisibleHit::Code { index: i, ticks };
+		}
+	}
+	VisibleHit::None
+}
+
+fn find_fence_close_end(buffer: &str, ticks: usize, final_: bool) -> Option<usize> {
+	let mut start = 0;
+	while start <= buffer.len() {
+		let nl = buffer[start..].find('\n');
+		let (line, term_len) = match nl {
+			Some(idx) => (&buffer[start..start + idx], 1),
+			None => (&buffer[start..], 0),
+		};
+		let trimmed = line.trim();
+		if trimmed.len() >= ticks && trimmed.chars().all(|c| c == '`') && (term_len > 0 || final_) {
+			return Some(if term_len > 0 { start + line.len() + 1 } else { buffer.len() });
+		}
+		if nl.is_none() {
+			break;
+		}
+		start += line.len() + 1;
+	}
+	None
+}
+
+fn find_backtick_run(buffer: &str, from: usize, ticks: usize) -> Option<usize> {
+	let mut i = from;
+	while i < buffer.len() {
+		if let Some(pos) = buffer[i..].find('`') {
+			let idx = i + pos;
+			let run = buffer[idx..].chars().take_while(|c| *c == '`').count();
+			if run == ticks {
+				return Some(idx);
+			}
+			i = idx + run;
+		} else {
+			break;
+		}
+	}
+	None
+}
+
+fn trailing_backtick_run(buffer: &str) -> usize {
+	buffer.chars().rev().take_while(|c| *c == '`').count()
+}
+
+fn trailing_line_indent(text: &str, prior: i32) -> i32 {
+	let last_nl = text.rfind('\n');
+	let mut indent = if last_nl.is_none() { prior } else { 0 };
+	let start = last_nl.map(|idx| idx + 1).unwrap_or(0);
+	for c in text[start..].chars() {
+		if indent == -1 {
+			break;
+		}
+		if c == ' ' {
+			indent += 1;
+		} else {
+			indent = -1;
+		}
+	}
+	indent
+}
+
+#[derive(Default)]
+pub struct ThinkingInbandScanner {
+	buffer: String,
+	close_tag: Option<&'static str>,
+	thinking: String,
+	fenced: Option<FencedThinkingScanner>,
+	code_ticks: usize,
+	code_fenced: bool,
+	line_indent: i32,
+}
+
+impl ThinkingInbandScanner {
+	pub fn feed(&mut self, text: &str) -> Vec<InbandScanEvent> {
+		if text.is_empty() {
+			return Vec::new();
+		}
+		self.buffer.push_str(text);
+		self.consume(false)
+	}
+
+	pub fn flush(&mut self) -> Vec<InbandScanEvent> {
+		let mut events = self.consume(true);
+		if !self.buffer.is_empty() {
+			if self.close_tag.is_some() {
+				self.emit_thinking(&self.buffer.clone(), &mut events);
+				events.push(InbandScanEvent::ThinkingEnd);
+			} else {
+				events.push(InbandScanEvent::Text(std::mem::take(&mut self.buffer)));
+			}
+		}
+		self.buffer.clear();
+		self.close_tag = None;
+		events
+	}
+
+	fn consume(&mut self, final_: bool) -> Vec<InbandScanEvent> {
+		let mut events = Vec::new();
+		loop {
+			if let Some(fenced) = &mut self.fenced {
+				let result = fenced.feed(&self.buffer, final_);
+				self.buffer = if result.closed { result.rest } else { String::new() };
+				self.emit_thinking(&result.thinking, &mut events);
+				if result.closed || final_ {
+					events.push(InbandScanEvent::ThinkingEnd);
+					self.thinking.clear();
+					self.close_tag = None;
+					self.fenced = None;
+				}
+				if self.fenced.is_some() {
+					break;
+				}
+				continue;
+			}
+
+			if self.buffer.is_empty() {
+				break;
+			}
+
+			if let Some(close_tag) = self.close_tag {
+				if let Some(close_idx) = self.buffer.find(close_tag) {
+					let pre = self.buffer[..close_idx].to_string();
+					self.emit_thinking(&pre, &mut events);
+					self.buffer = self.buffer[close_idx + close_tag.len()..].to_string();
+					events.push(InbandScanEvent::ThinkingEnd);
+					self.thinking.clear();
+					self.close_tag = None;
+					continue;
+				}
+				let hold = if final_ {
+					0
+				} else {
+					partial_suffix_overlap_any(&self.buffer, &[close_tag])
+				};
+				let emit_end = self.buffer.len() - hold;
+				let pre = self.buffer[..emit_end].to_string();
+				self.emit_thinking(&pre, &mut events);
+				self.buffer = self.buffer[emit_end..].to_string();
+				break;
+			}
+
+			if self.code_ticks > 0 {
+				if self.emit_code(final_, &mut events) {
+					continue;
+				}
+				break;
+			}
+
+			match scan_visible(&self.buffer, final_) {
+				VisibleHit::None => {
+					let all = std::mem::take(&mut self.buffer);
+					self.emit_text(&all, &mut events);
+					break;
+				}
+				VisibleHit::Hold { index } => {
+					let pre = self.buffer[..index].to_string();
+					self.emit_text(&pre, &mut events);
+					self.buffer = self.buffer[index..].to_string();
+					break;
+				}
+				VisibleHit::Code { index, ticks } => {
+					let fenced = ticks >= 3 && (0..=3).contains(&self.line_indent);
+					let pre = self.buffer[..index + ticks].to_string();
+					self.emit_text(&pre, &mut events);
+					self.buffer = self.buffer[index + ticks..].to_string();
+					self.code_ticks = ticks;
+					self.code_fenced = fenced;
+					continue;
+				}
+				VisibleHit::Tag { index, tag } => {
+					let pre = self.buffer[..index].to_string();
+					self.emit_text(&pre, &mut events);
+					self.buffer = self.buffer[index + tag.open.len()..].to_string();
+					self.close_tag = Some(tag.close);
+					self.thinking.clear();
+					if tag.fenced {
+						self.fenced = Some(FencedThinkingScanner::default());
+					}
+					events.push(InbandScanEvent::ThinkingStart);
+				}
+			}
+		}
+		events
+	}
+
+	fn emit_code(&mut self, final_: bool, events: &mut Vec<InbandScanEvent>) -> bool {
+		if self.code_fenced {
+			if let Some(end) = find_fence_close_end(&self.buffer, self.code_ticks, final_) {
+				let chunk = self.buffer[..end].to_string();
+				self.emit_text(&chunk, events);
+				self.buffer = self.buffer[end..].to_string();
+				self.code_ticks = 0;
+				self.code_fenced = false;
+				return true;
+			}
+			if final_ {
+				let chunk = std::mem::take(&mut self.buffer);
+				self.emit_text(&chunk, events);
+				self.code_ticks = 0;
+				self.code_fenced = false;
+				return false;
+			}
+			if let Some(last_nl) = self.buffer.rfind('\n') {
+				let chunk = self.buffer[..last_nl + 1].to_string();
+				self.emit_text(&chunk, events);
+				self.buffer = self.buffer[last_nl + 1..].to_string();
+			}
+			return false;
+		}
+
+		if let Some(close) = find_backtick_run(&self.buffer, 0, self.code_ticks) {
+			if final_ || close + self.code_ticks < self.buffer.len() {
+				let end = close + self.code_ticks;
+				let chunk = self.buffer[..end].to_string();
+				self.emit_text(&chunk, events);
+				self.buffer = self.buffer[end..].to_string();
+				self.code_ticks = 0;
+				return true;
+			}
+		}
+		let hold = if final_ { 0 } else { trailing_backtick_run(&self.buffer) };
+		let emit_end = self.buffer.len() - hold;
+		let chunk = self.buffer[..emit_end].to_string();
+		self.emit_text(&chunk, events);
+		self.buffer = self.buffer[emit_end..].to_string();
+		if final_ {
+			self.code_ticks = 0;
+		}
+		false
+	}
+
+	fn emit_text(&mut self, text: &str, events: &mut Vec<InbandScanEvent>) {
+		if !text.is_empty() {
+			events.push(InbandScanEvent::Text(text.to_string()));
+			self.line_indent = trailing_line_indent(text, self.line_indent);
+		}
+	}
+
+	fn emit_thinking(&mut self, delta: &str, events: &mut Vec<InbandScanEvent>) {
+		if !delta.is_empty() {
+			self.thinking.push_str(delta);
+			events.push(InbandScanEvent::ThinkingDelta(delta.to_string()));
+		}
+	}
+}
+
+const KIMI_SECTION_BEGIN: &str = "<|tool_calls_section_begin|>";
+const KIMI_SECTION_END: &str = "<|tool_calls_section_end|>";
+const KIMI_CALL_BEGIN: &str = "<|tool_call_begin|>";
+const KIMI_CALL_END: &str = "<|tool_call_end|>";
+const KIMI_ARG_BEGIN: &str = "<|tool_call_argument_begin|>";
+
+const KIMI_TOKENS: [&str; 5] = [
+	KIMI_SECTION_BEGIN,
+	KIMI_SECTION_END,
+	KIMI_CALL_BEGIN,
+	KIMI_CALL_END,
+	KIMI_ARG_BEGIN,
+];
+
+#[derive(Default)]
+pub struct KimiInbandScanner {
+	buffer: String,
+	in_section: bool,
+}
+
+impl KimiInbandScanner {
+	pub fn feed(&mut self, text: &str) -> Vec<InbandScanEvent> {
+		if text.is_empty() {
+			return Vec::new();
+		}
+		self.buffer.push_str(text);
+		self.consume(false)
+	}
+
+	pub fn flush(&mut self) -> Vec<InbandScanEvent> {
+		self.consume(true)
+	}
+
+	fn consume(&mut self, final_: bool) -> Vec<InbandScanEvent> {
+		let mut events = Vec::new();
+		loop {
+			if !self.in_section {
+				if let Some(pos) = self.buffer.find(KIMI_SECTION_BEGIN) {
+					if pos > 0 {
+						events.push(InbandScanEvent::Text(self.buffer[..pos].to_string()));
+					}
+					self.buffer = self.buffer[pos + KIMI_SECTION_BEGIN.len()..].to_string();
+					self.in_section = true;
+					continue;
+				}
+				let hold = if final_ {
+					0
+				} else {
+					partial_suffix_overlap_any(&self.buffer, &KIMI_TOKENS)
+				};
+				let emit_len = self.buffer.len() - hold;
+				if emit_len > 0 {
+					events.push(InbandScanEvent::Text(self.buffer[..emit_len].to_string()));
+					self.buffer = self.buffer[emit_len..].to_string();
+				}
+				break;
+			} else {
+				if let Some(end_pos) = self.buffer.find(KIMI_SECTION_END) {
+					let inner = &self.buffer[..end_pos];
+					self.parse_calls(inner, &mut events);
+					self.buffer = self.buffer[end_pos + KIMI_SECTION_END.len()..].to_string();
+					self.in_section = false;
+					continue;
+				}
+				if let Some(call_end_pos) = self.buffer.find(KIMI_CALL_END) {
+					let slice = &self.buffer[..call_end_pos + KIMI_CALL_END.len()];
+					self.parse_calls(slice, &mut events);
+					self.buffer = self.buffer[call_end_pos + KIMI_CALL_END.len()..].to_string();
+					continue;
+				}
+				if final_ {
+					let tail = std::mem::take(&mut self.buffer);
+					self.parse_calls(&tail, &mut events);
+					self.in_section = false;
+				}
+				break;
+			}
+		}
+		events
+	}
+
+	fn parse_calls(&self, s: &str, events: &mut Vec<InbandScanEvent>) {
+		let mut rest = s;
+		while let Some(begin) = rest.find(KIMI_CALL_BEGIN) {
+			let after_begin = &rest[begin + KIMI_CALL_BEGIN.len()..];
+			let Some(arg_idx) = after_begin.find(KIMI_ARG_BEGIN) else {
+				break;
+			};
+			let raw_name = after_begin[..arg_idx].trim();
+			let name = normalize_kimi_function_name(raw_name);
+			let after_arg = &after_begin[arg_idx + KIMI_ARG_BEGIN.len()..];
+			let Some(end_idx) = after_arg.find(KIMI_CALL_END) else {
+				break;
+			};
+			let raw_args = after_arg[..end_idx].trim();
+			let arguments = if raw_args.is_empty() {
+				"{}".to_string()
+			} else {
+				raw_args.to_string()
+			};
+			let id = format!("call_{}", &uuid_like_hex()[..24]);
+			events.push(InbandScanEvent::ToolCall { id, name, arguments });
+			rest = &after_arg[end_idx + KIMI_CALL_END.len()..];
+		}
+	}
+}
+
+const DSML_OPENS: [&str; 2] = ["<｜DSML｜tool_calls>", "<|DSML|tool_calls>"];
+const DSML_CLOSES: [&str; 2] = ["</｜DSML｜tool_calls>", "</|DSML|tool_calls>"];
+const DSML_INVOKE_OPENS: [&str; 2] = ["<｜DSML｜invoke", "<|DSML|invoke"];
+const DSML_INVOKE_CLOSES: [&str; 2] = ["</｜DSML｜invoke>", "</|DSML|invoke>"];
+const DSML_PARAM_OPENS: [&str; 2] = ["<｜DSML｜parameter", "<|DSML|parameter"];
+const DSML_PARAM_CLOSES: [&str; 2] = ["</｜DSML｜parameter>", "</|DSML|parameter>"];
+
+#[derive(Default)]
+pub struct DeepSeekInbandScanner {
+	buffer: String,
+	in_section: bool,
+}
+
+impl DeepSeekInbandScanner {
+	pub fn feed(&mut self, text: &str) -> Vec<InbandScanEvent> {
+		if text.is_empty() {
+			return Vec::new();
+		}
+		self.buffer.push_str(text);
+		self.consume(false)
+	}
+
+	pub fn flush(&mut self) -> Vec<InbandScanEvent> {
+		self.consume(true)
+	}
+
+	fn consume(&mut self, final_: bool) -> Vec<InbandScanEvent> {
+		let mut events = Vec::new();
+		loop {
+			if !self.in_section {
+				let open_hit = DSML_OPENS
+					.iter()
+					.filter_map(|op| self.buffer.find(op).map(|idx| (idx, *op)))
+					.min_by_key(|(idx, _)| *idx);
+				if let Some((pos, op)) = open_hit {
+					if pos > 0 {
+						events.push(InbandScanEvent::Text(self.buffer[..pos].to_string()));
+					}
+					self.buffer = self.buffer[pos + op.len()..].to_string();
+					self.in_section = true;
+					continue;
+				}
+				let hold = if final_ {
+					0
+				} else {
+					partial_suffix_overlap_any(&self.buffer, &DSML_OPENS)
+				};
+				let emit_len = self.buffer.len() - hold;
+				if emit_len > 0 {
+					events.push(InbandScanEvent::Text(self.buffer[..emit_len].to_string()));
+					self.buffer = self.buffer[emit_len..].to_string();
+				}
+				break;
+			} else {
+				let close_hit = DSML_CLOSES
+					.iter()
+					.filter_map(|cl| self.buffer.find(cl).map(|idx| (idx, *cl)))
+					.min_by_key(|(idx, _)| *idx);
+				if let Some((pos, cl)) = close_hit {
+					let inner = &self.buffer[..pos];
+					self.parse_invokes(inner, &mut events);
+					self.buffer = self.buffer[pos + cl.len()..].to_string();
+					self.in_section = false;
+					continue;
+				}
+				let invoke_close_hit = DSML_INVOKE_CLOSES
+					.iter()
+					.filter_map(|cl| self.buffer.find(cl).map(|idx| (idx, *cl)))
+					.min_by_key(|(idx, _)| *idx);
+				if let Some((pos, cl)) = invoke_close_hit {
+					let slice = &self.buffer[..pos + cl.len()];
+					self.parse_invokes(slice, &mut events);
+					self.buffer = self.buffer[pos + cl.len()..].to_string();
+					continue;
+				}
+				if final_ {
+					let tail = std::mem::take(&mut self.buffer);
+					self.parse_invokes(&tail, &mut events);
+					self.in_section = false;
+				}
+				break;
+			}
+		}
+		events
+	}
+
+	fn parse_invokes(&self, s: &str, events: &mut Vec<InbandScanEvent>) {
+		let mut rest = s;
+		while let Some((pos, op)) = DSML_INVOKE_OPENS
+			.iter()
+			.filter_map(|op| rest.find(op).map(|idx| (idx, *op)))
+			.min_by_key(|(idx, _)| *idx)
+		{
+			let after_op = &rest[pos + op.len()..];
+			let Some(tag_end) = after_op.find('>') else {
+				break;
+			};
+			let attr_part = &after_op[..tag_end];
+			let name = extract_attr(attr_part, "name").unwrap_or_else(|| "unknown".to_string());
+			let body_start = &after_op[tag_end + 1..];
+			let Some((close_pos, close_tag)) = DSML_INVOKE_CLOSES
+				.iter()
+				.filter_map(|cl| body_start.find(cl).map(|idx| (idx, *cl)))
+				.min_by_key(|(idx, _)| *idx)
+			else {
+				break;
+			};
+			let body = &body_start[..close_pos];
+			let arguments = self.parse_parameters(body);
+			let id = format!("call_{}", &uuid_like_hex()[..24]);
+			events.push(InbandScanEvent::ToolCall { id, name, arguments });
+			rest = &body_start[close_pos + close_tag.len()..];
+		}
+	}
+
+	fn parse_parameters(&self, s: &str) -> String {
+		let mut map = serde_json::Map::new();
+		let mut rest = s;
+		while let Some((pos, op)) = DSML_PARAM_OPENS
+			.iter()
+			.filter_map(|op| rest.find(op).map(|idx| (idx, *op)))
+			.min_by_key(|(idx, _)| *idx)
+		{
+			let after_op = &rest[pos + op.len()..];
+			let Some(tag_end) = after_op.find('>') else {
+				break;
+			};
+			let attr_part = &after_op[..tag_end];
+			let name = extract_attr(attr_part, "name").unwrap_or_default();
+			if let Some(val_str) = extract_attr(attr_part, "string") {
+				map.insert(name, Value::String(val_str));
+				rest = &after_op[tag_end + 1..];
+				continue;
+			}
+			let body_start = &after_op[tag_end + 1..];
+			if let Some((close_pos, close_tag)) = DSML_PARAM_CLOSES
+				.iter()
+				.filter_map(|cl| body_start.find(cl).map(|idx| (idx, *cl)))
+				.min_by_key(|(idx, _)| *idx)
+			{
+				let raw_val = body_start[..close_pos].trim();
+				let parsed = serde_json::from_str(raw_val)
+					.unwrap_or_else(|_| Value::String(raw_val.to_string()));
+				map.insert(name, parsed);
+				rest = &body_start[close_pos + close_tag.len()..];
+			} else {
+				break;
+			}
+		}
+		Value::Object(map).to_string()
+	}
+}
+
+fn extract_attr(s: &str, attr_name: &str) -> Option<String> {
+	let key = format!("{attr_name}=\"");
+	if let Some(idx) = s.find(&key) {
+		let after = &s[idx + key.len()..];
+		if let Some(end) = after.find('"') {
+			return Some(after[..end].to_string());
+		}
+	}
+	let key_single = format!("{attr_name}='");
+	if let Some(idx) = s.find(&key_single) {
+		let after = &s[idx + key_single.len()..];
+		if let Some(end) = after.find('\'') {
+			return Some(after[..end].to_string());
+		}
+	}
+	None
+}
+
+fn uuid_like_hex() -> String {
+	static COUNTER: AtomicU64 = AtomicU64::new(1);
+	let count = COUNTER.fetch_add(1, Ordering::Relaxed);
+	let now = std::time::SystemTime::now()
+		.duration_since(std::time::UNIX_EPOCH)
+		.map(|d| d.as_nanos())
+		.unwrap_or(0);
+	format!("{:016x}{:016x}", now, count)
+}
+
+pub struct MarkupHealer {
+	pattern: StreamMarkupHealingPattern,
+	kimi: Option<KimiInbandScanner>,
+	dsml: Option<DeepSeekInbandScanner>,
+	thinking: ThinkingInbandScanner,
+}
+
+impl MarkupHealer {
+	pub fn new(pattern: StreamMarkupHealingPattern) -> Self {
+		let kimi = if pattern == StreamMarkupHealingPattern::Kimi {
+			Some(KimiInbandScanner::default())
+		} else {
+			None
+		};
+		let dsml = if pattern == StreamMarkupHealingPattern::Dsml {
+			Some(DeepSeekInbandScanner::default())
+		} else {
+			None
+		};
+		Self {
+			pattern,
+			kimi,
+			dsml,
+			thinking: ThinkingInbandScanner::default(),
+		}
+	}
+
+	pub fn feed_events(&mut self, text: &str) -> Vec<MarkupHealingEvent> {
+		if text.is_empty() {
+			return Vec::new();
+		}
+		let scan_events = if let Some(kimi) = &mut self.kimi {
+			let tool_events = kimi.feed(text);
+			self.heal_thinking(tool_events)
+		} else if let Some(dsml) = &mut self.dsml {
+			let tool_events = dsml.feed(text);
+			self.heal_thinking(tool_events)
+		} else {
+			self.thinking.feed(text)
+		};
+		self.convert_events(scan_events)
+	}
+
+	pub fn feed_events_without_calls(&mut self, text: &str) -> Vec<MarkupHealingEvent> {
+		let events = self.feed_events(text);
+		events
+			.into_iter()
+			.filter(|e| !matches!(e, MarkupHealingEvent::ToolCall(_)))
+			.collect()
+	}
+
+	pub fn flush_events(&mut self) -> Vec<MarkupHealingEvent> {
+		let mut scan_events = Vec::new();
+		if let Some(kimi) = &mut self.kimi {
+			let tool_events = kimi.flush();
+			scan_events.extend(self.heal_thinking(tool_events));
+		} else if let Some(dsml) = &mut self.dsml {
+			let tool_events = dsml.flush();
+			scan_events.extend(self.heal_thinking(tool_events));
+		}
+		scan_events.extend(self.thinking.flush());
+		self.convert_events(scan_events)
+	}
+
+	fn heal_thinking(&mut self, events: Vec<InbandScanEvent>) -> Vec<InbandScanEvent> {
+		let mut out = Vec::new();
+		for event in events {
+			match event {
+				InbandScanEvent::Text(t) => {
+					out.extend(self.thinking.feed(&t));
+				}
+				other => out.push(other),
+			}
+		}
+		out
+	}
+
+	fn convert_events(&self, events: Vec<InbandScanEvent>) -> Vec<MarkupHealingEvent> {
+		let mut out = Vec::new();
+		for event in events {
+			match event {
+				InbandScanEvent::Text(text) => out.push(MarkupHealingEvent::Text(text)),
+				InbandScanEvent::ThinkingDelta(delta) => {
+					if !delta.is_empty() {
+						out.push(MarkupHealingEvent::Thinking(delta));
+					}
+				}
+				InbandScanEvent::ToolCall { id, name, arguments } => {
+					out.push(MarkupHealingEvent::ToolCall(HealedToolCall {
+						id,
+						name,
+						arguments,
+					}));
+				}
+				InbandScanEvent::ThinkingStart | InbandScanEvent::ThinkingEnd => {}
+			}
+		}
+		out
+	}
+}
+
+fn with_markup_healing(
+	stream: ChunkStream,
+	pattern: StreamMarkupHealingPattern,
+) -> ChunkStream {
+	struct HealingState {
+		stream: ChunkStream,
+		healer: MarkupHealer,
+		saw_native_tool_calls: bool,
+		saw_healed_tool_calls: bool,
+		tool_index: usize,
+		pending_queue: VecDeque<StreamChunk>,
+		finished: bool,
+	}
+
+	let state = HealingState {
+		stream,
+		healer: MarkupHealer::new(pattern),
+		saw_native_tool_calls: false,
+		saw_healed_tool_calls: false,
+		tool_index: 0,
+		pending_queue: VecDeque::new(),
+		finished: false,
+	};
+
+	Box::pin(futures::stream::unfold(Some(state), |state| async move {
+		let mut state = state?;
+		loop {
+			if let Some(chunk) = state.pending_queue.pop_front() {
+				return Some((Ok(chunk), Some(state)));
+			}
+			if state.finished {
+				return None;
+			}
+
+			match state.stream.next().await {
+				Some(Ok(chunk)) => {
+					if chunk.is_done {
+						let flush_events = state.healer.flush_events();
+						for ev in flush_events {
+							match ev {
+								MarkupHealingEvent::Text(t) => {
+									state.pending_queue.push_back(delta_chunk(Some(t), None, Vec::new(), 0));
+								}
+								MarkupHealingEvent::Thinking(th) => {
+									state.pending_queue.push_back(delta_chunk(None, Some(th), Vec::new(), 0));
+								}
+								MarkupHealingEvent::ToolCall(call) => {
+									state.saw_healed_tool_calls = true;
+									let idx = state.tool_index;
+									state.tool_index += 1;
+									state.pending_queue.push_back(delta_chunk(
+										None,
+										None,
+										vec![ToolCallDelta {
+											index: idx,
+											id: Some(call.id),
+											name: Some(call.name),
+											partial_json: Some(call.arguments),
+										}],
+										0,
+									));
+								}
+							}
+						}
+
+						let final_stop_reason = if state.saw_healed_tool_calls
+							&& chunk.stop_reason == Some(StopReason::Stop)
+						{
+							StopReason::ToolUse
+						} else {
+							chunk.stop_reason.unwrap_or(StopReason::Stop)
+						};
+
+						state.pending_queue.push_back(done_chunk(
+							chunk.usage,
+							final_stop_reason,
+							chunk.error_message,
+						));
+						state.finished = true;
+						if let Some(c) = state.pending_queue.pop_front() {
+							return Some((Ok(c), Some(state)));
+						}
+						return None;
+					}
+
+					if !chunk.tool_call_deltas.is_empty() {
+						state.saw_native_tool_calls = true;
+					}
+					let content_idx = chunk.content_index.unwrap_or(0);
+					let events = if let Some(text) = &chunk.content {
+						if state.saw_native_tool_calls {
+							state.healer.feed_events_without_calls(text)
+						} else {
+							state.healer.feed_events(text)
+						}
+					} else {
+						Vec::new()
+					};
+
+					let mut emitted = false;
+					for ev in events {
+						match ev {
+							MarkupHealingEvent::Text(t) => {
+								state.pending_queue.push_back(delta_chunk(Some(t), None, Vec::new(), content_idx));
+								emitted = true;
+							}
+							MarkupHealingEvent::Thinking(th) => {
+								state.pending_queue.push_back(delta_chunk(None, Some(th), Vec::new(), content_idx));
+								emitted = true;
+							}
+							MarkupHealingEvent::ToolCall(call) => {
+								state.saw_healed_tool_calls = true;
+								let idx = state.tool_index;
+								state.tool_index += 1;
+								state.pending_queue.push_back(delta_chunk(
+									None,
+									None,
+									vec![ToolCallDelta {
+										index: idx,
+										id: Some(call.id),
+										name: Some(call.name),
+										partial_json: Some(call.arguments),
+									}],
+									content_idx,
+								));
+								emitted = true;
+							}
+						}
+					}
+
+					if chunk.reasoning.is_some() || !chunk.tool_call_deltas.is_empty() {
+						state.pending_queue.push_back(delta_chunk(
+							None,
+							chunk.reasoning,
+							chunk.tool_call_deltas,
+							content_idx,
+						));
+						emitted = true;
+					}
+
+					if emitted {
+						if let Some(c) = state.pending_queue.pop_front() {
+							return Some((Ok(c), Some(state)));
+						}
+					}
+				}
+				Some(Err(err)) => {
+					state.finished = true;
+					return Some((Err(err), None));
+				}
+				None => {
+					state.finished = true;
+					return None;
+				}
+			}
+		}
+	}))
+}
+
+fn is_progress_chunk(chunk: &StreamChunk) -> bool {
+	chunk.content.as_ref().map(|s| !s.is_empty()).unwrap_or(false)
+		|| chunk.reasoning.as_ref().map(|s| !s.is_empty()).unwrap_or(false)
+		|| !chunk.tool_call_deltas.is_empty()
+		|| chunk.is_done
+}
+
+fn is_meaningful_chunk(chunk: &StreamChunk) -> bool {
+	if chunk.is_done {
+		return false;
+	}
+	chunk.content.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false)
+		|| chunk.reasoning.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false)
+		|| !chunk.tool_call_deltas.is_empty()
+}
+
+fn with_stream_watchdog(
+	stream: ChunkStream,
+	first_event_timeout: Option<Duration>,
+	idle_timeout: Option<Duration>,
+) -> ChunkStream {
+	let start_time = tokio::time::Instant::now();
+
+	struct WatchdogState {
+		stream: ChunkStream,
+		first_deadline: Option<tokio::time::Instant>,
+		idle_timeout: Option<Duration>,
+		awaiting_first_item: bool,
+		last_progress: tokio::time::Instant,
+	}
+
+	let state = WatchdogState {
+		stream,
+		first_deadline: first_event_timeout.map(|d| start_time + d),
+		idle_timeout,
+		awaiting_first_item: true,
+		last_progress: tokio::time::Instant::now(),
+	};
+
+	Box::pin(futures::stream::unfold(Some(state), |state| async move {
+		let mut state = state?;
+		let now = tokio::time::Instant::now();
+
+		let timeout_duration = if state.awaiting_first_item {
+			if let Some(deadline) = state.first_deadline {
+				if now >= deadline {
+					return Some((
+						Err(ProviderError::Network(
+							"Ollama stream timed out waiting for first event".to_string(),
+						)),
+						None,
+					));
+				}
+				Some(deadline - now)
+			} else {
+				None
+			}
+		} else if let Some(idle) = state.idle_timeout {
+			let deadline = state.last_progress + idle;
+			if now >= deadline {
+				return Some((
+					Err(ProviderError::Network(
+						"Ollama stream idle timeout exceeded".to_string(),
+					)),
+					None,
+				));
+			}
+			Some(deadline - now)
+		} else {
+			None
+		};
+
+		let next_item = if let Some(duration) = timeout_duration {
+			match tokio::time::timeout(duration, state.stream.next()).await {
+				Ok(item) => item,
+				Err(_) => {
+					let msg = if state.awaiting_first_item {
+						"Ollama stream timed out waiting for first event"
+					} else {
+						"Ollama stream idle timeout exceeded"
+					};
+					return Some((Err(ProviderError::Network(msg.to_string())), None));
+				}
+			}
+		} else {
+			state.stream.next().await
+		};
+
+		match next_item {
+			Some(Ok(chunk)) => {
+				if is_progress_chunk(&chunk) {
+					state.awaiting_first_item = false;
+					state.last_progress = tokio::time::Instant::now();
+				}
+				Some((Ok(chunk), Some(state)))
+			}
+			Some(Err(err)) => Some((Err(err), None)),
+			None => None,
+		}
+	}))
+}
+
+pub fn is_llama_cpp_parse_error(body: &str) -> bool {
+	let lower = body.to_ascii_lowercase();
+	lower.contains("failed to parse tool call arguments as json")
+		|| lower.contains("[json.exception.parse_error.101]")
+}
+
+pub fn should_retry_ollama_response(status: u16, body_text: &str) -> bool {
+	if (500..=599).contains(&status) {
+		return !is_llama_cpp_parse_error(body_text);
+	}
+	status == 429
+}
+
+pub fn extract_retry_hint(headers: &reqwest::header::HeaderMap, body: &str) -> Option<Duration> {
+	if let Some(val) = headers.get("retry-after-ms").and_then(|v| v.to_str().ok()) {
+		if let Ok(ms) = val.trim().parse::<u64>() {
+			return Some(Duration::from_millis(ms));
+		}
+	}
+	if let Some(val) = headers.get("retry-after").and_then(|v| v.to_str().ok()) {
+		if let Ok(secs) = val.trim().parse::<u64>() {
+			return Some(Duration::from_secs(secs));
+		}
+	}
+	if let Some(val) = headers.get("x-ratelimit-reset-ms").and_then(|v| v.to_str().ok()) {
+		if let Ok(ms) = val.trim().parse::<u64>() {
+			return Some(Duration::from_millis(ms));
+		}
+	}
+	if let Some(val) = headers.get("x-ratelimit-reset").and_then(|v| v.to_str().ok()) {
+		if let Ok(secs) = val.trim().parse::<u64>() {
+			return Some(Duration::from_secs(secs));
+		}
+	}
+	if let Some(val) = headers.get("x-ratelimit-reset-after").and_then(|v| v.to_str().ok()) {
+		if let Ok(secs) = val.trim().parse::<u64>() {
+			return Some(Duration::from_secs(secs));
+		}
+	}
+	let lower = body.to_ascii_lowercase();
+	for keyword in &["try again in ", "retry in ", "reset in ", "please retry after "] {
+		if let Some(idx) = lower.find(keyword) {
+			let rest = &lower[idx + keyword.len()..];
+			let num_str: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+			if let Ok(val) = num_str.parse::<u64>() {
+				let after_num = rest[num_str.len()..].trim_start();
+				if after_num.starts_with("ms") || after_num.starts_with("millisecond") {
+					return Some(Duration::from_millis(val));
+				} else {
+					return Some(Duration::from_secs(val));
+				}
+			}
+		}
+	}
+	None
+}
+
 #[async_trait]
 impl ModelProvider for OllamaProvider {
 	fn supports_images(&self) -> bool {
@@ -1021,31 +2946,7 @@ impl ModelProvider for OllamaProvider {
 		tool_choice: &ToolChoice,
 	) -> Result<ChunkStream, ProviderError> {
 		self.check_support(messages)?;
-		let body = self.request(messages, tools, tool_choice, true)?;
-		let mut request = self.http.post(self.endpoint()).json(&body);
-		if let Some(api_key) = self.api_key.as_deref() {
-			request = request.bearer_auth(api_key);
-		}
-		let response = request.send().await.map_err(network_error)?;
-		let status = response.status();
-		let secrets = credential_values(self.api_key.as_deref());
-		if !status.is_success() {
-			let body = match read_body_bounded(response, ERROR_BODY_BYTES).await {
-				Ok(body) => bounded_redaction(&body.text, &secrets, body.truncated),
-				Err(err) => format!("<failed to read error body: {err}>"),
-			};
-			return Err(ProviderError::HttpStatus(status.as_u16(), body));
-		}
-		let body = response
-			.bytes_stream()
-			.map(|item| item.map_err(|err| err.to_string()));
-		// ponytail: TS additionally wraps this request in `fetchWithRetry`,
-		// `withReplaySafeStreamRetry`, `armedPreResponseTimeout` and
-		// `StreamMarkupHealing`. The NDJSON parser now carries terminal stop
-		// reasons/errors so the first three have a surface to hook; the markup
-		// healer needs the dialect scanner subsystem, which this crate does not
-		// have yet.
-		Ok(ndjson_stream(body, secrets))
+		self.stream_with_empty_retry(messages, tools, tool_choice).await
 	}
 }
 

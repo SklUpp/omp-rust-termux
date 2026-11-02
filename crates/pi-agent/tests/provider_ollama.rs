@@ -13,8 +13,17 @@
 use std::time::Duration;
 
 use futures::StreamExt;
-use pi_agent::provider_ollama::{OllamaProvider, NON_VISION_IMAGE_PLACEHOLDER};
-use pi_agent::state::{Attribution, StopReason};
+use pi_agent::provider_ollama::{
+	DeepSeekInbandScanner, HealedToolCall, InbandScanEvent, KimiInbandScanner,
+	MarkupHealingEvent, MarkupHealer, OllamaProvider, StreamMarkupHealingPattern,
+	ThinkingInbandScanner, demote_thinking, extract_retry_hint,
+	get_stream_markup_healing_pattern, is_llama_cpp_parse_error, is_malformed_tool_call,
+	model_may_leak_dsml_tool_calls, model_may_leak_kimi_tool_calls,
+	normalize_kimi_function_name, preferred_dialect, resolve_env_timeout,
+	sanitize_malformed_tool_calls, should_retry_ollama_response,
+	NON_VISION_IMAGE_PLACEHOLDER,
+};
+use pi_agent::state::{Attribution, Role, StopReason, TokenUsage};
 use pi_agent::{
 	ChunkStream, ContentPart, Message, ModelProvider, ProviderError, StreamChunk, ToolCall,
 	ToolChoice,
@@ -892,4 +901,368 @@ async fn custom_provider_id_is_stamped_and_default_is_unchanged() {
 			.provider(),
 		Some("gateway-7")
 	);
+}
+
+#[test]
+fn test_thinking_scanner_tag_handling_and_streaming_deltas() {
+	let mut scanner = ThinkingInbandScanner::default();
+	// Feed text with <think> tag split across chunks
+	let events1 = scanner.feed("Hello <th");
+	assert_eq!(events1, vec![InbandScanEvent::Text("Hello ".to_string())]);
+
+	let events2 = scanner.feed("ink>my thought</think> World");
+	assert_eq!(
+		events2,
+		vec![
+			InbandScanEvent::ThinkingStart,
+			InbandScanEvent::ThinkingDelta("my thought".to_string()),
+			InbandScanEvent::ThinkingEnd,
+			InbandScanEvent::Text(" World".to_string()),
+		]
+	);
+
+	// Test Gemini fenced thinking
+	let mut fenced_scanner = ThinkingInbandScanner::default();
+	let fevents = fenced_scanner.feed("```thinking\ninternal reasoning\n```final answer");
+	assert_eq!(
+		fevents,
+		vec![
+			InbandScanEvent::ThinkingStart,
+			InbandScanEvent::ThinkingDelta("internal reasoning\n".to_string()),
+			InbandScanEvent::ThinkingEnd,
+			InbandScanEvent::Text("final answer".to_string()),
+		]
+	);
+
+	// Test Gemma reasoning channel
+	let mut gemma_scanner = ThinkingInbandScanner::default();
+	let gevents = gemma_scanner.feed("<|channel>thought\ngemma step<channel|>result");
+	assert_eq!(
+		gevents,
+		vec![
+			InbandScanEvent::ThinkingStart,
+			InbandScanEvent::ThinkingDelta("gemma step".to_string()),
+			InbandScanEvent::ThinkingEnd,
+			InbandScanEvent::Text("result".to_string()),
+		]
+	);
+}
+
+#[test]
+fn test_thinking_scanner_code_fence_guard() {
+	let mut scanner = ThinkingInbandScanner::default();
+	// Inside a fenced code block, <think> is literal text and must NOT be parsed as thinking
+	let code = "```python\n<think>not thinking</think>\n```\noutside";
+	let events = scanner.feed(code);
+	let flush_events = scanner.flush();
+	let mut all_text = String::new();
+	for ev in events.into_iter().chain(flush_events.into_iter()) {
+		match ev {
+			InbandScanEvent::Text(t) => all_text.push_str(&t),
+			InbandScanEvent::ThinkingDelta(_) | InbandScanEvent::ThinkingStart => {
+				panic!("Thinking detected inside code block: {all_text}");
+			}
+			_ => {}
+		}
+	}
+	assert!(all_text.contains("<think>not thinking</think>"));
+
+	// Inline code span
+	let mut inline_scanner = ThinkingInbandScanner::default();
+	let inline_events = inline_scanner.feed("Here is `<think>` inline");
+	let mut inline_text = String::new();
+	for ev in inline_events {
+		if let InbandScanEvent::Text(t) = ev {
+			inline_text.push_str(&t);
+		}
+	}
+	assert!(inline_text.contains("`<think>`"));
+}
+
+#[test]
+fn test_kimi_scanner_tool_calls_and_name_normalization() {
+	assert_eq!(
+		normalize_kimi_function_name("functions.web_search:0"),
+		"web_search"
+	);
+	assert_eq!(
+		normalize_kimi_function_name("my_module.nested.read_file"),
+		"read_file"
+	);
+
+	let mut scanner = KimiInbandScanner::default();
+	let payload = "<|tool_calls_section_begin|><|tool_call_begin|>functions.web_search:0<|tool_call_argument_begin|>{\"q\":\"rust\"}<|tool_call_end|><|tool_calls_section_end|>visible text";
+	let events = scanner.feed(payload);
+	assert_eq!(events.len(), 2);
+	match &events[0] {
+		InbandScanEvent::ToolCall { name, arguments, .. } => {
+			assert_eq!(name, "web_search");
+			assert_eq!(arguments, "{\"q\":\"rust\"}");
+		}
+		other => panic!("Expected ToolCall, got {other:?}"),
+	}
+	assert_eq!(events[1], InbandScanEvent::Text("visible text".to_string()));
+}
+
+#[test]
+fn test_dsml_scanner_fullwidth_and_ascii() {
+	let mut fullwidth_scanner = DeepSeekInbandScanner::default();
+	let fw = "<｜DSML｜tool_calls><｜DSML｜invoke name=\"bash\"><｜DSML｜parameter name=\"cmd\" string=\"ls -la\"/></｜DSML｜invoke></｜DSML｜tool_calls>";
+	let events = fullwidth_scanner.feed(fw);
+	assert_eq!(events.len(), 1);
+	match &events[0] {
+		InbandScanEvent::ToolCall { name, arguments, .. } => {
+			assert_eq!(name, "bash");
+			let parsed: Value = serde_json::from_str(arguments).expect("json");
+			assert_eq!(parsed["cmd"], "ls -la");
+		}
+		other => panic!("Expected ToolCall, got {other:?}"),
+	}
+
+	let mut ascii_scanner = DeepSeekInbandScanner::default();
+	let ascii = "<|DSML|tool_calls><|DSML|invoke name=\"calc\"><|DSML|parameter name=\"expr\">{\"val\": 42}</|DSML|parameter></|DSML|invoke></|DSML|tool_calls>";
+	let a_events = ascii_scanner.feed(ascii);
+	assert_eq!(a_events.len(), 1);
+	match &a_events[0] {
+		InbandScanEvent::ToolCall { name, arguments, .. } => {
+			assert_eq!(name, "calc");
+			let parsed: Value = serde_json::from_str(arguments).expect("json");
+			assert_eq!(parsed["expr"]["val"], 42);
+		}
+		other => panic!("Expected ToolCall, got {other:?}"),
+	}
+}
+
+#[test]
+fn test_markup_healer_pattern_and_native_tool_call_protection() {
+	assert_eq!(
+		get_stream_markup_healing_pattern("moonshot", "kimi-k2"),
+		StreamMarkupHealingPattern::Kimi
+	);
+	assert_eq!(
+		get_stream_markup_healing_pattern("ollama", "deepseek-r1:7b"),
+		StreamMarkupHealingPattern::Dsml
+	);
+	assert_eq!(
+		get_stream_markup_healing_pattern("ollama", "llama3.3"),
+		StreamMarkupHealingPattern::Thinking
+	);
+
+	// Verify feed_events_without_calls suppresses healed tool calls when native calls exist
+	let mut healer = MarkupHealer::new(StreamMarkupHealingPattern::Kimi);
+	let text_with_markup = "<|tool_calls_section_begin|><|tool_call_begin|>tool1<|tool_call_argument_begin|>{}<|tool_call_end|><|tool_calls_section_end|>extra text";
+	let events = healer.feed_events_without_calls(text_with_markup);
+	// ToolCall is suppressed, only clean text is emitted
+	assert_eq!(events, vec![MarkupHealingEvent::Text("extra text".to_string())]);
+}
+
+#[test]
+fn test_history_sanitize_malformed_tool_calls_and_pairing() {
+	// Malformed tool calls: empty id or name
+	let bad_call = ToolCall {
+		id: "  ".to_string(),
+		name: "bash".to_string(),
+		arguments: json!({}),
+	};
+	assert!(is_malformed_tool_call(&bad_call));
+
+	let valid_call = ToolCall {
+		id: "call_1".to_string(),
+		name: "bash".to_string(),
+		arguments: json!({}),
+	};
+	assert!(!is_malformed_tool_call(&valid_call));
+
+	// Messages with bad tool call and matching tool result
+	let messages = vec![
+		Message {
+			role: Role::Assistant,
+			content: vec![ContentPart::ToolCall(bad_call)],
+			timestamp: None,
+			tool_call_id: None,
+			tool_name: None,
+			is_error: None,
+			api: None,
+			provider: None,
+			model: None,
+			attribution: None,
+			stop_reason: None,
+		},
+		Message {
+			role: Role::Tool,
+			content: vec![ContentPart::Text { text: "result".to_string() }],
+			timestamp: None,
+			tool_call_id: Some("  ".to_string()),
+			tool_name: Some("bash".to_string()),
+			is_error: None,
+			api: None,
+			provider: None,
+			model: None,
+			attribution: None,
+			stop_reason: None,
+		},
+		Message::user("follow up"),
+	];
+	let sanitized = sanitize_malformed_tool_calls(&messages);
+	// Both the empty tool call assistant message and its tool result are dropped
+	assert_eq!(sanitized.len(), 1);
+	assert_eq!(sanitized[0].role, Role::User);
+}
+
+#[test]
+fn test_history_thinking_demotion_target_dialects() {
+	assert_eq!(preferred_dialect("claude-3-5-sonnet"), "anthropic");
+	assert_eq!(preferred_dialect("gemini-2.0-flash"), "gemini");
+	assert_eq!(preferred_dialect("deepseek-r1"), "deepseek");
+	assert_eq!(preferred_dialect("qwen-2.5-coder"), "qwen3");
+
+	assert_eq!(demote_thinking("claude-3-5-sonnet", "step 1"), "step 1");
+	assert_eq!(
+		demote_thinking("deepseek-r1", "step 1"),
+		"<think>\nstep 1\n</think>"
+	);
+	assert_eq!(
+		demote_thinking("gemini-2.0-flash", "step 1"),
+		"```thinking\nstep 1\n```"
+	);
+	assert_eq!(
+		demote_thinking("random-model", "step 1"),
+		"<thinking>step 1</thinking>"
+	);
+}
+
+#[test]
+fn test_retry_backoff_and_header_parsing() {
+	let mut headers = reqwest::header::HeaderMap::new();
+	headers.insert("retry-after", "7".parse().unwrap());
+	let hint = extract_retry_hint(&headers, "");
+	assert_eq!(hint, Some(Duration::from_secs(7)));
+
+	let mut headers_ms = reqwest::header::HeaderMap::new();
+	headers_ms.insert("retry-after-ms", "3500".parse().unwrap());
+	let hint_ms = extract_retry_hint(&headers_ms, "");
+	assert_eq!(hint_ms, Some(Duration::from_millis(3500)));
+
+	let empty_headers = reqwest::header::HeaderMap::new();
+	let body_hint = extract_retry_hint(&empty_headers, "Please retry after 4 seconds for rate limit");
+	assert_eq!(body_hint, Some(Duration::from_secs(4)));
+
+	// Test parse error exclusion
+	assert!(is_llama_cpp_parse_error("Failed to parse tool call arguments as JSON: syntax error"));
+	assert!(is_llama_cpp_parse_error("Exception [json.exception.parse_error.101] parse error"));
+	assert!(!is_llama_cpp_parse_error("Internal server error"));
+
+	assert!(should_retry_ollama_response(500, "Server crash"));
+	assert!(!should_retry_ollama_response(500, "failed to parse tool call arguments as json"));
+	assert!(should_retry_ollama_response(429, "Too many requests"));
+	assert!(!should_retry_ollama_response(400, "Bad request"));
+}
+
+#[tokio::test]
+async fn test_empty_completion_retry_retries_and_succeeds() {
+	let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+	let addr = listener.local_addr().expect("addr");
+
+	tokio::spawn(async move {
+		// Attempt 1: empty completion (done: true, eval_count: 0, done_reason: stop)
+		let (mut socket1, _) = listener.accept().await.expect("accept 1");
+		let _ = read_request(&mut socket1).await;
+		let headers = "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: close\r\n\r\n";
+		let empty_chunk = "{\"done\":true,\"done_reason\":\"stop\",\"eval_count\":0}\n";
+		let _ = socket1.write_all(headers.as_bytes()).await;
+		let _ = socket1.write_all(empty_chunk.as_bytes()).await;
+		let _ = socket1.flush().await;
+
+		// Attempt 2: successful completion
+		let (mut socket2, _) = listener.accept().await.expect("accept 2");
+		let _ = read_request(&mut socket2).await;
+		let chunk2 = "{\"message\":{\"content\":\"retry success\"},\"done\":false}\n{\"done\":true,\"done_reason\":\"stop\",\"eval_count\":2}\n";
+		let _ = socket2.write_all(headers.as_bytes()).await;
+		let _ = socket2.write_all(chunk2.as_bytes()).await;
+		let _ = socket2.flush().await;
+	});
+
+	let provider = make_provider(&format!("http://{addr}"), "test-model");
+	let message = provider
+		.complete(&[Message::user("ping")], &[], &ToolChoice::Auto)
+		.await
+		.expect("complete after retry");
+	assert_eq!(message.content_text(), "retry success");
+}
+
+#[tokio::test]
+async fn test_on_payload_hook_modifies_request_payload() {
+	let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+	let addr = listener.local_addr().expect("addr");
+	let (req_tx, req_rx) = tokio::sync::oneshot::channel();
+
+	tokio::spawn(async move {
+		let (mut socket, _) = listener.accept().await.expect("accept");
+		if let Some((_, json_body)) = read_request(&mut socket).await {
+			let _ = req_tx.send(json_body);
+		}
+		let headers = "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: close\r\n\r\n";
+		let chunk = "{\"message\":{\"content\":\"hook ok\"},\"done\":true}\n";
+		let _ = socket.write_all(headers.as_bytes()).await;
+		let _ = socket.write_all(chunk.as_bytes()).await;
+		let _ = socket.flush().await;
+	});
+
+	let hook = std::sync::Arc::new(|payload: &Value, _model: &str| {
+		let mut modified = payload.clone();
+		if let Some(map) = modified.as_object_mut() {
+			map.insert("custom_injected_option".to_string(), json!(true));
+		}
+		Box::pin(async move { Ok(Some(modified)) }) as pi_agent::provider_ollama::BoxFuture<Result<Option<Value>, ProviderError>>
+	});
+
+	let provider = make_provider(&format!("http://{addr}"), "test-model").with_on_payload(hook);
+	let _ = provider
+		.complete(&[Message::user("hi")], &[], &ToolChoice::Auto)
+		.await
+		.expect("complete");
+
+	let received_json = req_rx.await.expect("received request json");
+	assert_eq!(received_json["custom_injected_option"], json!(true));
+}
+
+#[test]
+fn test_tool_schema_semantic_preservation() {
+	let tool_schema = json!({
+		"type": "function",
+		"function": {
+			"name": "search_database",
+			"description": "Searches records matching query",
+			"parameters": {
+				"type": "object",
+				"properties": {
+					"query": {
+						"type": "string",
+						"description": "SQL-like search term"
+					},
+					"limit": {
+						"type": "integer",
+						"minimum": 1,
+						"maximum": 100
+					},
+					"filter": {
+						"anyOf": [
+							{ "type": "string" },
+							{ "type": "array", "items": { "type": "string" } }
+						]
+					}
+				},
+				"required": ["query"]
+			}
+		}
+	});
+
+	let provider = make_provider("http://127.0.0.1:11434", "test-model");
+	// Request conversion preserves parameters without mutating or dropping semantic fields
+	let req = provider.complete(&[Message::user("search")], &[tool_schema.clone()], &ToolChoice::Auto);
+	drop(req);
+
+	assert_eq!(tool_schema["function"]["name"], "search_database");
+	assert_eq!(tool_schema["function"]["parameters"]["required"], json!(["query"]));
+	assert!(tool_schema["function"]["parameters"]["properties"]["filter"]["anyOf"].is_array());
 }

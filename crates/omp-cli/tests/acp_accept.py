@@ -1125,7 +1125,7 @@ def run_plan_yolo_mounted_tool(binary: str) -> None:
     target_provider.mounted_plan_target = True
     script = root / "probe_mcp.py"
     script.write_text(
-        """import sys, json
+        r"""import sys, json
 for line in sys.stdin:
     line = line.strip()
     if not line:

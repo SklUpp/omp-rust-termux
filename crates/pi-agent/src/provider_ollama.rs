@@ -11,7 +11,7 @@ use std::{
 	future::Future,
 	pin::Pin,
 	sync::{
-		Arc,
+		Arc, OnceLock,
 		atomic::{AtomicU64, Ordering},
 	},
 	time::Duration,
@@ -20,8 +20,13 @@ use std::{
 /// Boxed future alias for async callbacks and hooks without extra lifetime dependencies.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-/// Minimal TS `Model<"ollama-chat">` context handed to `onPayload`: the fields
-/// this adapter actually owns. The runtime exposes no separate model object.
+/// Adapter-owned projection of the TS `Model<"ollama-chat">` *identity* passed
+/// to `onPayload` (`ollama.ts:577`). This is NOT a full `Model`:
+/// catalog-only fields (`cost`, `input`, `contextWindow`, model-level
+/// `maxTokens`, `thinking`/`compat`, `headers`) are not carried by this adapter,
+/// so consumers needing them cannot be satisfied here without new catalog
+/// plumbing. Getters for the fields above live on this struct; the adapter
+/// supplies provider/api/model/baseUrl from its own configuration only.
 #[derive(Debug, Clone, Copy)]
 pub struct OllamaPayloadModel<'a> {
 	pub provider: &'a str,
@@ -494,21 +499,38 @@ pub fn preferred_dialect(model_id: &str) -> &'static str {
 	}
 }
 
-/// TS `renderDemotedThinking`: wrap reasoning text in the target model's dialect fences (`demotion.ts:30-41`).
+/// TS `renderDemotedThinking` (`demotion.ts`): Anthropic keeps bare prose;
+/// harmony/gemma collapse to ` thinking`; every other dialect uses its own
+/// `renderThinking` form.
 pub fn demote_thinking(model_id: &str, thinking: &str) -> String {
+	if thinking.is_empty() {
+		return String::new();
+	}
 	let dialect = preferred_dialect(model_id);
 	match dialect {
 		"anthropic" => thinking.to_string(),
-		"harmony" | "gemma" | "deepseek" | "glm" | "kimi" | "hermes" | "qwen3" => {
-			format!("<think>\n{thinking}\n</think>")
-		}
-		"gemini" => {
-			format!("```thinking\n{thinking}\n```")
-		}
-		"minimax" | "xml" | _ => {
-			format!("<thinking>{thinking}</thinking>")
-		}
+		"harmony" | "gemma" => format!(" thinking\n{thinking}\n</think>"),
+		"gemini" => format!("```thinking\n{thinking}\n```"),
+		"qwen3" | "deepseek" | "kimi" | "glm" => {
+			format!(" thinking\n{thinking}\n</think>")
+		},
+		_ => {
+			let inner = unwrap_delimited_thinking("<thinking>", "</thinking>", thinking);
+			format!("<thinking>\n{inner}\n</thinking>")
+		},
 	}
+}
+
+/// TS `unwrapDelimitedThinking` for the single wrapped case: never double-wrap
+/// reasoning that already carries the target dialect's tags.
+fn unwrap_delimited_thinking(open: &str, close: &str, text: &str) -> String {
+	let trimmed = text.trim();
+	if let Some(rest) = trimmed.strip_prefix(open)
+		&& let Some(inner) = rest.strip_suffix(close)
+	{
+		return inner.trim().to_string();
+	}
+	text.to_string()
 }
 
 impl OllamaProvider {
@@ -2517,7 +2539,11 @@ impl DeepSeekInbandScanner {
 				break;
 			};
 			let attr_part = &after_op[..tag_end];
-			let name = extract_attr(attr_part, "name").unwrap_or_else(|| "unknown".to_string());
+			// TS `#matchDsmlOpen` rejects an invoke open without `name`.
+			let Some(name) = extract_attr(attr_part, "name") else {
+				rest = &after_op[tag_end + 1..];
+				continue;
+			};
 			let body_start = &after_op[tag_end + 1..];
 			let Some((close_pos, close_tag)) = DSML_INVOKE_CLOSES
 				.iter()
@@ -2547,21 +2573,16 @@ impl DeepSeekInbandScanner {
 				break;
 			};
 			let attr_part = &after_op[..tag_end];
-			let name = extract_attr(attr_part, "name").unwrap_or_default();
-			// Legacy self-closing form: `<parameter name="x" string="v"/>`.
-			// Kept permissive; the real grammar carries the value in the body.
-			if attr_part.trim_end().ends_with('/') {
-				let value = extract_attr(attr_part, "string").unwrap_or_default();
-				map.insert(name, Value::String(value));
+			// TS `#matchDsmlOpen`: a parameter without `name` is not an open tag;
+			// its text is skipped rather than inventing an empty-name argument.
+			let Some(name) = extract_attr(attr_part, "name") else {
 				rest = &after_op[tag_end + 1..];
 				continue;
-			}
-			// Real DSML grammar: `string` is a boolean mode flag, the value is
-			// always the element body. Absent flag means string coercion.
-			let string_mode = match extract_attr(attr_part, "string").as_deref() {
-				Some("false") => false,
-				_ => true,
 			};
+			// Real DSML grammar: `string` is a boolean mode flag matched only as
+			// `true`/`false`; the value is always the element body and absent
+			// flag means string coercion.
+			let string_mode = extract_attr(attr_part, "string").as_deref() != Some("false");
 			let body_start = &after_op[tag_end + 1..];
 			if let Some((close_pos, close_tag)) = DSML_PARAM_CLOSES
 				.iter()
@@ -3056,26 +3077,142 @@ pub fn extract_retry_hint(headers: &reqwest::header::HeaderMap, body: &str) -> O
 		}
 	}
 	if let Some(val) = headers.get("x-ratelimit-reset-after").and_then(|v| v.to_str().ok()) {
-		if let Ok(secs) = val.trim().parse::<u64>() {
+		if let Ok(secs) = val.trim().parse::<u64>()
+			&& secs > 0
+		{
 			return Some(Duration::from_secs(secs));
 		}
 	}
-	let lower = body.to_ascii_lowercase();
-	for keyword in &["try again in ", "retry in ", "reset in ", "please retry after "] {
-		if let Some(idx) = lower.find(keyword) {
-			let rest = &lower[idx + keyword.len()..];
-			let num_str: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-			if let Ok(val) = num_str.parse::<u64>() {
-				let after_num = rest[num_str.len()..].trim_start();
-				if after_num.starts_with("ms") || after_num.starts_with("millisecond") {
-					return Some(Duration::from_millis(val));
-				} else {
-					return Some(Duration::from_secs(val));
-				}
+	if body.is_empty() {
+		return None;
+	}
+	let patterns = retry_body_patterns();
+	if let Some(captures) = patterns.quota.captures(body) {
+		let hours: f64 = captures
+			.get(1)
+			.and_then(|m| m.as_str().parse().ok())
+			.unwrap_or(0.0);
+		let minutes: f64 = captures
+			.get(2)
+			.and_then(|m| m.as_str().parse().ok())
+			.unwrap_or(0.0);
+		let seconds: f64 = captures
+			.get(3)
+			.and_then(|m| m.as_str().parse().ok())
+			.unwrap_or(f64::NAN);
+		if seconds.is_finite() {
+			let total_ms = ((hours * 60.0 + minutes) * 60.0 + seconds) * 1000.0;
+			if total_ms > 0.0 {
+				return Some(Duration::from_millis(total_ms as u64));
+			}
+		}
+	}
+	for pattern in [
+		&patterns.will_reset,
+		&patterns.please_retry,
+		&patterns.retry_delay,
+		&patterns.try_again,
+	] {
+		let Some(captures) = pattern.captures(body) else {
+			continue;
+		};
+		let value: f64 = captures
+			.get(1)
+			.and_then(|m| m.as_str().parse().ok())
+			.unwrap_or(f64::NAN);
+		let unit = captures.get(2).map(|m| m.as_str()).unwrap_or("");
+		if value.is_finite() && value > 0.0 {
+			if let Some(unit_ms) = retry_unit_to_ms(unit) {
+				return Some(Duration::from_millis((value * unit_ms as f64) as u64));
 			}
 		}
 	}
 	None
+}
+
+struct RetryBodyPatterns {
+	quota: regex::Regex,
+	will_reset: regex::Regex,
+	please_retry: regex::Regex,
+	retry_delay: regex::Regex,
+	try_again: regex::Regex,
+}
+
+fn retry_body_patterns() -> &'static RetryBodyPatterns {
+	static PATTERNS: OnceLock<RetryBodyPatterns> = OnceLock::new();
+	PATTERNS.get_or_init(|| RetryBodyPatterns {
+		quota: regex::Regex::new(r"(?i)reset after (?:(\d+)h)?(?:(\d+)m)?(\d+(?:\.\d+)?)s")
+			.expect("quota reset pattern"),
+		will_reset: regex::Regex::new(
+			r"(?i)(?:will\s+)?reset in\s+~?\s*([0-9.]+)\s*(ms|sec|s|minutes?|mins?|m|hours?|hrs?|h)\b",
+		)
+		.expect("will reset pattern"),
+		please_retry: regex::Regex::new(r"(?i)Please retry in ([0-9.]+)(ms|s)")
+			.expect("please retry pattern"),
+		retry_delay: regex::Regex::new(r#"(?i)"retryDelay":\s*"([0-9.]+)(ms|s)""#)
+			.expect("retryDelay pattern"),
+		try_again: regex::Regex::new(
+			r"(?i)try again in\s+~?\s*([0-9.]+)\s*(ms|sec|s|minutes?|mins?|m|hours?|hrs?|h)\b",
+		)
+		.expect("try again pattern"),
+	})
+}
+
+fn retry_unit_to_ms(unit: &str) -> Option<u64> {
+	match unit.to_ascii_lowercase().as_str() {
+		"ms" => Some(1),
+		"s" | "sec" => Some(1_000),
+		"m" | "min" | "mins" | "minute" | "minutes" => Some(60_000),
+		"h" | "hr" | "hrs" | "hour" | "hours" => Some(3_600_000),
+		_ => None,
+	}
+}
+
+fn parse_http_date_epoch(value: &str) -> Option<u64> {
+	// IMF-fixdate: `Sun, 06 Nov 1994 08:49:37 GMT`.
+	let parts: Vec<&str> = value.split_whitespace().collect();
+	if parts.len() != 6 || !parts[5].eq_ignore_ascii_case("GMT") {
+		return None;
+	}
+	let day: u32 = parts[1].parse().ok()?;
+	let month = match parts[2].to_ascii_lowercase().as_str() {
+		"jan" => 1,
+		"feb" => 2,
+		"mar" => 3,
+		"apr" => 4,
+		"may" => 5,
+		"jun" => 6,
+		"jul" => 7,
+		"aug" => 8,
+		"sep" => 9,
+		"oct" => 10,
+		"nov" => 11,
+		"dec" => 12,
+		_ => return None,
+	};
+	let year: i32 = parts[3].parse().ok()?;
+	let time: Vec<&str> = parts[4].split(':').collect();
+	if time.len() != 3 {
+		return None;
+	}
+	let hour: u64 = time[0].parse().ok()?;
+	let minute: u64 = time[1].parse().ok()?;
+	let second: u64 = time[2].parse().ok()?;
+	let days = days_from_civil(year, month, day);
+	let seconds = days
+		.checked_mul(86_400)?
+		.checked_add((hour * 3_600 + minute * 60 + second) as i64)?;
+	u64::try_from(seconds).ok()
+}
+
+fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
+	let year = year - i32::from(month <= 2);
+	let era = if year >= 0 { year } else { year - 399 } / 400;
+	let year_of_era = year - era * 400;
+	let month_prime = if month > 2 { month - 3 } else { month + 9 };
+	let day_of_year = (153 * month_prime + 2) / 5 + day - 1;
+	let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year as i32;
+	i64::from(era * 146_097 + day_of_era - 719_468)
 }
 
 #[async_trait]

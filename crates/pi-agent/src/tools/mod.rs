@@ -1419,6 +1419,7 @@ impl WriteTool {
 	) -> Result<ToolResult, ToolError> {
 		let id_text = conflict_id_text(uri.id);
 		if let Some(scope) = uri.scope {
+			let scope = scope.as_str();
 			return Err(ToolError::Rejected(format!(
 				"Conflict URI scope '/{scope}' is read-only — read `conflict://{id_text}/{scope}` to inspect that side. To write, drop the scope (`conflict://{id_text}`) and put the chosen content (or shorthand like `@{scope}`) in `content`."
 			)));
@@ -1542,9 +1543,9 @@ impl WriteTool {
 				"\nNote: dropped {echo_trimmed} content line(s) that duplicated the code adjacent to the conflict region — writes replace only the marker block; surrounding lines stay in place."
 			));
 		}
-		Ok(result_with_details(
+		Ok(read::result_with_details(
 			text,
-			json!({ "resolvedPath": entry.absolute_path.display().to_string() }),
+			serde_json::json!({ "resolvedPath": entry.absolute_path.display().to_string() }),
 			false,
 		))
 	}

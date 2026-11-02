@@ -978,7 +978,7 @@ pub fn parse_bulk_directives(content: &str) -> Result<Option<BTreeMap<u64, Strin
 		};
 		let sample = truncate_directive(sample);
 		return Err(format!(
-			"Malformed `conflict://*` per-id block: {} line(s) are not `<id>: @side` directives (first: `{sample}`). {token_hint}Literal or multi-line replacement content isn't supported in a per-id block — resolve those blocks with individual `write({ path: \"conflict://<N>\", content })` calls (you can issue several at once). For a pure pick-a-side pass, make every non-empty line `<id>: @ours` (or @theirs/@base/@both).",
+			"Malformed `conflict://*` per-id block: {} line(s) are not `<id>: @side` directives (first: `{sample}`). {token_hint}Literal or multi-line replacement content isn't supported in a per-id block — resolve those blocks with individual `write({{ path: \"conflict://<N>\", content }})` calls (you can issue several at once). For a pure pick-a-side pass, make every non-empty line `<id>: @ours` (or @theirs/@base/@both).", 
 			stray.len()
 		));
 	}

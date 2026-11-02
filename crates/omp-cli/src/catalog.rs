@@ -72,6 +72,14 @@ pub struct ModelInfo {
 	/// `maxTokens`, `effortMap`, ...); `efforts` above is its listing subset.
 	/// No provider-level fallback: TS inherits thinking from the model only.
 	pub thinking:        Option<serde_json::Value>,
+	/// TS `Model.headers`: per-model request headers as authored by the row,
+	/// layered before connection headers by the runtime. Never carries a
+	/// credential; the adapter appends `Authorization` last.
+	pub headers:          Option<BTreeMap<String, String>>,
+	/// TS `Model.requestModelId`: wire model id when it differs from `id`.
+	pub request_model_id: Option<String>,
+	/// TS `Model.tokenizer`: local tokenizer family when the row declares one.
+	pub tokenizer:        Option<String>,
 	/// TS `compat.supportsUsageInStreaming` override for this model
 	/// (`models.json`/`models.yml`). `None` means the model declares nothing,
 	/// so the provider-level default applies (`!isCerebras`, as
@@ -107,6 +115,12 @@ struct ModelEntry {
 	base_url: Option<String>,
 	#[serde(default)]
 	compat: Option<serde_json::Value>,
+	#[serde(default)]
+	headers: Option<BTreeMap<String, String>>,
+	#[serde(default, rename = "requestModelId")]
+	request_model_id: Option<String>,
+	#[serde(default)]
+	tokenizer: Option<String>,
 }
 
 /// One authored `models.yml` model plus the authored-ness a same-id patch
@@ -154,6 +168,11 @@ impl YamlModel {
 			base_url:        info.base_url,
 			compat,
 			thinking:        info.thinking.or(base.thinking),
+			// Same-id patch: an authored request field replaces the row's value,
+			// an omitted one keeps it. No cross-field merge is invented.
+			headers:         info.headers.or(base.headers),
+			request_model_id: info.request_model_id.or(base.request_model_id),
+			tokenizer:       info.tokenizer.or(base.tokenizer),
 			supports_usage_in_streaming,
 		}
 	}
@@ -254,6 +273,19 @@ fn apply_provider_overrides(
 
 /// `thinking.efforts` from a catalog `thinking` block; `true`-only or absent
 /// thinking metadata yields `None` (no controllable effort surface).
+/// String map of an authored per-model `headers` block (`models.yml`).
+///
+/// Non-string values are dropped: the TS wire type is `Record<string, string>`
+/// and a header can never be a credential carrier here.
+fn yml_headers(value: Option<serde_json::Value>) -> Option<BTreeMap<String, String>> {
+	let map = value?.as_object()?.clone();
+	let headers: BTreeMap<String, String> = map
+		.into_iter()
+		.filter_map(|(name, value)| value.as_str().map(|value| (name, value.to_string())))
+		.collect();
+	(!headers.is_empty()).then_some(headers)
+}
+
 fn thinking_efforts(thinking: Option<serde_json::Value>) -> Option<Vec<String>> {
 	let thinking = thinking?;
 	let efforts = thinking.get("efforts")?.as_array()?;
@@ -392,6 +424,9 @@ impl Catalog {
 						base_url: entry.base_url,
 						compat: entry.compat,
 						thinking,
+						headers: entry.headers,
+						request_model_id: entry.request_model_id,
+						tokenizer: entry.tokenizer,
 						supports_usage_in_streaming,
 					},
 				);
@@ -504,6 +539,11 @@ fn yml_sections(
 								),
 								compat,
 								thinking,
+								headers: yml_headers(item.get("headers").map(yaml_json)),
+								request_model_id: item
+									.get("requestModelId")
+									.and_then(yaml::Value::to_text),
+								tokenizer: item.get("tokenizer").and_then(yaml::Value::to_text),
 							},
 							reasoning,
 						});

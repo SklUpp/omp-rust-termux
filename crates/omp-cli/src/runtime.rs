@@ -2556,20 +2556,30 @@ fn wire_provider(
 			Ok(Arc::new(provider))
 		},
 		WireDialect::OllamaChat => {
+			let reasoning = resolve_openai_reasoning_effort(
+				target.provider,
+				target.model,
+				info,
+				compat,
+				thinking,
+				target.effort,
+			)?;
+			// Built once per provider: the hook only borrows it per request.
+			let model = ollama_model_context(
+				catalog,
+				config,
+				target,
+				info,
+				reasoning.clone(),
+			);
 			let provider = OllamaProvider::new(target.base_url, target.api_key, target.model)
 				.map_err(setup)?
 				.with_images(target.supports_images)
 				.with_cloud(target.provider == "ollama-cloud")
 				.with_model_reasoning(info.is_some_and(|info| info.reasoning))
-				.with_reasoning(resolve_openai_reasoning_effort(
-					target.provider,
-					target.model,
-					info,
-					compat,
-					thinking,
-					target.effort,
-				)?)
+				.with_reasoning(reasoning)
 				.with_disable_reasoning(config.external_thinking)
+				.with_payload_model(payload_model(model))
 				// Stamp the configured route, not the adapter's default dialect
 				// label: signed reasoning must replay only to its issuer.
 				.with_provider_id(Some(target.provider.to_owned()))
@@ -2634,6 +2644,236 @@ fn wire_provider(
 			let provider = AnthropicMessagesProvider::from_config(anthropic).map_err(setup)?;
 			Ok(Arc::new(provider))
 		},
+	}
+}
+
+/// Resolved TS `Model<"ollama-chat">` metadata supplied to the adapter once per
+/// provider. Mirrors the adapter's public payload-model type field for field;
+/// [`payload_model`] is the only conversion and the only adapter dependency.
+#[derive(Clone, PartialEq)]
+pub(crate) struct OllamaModelContext {
+	pub(crate) provider:              String,
+	pub(crate) api:                   String,
+	pub(crate) id:                    String,
+	pub(crate) request_model_id:      Option<String>,
+	pub(crate) name:                  String,
+	pub(crate) base_url:              String,
+	pub(crate) input:                 Vec<String>,
+	pub(crate) tokenizer:             Option<String>,
+	pub(crate) cost:                  Option<OllamaModelCost>,
+	pub(crate) context_window:        Option<u64>,
+	pub(crate) max_tokens:            Option<u64>,
+	pub(crate) omit_max_output_tokens: bool,
+	pub(crate) reasoning:             bool,
+	pub(crate) thinking:              Option<OllamaModelThinking>,
+	pub(crate) effort:                Option<String>,
+	pub(crate) headers:               Vec<(String, String)>,
+}
+
+/// TS `ModelCost` / `TokenCost`: the four per-million rates, with the authored
+/// `longContext` block kept verbatim. `None` on the model means unknown.
+#[derive(Clone, PartialEq)]
+pub(crate) struct OllamaModelCost {
+	pub(crate) input:        f64,
+	pub(crate) output:       f64,
+	pub(crate) cache_read:   f64,
+	pub(crate) cache_write:  f64,
+	pub(crate) long_context: Option<serde_json::Value>,
+}
+
+/// Materialized TS `ThinkingConfig`: a non-empty effort ladder with an explicit
+/// mode, default level and the authored effort remap (identity for omitted
+/// efforts). The authored block alone is not the resolved shape TS exposes.
+#[derive(Clone, PartialEq)]
+pub(crate) struct OllamaModelThinking {
+	pub(crate) mode:          String,
+	pub(crate) efforts:       Vec<String>,
+	pub(crate) default_level: Option<String>,
+	pub(crate) effort_map:    Vec<(String, String)>,
+}
+
+/// Parse the catalog `cost` block into the TS rate record.
+fn ollama_model_cost(cost: Option<&serde_json::Value>) -> Option<OllamaModelCost> {
+	let cost = cost?.as_object()?;
+	let rate = |key: &str| {
+		cost.get(key)
+			.and_then(serde_json::Value::as_f64)
+			.unwrap_or(0.0)
+	};
+	Some(OllamaModelCost {
+		input:        rate("input"),
+		output:       rate("output"),
+		cache_read:   rate("cacheRead"),
+		cache_write:  rate("cacheWrite"),
+		long_context: cost.get("longContext").cloned(),
+	})
+}
+
+/// Materialize the authored thinking block plus the catalog effort listing.
+/// TS carries no thinking config when the model exposes no effort ladder.
+fn ollama_model_thinking(
+	thinking: Option<&serde_json::Value>,
+	efforts: Option<&[String]>,
+) -> Option<OllamaModelThinking> {
+	let thinking = thinking?;
+	let efforts: Vec<String> = thinking
+		.get("efforts")
+		.and_then(serde_json::Value::as_array)
+		.map(|efforts| {
+			efforts
+				.iter()
+				.filter_map(|effort| effort.as_str().map(str::to_string))
+				.collect()
+		})
+		.unwrap_or_else(|| efforts.unwrap_or(&[]).to_vec());
+	if efforts.is_empty() {
+		return None;
+	}
+	Some(OllamaModelThinking {
+		mode:          thinking
+			.get("mode")
+			.and_then(serde_json::Value::as_str)
+			.unwrap_or("effort")
+			.to_string(),
+		efforts,
+		default_level: thinking
+			.get("defaultLevel")
+			.and_then(serde_json::Value::as_str)
+			.map(str::to_string),
+		effort_map:    json_string_map(Some(thinking), "effortMap"),
+	})
+}
+
+/// Input modalities: the authored list wins, otherwise they are derived from the
+/// resolved image capability so the array is always concrete.
+fn ollama_model_input(
+	info: Option<&crate::catalog::ModelInfo>,
+	supports_images: bool,
+) -> Vec<String> {
+	match info.and_then(|info| info.input.clone()) {
+		Some(input) if !input.is_empty() => input,
+		_ if supports_images => vec!["text".to_string(), "image".to_string()],
+		_ => vec!["text".to_string()],
+	}
+}
+
+/// Pre-auth header set in TS emission order: model-level headers, then the
+/// `config.yml` provider headers. The adapter appends `Authorization` and
+/// `Content-Type` last, so nothing here can override the credential.
+fn ollama_model_headers(
+	info: Option<&crate::catalog::ModelInfo>,
+	config: &crate::config::Config,
+	provider: &str,
+) -> Vec<(String, String)> {
+	let mut headers: Vec<(String, String)> = info
+		.and_then(|info| info.headers.as_ref())
+		.map(|headers| {
+			headers
+				.iter()
+				.map(|(name, value)| (name.clone(), value.clone()))
+				.collect()
+		})
+		.unwrap_or_default();
+	if let Some(provider_config) = config.providers.get(provider) {
+		headers.extend(
+			provider_config
+				.headers
+				.iter()
+				.map(|(name, value)| (name.clone(), value.clone())),
+		);
+	}
+	headers
+}
+
+/// Build the resolved model context once per provider.
+fn ollama_model_context(
+	catalog: &crate::catalog::Catalog,
+	config: &crate::config::Config,
+	target: &WireTarget<'_>,
+	info: Option<&crate::catalog::ModelInfo>,
+	effort: Option<String>,
+) -> OllamaModelContext {
+	OllamaModelContext {
+		provider: target.provider.to_string(),
+		api: target.dialect.api().to_string(),
+		id: target.model.to_string(),
+		request_model_id: info.and_then(|info| info.request_model_id.clone()),
+		name: info
+			.and_then(|info| info.name.clone())
+			.unwrap_or_else(|| target.model.to_string()),
+		base_url: target.base_url.to_string(),
+		input: ollama_model_input(info, target.supports_images),
+		tokenizer: info.and_then(|info| info.tokenizer.clone()),
+		cost: ollama_model_cost(info.and_then(|info| info.cost.as_ref())),
+		context_window: info
+			.and_then(|info| info.context_window)
+			.and_then(|window| u64::try_from(window).ok()),
+		max_tokens: info.and_then(|info| info.max_tokens),
+		omit_max_output_tokens: catalog
+			.omit_max_output_tokens(target.provider, target.model)
+			.unwrap_or(false),
+		reasoning: info.is_some_and(|info| info.reasoning),
+		thinking: ollama_model_thinking(
+			catalog.model_thinking(target.provider, target.model),
+			info.and_then(|info| info.efforts.as_deref()),
+		),
+		effort,
+		headers: ollama_model_headers(info, config, target.provider),
+	}
+}
+
+/// Convert the resolved context into the adapter's public payload-model type.
+fn payload_model(
+	context: OllamaModelContext,
+) -> pi_agent::provider_ollama::OllamaPayloadModel {
+	let OllamaModelContext {
+		provider,
+		api,
+		id,
+		request_model_id,
+		name,
+		base_url,
+		input,
+		tokenizer,
+		cost,
+		context_window,
+		max_tokens,
+		omit_max_output_tokens,
+		reasoning,
+		thinking,
+		effort,
+		headers,
+	} = context;
+	pi_agent::provider_ollama::OllamaPayloadModel {
+		provider,
+		api,
+		id,
+		request_model_id,
+		name,
+		base_url,
+		input,
+		tokenizer,
+		cost: cost.map(|cost| pi_agent::provider_ollama::OllamaPayloadCost {
+			input:        cost.input,
+			output:       cost.output,
+			cache_read:   cost.cache_read,
+			cache_write:  cost.cache_write,
+			long_context: cost.long_context,
+		}),
+		context_window,
+		max_tokens,
+		omit_max_output_tokens,
+		reasoning,
+		thinking: thinking.map(|thinking| {
+			pi_agent::provider_ollama::OllamaPayloadThinking {
+				mode: thinking.mode,
+				efforts: thinking.efforts,
+				default_level: thinking.default_level,
+				effort_map: thinking.effort_map,
+			}
+		}),
+		effort,
+		headers,
 	}
 }
 
@@ -8352,6 +8592,100 @@ mod tests {
 	/// `config.yml` is the CLI's own override: a gateway base URL there must not
 	/// be shadowed by the catalog's (usually bundled, vendor-default) route.
 	#[test]
+
+	/// The adapter payload context is the resolved TS model shape, not the
+	/// authored JSON: materialized thinking, parsed cost, honest limits, inputs,
+	/// effort, and pre-auth headers in model-then-config order.
+	#[test]
+	fn ollama_payload_context_materializes_catalog_metadata() {
+		use crate::catalog::{Catalog, ModelInfo};
+		let mut models = BTreeMap::new();
+		models.insert("qwen3".to_string(), ModelInfo {
+			provider: "ollama".to_string(),
+			api: Some("ollama-chat".to_string()),
+			base_url: Some("http://127.0.0.1:11434".to_string()),
+			name: Some("Qwen3".to_string()),
+			context_window: Some(131072),
+			max_tokens: Some(8192),
+			omit_max_output_tokens: Some(false),
+			reasoning: true,
+			efforts: Some(vec!["low".to_string(), "high".to_string()]),
+			cost: Some(serde_json::json!({
+				"input": 0.5,
+				"output": 1.5,
+				"cacheRead": 0.1,
+				"cacheWrite": 0.2,
+				"longContext": {"input": 1.0, "inputThreshold": 200000}
+			})),
+			thinking: Some(serde_json::json!({
+				"mode": "effort",
+				"efforts": ["low", "high"],
+				"defaultLevel": "low",
+				"effortMap": {"high": "max"}
+			})),
+			headers: Some(BTreeMap::from([("X-Model".to_string(), "row".to_string())])),
+			request_model_id: Some("qwen3-wire".to_string()),
+			tokenizer: Some("qwen3".to_string()),
+			..ModelInfo::default()
+		});
+		let mut providers = BTreeMap::new();
+		providers.insert("ollama".to_string(), models);
+		let catalog = Catalog {
+			providers,
+			connections: BTreeMap::new(),
+			source: PathBuf::from("models.json"),
+		};
+		let mut config = Config::default();
+		config.providers.insert("ollama".to_string(), ProviderConfig {
+			headers: BTreeMap::from([
+				("X-Model".to_string(), "config".to_string()),
+				("X-Config".to_string(), "yes".to_string()),
+			]),
+			..ProviderConfig::default()
+		});
+		let target = WireTarget {
+			dialect: WireDialect::OllamaChat,
+			provider: "ollama",
+			model: "qwen3",
+			base_url: "http://127.0.0.1:11434",
+			api_key: "",
+			effort: Some("high"),
+			supports_images: false,
+			usage_in_streaming: None,
+		};
+		let info = catalog.providers["ollama"].get("qwen3");
+		let context = ollama_model_context(&catalog, &config, &target, info, Some("high".to_string()));
+		assert_eq!(context.provider, "ollama");
+		assert_eq!(context.api, "ollama-chat");
+		assert_eq!(context.id, "qwen3");
+		assert_eq!(context.name, "Qwen3");
+		assert_eq!(context.request_model_id.as_deref(), Some("qwen3-wire"));
+		assert_eq!(context.tokenizer.as_deref(), Some("qwen3"));
+		assert_eq!(context.input, vec!["text".to_string()]);
+		assert_eq!(context.context_window, Some(131072));
+		assert_eq!(context.max_tokens, Some(8192));
+		assert!(!context.omit_max_output_tokens, "an explicit false stays false");
+		assert!(context.reasoning);
+		let cost = context.cost.expect("cost parsed");
+		assert_eq!((cost.input, cost.output, cost.cache_read, cost.cache_write), (0.5, 1.5, 0.1, 0.2));
+		assert_eq!(cost.long_context.as_ref().and_then(|value| value.get("inputThreshold")), Some(&serde_json::json!(200000)));
+		let thinking = context.thinking.expect("materialized thinking");
+		assert_eq!(thinking.mode, "effort");
+		assert_eq!(thinking.efforts, vec!["low".to_string(), "high".to_string()]);
+		assert_eq!(thinking.default_level.as_deref(), Some("low"));
+		assert_eq!(thinking.effort_map, vec![("high".to_string(), "max".to_string())]);
+		assert_eq!(context.effort.as_deref(), Some("high"));
+		assert_eq!(
+			context.headers,
+			vec![
+				("X-Model".to_string(), "row".to_string()),
+				("X-Model".to_string(), "config".to_string()),
+				("X-Config".to_string(), "yes".to_string()),
+			],
+			"model headers precede config headers; the adapter appends the credential last"
+		);
+	}
+
 	fn cli_base_url_outranks_the_catalog_route() {
 		let catalog = catalog_with_model("childprov", "claude-child", ModelInfo {
 			provider: "childprov".to_string(),

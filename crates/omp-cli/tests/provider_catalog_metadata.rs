@@ -260,3 +260,64 @@ fn yml_models_keep_model_metadata_above_provider_defaults() {
 	);
 	fs::remove_dir_all(dir).ok();
 }
+
+/// Per-model request metadata the Ollama payload context needs: `headers`,
+/// `requestModelId` and `tokenizer` survive loading with the same patch
+/// precedence as the other authored fields. A provider block is a connection
+/// override and never becomes a model-level header.
+#[test]
+fn json_rows_and_yml_models_carry_request_metadata() {
+	let dir = temp_dir();
+	let json = dir.join("models.json");
+	write(&json, r#"{
+		"ollama": {
+			"qwen3": {
+				"id": "qwen3",
+				"name": "Qwen3 bundled",
+				"api": "ollama-chat",
+				"baseUrl": "http://127.0.0.1:11434",
+				"headers": {"User-Agent": "row-agent"},
+				"requestModelId": "qwen3-row",
+				"tokenizer": "qwen3"
+			},
+			"llama3": {
+				"id": "llama3",
+				"name": "Llama bundled",
+				"api": "ollama-chat",
+				"baseUrl": "http://127.0.0.1:11434",
+				"headers": {"User-Agent": "row-agent"}
+			}
+		}
+	}"#);
+	let yml = dir.join("models.yml");
+	write(&yml, r#"
+providers:
+  ollama:
+    baseUrl: http://127.0.0.1:11434
+    headers:
+      X-Connection: provider
+    models:
+      - id: qwen3
+        headers:
+          X-Model: patch
+        requestModelId: qwen3-patch
+        tokenizer: qwen3-v2
+"#);
+	let catalog = Catalog::load(Some(&json), Some(&yml)).expect("load catalog");
+	let qwen = &catalog.providers["ollama"]["qwen3"];
+	assert_eq!(qwen.name.as_deref(), Some("Qwen3 bundled"), "an omitted field keeps the row value");
+	assert_eq!(qwen.request_model_id.as_deref(), Some("qwen3-patch"), "the patch wins");
+	assert_eq!(qwen.tokenizer.as_deref(), Some("qwen3-v2"), "the patch wins");
+	assert_eq!(
+		qwen.headers.as_ref(),
+		Some(&BTreeMap::from([("X-Model".to_string(), "patch".to_string())])),
+		"the patch replaces the row headers; connection headers stay out of the model"
+	);
+	let llama = &catalog.providers["ollama"]["llama3"];
+	assert_eq!(
+		llama.headers.as_ref(),
+		Some(&BTreeMap::from([("User-Agent".to_string(), "row-agent".to_string())])),
+		"a row the provider block does not patch keeps its own headers"
+	);
+	assert_eq!(llama.request_model_id, None);
+}

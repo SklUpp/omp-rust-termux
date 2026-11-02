@@ -21,7 +21,7 @@ use serde_json::{json, Value};
 
 use omp_cli::{
 	approve::ApprovalMode,
-	catalog::Catalog,
+	catalog::{Catalog, ModelInfo},
 	config::{Config, ProviderConfig},
 	prompts::Prompts,
 	rpc::{
@@ -450,8 +450,22 @@ struct ToolScript {
 /// [`spawn_model`] variant that emits one tool call and records every request
 /// body, so a test can assert exactly which conversation the provider saw.
 fn spawn_tool_model(scripts: Vec<ToolScript>) -> (u16, Arc<Mutex<Vec<Value>>>) {
+	let (port, requests, _authorizations) = spawn_tool_model_with_auth(scripts);
+	(port, requests)
+}
+
+/// [`spawn_tool_model`] plus each request's `Authorization` header.
+fn spawn_tool_model_with_auth(
+	scripts: Vec<ToolScript>,
+) -> (
+	u16,
+	Arc<Mutex<Vec<Value>>>,
+	Arc<Mutex<Vec<Option<String>>>>,
+) {
 	let requests: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
 	let recorded = Arc::clone(&requests);
+	let authorizations: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
+	let auths = Arc::clone(&authorizations);
 	let listener = TcpListener::bind("127.0.0.1:0").expect("bind model");
 	let port = listener.local_addr().expect("addr").port();
 	thread::spawn(move || {
@@ -474,6 +488,16 @@ fn spawn_tool_model(scripts: Vec<ToolScript>) -> (u16, Arc<Mutex<Vec<Value>>>) {
 					.lock()
 					.unwrap_or_else(std::sync::PoisonError::into_inner)
 					.push(value);
+				let head = String::from_utf8_lossy(&request[..body_start]);
+				let authorization = head.lines().find_map(|line| {
+					let (name, value) = line.split_once(':')?;
+					name.eq_ignore_ascii_case("authorization")
+						.then(|| value.trim().to_string())
+				});
+				auths
+					.lock()
+					.unwrap_or_else(std::sync::PoisonError::into_inner)
+					.push(authorization);
 			}
 			let _ = stream.write_all(
 				b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
@@ -516,7 +540,7 @@ fn spawn_tool_model(scripts: Vec<ToolScript>) -> (u16, Arc<Mutex<Vec<Value>>>) {
 			let _ = stream.flush();
 		}
 	});
-	(port, requests)
+	(port, requests, authorizations)
 }
 
 /// Text of the last `user` message in an OpenAI-compatible request body.

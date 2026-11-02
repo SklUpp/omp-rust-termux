@@ -14,6 +14,7 @@
 //!   (TS `#loadBuiltInModels` / `#applyProviderTransportOverride`);
 //! * a bare `compat:` (null) is absent and never erases an existing block.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};

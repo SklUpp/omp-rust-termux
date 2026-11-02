@@ -128,7 +128,7 @@ impl FileMentionMessage {
 			} else {
 				format!("\n{}\n", file.content)
 			};
-			out.push_str(&format!("<file path=\"{}\">{}</file>", file.path, inner));
+			out.push_str(&format!("<file path=\"{}\">{}</file>", escape_xml_attr(&file.path), inner));
 		}
 		out
 	}
@@ -146,7 +146,7 @@ impl FileMentionMessage {
 			} else {
 				format!("\n{}\n", file.content)
 			};
-			out.push_str(&format!("<file path=\"{}\">{}</file>", file.path, inner));
+			out.push_str(&format!("<file path=\"{}\">{}</file>", escape_xml_attr(&file.path), inner));
 		}
 		out
 	}
@@ -936,7 +936,7 @@ pub fn generate_file_mention_messages_vec(
 	process_file_mentions(file_paths, cwd).into_iter().collect()
 }
 
-/// Formats a [`FileMentionMessage`] into standard `<file path="...">` blocks for prompt context.
+/// Escapes a filesystem path for a double-quoted XML attribute.
 #[must_use]
 pub fn escape_xml_attr(input: &str) -> String {
 	let mut out = String::with_capacity(input.len());
@@ -952,6 +952,7 @@ pub fn escape_xml_attr(input: &str) -> String {
 	out
 }
 
+/// Formats every mentioned file into `<file path="...">` blocks for prompt context.
 #[must_use]
 pub fn format_prompt_block(message: &FileMentionMessage) -> String {
 	let mut out = String::new();
@@ -1235,6 +1236,49 @@ mod tests {
 		let formatted = format_prompt_block(&msg);
 		assert!(formatted.contains("<file path=\"src/main.rs\">\nfn main() {}\n</file>"));
 		assert!(formatted.contains("<file path=\"pic.png\">\n</file>"));
+	}
+
+	#[test]
+	fn escape_xml_attr_covers_every_attribute_special() {
+		assert_eq!(escape_xml_attr("a&b<c>d\"e"), "a&amp;b&lt;c&gt;d&quot;e");
+		assert_eq!(escape_xml_attr("plain/path.rs"), "plain/path.rs");
+	}
+
+	/// A POSIX path may contain `&`, `<`, `>` and `"`; every `<file>` producer must
+	/// keep them inside the attribute.
+	#[test]
+	fn every_prompt_block_escapes_the_path_attribute() {
+		let msg = FileMentionMessage {
+			role: "fileMention".to_string(),
+			files: vec![
+				MentionedFile {
+					path: "src/a&b\"<c>.rs".to_string(),
+					content: "fn main() {}".to_string(),
+					line_count: Some(1),
+					byte_size: Some(12),
+					skipped_reason: None,
+					image: None,
+				},
+				MentionedFile {
+					path: "pic&\"<x>.png".to_string(),
+					content: String::new(),
+					line_count: None,
+					byte_size: Some(100),
+					skipped_reason: None,
+					image: Some(ImagePayload::new("image/png", "aGVsbG8=")),
+				},
+			],
+			timestamp: 1,
+		};
+
+		let escaped = "<file path=\"src/a&amp;b&quot;&lt;c&gt;.rs\">\nfn main() {}\n</file>";
+		assert!(format_prompt_block(&msg).contains(escaped));
+		assert!(msg.format_text_prompt_block().contains(escaped));
+		assert!(
+			msg.format_image_prompt_block()
+				.contains("<file path=\"pic&amp;&quot;&lt;x&gt;.png\">\n</file>")
+		);
+		assert!(!msg.format_text_prompt_block().contains("a&b\"<c>"));
 	}
 
 	#[test]

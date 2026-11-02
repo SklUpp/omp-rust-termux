@@ -154,17 +154,17 @@ pub async fn run(
 								)
 								.for_provider(provider)
 							})?;
-						if !expected_state.is_empty() {
-							let matches = state
-								.as_deref()
-								.map(|s| constant_time_eq(s, expected_state))
-								.unwrap_or(false);
-							if !matches {
-								return Err(
-									AuthError::new(AuthErrorKind::Validation, "OAuth state mismatch")
-										.for_provider(provider),
-								);
-							}
+						// `callback-server.ts#waitForCallback`: a pasted value is only
+						// state-checked when it actually carries one, so the documented
+						// bare-code paste path keeps working.
+						if let Some(pasted_state) = state.as_deref().filter(|state| !state.is_empty())
+							&& !expected_state.is_empty()
+							&& !constant_time_eq(pasted_state, expected_state)
+						{
+							return Err(
+								AuthError::new(AuthErrorKind::Validation, "OAuth state mismatch")
+									.for_provider(provider),
+							);
 						}
 						return Ok(CodeExchange { code, state: state.unwrap_or_default(), redirect_uri });
 					},
@@ -372,6 +372,52 @@ mod tests {
 		assert_eq!(exchange.code, "pasted-code");
 		assert_eq!(exchange.state, TEST_STATE);
 		assert!(recorder.prompt_returned.load(Ordering::SeqCst));
+	}
+
+	#[tokio::test]
+	async fn bare_pasted_code_is_accepted_even_with_an_expected_state() {
+		// `codex.ts`/`gitlab.ts` etc. document "paste the authorization code",
+		// and the upstream manual race accepts a value without `state`.
+		let entry = registry::find("devin").expect("devin entry");
+		let http = HttpClient::new();
+		let recorder = Arc::new(RecordingCallbacks::default());
+		*recorder.reply.lock().expect("reply") = Some(InputReply::Value("pasted-code".to_string()));
+		let callbacks: Arc<dyn LoginCallbacks> = recorder.clone();
+		let cancel = Cancel::new();
+		let flow = Flow { entry, http: &http, callbacks: &callbacks, cancel: &cancel };
+		let mut spec = CodeFlowSpec::new(callback_config());
+		spec.manual_prompt = Some("Paste the authorization code".to_string());
+		spec.timeout = Duration::from_secs(10);
+
+		let exchange = run(&flow, &spec, TEST_STATE, |redirect_uri| {
+			(format!("https://example.invalid/authorize?redirect_uri={redirect_uri}"), None)
+		})
+		.await
+		.expect("a bare pasted code is accepted");
+		assert_eq!(exchange.code, "pasted-code");
+		assert_eq!(exchange.state, "");
+	}
+
+	#[tokio::test]
+	async fn pasted_code_carrying_a_foreign_state_is_rejected() {
+		let entry = registry::find("devin").expect("devin entry");
+		let http = HttpClient::new();
+		let recorder = Arc::new(RecordingCallbacks::default());
+		*recorder.reply.lock().expect("reply") = Some(InputReply::Value("pasted-code#other-state".to_string()));
+		let callbacks: Arc<dyn LoginCallbacks> = recorder.clone();
+		let cancel = Cancel::new();
+		let flow = Flow { entry, http: &http, callbacks: &callbacks, cancel: &cancel };
+		let mut spec = CodeFlowSpec::new(callback_config());
+		spec.manual_prompt = Some("Paste the authorization code".to_string());
+		spec.timeout = Duration::from_secs(10);
+
+		let error = run(&flow, &spec, TEST_STATE, |redirect_uri| {
+			(format!("https://example.invalid/authorize?redirect_uri={redirect_uri}"), None)
+		})
+		.await
+		.expect_err("a state-bearing value must still be verified");
+		assert_eq!(error.kind, AuthErrorKind::Validation);
+		assert_eq!(error.message, "OAuth state mismatch");
 	}
 
 	#[tokio::test]

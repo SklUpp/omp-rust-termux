@@ -558,6 +558,19 @@ class Client:
                     }
                 )
                 continue
+            if current.get("method") == "elicitation/create":
+                requests.append(current)
+                self.send(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": current["id"],
+                        "result": {
+                            "action": "accept",
+                            "content": {"value": "Approve and execute"},
+                        },
+                    }
+                )
+                continue
             if current.get("id") == request_id and ("result" in current or "error" in current):
                 if "error" in current:
                     raise AssertionError(f"prompt failed: {current['error']}")
@@ -906,7 +919,13 @@ def run_plan_yolo(binary: str) -> None:
     target_provider.start()
     client = Client(binary, root, root_provider, plan_yolo_target=target_provider)
     try:
-        client.request("initialize", {"protocolVersion": 1, "clientCapabilities": {}})
+        client.request(
+            "initialize",
+            {
+                "protocolVersion": 1,
+                "clientCapabilities": {"elicitation": {"form": {}}},
+            },
+        )
         cwd = str(client.cwd)
         created = client.request("session/new", {"cwd": cwd, "mcpServers": []})
         session_id = created["sessionId"]
@@ -1014,7 +1033,9 @@ def run_plan_yolo(binary: str) -> None:
             abort_session, "ORDINARY_PROPOSE", "allow_once"
         )
         assert_eq(ordinary["stopReason"], "end_turn", "ordinary plan proposal")
-        assert permissions, "manual plan must propose through the client approval dialog"
+        assert permissions and permissions[0].get("method") == "elicitation/create", (
+            "manual plan must propose through the client approval dialog"
+        )
         assert_eq(
             target_provider.requests,
             target_before,

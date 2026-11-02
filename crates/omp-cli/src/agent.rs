@@ -224,6 +224,13 @@ pub struct RunRequest {
 	/// inserted immediately before the user message and never journaled as a
 	/// user turn.
 	pub goal_context: Option<String>,
+	/// Host-hidden Plan reference context, inserted once before the current user
+	/// prompt (TS pre-LLM plan slot). Never persisted as a transcript turn.
+	pub plan_context: Option<String>,
+	/// Resolved per-family service-tier selection (TS `ServiceTierByFamily`,
+	/// string values). Empty means "no selection" and must not re-enable the
+	/// configured priority default.
+	pub service_tier_by_family: std::collections::BTreeMap<String, String>,
 	/// Per-request credential resolver installed by the RPC auth bridge. Key
 	/// precedence stays TS `getApiKey` order: an explicit `--api-key`/config key
 	/// wins, then this store (login, env, static), then the connection block.
@@ -317,6 +324,8 @@ impl RunRequest {
 	pub fn has_image(&self) -> bool {
 		self.parts.iter().any(crate::session::ContentPart::is_image)
 	}
+	plan_context: None,
+	service_tier_by_family: std::collections::BTreeMap::new(),
 }
 
 pub trait AgentRunner: Send + Sync {

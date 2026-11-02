@@ -459,6 +459,8 @@ fn fake_request(prompt: &str) -> RunRequest {
 		credential_resolver: None,
 		plan_mode: Default::default(),
 		continuation: false,
+		plan_context: None,
+		service_tier_by_family: std::collections::BTreeMap::new(),
 	}
 }
 

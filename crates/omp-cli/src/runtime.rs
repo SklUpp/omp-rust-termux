@@ -1431,6 +1431,18 @@ impl AgentRunner for PiAgentRunner {
 		// TS pre-LLM slot: plan reference, plan mode, goal mode, vibe, then the
 		// user message. This build carries no plan/vibe context, so the goal
 		// context is the last hidden message before the user turn.
+		// TS pre-LLM slot order: plan reference, plan mode, goal mode, then the
+		// user turn. The plan reference keeps the typed identity so later
+		// guidance scrub/replay does not treat it as a generic developer turn.
+		if let Some(context) = request
+			.plan_context
+			.as_deref()
+			.filter(|text| !text.trim().is_empty())
+		{
+			let mut message = pi_agent::Message::developer(context.to_string());
+			message.custom_type = Some("plan-mode".to_string());
+			messages.push(message);
+		}
 		if let Some(context) = &request.goal_context {
 			messages.push(pi_agent::Message::user(context.clone()));
 		}
@@ -5908,8 +5920,10 @@ mod tests {
 			credential_resolver: None,
 			plan_mode: Default::default(),
 			continuation: false,
+			plan_context: None,
+			service_tier_by_family: std::collections::BTreeMap::new(),
 		}
-	}
+}
 
 	fn yolo() -> Approvals {
 		Approvals::new(ApprovalMode::Yolo, Vec::new())

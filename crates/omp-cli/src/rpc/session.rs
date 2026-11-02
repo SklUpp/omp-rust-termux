@@ -1873,7 +1873,9 @@ impl RpcSession {
 			goal_context,
 			plan_mode: self.plan_mode.clone(),
 			continuation,
-		})
+			plan_context: None,
+			service_tier_by_family: std::collections::BTreeMap::new(),
+})
 	}
 
 	/// Persist one host-injected developer message (TS plan reminder) exactly

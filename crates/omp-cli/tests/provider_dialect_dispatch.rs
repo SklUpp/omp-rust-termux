@@ -95,6 +95,8 @@ fn wire_request(catalog: Catalog, provider: &str, model: &str, api_key: Option<&
 		credential_resolver: None,
 		plan_mode: Default::default(),
 		continuation: false,
+		plan_context: None,
+		service_tier_by_family: std::collections::BTreeMap::new(),
 	}
 }
 

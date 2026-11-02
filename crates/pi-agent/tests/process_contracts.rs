@@ -492,6 +492,14 @@ async fn cancelled_broker_pty_launch_reaps_os_child() {
 	assert!(alive(child_pid), "pty child {child_pid} was not running before cancellation");
 	task.abort();
 	let _ = task.await;
+	// `AbandonLaunch` only kills synchronously; the generation's settle task
+	// records the terminal state after `child.wait()` reaps. Wait on that
+	// contract (notify-driven) instead of racing `/proc` disappearance.
+	let settled = manager
+		.wait("cancel", None, WaitRequest { for_exit: true, pattern: None }, 2_000)
+		.await
+		.expect("wait for cancelled launch settlement");
+	assert!(!settled.timed_out, "cancelled broker launch never settled");
 	assert_reaped(child_pid).await;
 	assert!(
 		terminal(state_of(&manager, "cancel").unwrap_or(ProcessState::Exited)),

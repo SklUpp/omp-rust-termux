@@ -29,6 +29,8 @@ use crate::{
 
 /// TS `DEFAULT_PLAN_YOLO_TARGET`.
 pub const DEFAULT_TARGET: &str = "@smol";
+/// TS `PLAN_YOLO_HANDOFF_MESSAGE_TYPE`.
+pub const PLAN_YOLO_HANDOFF_TYPE: &str = "plan-yolo-handoff";
 
 const PLAN_YOLO_HANDOFF_PROMPT: &str = include_str!(
 	"../../../packages/coding-agent/src/prompts/system/plan-yolo-handoff.md"

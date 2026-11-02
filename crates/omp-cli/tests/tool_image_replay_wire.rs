@@ -3,7 +3,7 @@
 //! - Replay formats OpenAI Chat wire with grouped tool responses followed by a single user image message
 //! - Consecutive parallel tool results group their images without intermediate user messages
 //! - Image-only tool results use "(see attached image)" text placeholder on the tool message
-//! - Aborted turns with tool result images replay correctly
+//! - Aborted turns are excluded from replay: their partial results and images never reach the wire
 //! - Malformed/external image URLs fail closed before any HTTP request is issued
 //! - Legacy string-only tool results replay cleanly without synthetic image messages
 
@@ -17,7 +17,10 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 
-use omp_cli::session::{ContentPart, SessionOptions, SessionStore, ToolCallRecord, TurnRecord};
+use omp_cli::session::{
+	ContentPart, MessageContent, MessageEntry, SessionMessage, SessionOptions, SessionStore,
+	ToolCallRecord, TurnRecord,
+};
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -388,8 +391,91 @@ fn test_cli_image_only_tool_result_uses_placeholder_on_wire() {
 	server.stop();
 }
 
+/// A persisted array-shaped user message must replay as an array (its image
+/// part included), while a text user message stays a plain string: the stored
+/// content shape is what TS `openai-completions.ts:1974-1994` sends.
 #[test]
-fn test_cli_aborted_tool_turn_with_image_replays_properly() {
+fn test_cli_persisted_parts_user_message_keeps_array_content() {
+	let server = MockWireServer::start();
+	let base = temp_dir("parts-user-replay");
+	let (agent_dir, session_dir, cwd) = setup_dirs(&base, server.port);
+
+	let session_id = "sess-parts-user";
+	{
+		let mut store = SessionStore::open(&SessionOptions {
+			enabled: true,
+			cwd: cwd.clone(),
+			model: Some("mock/vision".to_string()),
+			provider: Some("mock".to_string()),
+			dir: Some(session_dir.clone()),
+			id: Some(session_id.to_string()),
+			continue_latest: false,
+			parent_session: None,
+			no_title: false,
+		});
+		assert!(store.enabled());
+		let entry = MessageEntry::new(
+			"user-parts-1",
+			None,
+			"2026-01-01T00:00:00Z",
+			SessionMessage::user(
+				MessageContent::Parts(vec![
+					ContentPart::text("array prompt"),
+					ContentPart::image("aW1nMQ==", "image/png"),
+				]),
+				0,
+			),
+		);
+		store.append_message(&entry).expect("append user parts");
+	}
+
+	let mut cmd = omp();
+	cmd.env("PI_CODING_AGENT_DIR", &agent_dir);
+	cmd.args([
+		"--cwd",
+		cwd.to_str().unwrap(),
+		"--session-dir",
+		session_dir.to_str().unwrap(),
+		"--resume",
+		session_id,
+		"--mode",
+		"text",
+		"--no-tools",
+		"next step",
+	]);
+	let out = cmd.output().expect("run resume command");
+	assert!(
+		out.status.success(),
+		"resume must succeed: {}",
+		String::from_utf8_lossy(&out.stderr)
+	);
+
+	let reqs = server.requests.lock().expect("lock").clone();
+	assert_eq!(reqs.len(), 1, "mock server must have received 1 request");
+	let messages = reqs[0]["messages"].as_array().expect("messages array");
+	assert_eq!(messages.len(), 2, "persisted user turn + new prompt: {messages:?}");
+
+	assert_eq!(messages[0]["role"], "user");
+	let parts = messages[0]["content"]
+		.as_array()
+		.expect("persisted parts content must stay an array");
+	assert_eq!(parts.len(), 2, "array content keeps both parts: {parts:?}");
+	assert_eq!(parts[0]["type"], "text");
+	assert_eq!(parts[0]["text"], "array prompt");
+	assert_eq!(parts[1]["type"], "image_url");
+	assert_eq!(parts[1]["image_url"]["url"], "data:image/png;base64,aW1nMQ==");
+
+	assert_eq!(messages[1]["role"], "user");
+	assert_eq!(
+		messages[1]["content"], "next step",
+		"a text user turn replays as a plain string, not a Text part array"
+	);
+
+	server.stop();
+}
+
+#[test]
+fn test_cli_aborted_tool_turn_with_image_is_excluded_from_replay() {
 	let server = MockWireServer::start();
 	let base = temp_dir("aborted-tool-img");
 	let (agent_dir, session_dir, cwd) = setup_dirs(&base, server.port);
@@ -458,11 +544,31 @@ fn test_cli_aborted_tool_turn_with_image_replays_properly() {
 	assert_eq!(reqs.len(), 1);
 	let messages = reqs[0]["messages"].as_array().expect("messages");
 
-	assert_eq!(messages[2]["role"], "tool");
-	assert_eq!(messages[2]["content"], "partial preview");
-	assert_eq!(messages[3]["role"], "user");
-	let parts = messages[3]["content"].as_array().expect("parts");
-	assert_eq!(parts[1]["image_url"]["url"], "data:image/png;base64,aW1nMQ==");
+	// TS `session-context.ts:561-582`: an aborted assistant and the contiguous
+	// tool results that belong to it are transcript events, not context. Only the
+	// two real user turns replay.
+	assert_eq!(
+		messages.len(),
+		2,
+		"the aborted turn must not replay: {messages:?}"
+	);
+	assert_eq!(messages[0]["role"], "user");
+	assert_eq!(messages[0]["content"], "start camera and interrupt");
+	assert_eq!(messages[1]["role"], "user");
+	assert_eq!(messages[1]["content"], "continue work");
+	assert!(
+		messages.iter().all(|message| message["role"] != "tool"),
+		"no tool result from the aborted turn may replay: {messages:?}"
+	);
+	let wire = serde_json::to_string(&messages).expect("serialize messages");
+	assert!(
+		!wire.contains("partial preview"),
+		"the interrupted partial result must not replay: {wire}"
+	);
+	assert!(
+		!wire.contains("aW1nMQ=="),
+		"the interrupted image must not replay: {wire}"
+	);
 
 	server.stop();
 }

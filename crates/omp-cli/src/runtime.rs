@@ -4942,14 +4942,18 @@ pub fn history_messages_from_entries(
 		let source = &entry.message;
 		match source.role.as_str() {
 			"user" => {
-				let parts = source.content.parts();
-				let mut message = if parts.is_empty() {
-					pi_agent::Message::user(source.content.text())
-				} else {
-					pi_agent::Message::user_with_parts(convert_content_parts(
-						&parts,
-						"session history",
-					)?)
+				// Preserve the persisted content shape: a text turn replays as a
+				// plain string, a parts turn keeps its array (images included).
+				// TS `openai-completions.ts:1974-1994` sends the stored shape, so
+				// flattening text into a single Text part changes the wire type.
+				let mut message = match &source.content {
+					crate::session::MessageContent::Parts(parts) => {
+						pi_agent::Message::user_with_parts(convert_content_parts(
+							parts,
+							"session history",
+						)?)
+					},
+					content => pi_agent::Message::user(content.text()),
 				};
 				apply_session_metadata(&mut message, source);
 				messages.push(message);

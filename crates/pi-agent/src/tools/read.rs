@@ -1286,8 +1286,9 @@ async fn read_bounded_regular(path: &Path, cap: u64) -> Option<Vec<u8>> {
 }
 
 /// Read at most `cap` bytes from the artifact descriptor the resolver already
-/// verified. A clone is rewound first, so the source descriptor's offset is
-/// untouched and no pathname is reopened.
+/// verified. The clone shares the descriptor's offset; artifact reads are
+/// sequential per call, so rewinding the clone first is safe and no pathname is
+/// reopened.
 async fn read_bounded_artifact(file: &std::fs::File, cap: u64) -> Option<Vec<u8>> {
 	let clone = file.try_clone().ok()?;
 	let mut file = tokio::fs::File::from_std(clone);
@@ -3450,6 +3451,60 @@ mod display_tests {
 		// A fresh resolution rejects the swapped leaf instead of following it.
 		let fresh = read_with(&tool, &dir, "artifact://0:raw").await;
 		assert!(fresh.is_error, "{}", fresh.content);
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn artifact_streaming_multirange_uses_the_verified_descriptor() {
+		use std::io::Write;
+
+		let dir = TempDir::new("artifact-swap-stream");
+		let artifacts = dir.0.join("artifacts");
+		fs::create_dir_all(&artifacts).expect("artifacts dir");
+		let leaf = artifacts.join("0.eval.log");
+		let outside = dir.0.join("outside.txt");
+		fs::write(&outside, "outside\n").expect("outside");
+		// Sparse tail keeps the fixture tiny while pushing the file past the
+		// 4 MiB snapshot threshold, so both ranges take the streaming arm.
+		{
+			let mut file = fs::File::create(&leaf).expect("artifact");
+			file.write_all(b"inside-1\ninside-2\n").expect("head");
+			file
+				.set_len(SNAPSHOT_MAX_BYTES + 64)
+				.expect("sparse tail");
+		}
+		let mut scope = UrlScope::default();
+		scope.local_roots.insert("local".to_string(), artifacts.clone());
+		let scope = Arc::new(scope);
+		let tool = ReadTool::new()
+			.with_internal_urls(Arc::new(InternalUrlRouter::new()), Arc::clone(&scope));
+		let ctx = AgentContext::new(dir.0.clone());
+		let parsed_url = InternalUrl::parse("artifact://0").expect("url");
+		let resolved = internal_urls_artifact::resolve_artifact(
+			&parsed_url,
+			&scope.resolve_context(&dir.0, &CancellationToken::new()),
+		)
+		.await
+		.expect("resolve");
+		assert!(resolved.size > SNAPSHOT_MAX_BYTES);
+
+		fs::remove_file(&leaf).expect("unlink leaf");
+		std::os::unix::fs::symlink(&outside, &leaf).expect("symlink leaf");
+
+		let selected = Sel::Lines {
+			ranges: vec![
+				LineRange { start_line: 1, end_line: Some(1) },
+				LineRange { start_line: 2, end_line: Some(2) },
+			],
+			raw:    true,
+		};
+		let result = tool
+			.read_resolved_artifact("artifact://0", resolved, &selected, &ctx)
+			.await
+			.expect("read executes");
+		assert!(!result.is_error, "{}", result.content);
+		assert_eq!(result.content, "inside-1\n\n…\n\ninside-2");
+		assert!(!result.content.contains("outside"), "{}", result.content);
 	}
 
 	#[tokio::test]

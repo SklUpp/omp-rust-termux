@@ -70,7 +70,7 @@ pub const CANCEL_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 pub const BOOTSTRAP_RACE_GUARD: Duration = Duration::from_millis(50);
 /// TS `ACP_TEXT_LIMIT`.
 pub const ACP_TEXT_LIMIT: usize = 4_000;
-/// Reverse-call observation interval.
+/// Reverse-call / cancel-cleanup observation interval.
 const CANCEL_POLL: Duration = Duration::from_millis(50);
 
 /// Immutable per-connection recipe resolved by the CLI hook.
@@ -737,13 +737,13 @@ impl AcpSession {
 				text = format!("{prefix}\n\n{text}");
 			}
 		}
-		self.gate.begin();
+		let generation = self.gate.begin();
 		if let Err(error) = self.ensure_open() {
-			self.gate.end();
+			self.gate.release(generation);
 			return Err(error);
 		}
 		let (tx, rx) = mpsc::channel();
-		self.spawn_turn(text, images, tx)?;
+		self.spawn_turn(text, images, tx, generation)?;
 		loop {
 			match rx.recv_timeout(CANCEL_POLL) {
 				Ok(done) => {
@@ -770,13 +770,14 @@ impl AcpSession {
 					if self.gate.cancel_requested() {
 						// The prompt response resolves cancelled immediately (TS
 						// `#beginCancelCleanup`); cleanup stays bounded and may
-						// close the session.
-						self.spawn_cleanup_monitor(rx);
+						// close the session, but only while this prompt still
+						// owns the gate.
+						self.spawn_cleanup_monitor(rx, generation);
 						return Ok(json!({ "stopReason": "cancelled" }));
 					}
 				},
 				Err(RecvTimeoutError::Disconnected) => {
-					self.gate.end();
+					self.gate.release(generation);
 					return Err(RequestError::internal_error().with_detail("ACP turn worker stopped"));
 				},
 			}
@@ -785,20 +786,30 @@ impl AcpSession {
 
 	/// Start the detached plan continuation after the prompt response was
 	/// handed to the transport. Owns the gate (busy surface) and the turn
-	/// token, so a later `session/cancel` reaches it.
+	/// token, so a later `session/cancel` reaches it, and gets the same bounded
+	/// cancel cleanup as a client prompt: an unresponsive continuation closes
+	/// the session instead of leaving it busy forever.
 	pub(crate) fn start_pending_continuation(self: &Arc<Self>) {
-		let claimed = self.lock_plan().take_continuation();
+		// Only the autonomous handoff owns the queue. A prompt answered
+		// `session_busy`, or a second response while the worker is running, must
+		// not claim the same continuation again.
+		let Some(generation) = self.gate.claim_continuation() else {
+			return;
+		};
+		let claimed = !self.is_closed()
+			&& !self.gate.cancel_requested()
+			&& self.lock_plan().take_continuation();
 		if !claimed {
-			// Non-plan prompts already ended their gate; never clear a prompt
-			// that began after that point. Autonomous ownership is released only
-			// if this session still holds it (guarded: plain active is a no-op).
-			self.gate.release_autonomous();
+			// Closed or cancelled between the handoff and this call: the
+			// cancelled response already left, so nothing may run. Otherwise the
+			// queue was empty and autonomy is simply released.
+			if self.is_closed() || self.gate.cancel_requested() {
+				self.lock_plan().discard_queued_continuation();
+			}
+			self.gate.release(generation);
 			return;
 		}
-		if self.is_closed() {
-			self.gate.release_autonomous();
-			return;
-		}
+		let (tx, rx) = mpsc::channel();
 		let session = Arc::clone(self);
 		let spawned = thread::Builder::new()
 			.name(format!("omp-acp-plan-cont-{}", self.id))
@@ -824,18 +835,28 @@ impl AcpSession {
 						}));
 						break;
 					}
+					// A cancelled continuation never starts another cycle.
+					if session.gate.cancel_requested() {
+						session.lock_plan().discard_queued_continuation();
+						break;
+					}
 					// Tool progress cleared the awaiting gate, so settle may have
 					// scheduled the next reminder cycle (cap-bounded upstream).
 					if !session.lock_plan().take_continuation() {
 						break;
 					}
 				}
-				session.gate.end();
+				// Guarded: a newer prompt that took the gate after a forced close
+				// is not released by this stale finalizer.
+				session.gate.release(generation);
+				let _ = tx.send(());
 			});
 		if spawned.is_err() {
 			// Nothing ran: keep the persisted reminder but drop the schedule.
-			self.gate.release_autonomous();
+			self.gate.release(generation);
+			return;
 		}
+		self.spawn_cleanup_monitor(rx, generation);
 	}
 
 	fn spawn_turn(
@@ -843,6 +864,7 @@ impl AcpSession {
 		text: String,
 		images: Vec<RpcImage>,
 		tx: Sender<TurnDone>,
+		generation: u64,
 	) -> Result<(), RequestError> {
 		let session = Arc::clone(self);
 		thread::Builder::new()
@@ -861,34 +883,57 @@ impl AcpSession {
 					},
 				};
 				*session.token.lock().unwrap_or_else(PoisonError::into_inner) = None;
-				if done.error.is_none() && session.lock_plan().has_continuation() {
+				if done.error.is_none()
+					&& !session.gate.cancel_requested()
+					&& session.lock_plan().has_continuation()
+				{
 					// The successful response is about to leave; the gate stays
 					// owned and autonomous until the detached continuation ends.
 					session.gate.switch_to_autonomous();
 				} else {
-					// Error responses never reach `after_response`, so nothing may
-					// be left queued: drop the schedule and free the gate here.
+					// Error and cancelled responses never start the continuation,
+					// so nothing may be left queued: drop the schedule and free
+					// the gate here.
 					session.lock_plan().discard_queued_continuation();
-					session.gate.end();
+					session.gate.release(generation);
 				}
 				let _ = tx.send(done);
 			})
 			.map(|_| ())
 			.map_err(|error| {
-				self.gate.end();
+				self.gate.release(generation);
 				RequestError::internal_error()
 					.with_detail(format!("cannot start ACP turn worker: {error}"))
 			})
 	}
 
-	fn spawn_cleanup_monitor(self: &Arc<Self>, rx: Receiver<TurnDone>) {
+	/// Bounded cleanup for one owner: wait for its worker, and once a cancel is
+	/// signalled give that worker at most [`CANCEL_CLEANUP_TIMEOUT`] to unwind
+	/// before closing its session. Normal completion only returns, so the
+	/// watchdog neither keeps the session alive nor touches newer owners.
+	fn spawn_cleanup_monitor<T: Send + 'static>(self: &Arc<Self>, rx: Receiver<T>, generation: u64) {
 		let session = Arc::clone(self);
 		let _ = thread::Builder::new()
 			.name(format!("omp-acp-cancel-{}", self.id))
 			.spawn(move || {
-				if rx.recv_timeout(CANCEL_CLEANUP_TIMEOUT).is_err() {
-					session.force_close("ACP cancel cleanup timed out");
+				let mut cancel_seen: Option<Instant> = None;
+				loop {
+					match rx.recv_timeout(CANCEL_POLL) {
+						Ok(_) => return,
+						// The worker died without completing: free the gate.
+						Err(RecvTimeoutError::Disconnected) => break,
+						Err(RecvTimeoutError::Timeout) => {},
+					}
+					if session.gate.cancel_requested() {
+						let seen = *cancel_seen.get_or_insert_with(Instant::now);
+						if seen.elapsed() >= CANCEL_CLEANUP_TIMEOUT {
+							break;
+						}
+					} else {
+						cancel_seen = None;
+					}
 				}
+				session.force_close_if_generation(generation, "ACP cancel cleanup timed out");
 			});
 	}
 
@@ -1114,9 +1159,24 @@ impl AcpSession {
 	/// Close after a timeout without waiting for the wedged turn, matching TS
 	/// `cancel()` closing the session once its cleanup barrier rejects.
 	pub fn force_close(&self, reason: &str) {
+		self.gate.abort();
+		self.finish_forced_close(reason);
+	}
+
+	/// Bounded cleanup hook: close only the owner generation that timed out, so
+	/// a stale watchdog can never close a newer prompt or session generation.
+	/// Returns false without touching any state when a newer owner took over.
+	pub(crate) fn force_close_if_generation(&self, generation: u64, reason: &str) -> bool {
+		if !self.gate.claim_close(generation) {
+			return false;
+		}
+		self.finish_forced_close(reason);
+		true
+	}
+
+	fn finish_forced_close(&self, reason: &str) {
 		*self.lock_closed() = Some(reason.to_string());
 		self.signal_cancel();
-		self.gate.abort();
 		if let Some(hook) = self
 			.on_close
 			.lock()
@@ -1354,6 +1414,14 @@ struct GateState {
 	cancel_requested: bool,
 	/// A detached plan continuation owns the session.
 	autonomous: bool,
+	/// The autonomous handoff was consumed by the detached worker; a second
+	/// prompt response (for example one answered `session_busy`) must not claim
+	/// the same continuation queue again.
+	continuation_claimed: bool,
+	/// Owner generation, bumped by every [`PromptGate::begin`]. A cleanup
+	/// watchdog or continuation finalizer from an older owner can never release
+	/// or close a newer one.
+	generation: u64,
 }
 
 impl PromptGate {
@@ -1377,7 +1445,7 @@ impl PromptGate {
 		self.lock().active
 	}
 
-	fn begin(&self) {
+	fn begin(&self) -> u64 {
 		let mut state = self.lock();
 		while state.active {
 			state = self
@@ -1387,14 +1455,44 @@ impl PromptGate {
 		}
 		state.active = true;
 		state.cancel_requested = false;
+		state.autonomous = false;
+		state.continuation_claimed = false;
+		state.generation = state.generation.wrapping_add(1);
+		state.generation
 	}
 
-	fn end(&self) {
+	/// Release the gate only while `generation` still owns it. A stale
+	/// finalizer running after a newer prompt took over is a no-op.
+	fn release(&self, generation: u64) -> bool {
 		let mut state = self.lock();
+		if state.generation != generation {
+			return false;
+		}
 		state.active = false;
 		state.cancel_requested = false;
 		state.autonomous = false;
+		state.continuation_claimed = false;
 		self.wake.notify_all();
+		true
+	}
+
+	/// Claim the forced close for the exact owner that timed out. Atomic with
+	/// the generation check, so a newer prompt can never observe a half-closed
+	/// gate. Returns false when a newer owner already took over.
+	fn claim_close(&self, generation: u64) -> bool {
+		let mut state = self.lock();
+		if state.generation != generation {
+			return false;
+		}
+		state.active = false;
+		state.cancel_requested = true;
+		state.autonomous = false;
+		state.continuation_claimed = false;
+		// Invalidate the owner: its finalizer and a second watchdog claim are
+		// both no-ops once the close was claimed.
+		state.generation = state.generation.wrapping_add(1);
+		self.wake.notify_all();
+		true
 	}
 
 	/// A client prompt during an autonomous turn is a protocol busy error, not
@@ -1411,6 +1509,19 @@ impl PromptGate {
 		state.active = true;
 		state.cancel_requested = false;
 		state.autonomous = true;
+		state.continuation_claimed = false;
+	}
+
+	/// Consume the autonomous handoff for the detached continuation worker.
+	/// `None` when no handoff is pending or one was already claimed, so a prompt
+	/// answered `session_busy` can never start a second worker.
+	fn claim_continuation(&self) -> Option<u64> {
+		let mut state = self.lock();
+		if !state.autonomous || state.continuation_claimed {
+			return None;
+		}
+		state.continuation_claimed = true;
+		Some(state.generation)
 	}
 
 	fn abort(&self) {
@@ -1418,19 +1529,8 @@ impl PromptGate {
 		state.active = false;
 		state.cancel_requested = true;
 		state.autonomous = false;
+		state.continuation_claimed = false;
 		self.wake.notify_all();
-	}
-
-	/// Release only an autonomous ownership this session established; a normal
-	/// prompt gate is left untouched.
-	fn release_autonomous(&self) {
-		let mut state = self.lock();
-		if state.autonomous {
-			state.active = false;
-			state.cancel_requested = false;
-			state.autonomous = false;
-			self.wake.notify_all();
-		}
 	}
 
 	fn wait_idle(&self, timeout: Duration) -> bool {
@@ -3436,27 +3536,64 @@ mod tests {
 	}
 
 	#[test]
-	fn plan_gate_release_autonomous_does_not_clear_client_prompt() {
-		// A stale continuation finalizer runs after a newer client prompt took
-		// the gate: releasing must be a guarded no-op, not an `end`.
+	fn plan_gate_continuation_handoff_is_claimed_once() {
+		// The prompt response hands the gate to the detached worker; a prompt
+		// answered `session_busy` while that worker runs must not claim the same
+		// continuation queue and start a second worker.
 		let gate = PromptGate::default();
-		gate.begin();
-		gate.release_autonomous();
-		assert!(gate.is_active());
-		assert!(!gate.is_autonomous());
-		gate.end();
+		let owner = gate.begin();
+		gate.switch_to_autonomous();
+		assert!(gate.is_autonomous());
+		assert_eq!(gate.claim_continuation(), Some(owner));
+		assert_eq!(gate.claim_continuation(), None, "second response claims the queue");
+		assert!(gate.is_active() && gate.is_autonomous());
+		assert!(gate.release(owner));
+		assert!(!gate.is_active());
 	}
 
 	#[test]
-	fn plan_gate_release_autonomous_frees_autonomous_owner() {
+	fn plan_gate_stale_finalizer_never_releases_newer_prompt() {
 		let gate = PromptGate::default();
-		gate.begin();
+		let old = gate.begin();
 		gate.switch_to_autonomous();
-		assert!(gate.is_autonomous());
-		gate.release_autonomous();
-		assert!(!gate.is_active());
-		gate.begin();
+		assert!(gate.claim_continuation().is_some());
+		assert!(gate.release(old), "owner releases its own gate");
+		let newer = gate.begin();
+		assert_ne!(newer, old);
+		assert!(!gate.release(old), "stale finalizer released a newer prompt");
 		assert!(gate.is_active());
-		gate.end();
+		assert!(!gate.is_autonomous());
+		assert!(gate.release(newer));
+	}
+
+	#[test]
+	fn plan_gate_stale_cleanup_never_closes_newer_prompt() {
+		// A cancel watchdog whose owner already unwound must not close the prompt
+		// that took the gate afterwards; only the current generation may be
+		// claimed, and the claim is atomic with the generation check.
+		let gate = PromptGate::default();
+		let old = gate.begin();
+		assert!(gate.release(old));
+		let newer = gate.begin();
+		assert!(!gate.claim_close(old), "stale watchdog closed a newer prompt");
+		assert!(gate.is_active());
+		assert!(!gate.cancel_requested());
+		assert!(gate.claim_close(newer));
+		assert!(!gate.is_active());
+		assert!(gate.cancel_requested());
+	}
+
+	#[test]
+	fn plan_gate_cancelled_continuation_owner_closes_only_once() {
+		// The detached continuation owns the generation the prompt began; a
+		// cancel watchdog may close it, and the finalizer that unwinds afterwards
+		// must not resurrect or re-release the gate.
+		let gate = PromptGate::default();
+		let owner = gate.begin();
+		gate.switch_to_autonomous();
+		assert_eq!(gate.claim_continuation(), Some(owner));
+		assert!(gate.claim_close(owner), "watchdog closes its owner");
+		assert!(!gate.is_active());
+		assert!(!gate.release(owner), "finalizer after the close is a no-op");
 	}
 }

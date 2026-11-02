@@ -43,6 +43,12 @@ class Provider:
     def __init__(self, model: str = "mock-model") -> None:
         self.model = model
         self.requests = 0
+        # Detached plan continuations: when armed, the reminder turn streams one
+        # chunk, stalls past the ACP cancel cleanup timeout, then emits a late
+        # chunk that a cancelled session must never publish.
+        self.hang_continuation = False
+        self.hang_seconds = 2.0
+        self.continuation_started = threading.Event()
         self.lock = threading.Lock()
         provider = self
 
@@ -105,6 +111,16 @@ class Provider:
 
         if tool_after_user:
             yield chunk({"role": "assistant", "content": "tool done"})
+            yield chunk({}, "stop")
+            yield "data: [DONE]"
+            return
+
+        if self.hang_continuation and "Plan mode turn ended without a required tool call." in last_user:
+            self.continuation_started.set()
+            yield chunk({"role": "assistant", "content": "continuation delta"})
+            time.sleep(self.hang_seconds)
+            # Only reaches a live reader; a cancelled session closed the socket.
+            yield chunk({"role": "assistant", "content": "orphan delta"})
             yield chunk({}, "stop")
             yield "data: [DONE]"
             return
@@ -521,14 +537,55 @@ def run(binary: str) -> None:
         )
         assert_eq(resumed_prompt["stopReason"], "end_turn", "resume prompt")
 
-        # 9. fork
+        # 9. cancel a detached plan continuation: the prompt response leaves
+        # first, the reminder turn stalls, and `session/cancel` must end
+        # ownership within the bounded cleanup window instead of leaving the
+        # session busy forever or publishing the orphaned continuation.
+        plan_session = client.request("session/new", {"cwd": cwd, "mcpServers": []})["sessionId"]
+        client.request("session/set_mode", {"sessionId": plan_session, "modeId": "plan"})
+        provider.hang_continuation = True
+        mark = client.mark()
+        plan_prompt = client.request(
+            "session/prompt",
+            {"sessionId": plan_session, "prompt": [{"type": "text", "text": "draft the plan"}]},
+            PROMPT_TIMEOUT,
+        )
+        assert_eq(plan_prompt["stopReason"], "end_turn", "plan prompt response")
+        assert provider.continuation_started.wait(10.0), (
+            f"detached continuation never reached the provider; stderr={client.stderr[-8:]!r}"
+        )
+        # Disarm first: a retry of the interrupted request must not stall again.
+        provider.hang_continuation = False
+        client.notify("session/cancel", {"sessionId": plan_session})
+        deadline = time.monotonic() + PROMPT_TIMEOUT
+        resolved = None
+        while time.monotonic() < deadline:
+            error = client.request_error(
+                "session/prompt",
+                {"sessionId": plan_session, "prompt": [{"type": "text", "text": "after continuation cancel"}]},
+            )
+            if error is None:
+                resolved = "accepted"
+                break
+            if error.get("code") == -32003:  # session_busy is bounded, never permanent
+                time.sleep(0.2)
+                continue
+            resolved = f"closed: {error.get('message')}"
+            break
+        assert resolved, "cancel left the detached continuation busy indefinitely"
+        # A cancelled continuation may not publish its late chunk.
+        time.sleep(provider.hang_seconds + 1.0)
+        late = [update for update in client.updates_since(mark, plan_session) if "orphan delta" in chunk_text([update])]
+        assert not late, f"orphaned continuation published after cancel: {late!r}"
+
+        # 10. fork
         forked = client.request("session/fork", {"sessionId": session_id, "cwd": cwd})
         fork_id = forked["sessionId"]
         assert fork_id and fork_id != session_id, "fork identity"
         listing = client.request("session/list", {"cwd": cwd})
         assert {session_id, fork_id} <= {session["sessionId"] for session in listing["sessions"]}, "fork listed"
 
-        # 10. load replays history before the response
+        # 11. load replays history before the response
         client.request("session/close", {"sessionId": session_id})
         client.request("session/close", {"sessionId": fork_id})
         mark = client.mark()
@@ -538,7 +595,7 @@ def run(binary: str) -> None:
         assert any(u.get("sessionUpdate") == "user_message_chunk" for u in replayed), "load replay user"
         assert any(u.get("sessionUpdate") == "agent_message_chunk" for u in replayed), "load replay assistant"
 
-        # 11. malformed line + unknown method keep the connection alive
+        # 12. malformed line + unknown method keep the connection alive
         client.send_raw("{not json")
         parse_error = client.wait_frame(lambda f: f.get("error", {}).get("code") == -32700)
         assert parse_error, "parse error"
@@ -547,7 +604,7 @@ def run(binary: str) -> None:
         again = client.request("initialize", {"protocolVersion": 1, "clientCapabilities": {}})
         assert_eq(again["protocolVersion"], 1, "connection alive")
 
-        # 12. EOF cleanup
+        # 13. EOF cleanup
         client.close_stdin()
         code = client.wait_exit(10.0)
         assert code is not None, f"process did not exit on EOF; stderr={client.stderr[-20:]!r}"

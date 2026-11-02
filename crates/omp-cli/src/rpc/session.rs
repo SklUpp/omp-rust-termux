@@ -422,6 +422,18 @@ impl RpcSession {
 				"cannot run RPC on a legacy v1 session log: read-only; use import_legacy_v1",
 			));
 		}
+		// Every persisted session owns a `local://` artifact directory. Tools
+		// may be configured without eval, so its creation cannot depend on the
+		// eval mount; plan writes fail without this root.
+		if store.enabled()
+			&& let Some(artifacts) = store.file().and_then(session::artifacts_directory_for)
+			&& let Err(err) = std::fs::create_dir_all(&artifacts)
+		{
+			return Err(Error::new(format!(
+				"cannot create session artifacts directory {}: {err}",
+				artifacts.display()
+			)));
+		}
 		let thinking_level = thinking.and_then(|level| match level {
 			runtime::CliThinking::Off => Some("off".to_string()),
 			runtime::CliThinking::Auto => None,

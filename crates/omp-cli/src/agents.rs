@@ -510,27 +510,37 @@ pub fn print_unpack(summary: &UnpackSummary, json: bool) -> Result<()> {
 }
 
 /// Serialize one agent in the same frontmatter shape the TypeScript loader
-/// writes. Fields this build does not round-trip (`readSummarize`, `prewalk`,
-/// `advisor`, `autoloadSkills`) are intentionally omitted, matching
-/// `toFrontmatter`.
+/// writes. Every field `parse_agent` populates is written back, including
+/// explicit empty `tools`/`spawns` allowlists and the `readSummarize`,
+/// `prewalk`, `advisor`, `autoloadSkills` metadata. The runtime still rejects
+/// the unsupported hand-off/skill capabilities at spawn time.
 pub fn serialize_agent(agent: &AgentDefinition) -> String {
 	let mut frontmatter = String::new();
 	yaml_scalar(&mut frontmatter, "name", &agent.name);
 	yaml_scalar(&mut frontmatter, "description", &agent.description);
-	if let Some(tools) = &agent.tools
-		&& !tools.is_empty()
-	{
-		frontmatter.push_str("tools: \n");
-		for tool in tools {
-			frontmatter.push_str("  - ");
-			frontmatter.push_str(&yaml_quote(tool));
-			frontmatter.push('\n');
+	if let Some(tools) = agent.tools.as_deref() {
+		// `Some([])` means "no tools"; omitting the key would inherit the
+		// session tool set on the next load.
+		if tools.is_empty() {
+			frontmatter.push_str("tools: []\n");
+		} else {
+			frontmatter.push_str("tools: \n");
+			for tool in tools {
+				frontmatter.push_str("  - ");
+				frontmatter.push_str(&yaml_quote(tool));
+				frontmatter.push('\n');
+			}
 		}
 	}
 	if let Some(spawns) = &agent.spawns {
 		match spawns {
 			Spawns::All => yaml_scalar(&mut frontmatter, "spawns", "*"),
-			Spawns::Only(names) if !names.is_empty() => {
+			Spawns::Only(names) if names.is_empty() => {
+				// Explicit empty allowlist disables spawning; omitting it would
+				// let a `task` tool re-infer `spawns: "*"` on the next load.
+				frontmatter.push_str("spawns: []\n");
+			},
+			Spawns::Only(names) => {
 				frontmatter.push_str("spawns: \n");
 				for name in names {
 					frontmatter.push_str("  - ");
@@ -538,7 +548,6 @@ pub fn serialize_agent(agent: &AgentDefinition) -> String {
 					frontmatter.push('\n');
 				}
 			},
-			Spawns::Only(_) => {},
 		}
 	}
 	if !agent.model.is_empty() {
@@ -559,7 +568,38 @@ pub fn serialize_agent(agent: &AgentDefinition) -> String {
 	if agent.blocking {
 		frontmatter.push_str("blocking: true\n");
 	}
+	if let Some(read_summarize) = agent.read_summarize {
+		frontmatter.push_str(if read_summarize {
+			"readSummarize: true\n"
+		} else {
+			"readSummarize: false\n"
+		});
+	}
+	if let Some(prewalk) = &agent.prewalk {
+		yaml_handoff(&mut frontmatter, "prewalk", prewalk);
+	}
+	if let Some(advisor) = &agent.advisor {
+		yaml_handoff(&mut frontmatter, "advisor", advisor);
+	}
+	if !agent.autoload_skills.is_empty() {
+		frontmatter.push_str("autoloadSkills: \n");
+		for skill in &agent.autoload_skills {
+			frontmatter.push_str("  - ");
+			frontmatter.push_str(&yaml_quote(skill));
+			frontmatter.push('\n');
+		}
+	}
 	format!("---\n{frontmatter}---\n\n{}\n", agent.system_prompt.trim())
+}
+
+fn yaml_handoff(output: &mut String, key: &str, target: &HandoffTarget) {
+	output.push_str(key);
+	output.push_str(": ");
+	match target {
+		HandoffTarget::Default => output.push_str("true"),
+		HandoffTarget::Pattern(pattern) => output.push_str(&yaml_quote(pattern)),
+	}
+	output.push('\n');
 }
 
 fn yaml_scalar(output: &mut String, key: &str, value: &str) {
@@ -827,6 +867,77 @@ mod tests {
 		assert_eq!(parsed.output, scout.output);
 		assert_eq!(parsed.spawns, scout.spawns);
 		assert_eq!(parsed.system_prompt, scout.system_prompt);
+	}
+
+	#[test]
+	fn serialized_agent_preserves_handoff_and_skill_metadata() {
+		let source = concat!(
+			"---\n",
+			"name: custom\n",
+			"description: \"Round-trip agent\"\n",
+			"tools: [read, task]\n",
+			"spawns: [scout]\n",
+			"model: \"@big:high\"\n",
+			"thinkingLevel: high\n",
+			"output:\n",
+			"  type: object\n",
+			"blocking: true\n",
+			"readSummarize: false\n",
+			"prewalk: \"gpt-5\"\n",
+			"advisor: true\n",
+			"autoloadSkills: [review, deploy]\n",
+			"---\nbody\n",
+		);
+		let first = parse_agent("custom.md", source, AgentSource::Project).expect("parse");
+		assert_eq!(first.prewalk, Some(HandoffTarget::Pattern("gpt-5".to_string())));
+		assert_eq!(first.advisor, Some(HandoffTarget::Default));
+		assert_eq!(first.read_summarize, Some(false));
+		assert_eq!(first.autoload_skills, vec!["review".to_string(), "deploy".to_string()]);
+		let serialized = serialize_agent(&first);
+		let second = parse_agent("custom.md", &serialized, AgentSource::Project).expect("reparse");
+		assert_eq!(second.tools, first.tools);
+		assert_eq!(second.spawns, first.spawns);
+		assert_eq!(second.model, first.model);
+		assert_eq!(second.thinking_level, first.thinking_level);
+		assert_eq!(second.output, first.output);
+		assert_eq!(second.blocking, first.blocking);
+		assert_eq!(second.read_summarize, first.read_summarize);
+		assert_eq!(second.prewalk, first.prewalk);
+		assert_eq!(second.advisor, first.advisor);
+		assert_eq!(second.autoload_skills, first.autoload_skills);
+		assert_eq!(second.system_prompt, first.system_prompt);
+		assert_eq!(serialize_agent(&second), serialized, "serialization is not idempotent");
+	}
+
+	#[test]
+	fn serialized_agent_preserves_explicit_empty_allowlists() {
+		let empty = parse_agent(
+			"empty.md",
+			"---\nname: bare\ndescription: none\ntools: []\nspawns: []\n---\nbody\n",
+			AgentSource::Project,
+		)
+		.expect("empty");
+		assert_eq!(empty.tools, Some(Vec::new()));
+		assert_eq!(empty.spawns, Some(Spawns::Only(Vec::new())));
+		let serialized = serialize_agent(&empty);
+		let parsed = parse_agent("empty.md", &serialized, AgentSource::Project).expect("reparse");
+		assert_eq!(parsed.tools, Some(Vec::new()));
+		assert_eq!(parsed.spawns, Some(Spawns::Only(Vec::new())));
+
+		// An explicit empty spawns list must not be re-inferred from `task`.
+		let spawnless = parse_agent(
+			"spawnless.md",
+			"---\nname: spawnless\ndescription: none\ntools: [read, task]\nspawns: []\n---\nbody\n",
+			AgentSource::Project,
+		)
+		.expect("spawnless");
+		let reparsed = parse_agent(
+			"spawnless.md",
+			&serialize_agent(&spawnless),
+			AgentSource::Project,
+		)
+		.expect("reparse spawnless");
+		assert_eq!(reparsed.spawns, Some(Spawns::Only(Vec::new())));
 	}
 
 	#[test]

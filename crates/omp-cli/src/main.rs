@@ -71,6 +71,21 @@ impl CliError {
 	}
 }
 
+/// Prewalk and plan-yolo both own the one-way model switch. Reject an
+/// effective pair from flags or settings before any session/provider starts.
+fn reject_dual_startup_arms(
+	prewalk_armed: bool,
+	plan_yolo_armed: bool,
+) -> std::result::Result<(), CliError> {
+	if prewalk_armed && plan_yolo_armed {
+		return Err(CliError::usage(
+			"--plan-yolo cannot be combined with an effective prewalk arm \
+			 (--prewalk, --prewalk-into, or prewalk.enabled); choose one startup switch",
+		));
+	}
+	Ok(())
+}
+
 fn base_dir(cli: &Cli) -> Result<PathBuf> {
 	match &cli.cwd {
 		Some(cwd) => Ok(dirs::absolute(&std::env::current_dir()?, cwd)),
@@ -754,6 +769,7 @@ fn run() -> std::result::Result<(), CliError> {
 		requested_api_key.as_deref(),
 	)
 	.map_err(CliError::fail)?;
+	reject_dual_startup_arms(prewalk_policy.arm.is_some(), plan_yolo_arm.is_some())?;
 
 	// Pre-resolve session target
 	let mut chosen_file: Option<PathBuf> = None;
@@ -1011,6 +1027,7 @@ fn run() -> std::result::Result<(), CliError> {
 			session.api_key.as_deref(),
 		)
 		.map_err(CliError::fail)?;
+		reject_dual_startup_arms(fresh_prewalk.arm.is_some(), plan_yolo_arm.is_some())?;
 		let mut recipe = acp::AcpRecipe::new(
 			runner,
 			session.config.clone(),
@@ -2806,7 +2823,9 @@ impl Session<'_> {
 								decision.continue_turn = true;
 								decision.tool_selection = plan_yolo_tools_restore
 									.as_ref()
-									.map(|tools| tools.restore());
+									.map(|tools| pi_agent::TurnToolSelection::Hide(
+										tools.hidden_by_plan(),
+									));
 								eprintln!("{}", commit.notice);
 								*plan_yolo_switch =
 									Some((target, switch_thinking, api_key));

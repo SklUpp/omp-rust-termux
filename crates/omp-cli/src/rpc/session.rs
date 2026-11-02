@@ -1048,7 +1048,9 @@ impl RpcSession {
 		&mut self,
 		shared: Arc<crate::plan_yolo::PlanYoloShared>,
 	) {
-		self.plan_mode = crate::plan_yolo::plan_hooks(&shared, self.plan_artifacts());
+		// The hooks are published by `arm_plan_yolo` only after the gate and
+		// tool selection are provably usable, so a failed arm leaves the
+		// ordinary/default hooks in place.
 		self.plan_yolo = Some(shared);
 	}
 
@@ -1745,8 +1747,11 @@ impl RpcSession {
 		let Some(arming) = shared.arm() else {
 			return Ok(());
 		};
+		let previous_plan_mode = self.plan_mode.clone();
 		let Some(artifacts) = self.plan_artifacts() else {
 			shared.rollback_arm(arming);
+			shared.abandon();
+			self.plan_mode = previous_plan_mode.clone();
 			return Err(Error::new(
 				"plan-yolo requires a persisted session for plan artifacts",
 			));
@@ -1758,6 +1763,8 @@ impl RpcSession {
 			Ok(tools) => tools,
 			Err(error) => {
 				shared.rollback_arm(arming);
+				shared.abandon();
+				self.plan_mode = previous_plan_mode;
 				return Err(Error::new(error));
 			},
 		};
@@ -2938,7 +2945,9 @@ impl RpcSession {
 					));
 					decision.continue_turn = true;
 					decision.tool_selection =
-						self.plan_yolo_tools.as_ref().map(|tools| tools.restore());
+						self.plan_yolo_tools.as_ref().map(|tools| {
+							pi_agent::TurnToolSelection::Hide(tools.hidden_by_plan())
+						});
 					eprintln!("{}", commit.notice);
 					self.provider = Some(target.provider);
 					self.model = Some(target.model);

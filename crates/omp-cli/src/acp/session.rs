@@ -649,14 +649,17 @@ impl AcpSession {
 			.lock()
 			.append_mode_change(persisted.0, persisted.1)
 			.map_err(|error| RequestError::new(INTERNAL_ERROR, error.to_string()))?;
-		// A plan-yolo turn leaves the session with no plan hooks after its
-		// cutover. A later manual `plan` entry must install the ordinary guard,
-		// proposal and policy again, sharing the same live gate.
-		if mode_id == plan::ACP_PLAN_MODE_ID
-			&& self.plan_yolo.as_ref().is_none_or(|shared| shared.is_completed())
-		{
-			let hooks = self.ordinary_plan_hooks();
-			self.lock().set_plan_mode(hooks);
+		// Leaving plan mode abandons an incomplete one-shot arm. Whenever the
+		// arm is inactive, restore ordinary standing hooks sharing this gate;
+		// this is true for a completed cutover and for an abandoned/failed arm.
+		if let Some(shared) = self.plan_yolo.as_ref() {
+			if mode_id == plan::ACP_DEFAULT_MODE_ID && shared.is_armed() {
+				shared.abandon();
+			}
+			if !shared.is_armed() {
+				let hooks = self.ordinary_plan_hooks();
+				self.lock().set_plan_mode(hooks);
+			}
 		}
 		self.emit_update(json!({
 			"sessionUpdate": "current_mode_update",
@@ -834,7 +837,9 @@ impl AcpSession {
 		let (text, images) = convert_prompt_blocks(prompt)?;
 		let mut text = text;
 		let ordinary_plan = self.runtime.recipe.tools_enabled
-			&& self.plan_yolo.as_ref().is_none_or(|shared| shared.is_completed());
+			&& self.plan_yolo.as_ref().is_none_or(|shared| {
+				shared.is_completed() || shared.is_abandoned()
+			});
 		if ordinary_plan {
 			// Approved-plan pointer: injected once on the first prompt after
 			// approval, and only when the file is actually readable. A failed
@@ -1016,7 +1021,7 @@ impl AcpSession {
 						if session
 							.plan_yolo
 							.as_ref()
-							.is_some_and(|shared| shared.is_completed())
+							.is_some_and(|shared| !shared.is_armed())
 						{
 							let hooks = session.ordinary_plan_hooks();
 							session.lock().set_plan_mode(hooks);
@@ -1190,7 +1195,7 @@ impl AcpSession {
 		if self
 			.plan_yolo
 			.as_ref()
-			.is_some_and(|shared| shared.is_completed())
+			.is_some_and(|shared| !shared.is_armed())
 		{
 			// The one-shot cutover cleared the plan hooks in `finish_turn`. Put
 			// the ordinary standing hooks back now, so any later manual plan

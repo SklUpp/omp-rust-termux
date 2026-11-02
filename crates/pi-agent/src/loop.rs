@@ -161,9 +161,15 @@ pub struct TurnAckDecision {
 	/// the run started with.
 	pub context_limit: Option<usize>,
 	/// Replace the live tool selection before the next provider request.
-	/// `Some(None)` means the full registry; `Some(Some(names))` keeps only
-	/// those internal names. `None` leaves the selection unchanged.
-	pub tool_selection: Option<Option<Vec<String>>>,
+	/// Hiding is deliberately a delta: mounted MCP/host tools that were never
+	/// in the config allowlist must not be filtered by an exhaustive snapshot.
+	pub tool_selection: Option<TurnToolSelection>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TurnToolSelection {
+	/// Internal tool names to remove from schemas and execution.
+	Hide(Vec<String>),
 }
 
 impl Default for TurnAckDecision {
@@ -855,9 +861,9 @@ impl AgentLoop {
 	/// Apply a typed tool-selection replacement at the turn boundary. It
 	/// changes both the schemas and execution immediately, before the next
 	/// provider request in this dialog.
-	fn apply_turn_tools(&self, selection: Option<Option<Vec<String>>>) {
-		if let Some(selection) = selection {
-			self.scheduler.set_selection(selection);
+	fn apply_turn_tools(&self, selection: Option<TurnToolSelection>) {
+		if let Some(TurnToolSelection::Hide(names)) = selection {
+			self.scheduler.hide_tools(names);
 		}
 	}
 
@@ -1004,10 +1010,8 @@ impl AgentLoop {
 			if cancellation_token.is_cancelled() {
 				return Err(AgentError::Interrupted);
 			}
-			let active_selection = self.scheduler.selection();
-			let schemas = self
-				.registry
-				.schemas_selected(active_selection.as_deref());
+			let hidden = self.scheduler.hidden();
+			let schemas = self.registry.schemas_excluding(&hidden);
 			// A compliant turn pays zero tool_choice change; only the escalated
 			// turn forces a choice, and only for the single request below. The
 			// policy owns that choice: a staged preview names `write`, while the

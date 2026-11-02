@@ -62,16 +62,13 @@ impl ToolRegistry {
 		self.tools.remove(name);
 	}
 
-	/// Tool schemas filtered to an active internal-name selection.
-	pub fn schemas_selected(&self, names: Option<&[String]>) -> Vec<Value> {
+	/// Tool schemas excluding hidden internal names. Everything mounted
+	/// outside the config allowlist stays visible.
+	pub fn schemas_excluding(&self, hidden: &[String]) -> Vec<Value> {
 		self
 			.tools
 			.values()
-			.filter(|tool| {
-				names.is_none_or(|names| {
-					names.iter().any(|name| name.as_str() == tool.name())
-				})
-			})
+			.filter(|tool| !hidden.iter().any(|name| name.as_str() == tool.name()))
 			.map(|tool| {
 				serde_json::json!({
 					"type": "function",

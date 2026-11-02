@@ -12,21 +12,21 @@ use crate::state::{AgentContext, ToolApprover, ToolCall, ToolResult};
 pub struct ToolScheduler {
 	registry: ToolRegistry,
 	approver: Option<Arc<dyn ToolApprover>>,
-	/// Session tool selection replaced at a turn boundary. `None` means the
-	/// whole registry; `Some(names)` rejects calls outside the active set.
-	selection: std::sync::Mutex<Option<Vec<String>>>,
+	/// Internal tools hidden at a turn boundary. A delta preserves mounted
+	/// MCP/host tools that were never in the config allowlist.
+	hidden: std::sync::Mutex<Vec<String>>,
 }
 
 impl ToolScheduler {
 	pub fn new(registry: ToolRegistry) -> Self {
-		Self { registry, approver: None, selection: std::sync::Mutex::new(None) }
+		Self { registry, approver: None, hidden: std::sync::Mutex::new(Vec::new()) }
 	}
 
 	pub fn with_approver(registry: ToolRegistry, approver: Arc<dyn ToolApprover>) -> Self {
 		Self {
 			registry,
 			approver: Some(approver),
-			selection: std::sync::Mutex::new(None),
+			hidden: std::sync::Mutex::new(Vec::new()),
 		}
 	}
 
@@ -34,18 +34,19 @@ impl ToolScheduler {
 		self.approver.as_ref()
 	}
 
-	/// Replace the active selection before the next provider request.
-	pub fn set_selection(&self, selection: Option<Vec<String>>) {
-		*self
-			.selection
+	/// Hide internal tool names before the next provider request.
+	pub fn hide_tools(&self, names: Vec<String>) {
+		let mut hidden = self
+			.hidden
 			.lock()
-			.unwrap_or_else(std::sync::PoisonError::into_inner) = selection;
+			.unwrap_or_else(std::sync::PoisonError::into_inner);
+		hidden.extend(names);
 	}
 
 	#[must_use]
-	pub fn selection(&self) -> Option<Vec<String>> {
+	pub fn hidden(&self) -> Vec<String> {
 		self
-			.selection
+			.hidden
 			.lock()
 			.unwrap_or_else(std::sync::PoisonError::into_inner)
 			.clone()
@@ -82,19 +83,17 @@ impl ToolScheduler {
 	}
 
 	async fn run_single(&self, call: &ToolCall, ctx: &AgentContext) -> ToolResult {
-		let selected = self.selection();
-		let allowed = selected.as_ref().is_none_or(|selected| {
-			selected.iter().any(|name| name == &call.name)
-				|| self
-					.registry
-					.get(&call.name)
-					.is_some_and(|tool| selected.iter().any(|name| name == tool.name()))
-		});
-		if !allowed {
+		let hidden = self.hidden();
+		let is_hidden = hidden.iter().any(|name| name == &call.name)
+			|| self
+				.registry
+				.get(&call.name)
+				.is_some_and(|tool| hidden.iter().any(|name| name == tool.name()));
+		if is_hidden {
 			return ToolResult {
 				tool_call_id: call.id.clone(),
 				content: format!(
-					"Tool execution denied: {} is not in the active tool selection.",
+					"Tool execution denied: {} is not available in the active tool selection.",
 					call.name
 				),
 				is_error: true,
@@ -245,19 +244,19 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn active_selection_denies_a_removed_tool_before_execution() {
-		let dir = temp_dir("selection");
+	async fn hidden_tool_is_denied_before_execution() {
+		let dir = temp_dir("hidden");
 		let marker = dir.join("ran");
 		let scheduler = ToolScheduler::new({
 			let mut registry = ToolRegistry::new();
 			registry.register(Arc::new(BashTool::new()));
 			registry
 		});
-		scheduler.set_selection(Some(Vec::new()));
+		scheduler.hide_tools(vec!["bash".to_string()]);
 		let results = scheduler.execute_batch(&bash_call(&marker), &AgentContext::new(dir)).await;
 		assert_eq!(results.len(), 1);
-		assert!(results[0].is_error, "a removed tool must not run");
-		assert!(results[0].content.contains("not in the active tool selection"));
+		assert!(results[0].is_error, "a hidden tool must not run");
+		assert!(results[0].content.contains("not available in the active tool selection"));
 		assert!(!marker.exists(), "the denied command must not execute");
 	}
 

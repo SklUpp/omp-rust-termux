@@ -123,6 +123,38 @@ class Provider:
             payload["choices"] = [{"index": 0, "delta": delta, "finish_reason": finish}]
             return "data: " + json.dumps(payload)
 
+        if "ORDINARY_PROPOSE" in last_user and not tool_after_user:
+            yield chunk(
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "index": 0,
+                            "id": "call_ordinary_propose",
+                            "type": "function",
+                            "function": {
+                                "name": "write",
+                                "arguments": json.dumps(
+                                    {
+                                        "path": "xd://propose",
+                                        "content": json.dumps(
+                                            {
+                                                "title": "Manual plan",
+                                                "slug": "manual-plan",
+                                                "content": "# Manual\n",
+                                            }
+                                        ),
+                                    }
+                                ),
+                            },
+                        }
+                    ],
+                }
+            )
+            yield chunk({}, "tool_calls")
+            yield "data: [DONE]"
+            return
+
         if "MANUAL_PLAN" in last_user and not tool_after_user:
             yield chunk(
                 {
@@ -970,6 +1002,20 @@ def run_plan_yolo(binary: str) -> None:
         )
         root_provider.hang_after_proposal = False
         target_before = target_provider.requests
+        # Leaving the incomplete arm abandons it; re-entering plan must install
+        # the ordinary client-approved proposal path, never plan-yolo.
+        client.request("session/set_mode", {"sessionId": abort_session, "modeId": "default"})
+        client.request("session/set_mode", {"sessionId": abort_session, "modeId": "plan"})
+        ordinary, permissions = client.prompt_answering_permission(
+            abort_session, "ORDINARY_PROPOSE", "allow_once"
+        )
+        assert_eq(ordinary["stopReason"], "end_turn", "ordinary plan proposal")
+        assert permissions, "manual plan must propose through the client approval dialog"
+        assert_eq(
+            target_provider.requests,
+            target_before,
+            "ordinary proposal must never auto-switch models",
+        )
         after_abort = client.request(
             "session/prompt",
             {"sessionId": abort_session, "prompt": [{"type": "text", "text": "NEXT"}]},

@@ -2033,6 +2033,87 @@ fn rpc_plan_yolo_guards_proposes_switches_and_journals_fallback() {
 /// Actual localhost wire: an inherited prompt-cache key survives a no-op or
 /// rejected thinking selection and dies only when the effective level changes.
 #[test]
+fn rpc_failed_plan_switch_surfaces_an_error_instead_of_success() {
+	let root = checkpoint_root("plan-yolo-build-error");
+	let worktree = root.join("worktree");
+	let sessions = root.join("sessions");
+	let (port, requests) = spawn_tool_model(vec![
+		ToolScript {
+			text: String::new(),
+			tool: Some((
+				"write",
+				json!({ "path": "blocked.txt", "content": "must not land" }),
+			)),
+		},
+		ToolScript {
+			text: String::new(),
+			tool: Some((
+				"write",
+				json!({
+					"path": "local://plan-plan.md",
+					"content": "# Plan\n\nImplement probe.\n"
+				}),
+			)),
+		},
+		ToolScript {
+			text: String::new(),
+			tool: Some((
+				"write",
+				json!({ "path": "xd://propose", "content": "Plan" }),
+			)),
+		},
+		ToolScript { text: "done".to_string(), tool: None },
+	]);
+	let mut launch = launch(port, "local/mock-model", "local");
+	launch.cwd = worktree.clone();
+	launch.tools_enabled = true;
+	launch.max_turns = 8;
+	launch.store_options = checkpoint_session_options(
+		&worktree,
+		&sessions,
+		Some("plan-yolo-rpc-build-error"),
+	);
+	launch.plan_yolo = Some(PlanYoloArm {
+		target: ModelSwitch {
+			provider: "missing-provider".to_string(),
+			model: "small".to_string(),
+			effort: None,
+			thinking: None,
+		},
+		thinking: None,
+	});
+	let harness = Harness::start(launch);
+	harness.send(json!({ "type": "prompt", "id": "p1", "message": "start" }));
+	let frames = harness.wait_for(
+		|frames| {
+			frames
+				.iter()
+				.any(|frame| frame["type"] == "error" && frame["id"] == "p1")
+		},
+		timeout(),
+	);
+	let error = frames
+		.iter()
+		.find(|frame| frame["type"] == "error" && frame["id"] == "p1")
+		.expect("prompt error");
+	assert!(
+		error.to_string().contains("plan-yolo switch failed"),
+		"error={error}"
+	);
+	assert_eq!(
+		requests
+			.lock()
+			.unwrap_or_else(std::sync::PoisonError::into_inner)
+			.len(),
+		4,
+		"provider build fails before any implementation request"
+	);
+	assert!(!worktree.join("probe.txt").exists());
+	drop(harness);
+	fs::remove_dir_all(&root).ok();
+}
+
+#[test]
 fn rpc_thinking_change_drops_inherited_cache_key_but_noop_keeps_it() {
 	let (port, requests, _) = spawn_tool_model_with_auth(vec![
 		ToolScript { text: "one".to_string(), tool: None },

@@ -140,6 +140,7 @@ pub struct PlanYoloShared {
 	pending: Mutex<Option<PlanYoloPending>>,
 	armed: AtomicBool,
 	completed: AtomicBool,
+	abandoned: AtomicBool,
 	/// Gate generation published by [`PlanYoloShared::arm`]. A manual plan
 	/// entry after arm/commit changes it, so the stale handler cannot approve.
 	arm_generation: AtomicU64,
@@ -199,6 +200,7 @@ impl PlanYoloShared {
 			pending: Mutex::new(None),
 			armed: AtomicBool::new(false),
 			completed: AtomicBool::new(false),
+			abandoned: AtomicBool::new(false),
 			arm_generation: AtomicU64::new(0),
 		}
 	}
@@ -216,6 +218,11 @@ impl PlanYoloShared {
 	#[must_use]
 	pub fn is_completed(&self) -> bool {
 		self.completed.load(Ordering::Acquire)
+	}
+
+	#[must_use]
+	pub fn is_abandoned(&self) -> bool {
+		self.abandoned.load(Ordering::Acquire)
 	}
 
 	fn approval_active(&self) -> bool {
@@ -252,6 +259,7 @@ impl PlanYoloShared {
 	/// plan mode before `write` is added to a restricted selection.
 	pub fn arm(&self) -> Option<PlanYoloArming> {
 		if self.completed.load(Ordering::Acquire)
+			|| self.abandoned.load(Ordering::Acquire)
 			|| self.armed.swap(true, Ordering::AcqRel)
 		{
 			return None;
@@ -304,6 +312,14 @@ impl PlanYoloShared {
 			.take();
 	}
 
+	/// Abandon an incomplete one-shot arm. It can never autoapprove later, and
+	/// the host can safely restore ordinary, non-autoapproving plan hooks.
+	pub fn abandon(&self) {
+		self.cancel_pending();
+		self.armed.store(false, Ordering::Release);
+		self.abandoned.store(true, Ordering::Release);
+	}
+
 	/// Atomically validate, build and commit the execution switch.
 	///
 	/// The guard is exited only after `build` succeeds, so an auth, config or
@@ -324,17 +340,15 @@ impl PlanYoloShared {
 			.pending
 			.lock()
 			.unwrap_or_else(|poison| poison.into_inner());
-		let Some(pending) = pending_slot.as_ref() else {
+		let Some(pending) = pending_slot.take() else {
 			return Err("plan-yolo has no approved plan pending a switch".to_string());
 		};
 		if !self.approval_active() {
-			*pending_slot = None;
 			return Err("plan-yolo is no longer armed for this session".to_string());
 		}
 		if let Err(error) =
 			ensure_plan_fully_read(&pending.plan_file_path, &pending.reviewed_content)
 		{
-			*pending_slot = None;
 			return Err(error);
 		}
 		let mut gate = self
@@ -344,31 +358,36 @@ impl PlanYoloShared {
 		if !gate.state.as_ref().is_some_and(|state| state.enabled)
 			|| gate.generation != self.arm_generation.load(Ordering::Acquire)
 		{
-			*pending_slot = None;
 			return Err("plan-yolo plan mode changed before the execution switch".to_string());
 		}
-		let root = artifacts.ok_or_else(|| {
-			"plan-yolo cannot switch: the session has no artifact directory".to_string()
-		})?;
-		let relative = pi_agent::tools::local_artifact_relative(&pending.plan_file_path)
-			.ok_or_else(|| {
-				format!(
-					"plan-yolo cannot switch: {} is not a local artifact path",
-					pending.plan_file_path
-				)
-			})?;
-		let current = pi_agent::tools::read_local_artifact(root, &relative).map_err(|error| {
-			format!(
-				"plan-yolo cannot revalidate {}: {error}",
+		let Some(root) = artifacts else {
+			*pending_slot = Some(pending);
+			return Err("plan-yolo cannot switch: the session has no artifact directory".to_string());
+		};
+		let Some(relative) = pi_agent::tools::local_artifact_relative(&pending.plan_file_path)
+		else {
+			let message = format!(
+				"plan-yolo cannot switch: {} is not a local artifact path",
 				pending.plan_file_path
-			)
-		})?;
+			);
+			*pending_slot = Some(pending);
+			return Err(message);
+		};
+		let current = match pi_agent::tools::read_local_artifact(root, &relative) {
+			Ok(current) => current,
+			Err(error) => {
+				let message = format!(
+					"plan-yolo cannot revalidate {}: {error}",
+					pending.plan_file_path
+				);
+				*pending_slot = Some(pending);
+				return Err(message);
+			},
+		};
 		if let Err(error) = ensure_plan_fully_read(&pending.plan_file_path, &current) {
-			*pending_slot = None;
 			return Err(error);
 		}
 		if current != pending.reviewed_content {
-			*pending_slot = None;
 			return Err(format!(
 				"plan-yolo: {} changed after approval; re-propose the updated plan",
 				pending.plan_file_path
@@ -376,12 +395,17 @@ impl PlanYoloShared {
 		}
 		// Build while the gate is still active. `Err` returns with both the
 		// pending approval and the guard untouched.
-		let built = build(pending).map_err(|error| {
-			format!(
-				"plan-yolo could not build the execution provider for {}/{}: {error}",
-				pending.target.provider, pending.target.model
-			)
-		})?;
+		let built = match build(&pending) {
+			Ok(built) => built,
+			Err(error) => {
+				let message = format!(
+					"plan-yolo could not build the execution provider for {}/{}: {error}",
+					pending.target.provider, pending.target.model
+				);
+				*pending_slot = Some(pending);
+				return Err(message);
+			},
+		};
 		let commit = PlanYoloCommit {
 			target: pending.target.clone(),
 			thinking: pending.thinking,
@@ -479,6 +503,24 @@ impl PlanYoloToolSelection {
 	#[must_use]
 	pub fn restore(&self) -> Option<Vec<String>> {
 		self.previous.clone()
+	}
+
+	/// Tools added only for planning. Hiding this delta at the boundary
+	/// restores the previous builtin allowlist without filtering mounted MCP
+	/// or host tools.
+	#[must_use]
+	pub fn hidden_by_plan(&self) -> Vec<String> {
+		let Some(previous) = self.previous.as_deref() else {
+			return Vec::new();
+		};
+		self
+			.selected
+			.as_deref()
+			.unwrap_or_default()
+			.iter()
+			.filter(|name| !previous.contains(*name))
+			.cloned()
+			.collect()
 	}
 }
 
@@ -770,6 +812,7 @@ mod tests {
 			Some(vec!["read".to_string(), "write".to_string()])
 		);
 		assert_eq!(tools.previous().map(|previous| previous.to_vec()), Some(read.clone()));
+		assert_eq!(tools.hidden_by_plan(), vec!["write".to_string()]);
 		assert_eq!(tools.restore(), Some(read));
 		assert!(plan_tools(false, None).is_err(), "--no-tools must not arm");
 	}
@@ -829,7 +872,7 @@ mod tests {
 		let ctx = AgentContext::new(root.clone());
 		let error = pi_agent::state::ProposeHandler::propose(
 			&handler,
-			r#"{"title":"Plan","content":"# Plan\n"}"#,
+			r##"{"title":"Plan","content":"# Plan\n"}"##,
 			&ctx,
 		)
 		.await

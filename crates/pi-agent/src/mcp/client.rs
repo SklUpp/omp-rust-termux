@@ -496,7 +496,7 @@ impl McpConnection {
     }
 
     pub async fn close(&self) -> Result<(), McpError> {
-        unregister_active_session(&self.name);
+        unregister_active_session_instance(self);
         let guard = self.transport.read().await;
         guard.close().await
     }
@@ -506,7 +506,7 @@ impl McpConnection {
 ///
 /// Mirrors TS `MCPManager.#connections` / `MCPManager.instance()`: the URI
 /// handler is stateless and looks sessions up here. Runtime code registers a
-/// connection after `connect_to_server` and unregisters on disconnect; this
+/// connection after `tools/list` succeeds and unregisters it on teardown; this
 /// module never connects on its own.
 static ACTIVE_SESSIONS: LazyLock<Mutex<BTreeMap<String, Arc<McpConnection>>>> =
 	LazyLock::new(|| Mutex::new(BTreeMap::new()));
@@ -518,14 +518,37 @@ fn lock_sessions() -> std::sync::MutexGuard<'static, BTreeMap<String, Arc<McpCon
 }
 
 /// Install or replace one live connection under its server name.
+///
+/// A replaced connection is not closed: its tools may still be executing.
+/// Closing that superseded instance later leaves this registration untouched.
 pub fn register_active_session(connection: Arc<McpConnection>) {
 	let name = connection.name.clone();
 	lock_sessions().insert(name, connection);
 }
 
 /// Drop one live connection by server name.
+///
+/// Name-addressed removal is a registry utility; connection teardown uses
+/// [`unregister_active_session_instance`] so a same-name successor survives.
 pub fn unregister_active_session(name: &str) -> Option<Arc<McpConnection>> {
 	lock_sessions().remove(name)
+}
+
+/// Drop `connection` only while it is still the instance registered under its
+/// name.
+///
+/// Registration is keyed by server name, and a later session with the same
+/// name replaces the entry. Removing by name on teardown would detach that
+/// successor and leave its consumers pointing at a closed session; ownership
+/// is therefore decided by pointer identity.
+fn unregister_active_session_instance(connection: &McpConnection) {
+	let mut sessions = lock_sessions();
+	let registered = sessions.get(&connection.name).is_some_and(|registered| {
+		std::ptr::eq(Arc::as_ptr(registered), connection as *const McpConnection)
+	});
+	if registered {
+		sessions.remove(&connection.name);
+	}
 }
 
 /// Look up one live connection by server name.
@@ -545,3 +568,4 @@ pub fn list_active_sessions() -> Vec<String> {
 pub fn clear_active_sessions() {
 	lock_sessions().clear();
 }
+

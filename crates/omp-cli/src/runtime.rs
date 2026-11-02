@@ -236,6 +236,13 @@ struct RunnerSession {
 	/// ACP reverse-call bridge for this run (set by the ACP transport); the
 	/// rebuilt root registry and the supervisor's children mount it.
 	acp_bridge:      Mutex<Option<Arc<dyn pi_agent::AcpClientBridge>>>,
+	/// MCP sessions discovered by this scope. Every discovered connection stays
+	/// tracked until scope teardown unless only this list's reference remains
+	/// (the owning turn finished and a newer same-name registration replaced
+	/// it); pruning then lets the transport drop. Teardown closes each instance
+	/// only while it still owns the registry entry, so a same-name session
+	/// started by another scope is left running.
+	mcp:             Mutex<Vec<Arc<McpConnection>>>,
 }
 
 /// Shared LSP ownership scope plus the transport preference it was built with.
@@ -268,6 +275,7 @@ impl RunnerSession {
 			internal_urls: Mutex::new(None),
 			url_scope: Mutex::new(Arc::new(pi_agent::tools::internal_urls::UrlScope::default())),
 			acp_bridge: Mutex::new(None),
+			mcp: Mutex::new(Vec::new()),
 		}
 	}
 
@@ -286,6 +294,28 @@ impl RunnerSession {
 			.lock()
 			.unwrap_or_else(|poison| poison.into_inner())
 			.clone()
+	}
+
+	/// Record this turn's discovered MCP sessions.
+	///
+	/// Ownership is per connection, not per name: a same-name successor never
+	/// evicts (and never closes) a predecessor whose tools may still be running.
+	/// Before adding, prune entries whose only remaining reference is this list:
+	/// the owning turn and registry are gone, so dropping them runs the
+	/// transport teardown. A connection still held by tools or by the `mcp://`
+	/// registry keeps `strong_count > 1` and stays tracked until teardown.
+	fn own_mcp_sessions(&self, connections: &[Arc<McpConnection>]) {
+		let mut owned = self.mcp.lock().unwrap_or_else(|poison| poison.into_inner());
+		owned.retain(|connection| Arc::strong_count(connection) > 1);
+		for connection in connections {
+			owned.push(Arc::clone(connection));
+		}
+	}
+
+	/// Take every MCP session this scope still owns, for teardown.
+	fn take_mcp_sessions(&self) -> Vec<Arc<McpConnection>> {
+		let mut owned = self.mcp.lock().unwrap_or_else(|poison| poison.into_inner());
+		std::mem::take(&mut *owned)
 	}
 
 
@@ -815,10 +845,11 @@ impl PiAgentRunner {
 const DAP_SHUTDOWN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Await-needing half of [`PiAgentRunner::shutdown`]: eval kernel/bridge
-/// disposal, LSP release (`shutdown` + `exit`, else kill) and the bounded DAP
-/// terminate that disconnects the root tree before killing adapters.
+/// disposal, LSP release (`shutdown` + `exit`, else kill), the bounded DAP
+/// terminate that disconnects the root tree before killing adapters, and this
+/// scope's MCP sessions.
 ///
-/// The three run concurrently and each carries its own bound, so a slow LSP
+/// The four run concurrently and each carries its own bound, so a slow LSP
 /// client can never starve the DAP disconnect (or kernels) of teardown, and no
 /// outer cap can cancel `LspSession::release` midway — it marks itself released
 /// and drains its keys before the first await, so a cancelled release leaks
@@ -827,6 +858,7 @@ async fn shutdown_session(session: Arc<RunnerSession>) {
 	let eval = session.take_eval();
 	let lsp = session.lsp_session();
 	let dap = session.dap_manager();
+	let mcp = session.take_mcp_sessions();
 	let dispose_eval = async move {
 		if let Some(eval) = eval {
 			eval.shutdown().await;
@@ -840,7 +872,16 @@ async fn shutdown_session(session: Arc<RunnerSession>) {
 		let cancel = pi_agent::CancellationToken::new();
 		let _ = dap.terminate(&cancel, deadline).await;
 	};
-	tokio::join!(dispose_eval, release_lsp, terminate_dap);
+	let close_mcp = close_mcp_sessions(mcp);
+	tokio::join!(dispose_eval, release_lsp, terminate_dap, close_mcp);
+}
+
+/// Close discovered MCP sessions. [`McpConnection::close`] unregisters only the
+/// instance itself, so a same-name session owned elsewhere survives.
+async fn close_mcp_sessions(connections: impl IntoIterator<Item = Arc<McpConnection>>) {
+	for connection in connections {
+		let _ = connection.close().await;
+	}
 }
 
 /// One-shot gate over the runner's exit teardown: `begin` elects the single
@@ -1230,6 +1271,7 @@ impl AgentRunner for PiAgentRunner {
 		} else {
 			McpSpawnResult {
 				tools: Vec::new(),
+				connections: Vec::new(),
 				server_errors: Vec::new(),
 				all_server_names: Vec::new(),
 			}
@@ -1239,6 +1281,8 @@ impl AgentRunner for PiAgentRunner {
 		sig_watcher.abort();
 
 		if cancellation_token.is_cancelled() {
+			self.runtime
+				.block_on(close_mcp_sessions(mcp_spawn.connections.iter().cloned()));
 			if timed_out.load(Ordering::SeqCst) {
 				return Err(Error::new("execution timed out during MCP discovery"));
 			}
@@ -1250,19 +1294,38 @@ impl AgentRunner for PiAgentRunner {
 		}
 
 
-		let plan = RunPlan::resolve_with_mcp(request, !mcp_spawn.tools.is_empty())?;
+		let plan = match RunPlan::resolve_with_mcp(request, !mcp_spawn.tools.is_empty()) {
+			Ok(plan) => plan,
+			Err(err) => {
+				self.runtime
+					.block_on(close_mcp_sessions(mcp_spawn.connections.iter().cloned()));
+				return Err(err);
+			},
+		};
 		let edit_options = EditToolOptions {
 			enforce_seen_lines: request.config.edit.enforce_seen_lines(),
 		};
 		let display_resolver: Arc<dyn SessionDisplayResolver> =
-			Arc::new(ConfigDisplayResolver::from_config(&request.config)?);
+			match ConfigDisplayResolver::from_config(&request.config) {
+				Ok(resolver) => Arc::new(resolver),
+				Err(err) => {
+					self.runtime
+						.block_on(close_mcp_sessions(mcp_spawn.connections.iter().cloned()));
+					return Err(err);
+				},
+			};
 		let active_model = format!("{}/{}", plan.provider, plan.model);
 		let resolved_display =
 			display_resolver.resolve(Some(&active_model), plan.tools.contains(&"edit"));
 		let scope = session_scope(request.session_id.as_deref(), request.session_file.as_deref());
-		let resources = self
-			.session_tools(&scope, edit_options, resolved_display.edit_tool)
-			.ok_or_else(|| Error::new("session scope is closed"))?;
+		let resources = match self.session_tools(&scope, edit_options, resolved_display.edit_tool) {
+			Some(resources) => resources,
+			None => {
+				self.runtime
+					.block_on(close_mcp_sessions(mcp_spawn.connections.iter().cloned()));
+				return Err(Error::new("session scope is closed"));
+			},
+		};
 		// Retained for the post-shutdown accounting drain, which must still be able
 		// to queue its persistence after this turn's stream is gone.
 		if let Some(goal) = &request.goal {
@@ -1272,6 +1335,7 @@ impl AgentRunner for PiAgentRunner {
 				.unwrap_or_else(|poison| poison.into_inner()) = Some(Arc::clone(goal));
 		}
 		let session = Arc::clone(&resources.tools);
+		session.own_mcp_sessions(&mcp_spawn.connections);
 		session.set_session_identity(
 			request.session_id.as_deref(),
 			request.session_file.as_deref(),
@@ -3067,6 +3131,160 @@ mod tests_mcp_infrastructure_error {
 	}
 }
 
+#[cfg(test)]
+mod tests_mcp_lifecycle {
+	use super::*;
+	use std::sync::atomic::{AtomicBool, Ordering};
+
+	struct FlagTransport {
+		closed: Arc<AtomicBool>,
+	}
+
+	#[async_trait::async_trait]
+	impl pi_agent::mcp::McpTransport for FlagTransport {
+		async fn request(
+			&self,
+			_method: &str,
+			_params: Option<serde_json::Value>,
+			_timeout: Option<std::time::Duration>,
+		) -> std::result::Result<serde_json::Value, McpError> {
+			Err(McpError::Closed)
+		}
+
+		async fn notify(
+			&self,
+			_method: &str,
+			_params: Option<serde_json::Value>,
+		) -> std::result::Result<(), McpError> {
+			Ok(())
+		}
+
+		async fn close(&self) -> std::result::Result<(), McpError> {
+			self.closed.store(true, Ordering::SeqCst);
+			Ok(())
+		}
+	}
+
+	impl Drop for FlagTransport {
+		fn drop(&mut self) {
+			self.closed.store(true, Ordering::SeqCst);
+		}
+	}
+
+	fn connection(name: &str) -> (Arc<McpConnection>, Arc<AtomicBool>) {
+		let closed = Arc::new(AtomicBool::new(false));
+		let connection = Arc::new(McpConnection {
+			name: name.to_string(),
+			config: MCPServerConfig::Stdio(MCPStdioServerConfig {
+				command: "true".to_string(),
+				args: Vec::new(),
+				env: HashMap::new(),
+				cwd: None,
+				timeout: None,
+				request_id_format: None,
+			}),
+			transport: Arc::new(tokio::sync::RwLock::new(
+				Arc::new(FlagTransport { closed: Arc::clone(&closed) })
+					as Arc<dyn pi_agent::mcp::McpTransport>,
+			)),
+			server_info: pi_agent::mcp::MCPServerInfo {
+				name: name.to_string(),
+				version: None,
+			},
+			capabilities: pi_agent::mcp::MCPServerCapabilities::default(),
+			instructions: None,
+		});
+		(connection, closed)
+	}
+
+	fn unique_name(label: &str) -> String {
+		format!("{label}-{}", std::process::id())
+	}
+
+	/// The scope that discovered a session owns its teardown: closing it must
+	/// drop the registry entry and close the transport (the stdio child dies
+	/// with it).
+	#[test]
+	fn session_teardown_closes_owned_mcp_sessions() {
+		let runtime =
+			tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+		let name = unique_name("teardown");
+		let (connection, closed) = connection(&name);
+		register_active_session(Arc::clone(&connection));
+		let session = Arc::new(RunnerSession::new(EditToolOptions::default()));
+		session.own_mcp_sessions(&[Arc::clone(&connection)]);
+
+		runtime.block_on(shutdown_session(Arc::clone(&session)));
+
+		assert!(closed.load(Ordering::SeqCst), "owned MCP transport must close");
+		assert!(
+			pi_agent::mcp::get_active_session(&name).is_none(),
+			"registry entry must be removed"
+		);
+	}
+
+	/// A same-name session registered by another scope is not this scope's
+	/// property: tearing this one down must leave it registered and open.
+	#[test]
+	fn session_teardown_keeps_same_name_session_owned_elsewhere() {
+		let runtime =
+			tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+		let name = unique_name("overlap-teardown");
+		let (older, older_closed) = connection(&name);
+		let (newer, newer_closed) = connection(&name);
+		register_active_session(Arc::clone(&older));
+		register_active_session(Arc::clone(&newer));
+		let session = Arc::new(RunnerSession::new(EditToolOptions::default()));
+		session.own_mcp_sessions(&[Arc::clone(&older)]);
+
+		runtime.block_on(shutdown_session(Arc::clone(&session)));
+
+		assert!(older_closed.load(Ordering::SeqCst), "owned superseded transport closes");
+		assert!(
+			!newer_closed.load(Ordering::SeqCst),
+			"successor transport must stay open"
+		);
+		let registered =
+			pi_agent::mcp::get_active_session(&name).expect("successor registration survives");
+		assert!(Arc::ptr_eq(&registered, &newer));
+
+		runtime.block_on(newer.close()).expect("close successor");
+		assert!(pi_agent::mcp::get_active_session(&name).is_none());
+	}
+
+	/// Ownership is tracked per connection: once a finished turn's session is
+	/// superseded in the registry and no tool holds it, the next discovery
+	/// prunes it (transport teardown) instead of keeping it until scope close.
+	#[test]
+	fn superseded_unused_session_is_pruned_by_the_next_discovery() {
+		let runtime =
+			tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+		let name = unique_name("prune");
+		let (older, older_closed) = connection(&name);
+		let (newer, newer_closed) = connection(&name);
+		register_active_session(Arc::clone(&older));
+		let session = Arc::new(RunnerSession::new(EditToolOptions::default()));
+		session.own_mcp_sessions(&[Arc::clone(&older)]);
+		drop(older);
+
+		register_active_session(Arc::clone(&newer));
+		session.own_mcp_sessions(&[Arc::clone(&newer)]);
+
+		assert!(
+			older_closed.load(Ordering::SeqCst),
+			"superseded session with no live users must be dropped"
+		);
+		assert!(
+			!newer_closed.load(Ordering::SeqCst),
+			"the registered successor must stay open"
+		);
+
+		runtime.block_on(shutdown_session(session));
+		assert!(newer_closed.load(Ordering::SeqCst), "teardown closes the tracked successor");
+		assert!(pi_agent::mcp::get_active_session(&name).is_none());
+	}
+}
+
 /// Dynamic MCP tool implementing pi-agent's `Tool` trait.
 #[derive(Clone)]
 pub struct McpTool {
@@ -3563,6 +3781,10 @@ async fn check_or_prompt_stdio_mcp_launch(
 #[derive(Debug, Clone)]
 pub struct McpSpawnResult {
 	pub tools: Vec<McpTool>,
+	/// Successfully discovered sessions that were registered for `mcp://`
+	/// resolution. The caller takes ownership; a run that aborts before
+	/// installing the tools must close them.
+	pub connections: Vec<Arc<McpConnection>>,
 	pub server_errors: Vec<(String, String)>,
 	pub all_server_names: Vec<String>,
 }
@@ -3576,6 +3798,9 @@ pub async fn filter_and_spawn_mcp_servers_with_paths_detailed(
 	cancel_token: &pi_agent::CancellationToken,
 ) -> Result<McpSpawnResult> {
 	let mut all_tools = Vec::new();
+	// Sessions registered for `mcp://` by this discovery. They are handed to
+	// the caller on success and closed on every abort path below.
+	let mut connections: Vec<Arc<McpConnection>> = Vec::new();
 	let mut server_errors: Vec<(String, String)> = Vec::new();
 	let all_server_names = collect_all_configured_server_names(cwd, Some(agent_dir), &discovered);
 	if let Some(requested_tools) = &config.tools {
@@ -3672,13 +3897,21 @@ pub async fn filter_and_spawn_mcp_servers_with_paths_detailed(
 
 		let mut server_config = server.config;
 		if let MCPServerConfig::Stdio(stdio) = &mut server_config {
-			let allowed = check_or_prompt_stdio_mcp_launch(
+			let allowed = match check_or_prompt_stdio_mcp_launch(
 				&server.name,
 				&all_server_names,
 				stdio,
 				approvals,
 				cancel_token,
-			).await?;
+			)
+			.await
+			{
+				Ok(allowed) => allowed,
+				Err(err) => {
+					close_mcp_sessions(connections.drain(..)).await;
+					return Err(err);
+				},
+			};
 			if !allowed {
 				let err_msg = format!(
 					"MCP server \"{}\" was not launched: stdio launch was not approved",
@@ -3697,11 +3930,7 @@ pub async fn filter_and_spawn_mcp_servers_with_paths_detailed(
 		let conn = tokio::select! {
 			_ = cancel_token.cancelled() => break,
 			res = connect_fut => match res {
-				Ok(connection) => {
-					let conn = Arc::new(connection);
-					register_active_session(Arc::clone(&conn));
-					conn
-				},
+				Ok(connection) => Arc::new(connection),
 				Err(err) => {
 					let safe_err = format_mcp_infrastructure_error(&server.name, "connect", &err);
 					eprintln!("{safe_err}");
@@ -3711,19 +3940,38 @@ pub async fn filter_and_spawn_mcp_servers_with_paths_detailed(
 			}
 		};
 
-		let list_fut = conn.list_tools();
-		let tool_defs = tokio::select! {
-			_ = cancel_token.cancelled() => break,
-			res = list_fut => match res {
-				Ok(defs) => defs,
-				Err(err) => {
-					let safe_err = format_mcp_infrastructure_error(&server.name, "list", &err);
-					eprintln!("{safe_err}");
-					server_errors.push((server.name.clone(), safe_err));
-					continue;
+		// Resource-only servers omit the `tools` capability and need not
+		// implement `tools/list` (TS `client.ts:214`). They still belong in the
+		// registry: `mcp://` reads their resources even though they expose no
+		// tools.
+		let tool_defs = if conn.capabilities.tools.is_none() {
+			Vec::new()
+		} else {
+			let list_fut = conn.list_tools();
+			tokio::select! {
+				_ = cancel_token.cancelled() => {
+					// The handshake succeeded but this run is going away; close the
+					// unregistered session instead of orphaning its child process.
+					let _ = conn.close().await;
+					break;
+				},
+				res = list_fut => match res {
+					Ok(defs) => defs,
+					Err(err) => {
+						let _ = conn.close().await;
+						let safe_err = format_mcp_infrastructure_error(&server.name, "list", &err);
+						eprintln!("{safe_err}");
+						server_errors.push((server.name.clone(), safe_err));
+						continue;
+					}
 				}
 			}
 		};
+
+		// Register only after the server proved usable: a failed or cancelled
+		// `tools/list` must not leave a live `mcp://` entry behind.
+		register_active_session(Arc::clone(&conn));
+		connections.push(Arc::clone(&conn));
 
 		for def in tool_defs {
 			let desc = def.description.as_deref().unwrap_or("");
@@ -3735,8 +3983,10 @@ pub async fn filter_and_spawn_mcp_servers_with_paths_detailed(
 
 	let mut unique_tools = deduplicate_mcp_tools_with_warning(all_tools);
 	if cancel_token.is_cancelled() {
+		close_mcp_sessions(connections.drain(..)).await;
 		return Ok(McpSpawnResult {
-			tools: unique_tools,
+			tools: Vec::new(),
+			connections,
 			server_errors,
 			all_server_names,
 		});
@@ -3762,16 +4012,19 @@ pub async fn filter_and_spawn_mcp_servers_with_paths_detailed(
 		if !unknown.is_empty() {
 			for (failed_server, err_msg) in &server_errors {
 				if mcp_server_matches_tools(failed_server, &all_server_names, approvals, &unknown) {
+					close_mcp_sessions(connections.drain(..)).await;
 					return Err(Error::new(err_msg.clone()));
 				}
 			}
 			let plural = if unknown.len() == 1 { "" } else { "s" };
-			return Err(Error::new(format!(
+			let message = format!(
 				"Unknown tool{} in --tools: {}. Valid tools: {}.",
 				plural,
 				unknown.join(", "),
 				known_tools.join(", ")
-			)));
+			);
+			close_mcp_sessions(connections.drain(..)).await;
+			return Err(Error::new(message));
 		}
 
 		unique_tools.retain(|tool| requested_tools.iter().any(|allowed| allowed == tool.name()));
@@ -3779,6 +4032,7 @@ pub async fn filter_and_spawn_mcp_servers_with_paths_detailed(
 
 	Ok(McpSpawnResult {
 		tools: unique_tools,
+		connections,
 		server_errors,
 		all_server_names,
 	})

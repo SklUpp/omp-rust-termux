@@ -4144,17 +4144,15 @@ mod tests {
 	fn in_record_text_around_thinking_gets_ordered_blocks() {
 		let mut healer = RecordHealer::new(StreamMarkupHealingPattern::Thinking);
 		let mut out = Vec::new();
-		healer
-			.push_events(
-				vec![
-					MarkupHealingEvent::Text("a".to_string()),
-					MarkupHealingEvent::Thinking("b".to_string()),
-					MarkupHealingEvent::Text("c".to_string()),
-				],
-				0,
-				&mut out,
-			)
-			.expect("push events");
+		healer.push_events(
+			vec![
+				MarkupHealingEvent::Text("a".to_string()),
+				MarkupHealingEvent::Thinking("b".to_string()),
+				MarkupHealingEvent::Text("c".to_string()),
+			],
+			0,
+			&mut out,
+		);
 		let parts: Vec<(String, usize, String)> = out
 			.iter()
 			.filter_map(|chunk| match (&chunk.content, &chunk.reasoning, chunk.content_index) {

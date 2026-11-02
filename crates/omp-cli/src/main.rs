@@ -1615,15 +1615,15 @@ impl Session<'_> {
 			// No journal: replay the exact branch conversation the loop last
 			// accepted, so an in-memory rewind survives the next prompt.
 			Some(self.in_memory_messages.clone().unwrap_or_default())
-		} else if self.store.has_branch_context() {
+		} else if self.store.is_v1() {
+			None
+		} else {
 			if let Some(warning) = self.store.branch_chain_warning() {
 				eprintln!("warning: {warning}");
 			}
 			// Fail closed: a damaged journal must surface before the provider
 			// call instead of silently replaying a degraded conversation.
 			Some(CheckpointHost::context_messages(&self.store).map_err(Error::new)?)
-		} else {
-			None
 		};
 		let checkpoint_controller = self
 			.config

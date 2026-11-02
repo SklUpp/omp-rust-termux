@@ -2579,7 +2579,12 @@ fn wire_provider(
 				.with_model_reasoning(info.is_some_and(|info| info.reasoning))
 				.with_reasoning(reasoning)
 				.with_disable_reasoning(config.external_thinking)
-				.with_payload_model(payload_model(model))
+				.with_payload_model(model)
+				.with_request_headers(ollama_request_headers(
+					catalog,
+					config,
+					target.provider,
+				))
 				// Stamp the configured route, not the adapter's default dialect
 				// label: signed reasoning must replay only to its issuer.
 				.with_provider_id(Some(target.provider.to_owned()))
@@ -2647,60 +2652,18 @@ fn wire_provider(
 	}
 }
 
-/// Resolved TS `Model<"ollama-chat">` metadata supplied to the adapter once per
-/// provider. Mirrors the adapter's public payload-model type field for field;
-/// [`payload_model`] is the only conversion and the only adapter dependency.
-#[derive(Clone, PartialEq)]
-pub(crate) struct OllamaModelContext {
-	pub(crate) provider:              String,
-	pub(crate) api:                   String,
-	pub(crate) id:                    String,
-	pub(crate) request_model_id:      Option<String>,
-	pub(crate) name:                  String,
-	pub(crate) base_url:              String,
-	pub(crate) input:                 Vec<String>,
-	pub(crate) tokenizer:             Option<String>,
-	pub(crate) cost:                  Option<OllamaModelCost>,
-	pub(crate) context_window:        Option<u64>,
-	pub(crate) max_tokens:            Option<u64>,
-	pub(crate) omit_max_output_tokens: bool,
-	pub(crate) reasoning:             bool,
-	pub(crate) thinking:              Option<OllamaModelThinking>,
-	pub(crate) effort:                Option<String>,
-	pub(crate) headers:               Vec<(String, String)>,
-}
-
-/// TS `ModelCost` / `TokenCost`: the four per-million rates, with the authored
-/// `longContext` block kept verbatim. `None` on the model means unknown.
-#[derive(Clone, PartialEq)]
-pub(crate) struct OllamaModelCost {
-	pub(crate) input:        f64,
-	pub(crate) output:       f64,
-	pub(crate) cache_read:   f64,
-	pub(crate) cache_write:  f64,
-	pub(crate) long_context: Option<serde_json::Value>,
-}
-
-/// Materialized TS `ThinkingConfig`: a non-empty effort ladder with an explicit
-/// mode, default level and the authored effort remap (identity for omitted
-/// efforts). The authored block alone is not the resolved shape TS exposes.
-#[derive(Clone, PartialEq)]
-pub(crate) struct OllamaModelThinking {
-	pub(crate) mode:          String,
-	pub(crate) efforts:       Vec<String>,
-	pub(crate) default_level: Option<String>,
-	pub(crate) effort_map:    Vec<(String, String)>,
-}
-
-/// Parse the catalog `cost` block into the TS rate record.
-fn ollama_model_cost(cost: Option<&serde_json::Value>) -> Option<OllamaModelCost> {
+/// Parse the catalog `cost` block into the TS `ModelCost` record: the four
+/// per-million rates (missing ones `0`) and the authored `longContext` verbatim.
+fn ollama_model_cost(
+	cost: Option<&serde_json::Value>,
+) -> Option<pi_agent::provider_ollama::OllamaPayloadCost> {
 	let cost = cost?.as_object()?;
 	let rate = |key: &str| {
 		cost.get(key)
 			.and_then(serde_json::Value::as_f64)
 			.unwrap_or(0.0)
 	};
-	Some(OllamaModelCost {
+	Some(pi_agent::provider_ollama::OllamaPayloadCost {
 		input:        rate("input"),
 		output:       rate("output"),
 		cache_read:   rate("cacheRead"),
@@ -2709,12 +2672,50 @@ fn ollama_model_cost(cost: Option<&serde_json::Value>) -> Option<OllamaModelCost
 	})
 }
 
+/// Authored `thinking` flag; `None` when the model never declared it.
+fn authored_flag(thinking: &serde_json::Value, key: &str) -> Option<bool> {
+	thinking.get(key).and_then(serde_json::Value::as_bool)
+}
+
+/// Authored `thinking` string map (`effortMap`, `effortRouting`). `None` when
+/// the key is absent; non-string values are dropped, as the catalog does.
+fn authored_string_map(
+	thinking: &serde_json::Value,
+	key: &str,
+) -> Option<Vec<(String, String)>> {
+	let map = thinking.get(key)?.as_object()?;
+	Some(
+		map.iter()
+			.filter_map(|(name, value)| {
+				value
+					.as_str()
+					.map(|value| (name.clone(), value.to_string()))
+			})
+			.collect(),
+	)
+}
+
+/// Authored `thinking.effortBudgets`: TS numbers, kept as `u64` without
+/// truncation; non-numeric entries are dropped.
+fn authored_u64_map(
+	thinking: &serde_json::Value,
+	key: &str,
+) -> Option<Vec<(String, u64)>> {
+	let map = thinking.get(key)?.as_object()?;
+	Some(
+		map.iter()
+			.filter_map(|(name, value)| value.as_u64().map(|value| (name.clone(), value)))
+			.collect(),
+	)
+}
+
 /// Materialize the authored thinking block plus the catalog effort listing.
-/// TS carries no thinking config when the model exposes no effort ladder.
+/// TS carries no thinking config when the model exposes no effort ladder, and
+/// every optional field stays authored optionality (`None`, never `false`).
 fn ollama_model_thinking(
 	thinking: Option<&serde_json::Value>,
 	efforts: Option<&[String]>,
-) -> Option<OllamaModelThinking> {
+) -> Option<pi_agent::provider_ollama::OllamaPayloadThinking> {
 	let thinking = thinking?;
 	let efforts: Vec<String> = thinking
 		.get("efforts")
@@ -2729,8 +2730,8 @@ fn ollama_model_thinking(
 	if efforts.is_empty() {
 		return None;
 	}
-	Some(OllamaModelThinking {
-		mode:          thinking
+	Some(pi_agent::provider_ollama::OllamaPayloadThinking {
+		mode: thinking
 			.get("mode")
 			.and_then(serde_json::Value::as_str)
 			.unwrap_or("effort")
@@ -2740,7 +2741,12 @@ fn ollama_model_thinking(
 			.get("defaultLevel")
 			.and_then(serde_json::Value::as_str)
 			.map(str::to_string),
-		effort_map:    json_string_map(Some(thinking), "effortMap"),
+		effort_map: authored_string_map(thinking, "effortMap"),
+		effort_routing: authored_string_map(thinking, "effortRouting"),
+		effort_budgets: authored_u64_map(thinking, "effortBudgets"),
+		supports_display: authored_flag(thinking, "supportsDisplay"),
+		suppress_when_off: authored_flag(thinking, "suppressWhenOff"),
+		requires_effort: authored_flag(thinking, "requiresEffort"),
 	})
 }
 
@@ -2757,43 +2763,52 @@ fn ollama_model_input(
 	}
 }
 
-/// Pre-auth header set in TS emission order: model-level headers, then the
-/// `config.yml` provider headers. The adapter appends `Authorization` and
-/// `Content-Type` last, so nothing here can override the credential.
-fn ollama_model_headers(
-	info: Option<&crate::catalog::ModelInfo>,
-	config: &crate::config::Config,
-	provider: &str,
-) -> Vec<(String, String)> {
-	let mut headers: Vec<(String, String)> = info
-		.and_then(|info| info.headers.as_ref())
+/// TS `Model.headers`: the model-authored headers only.
+fn ollama_model_headers(info: Option<&crate::catalog::ModelInfo>) -> Vec<(String, String)> {
+	info.and_then(|info| info.headers.as_ref())
 		.map(|headers| {
 			headers
 				.iter()
 				.map(|(name, value)| (name.clone(), value.clone()))
 				.collect()
 		})
-		.unwrap_or_default();
-	if let Some(provider_config) = config.providers.get(provider) {
-		headers.extend(
-			provider_config
-				.headers
-				.iter()
-				.map(|(name, value)| (name.clone(), value.clone())),
-		);
-	}
-	headers
+		.unwrap_or_default()
 }
 
-/// Build the resolved model context once per provider.
+/// Effective connection headers delivered outside the hook-visible model. The
+/// precedence is the runtime's existing one: `config.yml` provider, else the
+/// `models.yml` provider block (the same pair used for baseUrl/api/key and
+/// Anthropic caller headers).
+fn ollama_request_headers(
+	catalog: &crate::catalog::Catalog,
+	config: &crate::config::Config,
+	provider: &str,
+) -> Vec<(String, String)> {
+	config
+		.providers
+		.get(provider)
+		.or_else(|| catalog.connections.get(provider))
+		.map(|provider| {
+			provider
+				.headers
+				.iter()
+				.map(|(name, value)| (name.clone(), value.clone()))
+				.collect()
+		})
+		.unwrap_or_default()
+}
+
+/// Build the resolved model context once per provider, directly in the
+/// adapter-owned type: this is the only boundary between catalog data and the
+/// `onPayload` hook, with no intermediate mirror.
 fn ollama_model_context(
 	catalog: &crate::catalog::Catalog,
 	config: &crate::config::Config,
 	target: &WireTarget<'_>,
 	info: Option<&crate::catalog::ModelInfo>,
 	effort: Option<String>,
-) -> OllamaModelContext {
-	OllamaModelContext {
+) -> pi_agent::provider_ollama::OllamaPayloadModel {
+	pi_agent::provider_ollama::OllamaPayloadModel {
 		provider: target.provider.to_string(),
 		api: target.dialect.api().to_string(),
 		id: target.model.to_string(),
@@ -2818,62 +2833,7 @@ fn ollama_model_context(
 			info.and_then(|info| info.efforts.as_deref()),
 		),
 		effort,
-		headers: ollama_model_headers(info, config, target.provider),
-	}
-}
-
-/// Convert the resolved context into the adapter's public payload-model type.
-fn payload_model(
-	context: OllamaModelContext,
-) -> pi_agent::provider_ollama::OllamaPayloadModel {
-	let OllamaModelContext {
-		provider,
-		api,
-		id,
-		request_model_id,
-		name,
-		base_url,
-		input,
-		tokenizer,
-		cost,
-		context_window,
-		max_tokens,
-		omit_max_output_tokens,
-		reasoning,
-		thinking,
-		effort,
-		headers,
-	} = context;
-	pi_agent::provider_ollama::OllamaPayloadModel {
-		provider,
-		api,
-		id,
-		request_model_id,
-		name,
-		base_url,
-		input,
-		tokenizer,
-		cost: cost.map(|cost| pi_agent::provider_ollama::OllamaPayloadCost {
-			input:        cost.input,
-			output:       cost.output,
-			cache_read:   cost.cache_read,
-			cache_write:  cost.cache_write,
-			long_context: cost.long_context,
-		}),
-		context_window,
-		max_tokens,
-		omit_max_output_tokens,
-		reasoning,
-		thinking: thinking.map(|thinking| {
-			pi_agent::provider_ollama::OllamaPayloadThinking {
-				mode: thinking.mode,
-				efforts: thinking.efforts,
-				default_level: thinking.default_level,
-				effort_map: thinking.effort_map,
-			}
-		}),
-		effort,
-		headers,
+		headers: ollama_model_headers(info),
 	}
 }
 
@@ -8593,9 +8553,10 @@ mod tests {
 	/// be shadowed by the catalog's (usually bundled, vendor-default) route.
 	#[test]
 
-	/// The adapter payload context is the resolved TS model shape, not the
-	/// authored JSON: materialized thinking, parsed cost, honest limits, inputs,
-	/// effort, and pre-auth headers in model-then-config order.
+	/// The adapter payload context is the resolved TS model shape, built
+	/// directly in the adapter types: materialized thinking with authored
+	/// optionality, parsed cost, honest limits, model-only headers, and the
+	/// connection headers kept outside the hook-visible model.
 	#[test]
 	fn ollama_payload_context_materializes_catalog_metadata() {
 		use crate::catalog::{Catalog, ModelInfo};
@@ -8621,7 +8582,12 @@ mod tests {
 				"mode": "effort",
 				"efforts": ["low", "high"],
 				"defaultLevel": "low",
-				"effortMap": {"high": "max"}
+				"effortMap": {"high": "max"},
+				"effortRouting": {"high": "qwen3-max"},
+				"effortBudgets": {"high": 4096},
+				"supportsDisplay": true,
+				"suppressWhenOff": false,
+				"requiresEffort": true
 			})),
 			headers: Some(BTreeMap::from([("X-Model".to_string(), "row".to_string())])),
 			request_model_id: Some("qwen3-wire".to_string()),
@@ -8654,7 +8620,8 @@ mod tests {
 			usage_in_streaming: None,
 		};
 		let info = catalog.providers["ollama"].get("qwen3");
-		let context = ollama_model_context(&catalog, &config, &target, info, Some("high".to_string()));
+		let context =
+			ollama_model_context(&catalog, &config, &target, info, Some("high".to_string()));
 		assert_eq!(context.provider, "ollama");
 		assert_eq!(context.api, "ollama-chat");
 		assert_eq!(context.id, "qwen3");
@@ -8667,22 +8634,48 @@ mod tests {
 		assert!(!context.omit_max_output_tokens, "an explicit false stays false");
 		assert!(context.reasoning);
 		let cost = context.cost.expect("cost parsed");
-		assert_eq!((cost.input, cost.output, cost.cache_read, cost.cache_write), (0.5, 1.5, 0.1, 0.2));
-		assert_eq!(cost.long_context.as_ref().and_then(|value| value.get("inputThreshold")), Some(&serde_json::json!(200000)));
+		assert_eq!(
+			(cost.input, cost.output, cost.cache_read, cost.cache_write),
+			(0.5, 1.5, 0.1, 0.2)
+		);
+		assert_eq!(
+			cost.long_context
+				.as_ref()
+				.and_then(|value| value.get("inputThreshold")),
+			Some(&serde_json::json!(200000))
+		);
 		let thinking = context.thinking.expect("materialized thinking");
 		assert_eq!(thinking.mode, "effort");
 		assert_eq!(thinking.efforts, vec!["low".to_string(), "high".to_string()]);
 		assert_eq!(thinking.default_level.as_deref(), Some("low"));
-		assert_eq!(thinking.effort_map, vec![("high".to_string(), "max".to_string())]);
+		assert_eq!(
+			thinking.effort_map,
+			Some(vec![("high".to_string(), "max".to_string())])
+		);
+		assert_eq!(
+			thinking.effort_routing,
+			Some(vec![("high".to_string(), "qwen3-max".to_string())])
+		);
+		assert_eq!(
+			thinking.effort_budgets,
+			Some(vec![("high".to_string(), 4096)])
+		);
+		assert_eq!(thinking.supports_display, Some(true));
+		assert_eq!(thinking.suppress_when_off, Some(false), "authored false is kept");
+		assert_eq!(thinking.requires_effort, Some(true));
 		assert_eq!(context.effort.as_deref(), Some("high"));
 		assert_eq!(
 			context.headers,
+			vec![("X-Model".to_string(), "row".to_string())],
+			"the hook-visible model carries model-authored headers only"
+		);
+		assert_eq!(
+			ollama_request_headers(&catalog, &config, "ollama"),
 			vec![
-				("X-Model".to_string(), "row".to_string()),
 				("X-Model".to_string(), "config".to_string()),
 				("X-Config".to_string(), "yes".to_string()),
 			],
-			"model headers precede config headers; the adapter appends the credential last"
+			"connection headers follow the existing config.yml-then-catalog precedence"
 		);
 	}
 

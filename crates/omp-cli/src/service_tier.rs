@@ -122,3 +122,21 @@ pub(crate) fn resolve<'a>(
 		.map(String::as_str)
 		.filter(|tier| !tier.is_empty())
 }
+
+/// TS `serviceTierForAllFamilies`: broadcast one chosen tier across families,
+/// clamped to what each family realizes (Anthropic only `priority`, Google
+/// only `flex`/`priority`). `none`/empty/`inherit` yield no selection.
+pub(crate) fn for_single(tier: Option<&str>) -> BTreeMap<String, String> {
+	let Some(tier) = tier.filter(|tier| !matches!(*tier, "" | "none" | "inherit")) else {
+		return BTreeMap::new();
+	};
+	let mut out = BTreeMap::new();
+	out.insert("openai".to_string(), tier.to_string());
+	if tier == "priority" {
+		out.insert("anthropic".to_string(), "priority".to_string());
+	}
+	if matches!(tier, "flex" | "priority") {
+		out.insert("google".to_string(), tier.to_string());
+	}
+	out
+}

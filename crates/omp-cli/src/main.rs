@@ -917,6 +917,8 @@ fn run() -> std::result::Result<(), CliError> {
 		skills_filter,
 		store: SessionStore::default(),
 		service_tier_by_family: store.service_tier_by_family(),
+		service_tier_explicit: cli.service_tier.is_some(),
+		service_tier_recorded: false,
 		history: Vec::new(),
 		checkpoint_host: CheckpointHost::new(),
 		in_memory_messages: None,
@@ -1169,6 +1171,18 @@ fn run() -> std::result::Result<(), CliError> {
 	};
 	session.checkpoint_host.rehydrate(&store);
 	session.store = store;
+	if session.service_tier_explicit {
+		// TS `setServiceTierFamily`: an explicit launch flag is recorded, so a
+		// later resume restores the re-armed selection.
+		let tiers = crate::service_tier::for_single(session.config.service_tier.as_deref());
+		if session.store.enabled()
+			&& let Err(err) = session.store.append_service_tier_change(&tiers)
+		{
+			eprintln!("warning: cannot record service tier change: {err}");
+		}
+		session.service_tier_by_family = tiers;
+		session.service_tier_recorded = true;
+	}
 	// TS `sdk.ts:1505-1545`: an explicit `--model` wins; otherwise a restored
 	// session's recorded model/role decides the route, with the configured
 	// default as fallback.
@@ -1476,6 +1490,12 @@ struct Session<'a> {
 	/// when `--no-session` disables persistence so a downgrade sticks across
 	/// prompts in this process.
 	service_tier_by_family: std::collections::BTreeMap<String, String>,
+	/// `--service-tier` was supplied at launch: it rearms the selection ahead
+	/// of any recorded entry, per TS precedence.
+	service_tier_explicit: bool,
+	/// A downgrade or rearm changed the in-memory selection (kept under
+	/// `--no-session`, where there is no journal to restore from).
+	service_tier_recorded: bool,
 	history: Vec<TurnRecord>,
 	checkpoint_host: CheckpointHost,
 	/// Live branch conversation for `--no-session` runs (no leading system
@@ -1795,6 +1815,18 @@ impl Session<'_> {
 			runtime::latest_todo_phases_from_turns(&self.history)
 		};
 		let goal_context = self.goal_mode_context(&todo_phases);
+		// TS precedence: an explicit launch flag rearms; otherwise a recorded
+		// entry (including an empty reset) wins over configured defaults, and a
+		// configured default applies only when the session recorded nothing.
+		let service_tier_by_family = if self.service_tier_explicit {
+			crate::service_tier::for_single(self.config.service_tier.as_deref())
+		} else if self.store.has_service_tier_entry() {
+			self.store.service_tier_by_family()
+		} else if self.service_tier_recorded {
+			self.service_tier_by_family.clone()
+		} else {
+			crate::service_tier::for_single(self.config.service_tier.as_deref())
+		};
 		Ok(RunRequest {
 			prompt,
 			parts,
@@ -1839,7 +1871,7 @@ impl Session<'_> {
 			plan_mode: Default::default(),
 			continuation: false,
 			plan_context: None,
-			service_tier_by_family: self.service_tier_by_family.clone(),
+			service_tier_by_family,
 })
 	}
 
@@ -2185,6 +2217,7 @@ impl Session<'_> {
 							== Some("priority")
 					{
 						self.service_tier_by_family.remove("anthropic");
+						self.service_tier_recorded = true;
 						if self.store.enabled()
 							&& let Err(err) =
 								self.store.append_service_tier_change(&self.service_tier_by_family)

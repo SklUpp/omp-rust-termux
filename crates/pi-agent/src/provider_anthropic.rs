@@ -1809,15 +1809,87 @@ impl ModelProvider for AnthropicMessagesProvider {
 		let body = response
 			.bytes_stream()
 			.map(|item| item.map_err(|err| err.to_string()));
-		Ok(with_disabled_features(
+		let mut stream = with_disabled_features(
 			anthropic_sse_stream(
 				Box::pin(body),
 				secrets,
 				self.first_event_timeout,
 				self.idle_timeout,
 			),
-			disabled_features,
-		))
+			disabled_features.clone(),
+		);
+		// TS `firstTokenTime === undefined`: a fast-mode failure before any
+		// observable output (text, reasoning, tool delta, redacted/signature
+		// block or terminal stop) retries once without `speed` and the beta.
+		// Metadata-only chunks do not count as output.
+		let mut prelude: Vec<Result<StreamChunk, ProviderError>> = Vec::new();
+		loop {
+			match stream.next().await {
+				Some(Ok(chunk)) => {
+					let observable = chunk
+						.content
+						.as_deref()
+						.is_some_and(|text| !text.is_empty())
+						|| chunk
+							.reasoning
+							.as_deref()
+							.is_some_and(|text| !text.is_empty())
+						|| !chunk.tool_call_deltas.is_empty()
+						|| chunk
+							.redacted
+							.as_deref()
+							.is_some_and(|data| !data.is_empty())
+						|| chunk.signature.is_some()
+						|| chunk.is_done;
+					prelude.push(Ok(chunk));
+					if observable {
+						break;
+					}
+				},
+				Some(Err(error)) => {
+					if self.fast_mode_active()
+						&& stream_error_is_fast_mode_unsupported(&error)
+					{
+						self.fast_mode_disabled.store(true, Ordering::Relaxed);
+						let retry_body =
+							self.build_request(messages, tools, tool_choice, true)?;
+						let retry = self
+							.send_with_retry(&retry_body, true, !tools.is_empty())
+							.await?;
+						let retry_status = retry.status();
+						if !retry_status.is_success() {
+							let text = match read_body_bounded(retry, ERROR_BODY_BYTES).await {
+								Ok(body) => {
+									self.redact_snippet(&body.text, body.truncated)
+								},
+								Err(err) => format!("<failed to read error body: {err}>"),
+							};
+							return Err(ProviderError::HttpStatus(
+								retry_status.as_u16(),
+								text,
+							));
+						}
+						let secrets = self.credential_values();
+						let retry_body = retry
+							.bytes_stream()
+							.map(|item| item.map_err(|err| err.to_string()));
+						return Ok(with_disabled_features(
+							anthropic_sse_stream(
+								Box::pin(retry_body),
+								secrets,
+								self.first_event_timeout,
+								self.idle_timeout,
+							),
+							Some(vec!["priority".to_string()]),
+						));
+					}
+					prelude.push(Err(error));
+					break;
+				},
+				None => break,
+			}
+		}
+		Ok(Box::pin(futures::stream::iter(prelude).chain(stream)))
 	}
 }
 
@@ -2600,6 +2672,21 @@ fn with_disabled_features(
 			chunk
 		})
 	}))
+}
+
+/// Fast-mode classification for a failure surfaced by the SSE stream rather
+/// than the HTTP status (`firstTokenTime === undefined` in TS).
+fn stream_error_is_fast_mode_unsupported(error: &ProviderError) -> bool {
+	match error {
+		ProviderError::HttpStatus(status, text) => is_fast_mode_unsupported(*status, text),
+		other => {
+			let text = other.to_string().to_ascii_lowercase();
+			(text.contains("invalid_request_error")
+				&& contains_word(&text, "speed")
+				&& text.contains("not support"))
+				|| (text.contains("rate_limit_error") && text.contains("fast mode"))
+		},
+	}
 }
 
 fn should_retry_response(response: &reqwest::Response) -> bool {

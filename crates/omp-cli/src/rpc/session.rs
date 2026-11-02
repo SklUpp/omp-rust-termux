@@ -2259,6 +2259,7 @@ impl RpcSession {
 		});
 		asst_msg.attribution = message.attribution.map(|value| value.as_str().to_string());
 		asst_msg.disabled_features = message.disabled_features.clone();
+		let mut priority_notice: Option<String> = None;
 		if message
 			.disabled_features
 			.as_deref()
@@ -2274,8 +2275,9 @@ impl RpcSession {
 			{
 				eprintln!("warning: cannot record service tier change: {err}");
 			}
-			eprintln!(
-				"warning: Priority/fast mode rejected for this model; retried without it. Fast mode is now off."
+			priority_notice = Some(
+				"Priority/fast mode rejected for this model; retried without it. Fast mode is now off."
+					.to_string(),
 			);
 		}
 		let asst_id = format!("msg-{}", output::session_id());
@@ -2447,6 +2449,15 @@ impl RpcSession {
 			messages.push(Message::system(warning));
 		}
 
+		if let Some(notice) = priority_notice.take() {
+			// Live protocol channel: the RPC/ACP consumer already receives the
+			// turn-ack warning, so the downgrade notice rides the same frame
+			// instead of a host-only log line.
+			decision.warning = Some(match decision.warning.take() {
+				Some(existing) => format!("{notice}\n{existing}"),
+				None => notice,
+			});
+		}
 		// Prewalk: advance the one-way switch at this settled boundary. A
 		// terminal provider turn never starts another request, so it neither
 		// swaps the provider nor injects guidance.

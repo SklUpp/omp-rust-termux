@@ -2571,7 +2571,8 @@ fn wire_provider(
 				.with_session_id(session_id)
 				.with_prompt_cache_key(prompt_cache_key)
 				.with_force_reasoning_off(config.external_thinking)
-				.with_service_tier(config.service_tier.clone())
+				// The resolved per-family selection, never the launch flag alone.
+				.with_service_tier(service_tier)
 				// Assembly stamps the real route on produced messages so signed
 				// reasoning is only replayed to the provider that issued it.
 				.with_provider_id(target.provider.to_string());

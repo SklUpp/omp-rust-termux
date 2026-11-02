@@ -770,9 +770,9 @@ impl SessionMessage {
 			stop_reason: None,
 			error_message: None,
 			timestamp_ms: Some(timestamp_ms),
-			is_error: None,
-			disabled_features: None,
-			extra: serde_json::Map::new(),
+				is_error: None,
+				disabled_features: None,
+				extra: serde_json::Map::new(),
 		}
 	}
 
@@ -811,9 +811,9 @@ impl SessionMessage {
 			stop_reason: canon_stop,
 			error_message: None,
 			timestamp_ms: Some(timestamp_ms),
-			is_error: None,
-			disabled_features: None,
-			extra: serde_json::Map::new(),
+				is_error: None,
+				disabled_features: None,
+				extra: serde_json::Map::new(),
 		}
 	}
 
@@ -2664,7 +2664,7 @@ impl SessionStore {
 						.then(|| USER_INTERRUPT_LABEL.to_string()),
 					timestamp_ms: Some(now_ms),
 					is_error: None,
-			disabled_features: None,
+					disabled_features: None,
 					extra: serde_json::Map::new(),
 				},
 			));
@@ -4387,7 +4387,6 @@ pub fn import_legacy_v1(
 			SessionMessage {
 				timestamp_ms: import_ms,
 				..SessionMessage::user(user_content, 0)
-				disabled_features: None,
 			},
 		);
 		lines.push(format!("{}\n", serde_json::to_string(&user_entry).map_err(|e| e.to_string())?));
@@ -4431,7 +4430,7 @@ pub fn import_legacy_v1(
 					error_message: None,
 					timestamp_ms: import_ms,
 					is_error: None,
-			disabled_features: None,
+					disabled_features: None,
 					extra: serde_json::Map::new(),
 				},
 			);
@@ -4454,7 +4453,6 @@ pub fn import_legacy_v1(
 						tc.is_error,
 						0,
 					)
-					disabled_features: None,
 				};
 				if let Some(details) = &tc.details {
 					message.extra.insert("details".to_string(), details.clone());
@@ -4494,7 +4492,7 @@ pub fn import_legacy_v1(
 				error_message: None,
 				timestamp_ms: import_ms,
 				is_error: None,
-			disabled_features: None,
+				disabled_features: None,
 				extra: serde_json::Map::new(),
 			},
 		);

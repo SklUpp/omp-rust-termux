@@ -647,6 +647,7 @@ fn launch(port: u16, model: &str, provider: &str) -> RpcLaunch {
 		skills: Vec::new(),
 		catalog: Arc::new(Catalog::default()),
 		agent_db: agent_db_path(),
+		service_tier_explicit: false,
 		approval_mode: ApprovalMode::Yolo,
 		allow: Vec::new(),
 		model: Some(model.to_string()),

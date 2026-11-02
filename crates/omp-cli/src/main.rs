@@ -916,7 +916,8 @@ fn run() -> std::result::Result<(), CliError> {
 		prompt_inputs,
 		skills_filter,
 		store: SessionStore::default(),
-		service_tier_by_family: store.service_tier_by_family(),
+		// Resolved once below, after the session store is opened.
+		service_tier_by_family: std::collections::BTreeMap::new(),
 		service_tier_explicit: cli.service_tier.is_some(),
 		service_tier_recorded: false,
 		history: Vec::new(),

@@ -1986,9 +1986,9 @@ const GALLERY_TOOLS: [GalleryTool; 20] = [
 	GalleryTool { name: "task", args: r#"{"task":"Add tests","agent":"task"}"#, result: "Subagent completed: 3 files changed" },
 	GalleryTool { name: "hub", args: r#"{"action":"list"}"#, result: "No background agents" },
 	GalleryTool { name: "goal", args: r#"{"goal":"Ship the headless preview"}"#, result: "Goal updated" },
-	GalleryTool { name: "think", args: r#"{"thought":"Check the cache path"}"#, result: "Recorded private thought" },
-	GalleryTool { name: "checkpoint", args: r#"{"label":"before-edit"}"#, result: "Checkpoint created" },
-	GalleryTool { name: "rewind", args: r#"{"label":"before-edit"}"#, result: "Rewound to before-edit" },
+	GalleryTool { name: "think", args: r#"{"thoughts":"Check the cache path"}"#, result: "------" },
+	GalleryTool { name: "checkpoint", args: r#"{"goal":"Investigate the failing test"}"#, result: "Checkpoint: Investigate the failing test" },
+	GalleryTool { name: "rewind", args: r#"{"report":"Explored the edit path; ready to rewind."}"#, result: "Rewind requested." },
 ];
 
 fn gallery_known_tools() -> Vec<String> {

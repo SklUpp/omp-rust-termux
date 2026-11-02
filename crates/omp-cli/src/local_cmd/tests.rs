@@ -215,6 +215,39 @@ fn gallery_covers_every_runtime_tool() {
 }
 
 #[test]
+fn gallery_fixture_arguments_validate_against_tool_schemas() {
+	use pi_agent::tools::Tool;
+
+	let args_for = |name: &str| -> Value {
+		let fixture = GALLERY_TOOLS
+			.iter()
+			.find(|tool| tool.name == name)
+			.expect("gallery fixture");
+		serde_json::from_str(fixture.args).expect("fixture args JSON")
+	};
+	let controller = std::sync::Arc::new(pi_agent::tools::checkpoint::CheckpointController::new());
+	let cases = [
+		("think", pi_agent::tools::think::ThinkTool::new().schema()),
+		(
+			"checkpoint",
+			pi_agent::tools::checkpoint::CheckpointTool::new(controller.clone()).schema(),
+		),
+		(
+			"rewind",
+			pi_agent::tools::checkpoint::RewindTool::new(controller).schema(),
+		),
+	];
+	for (name, schema) in cases {
+		let result = pi_agent::tools::task_catalog::validate_output(&schema, &args_for(name));
+		assert!(
+			result.is_ok(),
+			"{name}: {}",
+			result.err().map(|error| error.message).unwrap_or_default()
+		);
+	}
+}
+
+#[test]
 fn gallery_unknown_tool_and_plain_output() {
 	let opts = GalleryOptions {
 		tool:     Some("nope".to_string()),

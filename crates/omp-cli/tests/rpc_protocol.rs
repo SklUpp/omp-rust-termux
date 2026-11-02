@@ -35,7 +35,7 @@ use omp_cli::{
 		types::RpcHostUriSchemeDefinition,
 	},
 	prewalk::PrewalkArm,
-	runtime::{ModelSwitch, PiAgentRunner},
+	runtime::{CliThinking, ModelSwitch, PiAgentRunner},
 	session::{
 		ContentPart, MessageContent, MessageEntry, SessionMessage, SessionOptions, SessionStore,
 		fork_session,
@@ -606,6 +606,26 @@ fn agent_db_path() -> std::path::PathBuf {
 	static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 	let next = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 	std::env::temp_dir().join(format!("omp-rpc-agent-{}-{next}.db", std::process::id()))
+}
+
+fn effort_catalog() -> Catalog {
+	let mut catalog = Catalog::default();
+	let mut models = std::collections::BTreeMap::new();
+	models.insert(
+		"model-a".to_string(),
+		ModelInfo {
+			provider: "mock".to_string(),
+			reasoning: true,
+			efforts: Some(vec!["low".to_string(), "high".to_string()]),
+			thinking: Some(json!({
+				"efforts": ["low", "high"],
+				"defaultLevel": "high"
+			})),
+			..ModelInfo::default()
+		},
+	);
+	catalog.providers.insert("mock".to_string(), models);
+	catalog
 }
 
 fn launch(port: u16, model: &str, provider: &str) -> RpcLaunch {
@@ -1901,4 +1921,143 @@ fn rpc_prewalk_switches_after_todo_and_first_write() {
 	);
 	drop(harness);
 	fs::remove_dir_all(&root).ok();
+}
+
+/// Actual localhost wire: an inherited prompt-cache key survives a no-op or
+/// rejected thinking selection and dies only when the effective level changes.
+#[test]
+fn rpc_thinking_change_drops_inherited_cache_key_but_noop_keeps_it() {
+	let (port, requests, _) = spawn_tool_model_with_auth(vec![
+		ToolScript { text: "one".to_string(), tool: None },
+		ToolScript { text: "two".to_string(), tool: None },
+		ToolScript { text: "three".to_string(), tool: None },
+	]);
+	let mut launch = launch(port, "model-a", "mock");
+	launch.catalog = Arc::new(effort_catalog());
+	launch.thinking = Some(CliThinking::Effort("high"));
+	launch.thinking_level = Some("high".to_string());
+	launch.prompt_cache_key = Some("header-cache-1".to_string());
+	launch.prompt_cache_key_inherited = true;
+	launch.max_turns = 2;
+	let harness = Harness::start(launch);
+
+	harness.send(json!({ "type": "set_thinking_level", "id": "t1", "level": "high" }));
+	let frames = harness.wait_for(
+		|frames| frames.iter().any(|frame| frame["id"] == "t1"),
+		timeout(),
+	);
+	assert_eq!(
+		frames
+			.iter()
+			.find(|frame| frame["id"] == "t1")
+			.expect("same-level response")["success"],
+		true
+	);
+	harness.send(json!({ "type": "prompt", "id": "p1", "message": "one" }));
+	harness.wait_for(
+		|frames| {
+			frames
+				.iter()
+				.filter(|frame| frame["type"] == "agent_end")
+				.count()
+				>= 1
+		},
+		timeout(),
+	);
+
+	harness.send(json!({ "type": "set_thinking_level", "id": "t2", "level": "bogus" }));
+	let frames = harness.wait_for(
+		|frames| frames.iter().any(|frame| frame["id"] == "t2"),
+		timeout(),
+	);
+	assert_eq!(
+		frames
+			.iter()
+			.find(|frame| frame["id"] == "t2")
+			.expect("invalid-level response")["success"],
+		false
+	);
+	harness.send(json!({ "type": "prompt", "id": "p2", "message": "two" }));
+	harness.wait_for(
+		|frames| {
+			frames
+				.iter()
+				.filter(|frame| frame["type"] == "agent_end")
+				.count()
+				>= 2
+		},
+		timeout(),
+	);
+
+	harness.send(json!({ "type": "set_thinking_level", "id": "t3", "level": "low" }));
+	harness.wait_for(
+		|frames| frames.iter().any(|frame| frame["id"] == "t3"),
+		timeout(),
+	);
+	harness.send(json!({ "type": "prompt", "id": "p3", "message": "three" }));
+	harness.wait_for(
+		|frames| {
+			frames
+				.iter()
+				.filter(|frame| frame["type"] == "agent_end")
+				.count()
+				>= 3
+		},
+		timeout(),
+	);
+
+	let bodies = requests
+		.lock()
+		.unwrap_or_else(std::sync::PoisonError::into_inner)
+		.clone();
+	assert_eq!(bodies.len(), 3, "{bodies:#?}");
+	assert_eq!(bodies[0]["prompt_cache_key"], "header-cache-1");
+	assert_eq!(
+		bodies[1]["prompt_cache_key"], "header-cache-1",
+		"a rejected selection must not change the cache shape: {}",
+		bodies[1]
+	);
+	assert!(
+		bodies[2].get("prompt_cache_key").is_none(),
+		"an actual thinking change must drop the inherited key: {}",
+		bodies[2]
+	);
+	assert_eq!(bodies[2]["reasoning_effort"], "low");
+	drop(harness);
+}
+
+/// An explicit `--prompt-cache-key` is not inherited identity and survives an
+/// actual thinking change.
+#[test]
+fn rpc_thinking_change_keeps_explicit_cache_key() {
+	let (port, requests, _) = spawn_tool_model_with_auth(vec![ToolScript {
+		text: "one".to_string(),
+		tool: None,
+	}]);
+	let mut launch = launch(port, "model-a", "mock");
+	launch.catalog = Arc::new(effort_catalog());
+	launch.thinking = Some(CliThinking::Effort("high"));
+	launch.thinking_level = Some("high".to_string());
+	launch.prompt_cache_key = Some("explicit-cache-1".to_string());
+	launch.prompt_cache_key_inherited = false;
+	launch.max_turns = 2;
+	let harness = Harness::start(launch);
+	harness.send(json!({ "type": "set_thinking_level", "id": "t1", "level": "low" }));
+	harness.wait_for(
+		|frames| frames.iter().any(|frame| frame["id"] == "t1"),
+		timeout(),
+	);
+	harness.send(json!({ "type": "prompt", "id": "p1", "message": "one" }));
+	harness.wait_for(
+		|frames| frames.iter().any(|frame| frame["type"] == "agent_end"),
+		timeout(),
+	);
+	let bodies = requests
+		.lock()
+		.unwrap_or_else(std::sync::PoisonError::into_inner)
+		.clone();
+	assert_eq!(bodies.len(), 1, "{bodies:#?}");
+	assert_eq!(bodies[0]["prompt_cache_key"], "explicit-cache-1");
+	assert_eq!(bodies[0]["reasoning_effort"], "low");
+	drop(harness);
 }

@@ -1072,12 +1072,43 @@ impl RpcSession {
 				}
 			}
 		}
+		// TS `setThinkingLevel` clears the inherited prompt-cache identity only
+		// when the effective selection actually changes: entering auto from a
+		// fixed level, or a different resolved level. Re-applying the same level
+		// (and rejected input, which returns above) keeps the inherited key.
+		let was_auto = self.thinking == Some(runtime::CliThinking::Auto);
+		let changed = match parsed {
+			runtime::CliThinking::Auto => !was_auto,
+			runtime::CliThinking::Off => {
+				was_auto || self.thinking_level.as_deref() != Some("off")
+			},
+			runtime::CliThinking::Effort(_) => {
+				let provider = self
+					.provider
+					.as_deref()
+					.or_else(|| self.model.as_deref().and_then(|id| self.catalog.provider_of(id)))
+					.unwrap_or_default();
+				let effective = self.model.as_deref().and_then(|model| {
+					runtime::resolve_thinking_effort(
+						&self.catalog,
+						provider,
+						model,
+						Some(parsed),
+					)
+				});
+				was_auto || effective.as_deref() != self.thinking_level.as_deref()
+			},
+		};
 		self.thinking = Some(parsed);
 		self.thinking_level = match parsed {
 			runtime::CliThinking::Off => Some("off".to_string()),
 			runtime::CliThinking::Auto => None,
 			runtime::CliThinking::Effort(effort) => Some(effort.to_string()),
 		};
+		if changed && self.prompt_cache_key_inherited {
+			self.prompt_cache_key = None;
+			self.prompt_cache_key_inherited = false;
+		}
 		Ok(())
 	}
 

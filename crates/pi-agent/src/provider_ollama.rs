@@ -509,10 +509,10 @@ pub fn demote_thinking(model_id: &str, thinking: &str) -> String {
 	let dialect = preferred_dialect(model_id);
 	match dialect {
 		"anthropic" => thinking.to_string(),
-		"harmony" | "gemma" => format!(" thinking\n{thinking}\n</think>"),
+		"harmony" | "gemma" => format!("\x3cthink\x3e\n{thinking}\n\x3c/think\x3e"),
 		"gemini" => format!("```thinking\n{thinking}\n```"),
 		"qwen3" | "deepseek" | "kimi" | "glm" => {
-			format!(" thinking\n{thinking}\n</think>")
+			format!("\x3cthink\x3e\n{thinking}\n\x3c/think\x3e")
 		},
 		_ => {
 			let inner = unwrap_delimited_thinking("<thinking>", "</thinking>", thinking);
@@ -3096,8 +3096,15 @@ pub fn extract_retry_hint(headers: &reqwest::header::HeaderMap, body: &str) -> O
 		}
 	}
 	if let Some(val) = headers.get("retry-after").and_then(|v| v.to_str().ok()) {
-		if let Ok(secs) = val.trim().parse::<u64>() {
+		let trimmed = val.trim();
+		if let Ok(secs) = trimmed.parse::<u64>() {
 			return Some(Duration::from_secs(secs));
+		}
+		if let Some(epoch) = parse_http_date_epoch(trimmed) {
+			let target_ms = u128::from(epoch) * 1_000;
+			return Some(Duration::from_millis(
+				target_ms.saturating_sub(now_unix_ms()) as u64,
+			));
 		}
 	}
 	// `x-ratelimit-reset-ms`: epoch ms (`> 1e12`), epoch s (`> 1e9`), else delta ms.

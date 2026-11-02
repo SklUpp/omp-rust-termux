@@ -538,7 +538,10 @@ async fn stream_flushes_an_eof_record_without_a_trailing_newline() {
 
 #[tokio::test]
 async fn held_partial_tail_is_visible_so_length_stays_length() {
-	let body = "{\"message\":{\"content\":\"partial <\"},\"done\":false}\n{\"done\":true,\"done_reason\":\"length\",\"eval_count\":1}\n";
+	// The entire content is a held markup prefix: it is not visible before the
+	// terminal flush, so without flushing first `length` would become the empty
+	// completion error.
+	let body = "{\"message\":{\"content\":\"<\"},\"done\":false}\n{\"done\":true,\"done_reason\":\"length\",\"eval_count\":1}\n";
 	let (base, _request_rx) =
 		serve_once(response("200 OK", "application/x-ndjson", body)).await;
 	let provider = make_provider(&base, "m");
@@ -547,7 +550,7 @@ async fn held_partial_tail_is_visible_so_length_stays_length() {
 		.await
 		.expect("complete");
 	assert_eq!(message.stop_reason, Some(StopReason::Length));
-	assert_eq!(message.content, "partial <");
+	assert_eq!(message.content, "<");
 }
 
 #[tokio::test]
@@ -1193,8 +1196,20 @@ fn test_retry_backoff_and_header_parsing() {
 	assert_eq!(hint_ms, Some(Duration::from_millis(3500)));
 
 	let empty_headers = reqwest::header::HeaderMap::new();
-	let body_hint = extract_retry_hint(&empty_headers, "Please retry after 4 seconds for rate limit");
+	// TS `PLEASE_RETRY_PATTERN` requires `<digits><ms|s>` with no word between.
+	let body_hint = extract_retry_hint(&empty_headers, "Please retry in 4s for rate limit");
 	assert_eq!(body_hint, Some(Duration::from_secs(4)));
+
+	let mut date_headers = reqwest::header::HeaderMap::new();
+	date_headers.insert(
+		"retry-after",
+		"Sun, 06 Nov 2094 08:49:37 GMT".parse().unwrap(),
+	);
+	let date_hint = extract_retry_hint(&date_headers, "").expect("HTTP-date hint");
+	assert!(
+		date_hint >= Duration::from_secs(60 * 60 * 24 * 365 * 60),
+		"future HTTP date must produce a long hint: {date_hint:?}"
+	);
 
 	// Test parse error exclusion
 	assert!(is_llama_cpp_parse_error("Failed to parse tool call arguments as JSON: syntax error"));

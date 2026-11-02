@@ -2828,7 +2828,7 @@ impl Session<'_> {
 										tools.hidden_by_plan(),
 									));
 								eprintln!("{}", commit.notice);
-								*plan_yolo_switch =
+								plan_yolo_switch =
 									Some((target, switch_thinking, api_key));
 							},
 							Err(err) => {

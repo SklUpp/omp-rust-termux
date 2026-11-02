@@ -95,6 +95,16 @@ struct LaunchArgs {
 	#[arg(long = "prewalk-into", value_name = "MODEL")]
 	prewalk_into: Option<String>,
 
+	/// Force read-only plan mode at start, auto-approve the model's plan, then
+	/// switch to the execution target and implement it. Hidden until the host
+	/// wiring lands so unwired runs never advertise the flow.
+	#[arg(long = "plan-yolo", hide = true)]
+	plan_yolo: bool,
+
+	/// Target model or role for plan-yolo execution (default `@smol`).
+	#[arg(long = "plan-yolo-into", value_name = "MODEL", hide = true)]
+	plan_yolo_into: Option<String>,
+
 	/// Private think scratchpad; disables supported native provider reasoning.
 	#[arg(long = "external-thinking")]
 	external_thinking: bool,
@@ -313,6 +323,13 @@ pub struct Cli {
 	/// Model or role to switch to at the first edit/write (default `@smol`).
 	pub prewalk_into: Option<String>,
 
+	/// Force read-only plan mode at start, auto-approve the model's plan, then
+	/// switch to the execution target and implement it.
+	pub plan_yolo: bool,
+
+	/// Target model or role for plan-yolo execution (default `@smol`).
+	pub plan_yolo_into: Option<String>,
+
 	/// Private think scratchpad; disables supported native provider reasoning.
 	pub external_thinking: bool,
 
@@ -524,6 +541,8 @@ impl Cli {
 			prewalk: raw.prewalk,
 			no_prewalk: raw.no_prewalk,
 			prewalk_into: raw.prewalk_into,
+			plan_yolo: raw.plan_yolo,
+			plan_yolo_into: raw.plan_yolo_into,
 			external_thinking: raw.external_thinking,
 			service_tier: raw.service_tier,
 			provider: raw.provider,

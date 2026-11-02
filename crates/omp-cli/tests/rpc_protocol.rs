@@ -2086,19 +2086,35 @@ fn rpc_failed_plan_switch_surfaces_an_error_instead_of_success() {
 	harness.send(json!({ "type": "prompt", "id": "p1", "message": "start" }));
 	let frames = harness.wait_for(
 		|frames| {
-			frames
-				.iter()
-				.any(|frame| frame["type"] == "error" && frame["id"] == "p1")
+			frames.iter().any(|frame| {
+				frame["type"] == "response"
+					&& frame["id"] == "p1"
+					&& frame["success"] == false
+			}) && frames.iter().any(|frame| {
+				frame["type"] == "agent_end" && frame["willContinue"] == false
+			})
 		},
 		timeout(),
 	);
 	let error = frames
 		.iter()
-		.find(|frame| frame["type"] == "error" && frame["id"] == "p1")
-		.expect("prompt error");
+		.find(|frame| {
+			frame["type"] == "response"
+				&& frame["id"] == "p1"
+				&& frame["success"] == false
+		})
+		.expect("prompt error response");
 	assert!(
-		error.to_string().contains("plan-yolo switch failed"),
+		error["error"]
+			.as_str()
+			.is_some_and(|message| message.contains("plan-yolo switch failed")),
 		"error={error}"
+	);
+	assert!(
+		frames.iter().any(|frame| {
+			frame["type"] == "agent_end" && frame["willContinue"] == false
+		}),
+		"failed switch must terminate the run: {frames:#?}"
 	);
 	assert_eq!(
 		requests

@@ -1184,7 +1184,7 @@ fn run() -> std::result::Result<(), CliError> {
 	// `--service-tier` is the TS OpenAI-only override (`cli/args.ts:48` ->
 	// `sdk.ts:3408`): it layers onto the recorded/configured map and never
 	// touches the anthropic or google families.
-	let live_service_tiers = crate::service_tier::overlay_openai(
+	let live_service_tiers = omp_cli::service_tier::overlay_openai(
 		if session.service_tier_explicit {
 			session.config.service_tier.as_deref()
 		} else {

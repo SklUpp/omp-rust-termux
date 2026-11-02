@@ -126,7 +126,7 @@ pub(crate) fn resolve<'a>(
 /// TS `--service-tier` override (`cli/args.ts:48` -> `sdk.ts:3408`): it only
 /// mutates the `openai` family entry of the effective map, preserving the
 /// other families. `none`/empty removes only that entry.
-pub(crate) fn overlay_openai(
+pub fn overlay_openai(
 	explicit: Option<&str>,
 	base: &BTreeMap<String, String>,
 ) -> BTreeMap<String, String> {

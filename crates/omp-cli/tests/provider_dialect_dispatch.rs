@@ -334,7 +334,7 @@ fn serve_bounded(
 	captured: mpsc::Sender<(String, String)>,
 ) {
 	listener.set_nonblocking(true).expect("nonblocking listener");
-	let deadline = std::time::Instant::now() + Duration::from_secs(60);
+	let deadline = std::time::Instant::now() + Duration::from_secs(10);
 	let mut served = 0;
 	while served < expected {
 		assert!(
@@ -383,25 +383,13 @@ const CHILD_TOOL_TURN: &str = concat!(
 	"data: {\"type\":\"message_stop\"}\n\n"
 );
 
-const CHILD_FINAL_TURN: &str = concat!(
-	"event: message_start\n",
-	"data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_child_2\"}}\n\n",
-	"event: content_block_start\n",
-	"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
-	"event: content_block_delta\n",
-	"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"child done\"}}\n\n",
-	"event: content_block_stop\n",
-	"data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
-	"event: message_delta\n",
-	"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n\n",
-	"event: message_stop\n",
-	"data: {\"type\":\"message_stop\"}\n\n"
-);
 
 /// A delegated child is a real provider request on its own route: the root turn
 /// talks Ollama to one endpoint, the `task` child speaks `anthropic-messages` to
 /// another, the child sees only its own credential, the root endpoint never sees
-/// the child key, and the task result carries the child's real output.
+/// the child key, and the task result carries the child's real output. The child
+/// makes exactly one provider request: `yield` is its terminal tool, so no
+/// follow-up assistant turn follows the tool result.
 #[test]
 fn child_task_dispatch_reaches_its_own_endpoint_with_its_own_key() {
 	let root_listener = TcpListener::bind("127.0.0.1:0").expect("bind root");
@@ -418,10 +406,9 @@ fn child_task_dispatch_reaches_its_own_endpoint_with_its_own_key() {
 	});
 	let (child_tx, child_rx) = mpsc::channel::<(String, String)>();
 	let child_server = std::thread::spawn(move || {
-		serve_bounded(child_listener, 2, vec![
-			("text/event-stream", CHILD_TOOL_TURN),
-			("text/event-stream", CHILD_FINAL_TURN),
-		], child_tx);
+		// `yield` is terminal: the child completes on its first provider turn, so
+		// there is no follow-up assistant request to serve.
+		serve_bounded(child_listener, 1, vec![("text/event-stream", CHILD_TOOL_TURN)], child_tx);
 	});
 
 	let mut providers = BTreeMap::new();
@@ -481,6 +468,17 @@ fn child_task_dispatch_reaches_its_own_endpoint_with_its_own_key() {
 			}
 		}
 	}
+	// Captures are queued before each response is written, so the received
+	// requests are already complete; drain them before joining so a count
+	// mismatch is diagnosed instead of waiting on a request that never comes.
+	let mut root_requests = Vec::new();
+	while let Ok(captured) = root_rx.try_recv() {
+		root_requests.push(captured);
+	}
+	let mut child_requests = Vec::new();
+	while let Ok(captured) = child_rx.try_recv() {
+		child_requests.push(captured);
+	}
 	root_server.join().expect("root server");
 	child_server.join().expect("child server");
 
@@ -493,10 +491,6 @@ fn child_task_dispatch_reaches_its_own_endpoint_with_its_own_key() {
 		"the child's real output must reach the task result: {details}"
 	);
 
-	let mut root_requests = Vec::new();
-	while let Ok(captured) = root_rx.try_recv() {
-		root_requests.push(captured);
-	}
 	assert_eq!(root_requests.len(), 2, "root turn makes exactly two Ollama calls");
 	for (head, body) in &root_requests {
 		assert!(head.starts_with("POST /api/chat HTTP/1.1"), "{head}");
@@ -506,11 +500,10 @@ fn child_task_dispatch_reaches_its_own_endpoint_with_its_own_key() {
 		assert!(!body.contains("sk-ant-child"), "root body carried the child key: {body}");
 	}
 
-	let mut child_requests = Vec::new();
-	while let Ok(captured) = child_rx.try_recv() {
-		child_requests.push(captured);
-	}
-	assert_eq!(child_requests.len(), 2, "child runs two Anthropic turns");
+	assert_eq!(
+		child_requests.len(), 1,
+		"the terminal `yield` ends the delegated child after one request"
+	);
 	for (head, body) in &child_requests {
 		assert!(head.starts_with("POST /v1/messages HTTP/1.1"), "{head}");
 		let lower = head.to_ascii_lowercase();

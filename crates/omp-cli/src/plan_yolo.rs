@@ -33,6 +33,34 @@ const PLAN_YOLO_HANDOFF_PROMPT: &str = include_str!(
 	"../../../packages/coding-agent/src/prompts/system/plan-yolo-handoff.md"
 );
 
+/// Mirrors the `write` tool's `MAX_WRITE_BYTES`; inline proposal content must
+/// not take a private path around that public tool limit.
+const MAX_INLINE_PLAN_BYTES: usize = 1024 * 1024;
+
+/// `read_local_artifact` caps at `SNAPSHOT_MAX_BYTES + 1` bytes and discards
+/// the true length. A decoded read longer than the cap is therefore truncated
+/// (or exactly at the ambiguous cap+1 boundary); approving its prefix would
+/// let a suffix change escape revalidation.
+fn ensure_plan_fully_read(path: &str, content: &str) -> Result<(), String> {
+	if content.len() > pi_agent::tools::hashline::snapshot::SNAPSHOT_MAX_BYTES {
+		return Err(format!(
+			"Plan file {path} exceeds the approval read limit ({} bytes); shorten it before proposing.",
+			pi_agent::tools::hashline::snapshot::SNAPSHOT_MAX_BYTES
+		));
+	}
+	Ok(())
+}
+
+fn ensure_inline_plan_size(content: &str) -> Result<(), String> {
+	if content.len() > MAX_INLINE_PLAN_BYTES {
+		return Err(format!(
+			"Inline plan content is {} bytes; the write limit is {MAX_INLINE_PLAN_BYTES} bytes.",
+			content.len()
+		));
+	}
+	Ok(())
+}
+
 /// One resolved plan-yolo arm. Credentials and the endpoint are re-derived when
 /// the switch actually fires, exactly like prewalk.
 #[derive(Debug, Clone)]
@@ -248,6 +276,12 @@ impl PlanYoloShared {
 		let Some(pending) = pending_slot.as_ref() else {
 			return Err("plan-yolo has no approved plan pending a switch".to_string());
 		};
+		if let Err(error) =
+			ensure_plan_fully_read(&pending.plan_file_path, &pending.reviewed_content)
+		{
+			*pending_slot = None;
+			return Err(error);
+		}
 		let mut gate = self
 			.gate
 			.lock()
@@ -272,6 +306,10 @@ impl PlanYoloShared {
 				pending.plan_file_path
 			)
 		})?;
+		if let Err(error) = ensure_plan_fully_read(&pending.plan_file_path, &current) {
+			*pending_slot = None;
+			return Err(error);
+		}
 		if current != pending.reviewed_content {
 			*pending_slot = None;
 			return Err(format!(
@@ -421,6 +459,7 @@ impl pi_agent::state::ProposeHandler for PlanYoloProposalHandler {
 		// `local://` is read-only for the model, so the one inline-content path
 		// goes through the same fd-contained artifact writer as plan mode.
 		if let Some(content) = &proposal.content {
+			ensure_inline_plan_size(content).map_err(ToolError::Rejected)?;
 			let relative = pi_agent::tools::local_artifact_relative(&target_url)
 				.ok_or_else(|| {
 					ToolError::ExecutionFailed(format!(
@@ -441,6 +480,8 @@ impl pi_agent::state::ProposeHandler for PlanYoloProposalHandler {
 			})?;
 		}
 		let resolved = resolve_reviewed_plan(&proposal, &target_url, root)?;
+		ensure_plan_fully_read(&resolved.plan_file_path, &resolved.plan_content)
+			.map_err(ToolError::Rejected)?;
 		self.shared
 			.queue_pending(resolved.clone())
 			.map_err(ToolError::Rejected)?;
@@ -554,6 +595,46 @@ mod tests {
 			augment_tools(false, Some(&["read".to_string()])),
 			Some(vec!["read".to_string()])
 		);
+	}
+
+	#[test]
+	fn truncated_approval_read_cannot_become_a_prefix_approval() {
+		let over = "x".repeat(pi_agent::tools::hashline::snapshot::SNAPSHOT_MAX_BYTES + 1);
+		assert!(ensure_plan_fully_read("local://PLAN.md", &over).is_err());
+		let exact = "x".repeat(pi_agent::tools::hashline::snapshot::SNAPSHOT_MAX_BYTES);
+		assert!(ensure_plan_fully_read("local://PLAN.md", &exact).is_ok());
+	}
+
+	#[test]
+	fn inline_proposal_uses_the_write_tool_limit() {
+		let over = "x".repeat(MAX_INLINE_PLAN_BYTES + 1);
+		assert!(ensure_inline_plan_size(&over).is_err());
+		let exact = "x".repeat(MAX_INLINE_PLAN_BYTES);
+		assert!(ensure_inline_plan_size(&exact).is_ok());
+	}
+
+	#[test]
+	fn oversized_reviewed_plan_keeps_the_guard_and_clears_pending() {
+		let shared = shared();
+		let _arming = shared.arm().expect("arm");
+		let root = temp_root("oversized-plan");
+		let over = "x".repeat(pi_agent::tools::hashline::snapshot::SNAPSHOT_MAX_BYTES + 1);
+		std::fs::write(root.join("PLAN.md"), &over).expect("plan");
+		*shared.pending.lock().unwrap() = Some(PlanYoloPending {
+			target: target(),
+			thinking: None,
+			plan_file_path: "local://PLAN.md".to_string(),
+			title: "Plan".to_string(),
+			reviewed_content: over,
+		});
+
+		let error = shared
+			.commit_pending(Some(&root), |_| Ok(()))
+			.expect_err("truncated approval");
+		assert!(error.contains("approval read limit"));
+		assert!(shared.gate().lock().unwrap().state.as_ref().is_some_and(|state| state.enabled));
+		assert!(!shared.has_pending());
+		let _ = std::fs::remove_dir_all(root);
 	}
 
 	#[test]

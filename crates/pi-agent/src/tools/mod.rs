@@ -2,6 +2,7 @@ pub mod ask;
 pub mod ast_edit;
 pub mod ast_grep;
 pub mod checkpoint;
+pub mod conflict;
 pub mod edit_variants;
 pub mod hashline;
 pub mod hub;
@@ -31,6 +32,7 @@ pub use ast_grep::AstGrepTool;
 pub use checkpoint::{
 	CheckpointController, CheckpointState, CheckpointTool, CompletedRewindState, RewindTool,
 };
+pub use conflict::{ConflictHistory, ConflictScope, ParsedConflictUri, parse_conflict_uri};
 pub use hub::HubTool;
 pub use internal_urls::{
 	InternalResource, InternalUrl, InternalUrlRouter, ProtocolHandler, ResolveContext, UrlScope,
@@ -64,6 +66,7 @@ use crate::state::{
 	AcpClientBridge, AcpClientError, AgentContext, PlanWriteOp, PlanWriteTarget, ProposeHandler,
 	ToolResult,
 };
+use crate::tools::conflict::{ConflictEntry, ConflictId};
 use crate::tools::process::{ProcessBackend, ProcessError, ProcessSpec, RestartPolicy};
 
 /// Captured stdout+stderr budget for one bash call.
@@ -1275,16 +1278,21 @@ pub struct WriteTool {
 	/// Plan-approval handler for `xd://propose`; mounted only in plan mode.
 	/// The write guard itself rides on `AgentContext.plan`, never here.
 	propose: Option<Arc<dyn ProposeHandler>>,
+	/// Session snapshot store, shared with `read`/`edit`. Conflict resolution
+	/// invalidates the target so stale hashline tags cannot address pre-write
+	/// content. `None` in embedders that mount no hashline store.
+	snapshots: Option<Arc<hashline::SnapshotStore>>,
 }
 
 impl Default for WriteTool {
 	fn default() -> Self {
 		Self {
-			pending: None,
-			router:  None,
-			scope:   Arc::new(UrlScope::default()),
-			acp:     None,
-			propose: None,
+			pending:   None,
+			router:    None,
+			scope:     Arc::new(UrlScope::default()),
+			acp:       None,
+			propose:   None,
+			snapshots: None,
 		}
 	}
 }
@@ -1297,6 +1305,14 @@ impl WriteTool {
 	/// Mount the session's staging queue on this tool.
 	pub fn with_pending(pending: Arc<pending::PendingStore>) -> Self {
 		Self { pending: Some(pending), ..Self::default() }
+	}
+
+	/// Mount the session snapshot store so conflict resolution can drop tags
+	/// minted from the pre-splice content.
+	#[must_use]
+	pub fn with_snapshots(mut self, snapshots: Option<Arc<hashline::SnapshotStore>>) -> Self {
+		self.snapshots = snapshots;
+		self
 	}
 
 	/// Mount an ACP client bridge. Live writes then go through
@@ -1393,6 +1409,332 @@ impl WriteTool {
 		}));
 		Ok(result)
 	}
+
+	/// Dispatch `write({ path: "conflict://<N>" | "conflict://*" })`.
+	async fn dispatch_conflict(
+		&self,
+		uri: ParsedConflictUri,
+		content: &str,
+		ctx: &AgentContext,
+	) -> Result<ToolResult, ToolError> {
+		let id_text = conflict_id_text(uri.id);
+		if let Some(scope) = uri.scope {
+			return Err(ToolError::Rejected(format!(
+				"Conflict URI scope '/{scope}' is read-only — read `conflict://{id_text}/{scope}` to inspect that side. To write, drop the scope (`conflict://{id_text}`) and put the chosen content (or shorthand like `@{scope}`) in `content`."
+			)));
+		}
+		if content.len() > MAX_WRITE_BYTES {
+			return Err(ToolError::InvalidArguments(format!(
+				"content is {} bytes, the limit is {MAX_WRITE_BYTES}",
+				content.len()
+			)));
+		}
+		let mut result = match uri.id {
+			ConflictId::Wildcard => self.resolve_all_conflicts(content, ctx).await?,
+			ConflictId::Id(id) => self.resolve_single_conflict(id, content, ctx).await?,
+		};
+		if let Some(prefix) = uri.recovered_prefix {
+			result.content.push_str(&format!(
+				"\nNote: stripped erroneous '{prefix}:' prefix from path; conflict URIs are global (use `conflict://{id_text}`, not `<file>:conflict://{id_text}`)."
+			));
+		}
+		Ok(result)
+	}
+
+	/// Plan mode is enforced against the physical file a conflict belongs to,
+	/// never the `conflict://` address itself.
+	fn check_conflict_plan(&self, targets: &[PathBuf], ctx: &AgentContext) -> Result<(), ToolError> {
+		let Some(guard) = ctx.plan.as_ref() else {
+			return Ok(());
+		};
+		let owned: Vec<String> = targets
+			.iter()
+			.map(|path| path.to_string_lossy().into_owned())
+			.collect();
+		let plan_targets: Vec<PlanWriteTarget<'_>> = owned
+			.iter()
+			.map(|path| PlanWriteTarget::new(path, PlanWriteOp::Update))
+			.collect();
+		match guard.write_error("write", &plan_targets) {
+			Some(message) => Err(ToolError::Rejected(message)),
+			None => Ok(()),
+		}
+	}
+
+	/// Drop the resolved id, stale duplicate registrations of the same region,
+	/// and any hashline tag minted from the pre-splice content.
+	fn invalidate_conflict(&self, entry: &ConflictEntry, new_content: &str, ctx: &AgentContext) {
+		ctx.conflicts.invalidate(entry.id);
+		for other in ctx.conflicts.entries() {
+			if other.absolute_path == entry.absolute_path
+				&& conflict::conflict_regions_equal(&other.block, &entry.block)
+				&& !conflict::conflict_region_present(new_content, &other.block)
+			{
+				ctx.conflicts.invalidate(other.id);
+			}
+		}
+		if let Some(snapshots) = &self.snapshots {
+			snapshots.invalidate(&hashline::canonical_key(&entry.absolute_path));
+		}
+	}
+
+	async fn resolve_single_conflict(
+		&self,
+		id: u64,
+		content: &str,
+		ctx: &AgentContext,
+	) -> Result<ToolResult, ToolError> {
+		let entry = ctx.conflicts.get(id).ok_or_else(|| {
+			ToolError::Rejected(format!(
+				"Conflict #{id} not found. Conflict ids are registered when `read` surfaces a marker block; re-read the file to get a current id."
+			))
+		})?;
+		let expanded =
+			conflict::expand_content_tokens(content, &entry).map_err(ToolError::Rejected)?;
+		let original = match tokio::fs::read(&entry.absolute_path).await {
+			Ok(bytes) => bytes,
+			Err(_) => {
+				return Err(ToolError::Rejected(format!(
+					"Conflict #{} target '{}' no longer exists.",
+					entry.id, entry.display_path
+				)));
+			},
+		};
+		let original_text = String::from_utf8_lossy(&original).into_owned();
+		let splice = conflict::splice_conflict(&original_text, &entry, &expanded)
+			.map_err(ToolError::Rejected)?;
+		self.check_conflict_plan(std::slice::from_ref(&entry.absolute_path), ctx)?;
+		if ctx.cancellation_token.is_cancelled() {
+			return Ok(tool_result(format!("Write to conflict #{} cancelled", entry.id), true));
+		}
+		match write_atomic(&entry.absolute_path, splice.text.as_bytes(), &ctx.cancellation_token).await {
+			Ok(()) => {},
+			Err(err)
+				if err.kind() == std::io::ErrorKind::Interrupted
+					|| ctx.cancellation_token.is_cancelled() =>
+			{
+				return Ok(tool_result(format!("Write to conflict #{} cancelled", entry.id), true));
+			},
+			Err(err) => {
+				return Ok(tool_result(
+					format!("Failed to write {}: {err}", entry.display_path),
+					true,
+				));
+			},
+		}
+		self.invalidate_conflict(&entry, &splice.text, ctx);
+
+		let range = if entry.block.start_line == entry.block.end_line {
+			format!("line {}", entry.block.start_line)
+		} else {
+			format!(
+				"lines {}\u{2013}{}",
+				entry.block.start_line, entry.block.end_line
+			)
+		};
+		let mut text = format!(
+			"Resolved conflict #{} at {range} in {}.",
+			entry.id, entry.display_path
+		);
+		let echo_trimmed = splice.trimmed_leading + splice.trimmed_trailing;
+		if echo_trimmed > 0 {
+			text.push_str(&format!(
+				"\nNote: dropped {echo_trimmed} content line(s) that duplicated the code adjacent to the conflict region — writes replace only the marker block; surrounding lines stay in place."
+			));
+		}
+		Ok(result_with_details(
+			text,
+			json!({ "resolvedPath": entry.absolute_path.display().to_string() }),
+			false,
+		))
+	}
+
+	/// Bulk-resolve registered blocks, grouped per file and spliced bottom-up.
+	///
+	/// Each file is all-or-nothing: one failed splice leaves that file untouched
+	/// while other files still commit. `content` tokens expand per entry, so
+	/// `@ours` keeps each block's own side.
+	async fn resolve_all_conflicts(
+		&self,
+		content: &str,
+		ctx: &AgentContext,
+	) -> Result<ToolResult, ToolError> {
+		let all_entries = ctx.conflicts.entries();
+		if all_entries.is_empty() {
+			return Err(ToolError::Rejected(
+				"`conflict://*` has nothing to resolve — no conflicts are currently registered. Re-read the file(s) with conflicts first."
+					.to_string(),
+			));
+		}
+		let directives = conflict::parse_bulk_directives(content)
+			.map_err(ToolError::Rejected)?;
+		if let Some(directives) = &directives {
+			let unknown: Vec<String> = directives
+				.keys()
+				.filter(|id| !all_entries.iter().any(|entry| entry.id == **id))
+				.map(|id| format!("#{id}"))
+				.collect();
+			if !unknown.is_empty() {
+				let known: Vec<String> = all_entries.iter().map(|entry| format!("#{}", entry.id)).collect();
+				return Err(ToolError::Rejected(format!(
+					"Bulk directive references unknown conflict id(s) {}. Currently registered: {}.",
+					unknown.join(", "),
+					known.join(", ")
+				)));
+			}
+		}
+		let selected: Vec<ConflictEntry> = match &directives {
+			Some(directives) => all_entries
+				.iter()
+				.filter(|entry| directives.contains_key(&entry.id))
+				.cloned()
+				.collect(),
+			None => all_entries.clone(),
+		};
+		let selected_total = selected.len();
+		let targets: Vec<PathBuf> = selected.iter().map(|entry| entry.absolute_path.clone()).collect();
+		self.check_conflict_plan(&targets, ctx)?;
+		if ctx.cancellation_token.is_cancelled() {
+			return Ok(tool_result("Write to conflict://* cancelled", true));
+		}
+
+		let mut by_file: BTreeMap<PathBuf, Vec<ConflictEntry>> = BTreeMap::new();
+		for entry in selected {
+			by_file.entry(entry.absolute_path.clone()).or_default().push(entry);
+		}
+
+		let mut succeeded: Vec<(String, usize)> = Vec::new();
+		let mut failed: Vec<(String, usize, String)> = Vec::new();
+		let mut total_resolved = 0usize;
+		let mut total_echo_trimmed = 0usize;
+
+		for (absolute_path, mut entries) in by_file {
+			let sample = entries[0].display_path.clone();
+			entries.sort_by_key(|entry| std::cmp::Reverse(entry.block.start_line));
+			let mut text = match tokio::fs::read(&absolute_path).await {
+				Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+				Err(_) => {
+					failed.push((sample, entries.len(), "file no longer exists".to_string()));
+					continue;
+				},
+			};
+			let mut resolved: Vec<ConflictEntry> = Vec::new();
+			let mut stale: Vec<u64> = Vec::new();
+			let mut failure: Option<String> = None;
+			for entry in &entries {
+				let replacement = match &directives {
+					Some(directives) => {
+						directives.get(&entry.id).map(String::as_str).unwrap_or("")
+					},
+					None => content,
+				};
+				match conflict::expand_content_tokens(replacement, entry)
+					.and_then(|expanded| conflict::splice_conflict(&text, entry, &expanded))
+				{
+					Ok(splice) => {
+						text = splice.text;
+						total_echo_trimmed += splice.trimmed_leading + splice.trimmed_trailing;
+						resolved.push(entry.clone());
+					},
+					Err(message) => {
+						// A miss for a region an earlier entry already spliced in
+						// this pass is a stale duplicate registration.
+						if resolved.iter().any(|done| {
+							conflict::conflict_regions_equal(&done.block, &entry.block)
+						}) {
+							stale.push(entry.id);
+							continue;
+						}
+						failure = Some(message);
+						break;
+					},
+				}
+			}
+			if let Some(message) = failure {
+				failed.push((sample, entries.len(), message));
+				continue;
+			}
+			if let Err(err) = write_atomic(&absolute_path, text.as_bytes(), &ctx.cancellation_token).await {
+				let message = if err.kind() == std::io::ErrorKind::Interrupted
+					|| ctx.cancellation_token.is_cancelled()
+				{
+					"write cancelled".to_string()
+				} else {
+					err.to_string()
+				};
+				failed.push((sample, entries.len(), message));
+				continue;
+			}
+			for entry in &resolved {
+				self.invalidate_conflict(entry, &text, ctx);
+			}
+			for id in stale {
+				ctx.conflicts.invalidate(id);
+			}
+			total_resolved += resolved.len();
+			succeeded.push((sample, resolved.len()));
+		}
+
+		let conflict_word = |count: usize| if count == 1 { "conflict" } else { "conflicts" };
+		let file_word = |count: usize| if count == 1 { "file" } else { "files" };
+		let mut lines: Vec<String> = Vec::new();
+		if !succeeded.is_empty() {
+			lines.push(format!(
+				"Resolved {total_resolved} {} across {} {}:",
+				conflict_word(total_resolved),
+				succeeded.len(),
+				file_word(succeeded.len())
+			));
+			for (display_path, count) in &succeeded {
+				lines.push(format!("  {display_path}: {count} {}", conflict_word(*count)));
+			}
+		}
+		if let Some(directives) = &directives {
+			if selected_total < all_entries.len() {
+				let remaining: Vec<String> = all_entries
+					.iter()
+					.filter(|entry| !directives.contains_key(&entry.id))
+					.map(|entry| format!("#{}", entry.id))
+					.collect();
+				lines.push(format!(
+					"Directive mode: {} unlisted {} still registered ({}).",
+					remaining.len(),
+					conflict_word(remaining.len()),
+					remaining.join(", ")
+				));
+			}
+		}
+		if total_echo_trimmed > 0 {
+			lines.push(format!(
+				"Note: dropped {total_echo_trimmed} content line(s) that duplicated code adjacent to conflict regions — writes replace only the marker block; surrounding lines stay in place."
+			));
+		}
+		if !failed.is_empty() {
+			lines.push(format!(
+				"Failed to resolve {} {} — registered entries left intact for retry:",
+				failed.len(),
+				file_word(failed.len())
+			));
+			for (display_path, count, error) in &failed {
+				lines.push(format!(
+					"  {display_path}: {count} {} ({error})",
+					conflict_word(*count)
+				));
+			}
+		}
+		let text = lines.join("\n");
+		if succeeded.is_empty() {
+			return Err(ToolError::Rejected(text));
+		}
+		Ok(tool_result(text, !failed.is_empty()))
+	}
+}
+
+fn conflict_id_text(id: ConflictId) -> String {
+	match id {
+		ConflictId::Id(id) => id.to_string(),
+		ConflictId::Wildcard => "*".to_string(),
+	}
 }
 
 #[async_trait]
@@ -1447,6 +1789,14 @@ impl Tool for WriteTool {
 		}
 		if let Some(target) = pending::parse_xd_target(path) {
 			return self.dispatch_pending(path, target, content, ctx).await;
+		}
+		// Conflict URIs address a session-registered marker block, not a
+		// filesystem path: resolve the recorded physical target before the plan
+		// guard and the internal-URL router see anything.
+		match parse_conflict_uri(path) {
+			Ok(Some(uri)) => return self.dispatch_conflict(uri, content, ctx).await,
+			Ok(None) => {},
+			Err(message) => return Err(ToolError::Rejected(message)),
 		}
 		// Plan mode keeps the working tree read-only; the host classifies the
 		// resolved target (local:// artifacts stay writable).
@@ -2753,7 +3103,10 @@ pub fn builtin_tools() -> Vec<Arc<dyn Tool>> {
 	vec![
 		Arc::new(BashTool::new()),
 		Arc::new(ReadTool::with_snapshot_sink(sink.clone()).with_display_inputs(display)),
-		Arc::new(WriteTool::with_pending(Arc::clone(&pending))),
+		Arc::new(
+			WriteTool::with_pending(Arc::clone(&pending))
+				.with_snapshots(Some(Arc::clone(&snapshots))),
+		),
 		Arc::new(EditTool::new(Arc::clone(&snapshots))),
 		Arc::new(GlobTool),
 		Arc::new(GrepTool),
@@ -3255,5 +3608,221 @@ mod plan_mode_tool_tests {
 			["my-plan".to_string()]
 		);
 		assert!(std::fs::read_dir(&cwd).expect("read dir").next().is_none());
+	}
+
+	const CONFLICTED: &str =
+		"top\n<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> feature\nbottom\n";
+
+	fn register_conflicts(ctx: &AgentContext, path: &Path) -> Vec<u64> {
+		let text = std::fs::read_to_string(path).expect("seed");
+		let display = path
+			.file_name()
+			.and_then(|name| name.to_str())
+			.unwrap_or("f.txt")
+			.to_string();
+		let lines: Vec<String> = text.split('\n').map(str::to_string).collect();
+		crate::tools::conflict::scan_conflict_lines(&lines, 1)
+			.into_iter()
+			.map(|block| ctx.conflicts.register(path, display.clone(), block).id)
+			.collect()
+	}
+
+	#[tokio::test]
+	async fn conflict_write_resolves_by_content_after_line_shift() {
+		let cwd = temp_cwd("conflict-shift");
+		let file = cwd.join("f.txt");
+		std::fs::write(&file, CONFLICTED).expect("seed");
+		let ctx = AgentContext::new(cwd.clone());
+		assert_eq!(register_conflicts(&ctx, &file), vec![1]);
+
+		// Out-of-band prepend: recorded line numbers are stale, content is not.
+		std::fs::write(&file, format!("header\n{CONFLICTED}")).expect("shift");
+		let tool = WriteTool::with_pending(Arc::new(PendingStore::new()));
+		let result = tool
+			.execute(&json!({ "path": "conflict://1", "content": "@ours" }), &ctx)
+			.await
+			.expect("resolve");
+		assert!(!result.is_error, "{}", result.content);
+		assert!(result.content.contains("Resolved conflict #1"), "{}", result.content);
+		assert_eq!(
+			std::fs::read_to_string(&file).expect("file"),
+			"header\ntop\nours\nbottom\n"
+		);
+		assert!(ctx.conflicts.get(1).is_none(), "resolved id is dropped");
+	}
+
+	#[tokio::test]
+	async fn conflict_write_refuses_altered_block() {
+		let cwd = temp_cwd("conflict-stale");
+		let file = cwd.join("f.txt");
+		std::fs::write(&file, CONFLICTED).expect("seed");
+		let ctx = AgentContext::new(cwd.clone());
+		register_conflicts(&ctx, &file);
+		let altered = "top\n<<<<<<< HEAD\nCHANGED\n=======\ntheirs\n>>>>>>> feature\nbottom\n";
+		std::fs::write(&file, altered).expect("alter");
+
+		let tool = WriteTool::with_pending(Arc::new(PendingStore::new()));
+		let error = tool
+			.execute(&json!({ "path": "conflict://1", "content": "@ours" }), &ctx)
+			.await
+			.expect_err("stale block refused");
+		assert!(error.to_string().contains("no longer present"), "{error}");
+		assert_eq!(std::fs::read_to_string(&file).expect("untouched"), altered);
+		assert!(ctx.conflicts.get(1).is_some(), "id survives a refused write");
+	}
+
+	#[tokio::test]
+	async fn bulk_resolution_is_all_or_nothing_per_file() {
+		let cwd = temp_cwd("conflict-bulk");
+		let good = cwd.join("good.txt");
+		let bad = cwd.join("bad.txt");
+		std::fs::write(&good, CONFLICTED).expect("good");
+		let two_blocks = "top\n<<<<<<< HEAD\nours1\n=======\ntheirs1\n>>>>>>> feature\nmid\n<<<<<<< HEAD\nours2\n=======\ntheirs2\n>>>>>>> feature\n";
+		std::fs::write(&bad, two_blocks).expect("bad");
+		let ctx = AgentContext::new(cwd.clone());
+		let good_ids = register_conflicts(&ctx, &good);
+		let bad_ids = register_conflicts(&ctx, &bad);
+		assert_eq!(bad_ids.len(), 2);
+
+		// Corrupt one block in `bad`: that file must stay fully untouched.
+		let corrupted = "top\n<<<<<<< HEAD\nCHANGED\n=======\ntheirs1\n>>>>>>> feature\nmid\n<<<<<<< HEAD\nours2\n=======\ntheirs2\n>>>>>>> feature\n";
+		std::fs::write(&bad, corrupted).expect("corrupt");
+
+		let tool = WriteTool::with_pending(Arc::new(PendingStore::new()));
+		let result = tool
+			.execute(&json!({ "path": "conflict://*", "content": "@ours" }), &ctx)
+			.await
+			.expect("bulk");
+		assert!(result.is_error, "one file failed");
+		assert!(result.content.contains("good.txt: 1 conflict"), "{}", result.content);
+		assert!(result.content.contains("bad.txt: 2 conflicts"), "{}", result.content);
+		assert_eq!(
+			std::fs::read_to_string(&good).expect("good"),
+			"top\nours\nbottom\n"
+		);
+		assert_eq!(std::fs::read_to_string(&bad).expect("bad"), corrupted);
+		assert!(ctx.conflicts.get(good_ids[0]).is_none());
+		assert!(ctx.conflicts.get(bad_ids[0]).is_some());
+		assert!(ctx.conflicts.get(bad_ids[1]).is_some());
+	}
+
+	#[tokio::test]
+	async fn bulk_directives_pick_a_side_per_id() {
+		let cwd = temp_cwd("conflict-directives");
+		let file = cwd.join("f.txt");
+		let two_blocks = "top\n<<<<<<< HEAD\nours1\n=======\ntheirs1\n>>>>>>> feature\nmid\n<<<<<<< HEAD\nours2\n=======\ntheirs2\n>>>>>>> feature\n";
+		std::fs::write(&file, two_blocks).expect("seed");
+		let ctx = AgentContext::new(cwd.clone());
+		let ids = register_conflicts(&ctx, &file);
+		assert_eq!(ids.len(), 2);
+
+		let tool = WriteTool::with_pending(Arc::new(PendingStore::new()));
+		let result = tool
+			.execute(
+				&json!({ "path": "conflict://*", "content": format!("{}: @ours\n{}: @theirs", ids[0], ids[1]) }),
+				&ctx,
+			)
+			.await
+			.expect("directives");
+		assert!(!result.is_error, "{}", result.content);
+		assert_eq!(
+			std::fs::read_to_string(&file).expect("file"),
+			"top\nours1\nmid\ntheirs2\n"
+		);
+	}
+
+	#[tokio::test]
+	async fn conflict_ids_are_session_scoped_and_clones_share() {
+		let cwd = temp_cwd("conflict-session");
+		let file = cwd.join("f.txt");
+		std::fs::write(&file, CONFLICTED).expect("seed");
+		let ctx = AgentContext::new(cwd.clone());
+		register_conflicts(&ctx, &file);
+
+		let clone = ctx.clone();
+		assert!(clone.conflicts.get(1).is_some());
+		let other = AgentContext::new(cwd.clone());
+		assert!(other.conflicts.get(1).is_none());
+
+		let tool = WriteTool::with_pending(Arc::new(PendingStore::new()));
+		let error = tool
+			.execute(&json!({ "path": "conflict://1", "content": "@ours" }), &other)
+			.await
+			.expect_err("other session has no ids");
+		assert!(error.to_string().contains("Conflict #1 not found"), "{error}");
+		assert!(ctx.conflicts.get(1).is_some(), "original session unaffected");
+	}
+
+	struct RecordingGuard {
+		seen:  Arc<Mutex<Vec<String>>>,
+		allow: bool,
+	}
+
+	impl PlanModeGuard for RecordingGuard {
+		fn write_error(&self, _tool_name: &str, targets: &[PlanWriteTarget<'_>]) -> Option<String> {
+			let mut seen = self.seen.lock().unwrap_or_else(|poison| poison.into_inner());
+			seen.extend(targets.iter().map(|target| target.path.to_string()));
+			if self.allow { None } else { Some(READ_ONLY.to_string()) }
+		}
+	}
+
+	#[tokio::test]
+	async fn conflict_write_plan_guard_sees_the_physical_target() {
+		let cwd = temp_cwd("conflict-plan");
+		let file = cwd.join("f.txt");
+		std::fs::write(&file, CONFLICTED).expect("seed");
+		let seen = Arc::new(Mutex::new(Vec::new()));
+		let ctx = AgentContext::new(cwd.clone())
+			.with_plan(Some(Arc::new(RecordingGuard {
+				seen:  Arc::clone(&seen),
+				allow: false,
+			})));
+		register_conflicts(&ctx, &file);
+
+		let tool = WriteTool::with_pending(Arc::new(PendingStore::new()));
+		let error = tool
+			.execute(&json!({ "path": "conflict://1", "content": "@ours" }), &ctx)
+			.await
+			.expect_err("plan mode blocks the working tree");
+		assert_eq!(error.to_string(), READ_ONLY);
+		let paths = seen.lock().unwrap_or_else(|poison| poison.into_inner()).clone();
+		assert!(paths.iter().any(|path| path.ends_with("f.txt")), "{paths:?}");
+		assert!(paths.iter().all(|path| !path.starts_with("conflict://")), "{paths:?}");
+		assert_eq!(std::fs::read_to_string(&file).expect("untouched"), CONFLICTED);
+		assert!(ctx.conflicts.get(1).is_some());
+	}
+
+	#[tokio::test]
+	async fn conflict_write_invalidates_the_hashline_snapshot() {
+		let cwd = temp_cwd("conflict-snapshot");
+		let file = cwd.join("f.txt");
+		std::fs::write(&file, CONFLICTED).expect("seed");
+		let ctx = AgentContext::new(cwd.clone());
+		register_conflicts(&ctx, &file);
+		let store = Arc::new(hashline::SnapshotStore::new());
+		let key = hashline::snapshot::canonical_key(&file);
+		store.record(&key, CONFLICTED, None).expect("snapshot");
+		assert!(store.head(&key).is_some());
+
+		let tool = WriteTool::with_pending(Arc::new(PendingStore::new()))
+			.with_snapshots(Some(Arc::clone(&store)));
+		let result = tool
+			.execute(&json!({ "path": "conflict://1", "content": "@ours" }), &ctx)
+			.await
+			.expect("resolve");
+		assert!(!result.is_error, "{}", result.content);
+		assert!(store.head(&key).is_none(), "pre-splice tag is gone");
+	}
+
+	#[tokio::test]
+	async fn conflict_scope_is_read_only_on_write() {
+		let cwd = temp_cwd("conflict-scope");
+		let ctx = AgentContext::new(cwd);
+		let tool = WriteTool::with_pending(Arc::new(PendingStore::new()));
+		let error = tool
+			.execute(&json!({ "path": "conflict://1/ours", "content": "@ours" }), &ctx)
+			.await
+			.expect_err("scope rejected");
+		assert!(error.to_string().contains("read-only"), "{error}");
 	}
 }

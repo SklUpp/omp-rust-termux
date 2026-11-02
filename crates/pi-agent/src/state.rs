@@ -990,6 +990,11 @@ pub struct AgentContext {
 	/// Session plan-mode guard for this run. Per context, never on a shared
 	/// tool instance: concurrent sessions and child agents each build their own.
 	pub plan: Option<Arc<dyn PlanModeGuard>>,
+	/// Session-scoped ids for merge-conflict blocks surfaced by `read`.
+	/// A fresh context (child agent, embedder) starts its own history; clones
+	/// of one context share it. The session owner that outlives a single turn
+	/// can mount a long-lived handle with [`AgentContext::with_conflicts`].
+	pub conflicts: Arc<crate::tools::conflict::ConflictHistory>,
 }
 
 impl std::fmt::Debug for AgentContext {
@@ -1002,6 +1007,7 @@ impl std::fmt::Debug for AgentContext {
 			.field("has_ask", &self.ask.is_some())
 			.field("has_progress", &self.progress.is_some())
 			.field("has_plan", &self.plan.is_some())
+			.field("conflicts", &self.conflicts.len())
 			.finish()
 	}
 }
@@ -1016,6 +1022,7 @@ impl AgentContext {
 			ask: None,
 			progress: None,
 			plan: None,
+			conflicts: Arc::new(crate::tools::conflict::ConflictHistory::new()),
 		}
 	}
 
@@ -1028,6 +1035,7 @@ impl AgentContext {
 			ask: None,
 			progress: None,
 			plan: None,
+			conflicts: Arc::new(crate::tools::conflict::ConflictHistory::new()),
 		}
 	}
 
@@ -1045,7 +1053,15 @@ impl AgentContext {
 			ask,
 			progress: None,
 			plan: None,
+			conflicts: Arc::new(crate::tools::conflict::ConflictHistory::new()),
 		}
+	}
+
+	/// Mount a session-owned conflict history so ids survive this turn.
+	#[must_use]
+	pub fn with_conflicts(mut self, conflicts: Arc<crate::tools::conflict::ConflictHistory>) -> Self {
+		self.conflicts = conflicts;
+		self
 	}
 
 	/// Attach the session plan-mode guard for this run.

@@ -491,6 +491,9 @@ pub struct AgentLoop {
 	turn_ack: Option<Arc<TurnAck>>,
 	/// Session plan-mode guard copied into every tool call context of this run.
 	plan: Option<Arc<dyn crate::state::PlanModeGuard>>,
+	/// Session-owned conflict history, when the host outlives a single turn.
+	/// Without it each run starts from an empty per-context history.
+	conflicts: Option<Arc<crate::tools::conflict::ConflictHistory>>,
 	/// Detached plan continuation: history already carries the persisted
 	/// developer reminder, so no caller message is appended and the first
 	/// request is the policy's one-shot forced choice.
@@ -515,6 +518,7 @@ impl AgentLoop {
 			policy,
 			turn_ack: None,
 			plan: None,
+			conflicts: None,
 			continuation: false,
 		}
 	}
@@ -537,6 +541,7 @@ impl AgentLoop {
 			policy,
 			turn_ack: None,
 			plan: None,
+			conflicts: None,
 			continuation: false,
 		}
 	}
@@ -546,6 +551,17 @@ impl AgentLoop {
 	#[must_use]
 	pub fn with_plan(mut self, plan: Option<Arc<dyn crate::state::PlanModeGuard>>) -> Self {
 		self.plan = plan;
+		self
+	}
+
+	/// Mount the session-owned conflict history so `conflict://<N>` ids minted
+	/// in one turn stay resolvable in later turns of the same session.
+	#[must_use]
+	pub fn with_conflicts(
+		mut self,
+		conflicts: Option<Arc<crate::tools::conflict::ConflictHistory>>,
+	) -> Self {
+		self.conflicts = conflicts;
 		self
 	}
 
@@ -734,6 +750,10 @@ impl AgentLoop {
 		)
 		.with_progress(events.clone())
 		.with_plan(self.plan.clone());
+		let ctx = match &self.conflicts {
+			Some(conflicts) => ctx.with_conflicts(Arc::clone(conflicts)),
+			None => ctx,
+		};
 		let mut turn_results = Vec::new();
 		let mut soft = SoftRequirementState::default();
 		let mut continuation_pending = self.continuation;

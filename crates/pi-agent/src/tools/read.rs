@@ -9,10 +9,10 @@
 //! Remaining read slices (planned, not yet ported): markit documents,
 //! images/`:img`, and the internal-URL router. SQLite databases are handled by
 //! `read_sqlite.rs`; ZIP/tar/compressed streams and their members by
-//! `read_archive.rs` (Python 3 stdlib backend). `:conflicts`
-//! is blocked on the conflict-history store that
-//! `write({path:"conflict://<N>"})` resolves against; until that store lands
-//! the selector errors rather than listing ids nothing can act on.
+//! `read_archive.rs` (Python 3 stdlib backend). Merge conflicts are ported in
+//! `conflict.rs`: a plain window registers the marker blocks it surfaced,
+//! `<path>:conflicts` indexes the whole file, and `conflict://<N>[/scope]`
+//! renders one registered block under the same display rules.
 //!
 //! Display mode is resolved per call from [`FileDisplayInputs`] plus the
 //! per-read `raw` / `immutable` flags (`resolve_file_display_mode`), exactly as
@@ -217,6 +217,59 @@ impl ReadTool {
 			},
 		}
 	}
+
+	/// Render a `conflict://<N>` (or `conflict://<N>/<scope>`) region as
+	/// regular file content. Lines keep their original file numbers so hashline
+	/// anchors line up with the source file; no truncation footer is appended.
+	async fn read_conflict_region(
+		&self,
+		uri: super::conflict::ParsedConflictUri,
+		ctx: &AgentContext,
+	) -> Result<ToolResult, ToolError> {
+		let id = match uri.id {
+			super::conflict::ConflictId::Id(id) => id,
+			super::conflict::ConflictId::Wildcard => {
+				return Err(ToolError::Rejected(
+					"Reading `conflict://*` is not supported — wildcards are write-only. Use the `<path>:conflicts` read selector for the full list of conflicts in a file, or read `conflict://<N>` to inspect a single block."
+						.to_string(),
+				));
+			},
+		};
+		let entry = ctx.conflicts.get(id).ok_or_else(|| {
+			ToolError::Rejected(format!(
+				"Conflict #{id} not found. Conflict ids are registered when `read` surfaces a marker block; re-read the file to get a current id."
+			))
+		})?;
+		let (lines, start_line) = super::conflict::render_conflict_region(&entry, uri.scope)
+			.map_err(ToolError::Rejected)?;
+		let display_mode = self.display_mode(false, false);
+		let raw_text = lines.join("\n");
+		let mut output = if display_mode.hash_lines {
+			format_numbered(&lines, start_line, ':')
+		} else if display_mode.line_numbers {
+			format_numbered(&lines, start_line, '|')
+		} else {
+			raw_text.clone()
+		};
+		if display_mode.hash_lines
+			&& let Some(sink) = self.sink.as_deref()
+			&& let Some(bytes) = read_bounded_regular(&entry.absolute_path, SNAPSHOT_MAX_BYTES).await
+		{
+			let full_text = normalize_snapshot_text(&bytes);
+			// A region read displays no authored line provenance.
+			if let Some(header) = record_snapshot_text(sink, &entry.absolute_path, &ctx.cwd, &full_text, &[]) {
+				output = format!("{header}\n{output}");
+			}
+		}
+		Ok(result_with_details(
+			output,
+			json!({
+				"resolvedPath": entry.absolute_path.display().to_string(),
+				"displayContent": { "text": raw_text, "startLine": start_line },
+			}),
+			false,
+		))
+	}
 }
 
 #[async_trait]
@@ -270,6 +323,14 @@ impl Tool for ReadTool {
 		}
 		if is_cancelled(ctx) {
 			return Ok(tool_result("Read cancelled", true));
+		}
+
+		// `conflict://<N>[/scope]` addresses a block registered by an earlier
+		// read in this session; it is resolved before any path or URL probe.
+		match super::conflict::parse_conflict_uri(raw_path) {
+			Ok(Some(uri)) => return self.read_conflict_region(uri, ctx).await,
+			Ok(None) => {},
+			Err(message) => return Err(ToolError::Rejected(message)),
 		}
 
 		// Internal URLs are resolved by the mounted router before any
@@ -531,13 +592,40 @@ impl Tool for ReadTool {
 			));
 		}
 		if matches!(parsed, Sel::Conflicts) {
-			return Ok(unsupported(
-				format!(
-					"Conflict indexing is not supported in this build: '{}'. Inspect merge markers with the read tool directly.",
-					target.display()
-				),
+			let (blocks, scan_truncated) = match super::conflict::scan_file_for_conflicts(
 				&target,
-			));
+				super::conflict::SCAN_FILE_DEFAULT_MAX_BYTES,
+			)
+			.await
+			{
+				Ok(scan) => scan,
+				Err(err) => {
+					return Ok(tool_result(
+						format!("Failed to read {}: {err}", target.display()),
+						true,
+					));
+				},
+			};
+			let display = display_path(&target, &ctx.cwd);
+			let entries: Vec<super::conflict::ConflictEntry> = blocks
+				.into_iter()
+				.map(|block| ctx.conflicts.register(&target, display.clone(), block))
+				.collect();
+			let summary = if entries.is_empty() {
+				format!("No unresolved git merge conflicts in {display}.")
+			} else {
+				super::conflict::format_conflict_summary(&entries, &display, scan_truncated)
+			};
+			let mut result = result_with_details(
+				summary,
+				json!({
+					"resolvedPath": target.display().to_string(),
+					"conflictCount": entries.len(),
+				}),
+				false,
+			);
+			attach_suffix_details(&mut result.details, suffix_resolution.as_ref());
+			return Ok(result);
 		}
 
 		let image_ext = has_extension(&target, IMAGE_EXTENSIONS);
@@ -1707,6 +1795,41 @@ pub(super) async fn read_single_range(
 		}
 	}
 
+	// A window that surfaced a complete marker block registers it for
+	// `conflict://<N>` resolution and appends a compact footer.
+	let mut conflict_count: Option<usize> = None;
+	if !first_line_exceeds && !window.lines.is_empty() {
+		if let Some(path) = source.path() {
+			let blocks = super::conflict::scan_conflict_lines(&window.lines, display_start);
+			if !blocks.is_empty() {
+				let warn_path = display_path(path, &ctx.cwd);
+				let entries: Vec<super::conflict::ConflictEntry> = blocks
+					.into_iter()
+					.map(|block| ctx.conflicts.register(path, warn_path.clone(), block))
+					.collect();
+				// Best-effort full-file count; window ids stay authoritative.
+				let mut total_in_file = entries.len();
+				let mut scan_truncated = false;
+				if let Ok((blocks, truncated)) = super::conflict::scan_file_for_conflicts(
+					path,
+					super::conflict::SCAN_FILE_DEFAULT_MAX_BYTES,
+				)
+				.await
+				{
+					total_in_file = total_in_file.max(blocks.len());
+					scan_truncated = truncated;
+				}
+				output.push_str(&super::conflict::format_conflict_warning(
+					&entries,
+					total_in_file,
+					Some(warn_path.as_str()),
+					scan_truncated,
+				));
+				conflict_count = Some(entries.len());
+			}
+		}
+	}
+
 	let mut details = serde_json::Map::new();
 	details.insert("resolvedPath".into(), json!(source.label()));
 	details.insert("fileSize".into(), json!(file_size));
@@ -1724,6 +1847,9 @@ pub(super) async fn read_single_range(
 	}
 	if let Some(truncation) = truncation {
 		details.insert("truncation".into(), truncation);
+	}
+	if let Some(count) = conflict_count {
+		details.insert("conflictCount".into(), json!(count));
 	}
 	let mut meta = serde_json::Map::new();
 	meta.insert("source".into(), source.meta_source());
@@ -3109,5 +3235,170 @@ mod display_tests {
 		) -> Result<InternalResource, String> {
 			Ok(InternalResource::text(&url.href, format!("handler says {}", url.href)))
 		}
+	}
+}
+
+#[cfg(test)]
+mod conflict_read_tests {
+	use std::{
+		fs,
+		path::{Path, PathBuf},
+		time::{SystemTime, UNIX_EPOCH},
+	};
+
+	use serde_json::json;
+
+	use super::*;
+	use crate::tools::Tool as _;
+
+	struct TempDir(PathBuf);
+
+	impl TempDir {
+		fn new(label: &str) -> Self {
+			let nanos = SystemTime::now()
+				.duration_since(UNIX_EPOCH)
+				.map(|duration| duration.as_nanos())
+				.unwrap_or_default();
+			let path = std::env::temp_dir().join(format!(
+				"omp-read-conflict-{label}-{}-{nanos}",
+				std::process::id()
+			));
+			fs::create_dir_all(&path).expect("create temp dir");
+			Self(path)
+		}
+
+		fn path(&self) -> &Path {
+			&self.0
+		}
+	}
+
+	impl Drop for TempDir {
+		fn drop(&mut self) {
+			let _ = fs::remove_dir_all(&self.0);
+		}
+	}
+
+	const THREE_WAY: &str = "top\n<<<<<<< HEAD\nours1\nours2\n||||||| base\nbase1\n=======\ntheirs1\n>>>>>>> feature\nbottom\n";
+	const TWO_WAY: &str = "top\n<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> feature\nbottom\n";
+
+	#[tokio::test]
+	async fn window_read_registers_blocks_and_appends_footer() {
+		let dir = TempDir::new("window");
+		let file = dir.path().join("f.txt");
+		fs::write(&file, THREE_WAY).expect("seed");
+		let ctx = AgentContext::new(dir.path().to_path_buf());
+
+		let result = ReadTool::new()
+			.execute(&json!({ "path": file.display().to_string() }), &ctx)
+			.await
+			.expect("read");
+		assert!(!result.is_error, "{}", result.content);
+		assert!(result.content.contains("1 unresolved conflict"), "{}", result.content);
+		assert!(result.content.contains("conflict://1"), "{}", result.content);
+		assert_eq!(ctx.conflicts.len(), 1);
+		assert_eq!(
+			result.details.as_ref().and_then(|details| details.get("conflictCount")),
+			Some(&json!(1))
+		);
+	}
+
+	#[tokio::test]
+	async fn conflicts_selector_indexes_whole_file() {
+		let dir = TempDir::new("index");
+		let file = dir.path().join("f.txt");
+		fs::write(&file, THREE_WAY).expect("seed");
+		let ctx = AgentContext::new(dir.path().to_path_buf());
+
+		let result = ReadTool::new()
+			.execute(&json!({ "path": format!("{}:conflicts", file.display()) }), &ctx)
+			.await
+			.expect("index");
+		assert!(!result.is_error, "{}", result.content);
+		assert!(result.content.contains("#1  L2-L9  (3-way)"), "{}", result.content);
+		assert!(result.content.contains("Bulk-resolve"), "{}", result.content);
+		assert_eq!(ctx.conflicts.len(), 1);
+
+		let clean = dir.path().join("clean.txt");
+		fs::write(&clean, "nothing here\n").expect("clean");
+		let result = ReadTool::new()
+			.execute(&json!({ "path": format!("{}:conflicts", clean.display()) }), &ctx)
+			.await
+			.expect("clean index");
+		assert!(result.content.starts_with("No unresolved git merge conflicts"), "{}", result.content);
+	}
+
+	#[tokio::test]
+	async fn conflict_uri_renders_bare_and_scoped_sides() {
+		let dir = TempDir::new("region");
+		let file = dir.path().join("f.txt");
+		fs::write(&file, THREE_WAY).expect("seed");
+		let ctx = AgentContext::new(dir.path().to_path_buf());
+		ReadTool::new()
+			.execute(&json!({ "path": format!("{}:conflicts", file.display()) }), &ctx)
+			.await
+			.expect("index");
+
+		let tool = ReadTool::new();
+		let bare = tool
+			.execute(&json!({ "path": "conflict://1" }), &ctx)
+			.await
+			.expect("bare");
+		assert_eq!(
+			bare.content,
+			"2|<<<<<<< HEAD\n3|ours1\n4|ours2\n5||||||| base\n6|base1\n7|=======\n8|theirs1\n9|>>>>>>> feature"
+		);
+		let ours = tool
+			.execute(&json!({ "path": "conflict://1/ours" }), &ctx)
+			.await
+			.expect("ours");
+		assert_eq!(ours.content, "3|ours1\n4|ours2");
+		let theirs = tool
+			.execute(&json!({ "path": "conflict://1/theirs" }), &ctx)
+			.await
+			.expect("theirs");
+		assert_eq!(theirs.content, "8|theirs1");
+		let base = tool
+			.execute(&json!({ "path": "conflict://1/base" }), &ctx)
+			.await
+			.expect("base");
+		assert_eq!(base.content, "6|base1");
+	}
+
+	#[tokio::test]
+	async fn conflict_read_errors_are_actionable() {
+		let dir = TempDir::new("errors");
+		let two_way = dir.path().join("two.txt");
+		fs::write(&two_way, TWO_WAY).expect("seed");
+		let ctx = AgentContext::new(dir.path().to_path_buf());
+		let tool = ReadTool::new();
+		tool
+			.execute(&json!({ "path": format!("{}:conflicts", two_way.display()) }), &ctx)
+			.await
+			.expect("index");
+
+		let wildcard = tool
+			.execute(&json!({ "path": "conflict://*" }), &ctx)
+			.await
+			.expect_err("wildcard read is write-only");
+		assert!(wildcard.to_string().contains("write-only"), "{wildcard}");
+
+		let missing = tool
+			.execute(&json!({ "path": "conflict://99" }), &ctx)
+			.await
+			.expect_err("unknown id");
+		assert!(missing.to_string().contains("Conflict #99 not found"), "{missing}");
+
+		let no_base = tool
+			.execute(&json!({ "path": "conflict://1/base" }), &ctx)
+			.await
+			.expect_err("2-way has no base");
+		assert!(no_base.to_string().contains("no base section"), "{no_base}");
+
+		let other = AgentContext::new(dir.path().to_path_buf());
+		let isolated = tool
+			.execute(&json!({ "path": "conflict://1" }), &other)
+			.await
+			.expect_err("ids are session-scoped");
+		assert!(isolated.to_string().contains("Conflict #1 not found"), "{isolated}");
 	}
 }

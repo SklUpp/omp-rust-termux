@@ -949,14 +949,16 @@ impl Supervisor {
 		if registry.get("ast_edit").is_some() {
 			registry.remove("ast_edit");
 			registry.register(Arc::new(crate::tools::AstEditTool::with_display_inputs(
-				snapshots,
+				Arc::clone(&snapshots),
 				Arc::clone(&pending),
 				resolved.display,
 			)));
 		}
 		if registry.get("write").is_some() {
 			registry.remove("write");
-			let write = WriteTool::with_pending(Arc::clone(&pending)).with_acp_bridge(acp_bridge);
+			let write = WriteTool::with_pending(Arc::clone(&pending))
+				.with_acp_bridge(acp_bridge)
+				.with_snapshots(Some(snapshots));
 			registry.register(Arc::new(match &router {
 				Some(router) => write.with_internal_urls(Arc::clone(router), Arc::clone(&url_scope)),
 				None => write,

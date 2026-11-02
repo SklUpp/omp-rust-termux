@@ -2570,6 +2570,9 @@ fn wire_provider(
 					target.effort,
 				)?)
 				.with_disable_reasoning(config.external_thinking)
+				// Stamp the configured route, not the adapter's default dialect
+				// label: signed reasoning must replay only to its issuer.
+				.with_provider_id(Some(target.provider.to_owned()))
 				// Explicit `false` overrides the provider default; a model that
 				// declares nothing keeps emitting `num_predict`.
 				.with_omit_max_output_tokens(

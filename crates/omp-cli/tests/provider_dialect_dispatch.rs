@@ -285,10 +285,14 @@ fn root_ollama_dispatch_posts_api_chat_and_reads_ndjson() {
 
 	let runner = PiAgentRunner::new().expect("runner");
 	let mut answer = None;
+	let mut metadata = None;
 	let mut stops = Vec::new();
 	for event in runner.run(&request).expect("stream") {
 		match event {
-			Ok(Event::MessageEnd { message, .. }) => answer = Some(message.content),
+			Ok(Event::MessageEnd { message, .. }) => {
+				metadata = Some((message.api, message.provider, message.model));
+				answer = Some(message.content);
+			},
 			Ok(Event::TurnEnd { stop_reason, .. }) => stops.push(stop_reason),
 			_ => {},
 		}
@@ -296,6 +300,14 @@ fn root_ollama_dispatch_posts_api_chat_and_reads_ndjson() {
 	server.join().expect("server");
 	assert_eq!(answer.as_deref(), Some("hello"), "NDJSON deltas reach the turn");
 	assert_eq!(stops.last().map(String::as_str), Some("stop"));
+	let (api, provider, model) = metadata.expect("assistant message metadata");
+	assert_eq!(api.as_deref(), Some("ollama-chat"), "resolved dialect is stamped");
+	assert_eq!(
+		provider.as_deref(),
+		Some("ollama-proxy"),
+		"the configured provider id is stamped, not the adapter's dialect alias"
+	);
+	assert_eq!(model.as_deref(), Some("qwen3"));
 
 	let (head, body) = captured_rx.recv().expect("request");
 	assert!(head.starts_with("POST /api/chat HTTP/1.1"), "{head}");

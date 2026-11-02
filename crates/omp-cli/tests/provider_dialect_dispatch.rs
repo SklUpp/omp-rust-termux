@@ -324,3 +324,205 @@ fn unknown_provider_api_fails_before_contact() {
 	let message = error.to_string();
 	assert!(message.contains("unsupported provider api `openai-responses`"), "{message}");
 }
+
+/// Bound a mock endpoint: serve `expected` requests, then give up so a broken
+/// scenario fails the assertions instead of hanging the join.
+fn serve_bounded(
+	listener: TcpListener,
+	expected: usize,
+	responses: Vec<(&'static str, &'static str)>,
+	captured: mpsc::Sender<(String, String)>,
+) {
+	listener.set_nonblocking(true).expect("nonblocking listener");
+	let deadline = std::time::Instant::now() + Duration::from_secs(60);
+	let mut served = 0;
+	while served < expected {
+		assert!(
+			std::time::Instant::now() < deadline,
+			"mock endpoint served {served}/{expected} requests before the deadline"
+		);
+		match listener.accept() {
+			Ok((mut socket, _)) => {
+				socket.set_nonblocking(false).expect("blocking socket");
+				let (head, request) = read_http_request(&mut socket);
+				captured.send((head, request)).expect("capture request");
+				let (content_type, body) = responses[served];
+				write_http_response(&mut socket, content_type, body);
+				served += 1;
+			},
+			Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+				std::thread::sleep(Duration::from_millis(5));
+			},
+			Err(err) => panic!("accept failed: {err}"),
+		}
+	}
+}
+
+const OLLAMA_TASK_TURN: &str = concat!(
+	"{\"model\":\"qwen3\",\"message\":{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"type\":\"function\",\"function\":{\"name\":\"task\",\"arguments\":{\"name\":\"cli-child\",\"agent\":\"cli-child\",\"task\":\"CLI_CHILD_WORK\"}}}]},\"done\":false}\n",
+	"{\"model\":\"qwen3\",\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"done\":true,\"done_reason\":\"tool_calls\",\"prompt_eval_count\":5,\"eval_count\":3}\n"
+);
+
+const OLLAMA_FINAL_TURN: &str = concat!(
+	"{\"model\":\"qwen3\",\"message\":{\"role\":\"assistant\",\"content\":\"root done\"},\"done\":false}\n",
+	"{\"model\":\"qwen3\",\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"done\":true,\"done_reason\":\"stop\"}\n"
+);
+
+const CHILD_TOOL_TURN: &str = concat!(
+	"event: message_start\n",
+	"data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_child_1\",\"usage\":{\"input_tokens\":5,\"output_tokens\":0}}}\n\n",
+	"event: content_block_start\n",
+	"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_child_1\",\"name\":\"yield\",\"input\":{}}}\n\n",
+	"event: content_block_delta\n",
+	"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"result\\\":{\\\"data\\\":\\\"child-ok\\\"}}\"}}\n\n",
+	"event: content_block_stop\n",
+	"data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+	"event: message_delta\n",
+	"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":7}}\n\n",
+	"event: message_stop\n",
+	"data: {\"type\":\"message_stop\"}\n\n"
+);
+
+const CHILD_FINAL_TURN: &str = concat!(
+	"event: message_start\n",
+	"data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_child_2\"}}\n\n",
+	"event: content_block_start\n",
+	"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+	"event: content_block_delta\n",
+	"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"child done\"}}\n\n",
+	"event: content_block_stop\n",
+	"data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+	"event: message_delta\n",
+	"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n\n",
+	"event: message_stop\n",
+	"data: {\"type\":\"message_stop\"}\n\n"
+);
+
+/// A delegated child is a real provider request on its own route: the root turn
+/// talks Ollama to one endpoint, the `task` child speaks `anthropic-messages` to
+/// another, the child sees only its own credential, the root endpoint never sees
+/// the child key, and the task result carries the child's real output.
+#[test]
+fn child_task_dispatch_reaches_its_own_endpoint_with_its_own_key() {
+	let root_listener = TcpListener::bind("127.0.0.1:0").expect("bind root");
+	let root_addr = root_listener.local_addr().expect("root addr");
+	let child_listener = TcpListener::bind("127.0.0.1:0").expect("bind child");
+	let child_addr = child_listener.local_addr().expect("child addr");
+
+	let (root_tx, root_rx) = mpsc::channel::<(String, String)>();
+	let root_server = std::thread::spawn(move || {
+		serve_bounded(root_listener, 2, vec![
+			("application/x-ndjson", OLLAMA_TASK_TURN),
+			("application/x-ndjson", OLLAMA_FINAL_TURN),
+		], root_tx);
+	});
+	let (child_tx, child_rx) = mpsc::channel::<(String, String)>();
+	let child_server = std::thread::spawn(move || {
+		serve_bounded(child_listener, 2, vec![
+			("text/event-stream", CHILD_TOOL_TURN),
+			("text/event-stream", CHILD_FINAL_TURN),
+		], child_tx);
+	});
+
+	let mut providers = BTreeMap::new();
+	providers.insert("ollama-proxy".to_string(), BTreeMap::from([(
+		"qwen3".to_string(),
+		ModelInfo {
+			provider: "ollama-proxy".to_string(),
+			api: Some("ollama-chat".to_string()),
+			base_url: Some(format!("http://{root_addr}")),
+			max_tokens: Some(4096),
+			..ModelInfo::default()
+		},
+	)]));
+	providers.insert("childprov".to_string(), BTreeMap::from([(
+		"claude-child".to_string(),
+		ModelInfo {
+			provider: "childprov".to_string(),
+			api: Some("anthropic-messages".to_string()),
+			base_url: Some(format!("http://{child_addr}/v1")),
+			max_tokens: Some(2048),
+			reasoning: false,
+			..ModelInfo::default()
+		},
+	)]));
+	let catalog = Catalog {
+		providers,
+		connections: BTreeMap::new(),
+		source: PathBuf::from("models.json"),
+	};
+
+	// The child agent pins the delegated model; the root turn stays on Ollama.
+	let project = std::env::temp_dir().join(format!("omp-dialect-child-{}", std::process::id()));
+	let agents_dir = project.join(".omp/agents");
+	std::fs::create_dir_all(&agents_dir).expect("project agents dir");
+	std::fs::write(
+		agents_dir.join("cli-child.md"),
+		"---\nname: cli-child\ndescription: dialect child fixture\ntools:\n  - yield\nmodel: childprov/claude-child\n---\nYield the requested data.\n",
+	)
+	.expect("write cli-child agent");
+
+	let mut request = wire_request(catalog, "ollama-proxy", "qwen3", Some("root-only-key"));
+	request.prompt = "CHILD_WIRE".to_string();
+	request.cwd = project;
+	// Synchronous inline delegation: the task result is returned to this turn.
+	request.config.async_config.enabled = Some(false);
+	request.config.providers.insert("childprov".to_string(), ProviderConfig {
+		api_key: Some("sk-ant-child".to_string()),
+		..ProviderConfig::default()
+	});
+
+	let runner = PiAgentRunner::new().expect("runner");
+	let mut task_result = None;
+	for event in runner.run(&request).expect("run delegated turn") {
+		if let Ok(Event::ToolEnd { tool, result, .. }) = event {
+			if tool == "task" {
+				task_result = Some(result);
+			}
+		}
+	}
+	root_server.join().expect("root server");
+	child_server.join().expect("child server");
+
+	let task_result = task_result.expect("task tool ran");
+	let details: serde_json::Value = serde_json::from_str(&task_result).expect("task result json");
+	assert_eq!(details["results"][0]["name"], "cli-child");
+	assert_eq!(details["results"][0]["exitCode"].as_i64(), Some(0), "task result: {details}");
+	assert_eq!(
+		details["results"][0]["extractedToolData"]["yield"][0]["data"], "child-ok",
+		"the child's real output must reach the task result: {details}"
+	);
+
+	let mut root_requests = Vec::new();
+	while let Ok(captured) = root_rx.try_recv() {
+		root_requests.push(captured);
+	}
+	assert_eq!(root_requests.len(), 2, "root turn makes exactly two Ollama calls");
+	for (head, body) in &root_requests {
+		assert!(head.starts_with("POST /api/chat HTTP/1.1"), "{head}");
+		let lower = head.to_ascii_lowercase();
+		assert!(lower.contains("authorization: bearer root-only-key"), "{head}");
+		assert!(!lower.contains("sk-ant-child"), "root endpoint saw the child key: {head}");
+		assert!(!body.contains("sk-ant-child"), "root body carried the child key: {body}");
+	}
+
+	let mut child_requests = Vec::new();
+	while let Ok(captured) = child_rx.try_recv() {
+		child_requests.push(captured);
+	}
+	assert_eq!(child_requests.len(), 2, "child runs two Anthropic turns");
+	for (head, body) in &child_requests {
+		assert!(head.starts_with("POST /v1/messages HTTP/1.1"), "{head}");
+		let lower = head.to_ascii_lowercase();
+		assert!(
+			lower.contains("authorization: bearer sk-ant-child"),
+			"child must authenticate with its own key: {head}"
+		);
+		assert!(!lower.contains("x-api-key"), "non-official child endpoint: {head}");
+		assert!(!lower.contains("root-only-key"), "child endpoint saw the root key: {head}");
+		assert!(!body.contains("root-only-key"), "child body carried the root key: {body}");
+	}
+	let child_body: serde_json::Value = serde_json::from_str(&child_requests[0].1).expect("child body");
+	assert_eq!(child_body["model"], "claude-child");
+	assert_eq!(child_body["max_tokens"], 2048, "the child model's catalog cap applies");
+}

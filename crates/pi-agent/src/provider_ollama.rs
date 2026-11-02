@@ -2725,8 +2725,10 @@ impl MarkupHealer {
 struct RecordHealer {
 	healer: MarkupHealer,
 	next_block: usize,
-	text_block: Option<usize>,
-	thinking_block: Option<usize>,
+	/// Raw parser text block -> allocated content block.
+	text_blocks: HashMap<usize, usize>,
+	/// Raw parser thinking block -> allocated content block.
+	thinking_blocks: HashMap<usize, usize>,
 	/// Raw parser tool slot -> allocated content block.
 	tool_blocks: HashMap<usize, usize>,
 	saw_native_thinking: bool,
@@ -2740,8 +2742,8 @@ impl RecordHealer {
 		Self {
 			healer: MarkupHealer::new(pattern),
 			next_block: 0,
-			text_block: None,
-			thinking_block: None,
+			text_blocks: HashMap::new(),
+			thinking_blocks: HashMap::new(),
 			tool_blocks: HashMap::new(),
 			saw_native_thinking: false,
 			saw_healed_tool_calls: false,
@@ -2755,26 +2757,22 @@ impl RecordHealer {
 		block
 	}
 
-	fn ensure_text(&mut self) -> usize {
-		match self.text_block {
-			Some(block) => block,
-			None => {
-				let block = self.alloc_block();
-				self.text_block = Some(block);
-				block
-			},
+	fn ensure_text(&mut self, raw_block: usize) -> usize {
+		if let Some(block) = self.text_blocks.get(&raw_block) {
+			return *block;
 		}
+		let block = self.alloc_block();
+		self.text_blocks.insert(raw_block, block);
+		block
 	}
 
-	fn ensure_thinking(&mut self) -> usize {
-		match self.thinking_block {
-			Some(block) => block,
-			None => {
-				let block = self.alloc_block();
-				self.thinking_block = Some(block);
-				block
-			},
+	fn ensure_thinking(&mut self, raw_block: usize) -> usize {
+		if let Some(block) = self.thinking_blocks.get(&raw_block) {
+			return *block;
 		}
+		let block = self.alloc_block();
+		self.thinking_blocks.insert(raw_block, block);
+		block
 	}
 
 	fn ensure_tool_block(&mut self, raw_index: usize) -> usize {
@@ -2786,14 +2784,19 @@ impl RecordHealer {
 		block
 	}
 
-	fn push_events(&mut self, events: Vec<MarkupHealingEvent>, out: &mut Vec<StreamChunk>) {
+	fn push_events(
+		&mut self,
+		events: Vec<MarkupHealingEvent>,
+		raw_block: usize,
+		out: &mut Vec<StreamChunk>,
+	) {
 		for event in events {
 			match event {
 				MarkupHealingEvent::Text(text) => {
 					if !text.trim().is_empty() {
 						self.visible = true;
 					}
-					let block = self.ensure_text();
+					let block = self.ensure_text(raw_block);
 					out.push(delta_chunk(Some(text), None, Vec::new(), block));
 				},
 				MarkupHealingEvent::Thinking(thinking) => {
@@ -2802,7 +2805,7 @@ impl RecordHealer {
 					if self.saw_native_thinking {
 						continue;
 					}
-					let block = self.ensure_thinking();
+					let block = self.ensure_thinking(raw_block);
 					out.push(delta_chunk(None, Some(thinking), Vec::new(), block));
 				},
 				MarkupHealingEvent::ToolCall(call) => {
@@ -2843,16 +2846,17 @@ impl RecordHealer {
 				continue;
 			}
 			if let Some(content) = chunk.content.as_deref() {
+				let raw_block = chunk.content_index.unwrap_or(usize::MAX);
 				let events = if has_structured_calls {
 					self.healer.feed_events_without_calls(content)?
 				} else {
 					self.healer.feed_events(content)?
 				};
-				self.push_events(events, &mut out);
+				self.push_events(events, raw_block, &mut out);
 			}
 			if let Some(reasoning) = chunk.reasoning {
 				self.saw_native_thinking = true;
-				let block = self.ensure_thinking();
+				let block = self.ensure_thinking(chunk.content_index.unwrap_or(usize::MAX));
 				out.push(delta_chunk(None, Some(reasoning), Vec::new(), block));
 			}
 			if !chunk.tool_call_deltas.is_empty() {
@@ -2878,7 +2882,7 @@ impl RecordHealer {
 	) -> Result<Vec<StreamChunk>, ProviderError> {
 		let mut out = Vec::new();
 		let events = self.healer.flush_events()?;
-		self.push_events(events, &mut out);
+		self.push_events(events, usize::MAX, &mut out);
 		let stop = if self.saw_healed_tool_calls && stop == StopReason::Stop {
 			StopReason::ToolUse
 		} else {
@@ -3005,6 +3009,13 @@ pub fn should_retry_ollama_response(status: u16, body_text: &str) -> bool {
 	status == 408 || status == 429
 }
 
+fn now_unix_ms() -> u128 {
+	std::time::SystemTime::now()
+		.duration_since(std::time::UNIX_EPOCH)
+		.map(|elapsed| elapsed.as_millis())
+		.unwrap_or(0)
+}
+
 pub fn extract_retry_hint(headers: &reqwest::header::HeaderMap, body: &str) -> Option<Duration> {
 	if let Some(val) = headers.get("retry-after-ms").and_then(|v| v.to_str().ok()) {
 		if let Ok(ms) = val.trim().parse::<u64>() {
@@ -3016,14 +3027,29 @@ pub fn extract_retry_hint(headers: &reqwest::header::HeaderMap, body: &str) -> O
 			return Some(Duration::from_secs(secs));
 		}
 	}
+	// `x-ratelimit-reset-ms`: epoch ms (`> 1e12`), epoch s (`> 1e9`), else delta ms.
 	if let Some(val) = headers.get("x-ratelimit-reset-ms").and_then(|v| v.to_str().ok()) {
-		if let Ok(ms) = val.trim().parse::<u64>() {
-			return Some(Duration::from_millis(ms));
+		if let Ok(raw) = val.trim().parse::<u64>() {
+			let now = now_unix_ms();
+			let target = if raw > 1_000_000_000_000 {
+				raw as u128
+			} else if raw > 1_000_000_000 {
+				raw as u128 * 1_000
+			} else {
+				return Some(Duration::from_millis(raw));
+			};
+			if target > now {
+				return Some(Duration::from_millis((target - now) as u64));
+			}
 		}
 	}
+	// `x-ratelimit-reset`: epoch seconds.
 	if let Some(val) = headers.get("x-ratelimit-reset").and_then(|v| v.to_str().ok()) {
 		if let Ok(secs) = val.trim().parse::<u64>() {
-			return Some(Duration::from_secs(secs));
+			let target = secs as u128 * 1_000;
+			if target > now_unix_ms() {
+				return Some(Duration::from_millis((target - now_unix_ms()) as u64));
+			}
 		}
 	}
 	if let Some(val) = headers.get("x-ratelimit-reset-after").and_then(|v| v.to_str().ok()) {

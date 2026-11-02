@@ -614,7 +614,7 @@ fn effort_catalog() -> Catalog {
 	models.insert(
 		"model-a".to_string(),
 		ModelInfo {
-			provider: "mock".to_string(),
+			provider: "kimi-code".to_string(),
 			reasoning: true,
 			efforts: Some(vec!["low".to_string(), "high".to_string()]),
 			thinking: Some(json!({
@@ -624,7 +624,7 @@ fn effort_catalog() -> Catalog {
 			..ModelInfo::default()
 		},
 	);
-	catalog.providers.insert("mock".to_string(), models);
+	catalog.providers.insert("kimi-code".to_string(), models);
 	catalog
 }
 
@@ -1932,10 +1932,9 @@ fn rpc_thinking_change_drops_inherited_cache_key_but_noop_keeps_it() {
 		ToolScript { text: "two".to_string(), tool: None },
 		ToolScript { text: "three".to_string(), tool: None },
 	]);
-	let mut launch = launch(port, "model-a", "mock");
+	let mut launch = launch(port, "model-a", "kimi-code");
 	launch.catalog = Arc::new(effort_catalog());
 	launch.thinking = Some(CliThinking::Effort("high"));
-	launch.thinking_level = Some("high".to_string());
 	launch.prompt_cache_key = Some("header-cache-1".to_string());
 	launch.prompt_cache_key_inherited = true;
 	launch.max_turns = 2;
@@ -2035,12 +2034,11 @@ fn rpc_thinking_restored_clamped_noop_keeps_inherited_cache_key() {
 		ToolScript { text: "one".to_string(), tool: None },
 		ToolScript { text: "two".to_string(), tool: None },
 	]);
-	let mut launch = launch(port, "model-a", "mock");
+	let mut launch = launch(port, "model-a", "kimi-code");
 	launch.catalog = Arc::new(effort_catalog());
 	// Recorded as `:max`; this catalog only advertises low/high, so its
 	// effective level is high both before and after selecting high.
 	launch.thinking = Some(CliThinking::Effort("max"));
-	launch.thinking_level = Some("max".to_string());
 	launch.prompt_cache_key = Some("header-cache-1".to_string());
 	launch.prompt_cache_key_inherited = true;
 	launch.max_turns = 2;
@@ -2108,10 +2106,9 @@ fn rpc_thinking_change_keeps_explicit_cache_key() {
 		text: "one".to_string(),
 		tool: None,
 	}]);
-	let mut launch = launch(port, "model-a", "mock");
+	let mut launch = launch(port, "model-a", "kimi-code");
 	launch.catalog = Arc::new(effort_catalog());
 	launch.thinking = Some(CliThinking::Effort("high"));
-	launch.thinking_level = Some("high".to_string());
 	launch.prompt_cache_key = Some("explicit-cache-1".to_string());
 	launch.prompt_cache_key_inherited = false;
 	launch.max_turns = 2;

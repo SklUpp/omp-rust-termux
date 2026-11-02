@@ -15,7 +15,8 @@ use std::time::Duration;
 use futures::StreamExt;
 use pi_agent::provider_ollama::{
 	DeepSeekInbandScanner, InbandScanEvent, KimiInbandScanner, MAX_SECTION_BYTES,
-	MAX_STREAM_HOLD_BYTES, MarkupHealer, MarkupHealingEvent, OllamaPayloadHook, OllamaProvider,
+	MAX_STREAM_HOLD_BYTES, MarkupHealer, MarkupHealingEvent, OllamaPayloadHook,
+	OllamaPayloadModel, OllamaProvider,
 	StreamMarkupHealingPattern, ThinkingInbandScanner, demote_thinking, extract_retry_hint,
 	get_stream_markup_healing_pattern, is_llama_cpp_parse_error, is_malformed_tool_call,
 	normalize_kimi_function_name, preferred_dialect, sanitize_malformed_tool_calls,
@@ -1137,7 +1138,15 @@ fn test_retry_backoff_and_header_parsing() {
 	assert!(should_retry_ollama_response(500, "Server crash"));
 	assert!(!should_retry_ollama_response(500, "failed to parse tool call arguments as json"));
 	assert!(should_retry_ollama_response(429, "Too many requests"));
+	assert!(should_retry_ollama_response(408, "Request timeout"));
 	assert!(!should_retry_ollama_response(400, "Bad request"));
+
+	// A hint above the retry ceiling is surfaced, so the caller fails fast
+	// instead of sleeping a clamped budget.
+	let mut slow_headers = reqwest::header::HeaderMap::new();
+	slow_headers.insert("retry-after", "120".parse().unwrap());
+	let slow_hint = extract_retry_hint(&slow_headers, "").expect("hint");
+	assert!(slow_hint > Duration::from_secs(60));
 }
 
 #[tokio::test]
@@ -1184,19 +1193,25 @@ async fn test_on_payload_hook_modifies_request_payload() {
 			let _ = req_tx.send(json_body);
 		}
 		let headers = "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: close\r\n\r\n";
-		let chunk = "{\"message\":{\"content\":\"hook ok\"},\"done\":true}\n";
+		let chunk = "{\"message\":{\"content\":\"hook ok\"},\"done\":false}\n{\"done\":true,\"done_reason\":\"stop\",\"eval_count\":3}\n";
 		let _ = socket.write_all(headers.as_bytes()).await;
 		let _ = socket.write_all(chunk.as_bytes()).await;
 		let _ = socket.flush().await;
 	});
 
-	let hook: OllamaPayloadHook = std::sync::Arc::new(|payload: &Value, _model: &str| {
-		let mut modified = payload.clone();
-		if let Some(map) = modified.as_object_mut() {
-			map.insert("custom_injected_option".to_string(), json!(true));
-		}
-		Box::pin(async move { Ok(Some(modified)) })
-	});
+	let hook: OllamaPayloadHook = std::sync::Arc::new(
+		|payload: &Value, model: &OllamaPayloadModel<'_>| {
+			assert_eq!(model.model, "test-model");
+			assert_eq!(model.api, "ollama-chat");
+			assert_eq!(model.provider, "ollama");
+			assert_eq!(model.base_url, format!("http://{addr}"));
+			let mut modified = payload.clone();
+			if let Some(map) = modified.as_object_mut() {
+				map.insert("custom_injected_option".to_string(), json!(true));
+			}
+			Box::pin(async move { Ok(Some(modified)) })
+		},
+	);
 
 	let provider = make_provider(&format!("http://{addr}"), "test-model").with_on_payload(hook);
 	let _ = provider
@@ -1283,4 +1298,82 @@ fn test_tool_section_aggregate_cap_across_many_partial_records() {
 		fed += chunk.len();
 	}
 	assert!(dsml_err.is_some(), "unclosed DSML section must be capped");
+}
+
+#[tokio::test]
+async fn healed_text_and_thinking_get_distinct_block_indices() {
+	let content = format!("visible <{}>plan</{}>", "think", "think");
+	let payload = serde_json::json!({"message": {"content": content}, "done": false});
+	let records = format!("{payload}\n{{\"done\":true,\"done_reason\":\"stop\",\"eval_count\":4}}\n");
+	let base = serve_chunked(vec![records.as_bytes().to_vec()]).await;
+	let provider = make_provider(&base, "llama3.3");
+	let message = provider
+		.complete(&[Message::user("go")], &[], &ToolChoice::Auto)
+		.await
+		.expect("complete");
+	assert!(message.content.contains("visible "), "{}", message.content);
+	assert!(
+		message
+			.parts
+			.iter()
+			.any(|part| matches!(part, ContentPart::Thinking { .. })),
+		"{:?}",
+		message.parts
+	);
+}
+
+#[tokio::test]
+async fn structured_tool_calls_suppress_healed_duplicates_in_same_record() {
+	let leaked = "<|tool_calls_section_begin|><|tool_call_begin|>leak.x:0<|tool_call_argument_begin|>{}}<|tool_call_end|><|tool_calls_section_end|>";
+	let record = format!(
+		"{{\"message\":{{\"content\":\"{leaked}\",\"tool_calls\":[{{\"function\":{{\"name\":\"native_tool\",\"arguments\":{{}}}}}}]}},\"done\":false}}\n{{\"done\":true,\"done_reason\":\"tool_calls\"}}\n"
+	);
+	let base = serve_chunked(vec![record.into_bytes()]).await;
+	let provider = make_provider(&base, "kimi-k2");
+	let message = provider
+		.complete(&[Message::user("go")], &[], &ToolChoice::Auto)
+		.await
+		.expect("complete");
+	assert_eq!(message.tool_calls.len(), 1, "{:?}", message.tool_calls);
+	assert_eq!(message.tool_calls[0].name, "native_tool");
+	assert_eq!(message.stop_reason, Some(StopReason::ToolUse));
+}
+
+#[test]
+fn test_dsml_string_mode_real_grammar() {
+	let mut scanner = DeepSeekInbandScanner::default();
+	let input = "<|DSML|tool_calls><|DSML|invoke name=\"run\"><|DSML|parameter name=\"cmd\" string=\"true\">ls -la</|DSML|parameter></|DSML|invoke></|DSML|tool_calls>";
+	let events = scanner.feed(input).expect("feed");
+	match &events[0] {
+		InbandScanEvent::ToolCall { name, arguments, .. } => {
+			assert_eq!(name, "run");
+			let parsed: Value = serde_json::from_str(arguments).expect("json");
+			assert_eq!(parsed["cmd"], Value::String("ls -la".to_string()));
+		},
+		other => panic!("Expected ToolCall, got {other:?}"),
+	}
+
+	// Absent flag defaults to string coercion, so JSON-looking bodies stay text.
+	let mut default_scanner = DeepSeekInbandScanner::default();
+	let default_input = "<|DSML|tool_calls><|DSML|invoke name=\"keep\"><|DSML|parameter name=\"raw\">{\"a\":1}</|DSML|parameter></|DSML|invoke></|DSML|tool_calls>";
+	let default_events = default_scanner.feed(default_input).expect("feed");
+	match &default_events[0] {
+		InbandScanEvent::ToolCall { arguments, .. } => {
+			let parsed: Value = serde_json::from_str(arguments).expect("json");
+			assert_eq!(parsed["raw"], Value::String("{\"a\":1}".to_string()));
+		},
+		other => panic!("Expected ToolCall, got {other:?}"),
+	}
+
+	// Explicit `string="false"` coerces the body as JSON.
+	let mut typed_scanner = DeepSeekInbandScanner::default();
+	let typed_input = "<|DSML|tool_calls><|DSML|invoke name=\"calc\"><|DSML|parameter name=\"n\" string=\"false\">42</|DSML|parameter></|DSML|invoke></|DSML|tool_calls>";
+	let typed_events = typed_scanner.feed(typed_input).expect("feed");
+	match &typed_events[0] {
+		InbandScanEvent::ToolCall { arguments, .. } => {
+			let parsed: Value = serde_json::from_str(arguments).expect("json");
+			assert_eq!(parsed["n"], Value::from(42));
+		},
+		other => panic!("Expected ToolCall, got {other:?}"),
+	}
 }

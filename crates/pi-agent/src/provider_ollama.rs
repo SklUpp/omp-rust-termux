@@ -20,10 +20,23 @@ use std::{
 /// Boxed future alias for async callbacks and hooks without extra lifetime dependencies.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+/// Minimal TS `Model<"ollama-chat">` context handed to `onPayload`: the fields
+/// this adapter actually owns. The runtime exposes no separate model object.
+#[derive(Debug, Clone, Copy)]
+pub struct OllamaPayloadModel<'a> {
+	pub provider: &'a str,
+	pub api: &'a str,
+	pub model: &'a str,
+	pub base_url: &'a str,
+}
+
 /// TS `onPayload?: (payload: unknown, model?: Model<Api>) => unknown | undefined | Promise<unknown | undefined>`.
-/// Receives the serialized request body and the target model id, returning an optional replacement body or an error.
+/// Receives the serialized request body and its model context, returning an optional replacement body or an error.
 pub type OllamaPayloadHook = Arc<
-	dyn for<'a> Fn(&'a Value, &'a str) -> BoxFuture<'a, Result<Option<Value>, ProviderError>>
+	dyn for<'a> Fn(
+			&'a Value,
+			&'a OllamaPayloadModel<'a>,
+		) -> BoxFuture<'a, Result<Option<Value>, ProviderError>>
 		+ Send
 		+ Sync,
 >;
@@ -78,19 +91,27 @@ const EMPTY_OLLAMA_LENGTH_COMPLETION_MESSAGE: &str =
 const EMPTY_OLLAMA_LOAD_COMPLETION_MESSAGE: &str =
 	"Ollama loaded the model but generated nothing (done_reason: load): the request contained no user-role message.";
 /// Resolve an optional duration from environment variable names (`idle-iterator.ts:32`).
-/// A value of 0 explicitly disables the timeout; missing/invalid uses default.
+/// A value of 0 explicitly disables the watchdog; missing/invalid uses default.
 pub fn resolve_env_timeout(env_vars: &[&str], default_ms: u64) -> Option<Duration> {
+	match resolve_env_timeout_setting(env_vars, default_ms) {
+		StreamTimeout::Disabled => None,
+		StreamTimeout::Value(duration) => Some(duration),
+	}
+}
+
+fn resolve_env_timeout_setting(env_vars: &[&str], default_ms: u64) -> StreamTimeout {
 	for var in env_vars {
-		if let Ok(val) = std::env::var(var) {
-			if let Ok(num) = val.trim().parse::<u64>() {
-				if num == 0 {
-					return None;
-				}
-				return Some(Duration::from_millis(num));
-			}
+		if let Ok(val) = std::env::var(var)
+			&& let Ok(num) = val.trim().parse::<u64>()
+		{
+			return if num == 0 {
+				StreamTimeout::Disabled
+			} else {
+				StreamTimeout::Value(Duration::from_millis(num))
+			};
 		}
 	}
-	Some(Duration::from_millis(default_ms))
+	StreamTimeout::Value(Duration::from_millis(default_ms))
 }
 
 
@@ -348,9 +369,18 @@ pub struct OllamaProvider {
 	/// Optional request payload replacement hook (`ollama.ts:577-580`).
 	on_payload: Option<OllamaPayloadHook>,
 	/// Pre-response and first-event stream budget (`idle-iterator.ts:24`).
-	first_event_timeout: Option<Duration>,
+	first_event_timeout: StreamTimeout,
 	/// Idle gap budget between streamed stream chunks (`idle-iterator.ts:14`).
-	idle_timeout: Option<Duration>,
+	idle_timeout: StreamTimeout,
+}
+
+/// Explicit stream watchdog budget. `Disabled` is the TS `0` sentinel and is
+/// distinct from "unset": a disabled first-event budget must stay disabled even
+/// when an idle budget exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamTimeout {
+	Disabled,
+	Value(Duration),
 }
 
 /// True when a tool call has empty or whitespace-only id or name (`transform-messages.ts:166-168`).
@@ -360,12 +390,16 @@ pub fn is_malformed_tool_call(call: &crate::state::ToolCall) -> bool {
 
 /// Strip malformed tool calls and their matching tool results (`transform-messages.ts:170-229`).
 pub fn sanitize_malformed_tool_calls(messages: &[Message]) -> Vec<Message> {
-	let mut drop_queue: Vec<String> = Vec::new();
+	// One entry per declared call: `(id, malformed)`. A result shifts the first
+	// matching entry, so a duplicated id cannot consume the wrong result. The
+	// window resets on every non-tool message, matching TS assistant windows.
+	let mut drop_queue: Vec<(String, bool)> = Vec::new();
 	let mut sanitized = Vec::with_capacity(messages.len());
 
 	for msg in messages {
 		match msg.role {
 			Role::Assistant => {
+				drop_queue.clear();
 				let had_calls = !msg.tool_calls.is_empty()
 					|| msg.parts.iter().any(|part| matches!(part, ContentPart::ToolCall { .. }));
 				if !had_calls {
@@ -373,15 +407,12 @@ pub fn sanitize_malformed_tool_calls(messages: &[Message]) -> Vec<Message> {
 					continue;
 				}
 				let mut new_msg = msg.clone();
+				let declared: Vec<String> =
+					msg.tool_calls.iter().map(|call| call.id.clone()).collect();
 				new_msg.tool_calls.retain(|call| {
-					if is_malformed_tool_call(call) {
-						if !call.id.trim().is_empty() {
-							drop_queue.push(call.id.clone());
-						}
-						false
-					} else {
-						true
-					}
+					let malformed = is_malformed_tool_call(call);
+					drop_queue.push((call.id.clone(), malformed));
+					!malformed
 				});
 				new_msg.parts.retain(|part| match part {
 					ContentPart::ToolCall { id, name, .. } => {
@@ -391,8 +422,10 @@ pub fn sanitize_malformed_tool_calls(messages: &[Message]) -> Vec<Message> {
 							arguments: Value::Null,
 						};
 						if is_malformed_tool_call(&call) {
-							if !id.trim().is_empty() {
-								drop_queue.push(id.clone());
+							// The execution projection already queued this id when
+							// present; only queue here to keep every declared call.
+							if !declared.contains(id) {
+								drop_queue.push((id.clone(), true));
 							}
 							false
 						} else {
@@ -416,10 +449,12 @@ pub fn sanitize_malformed_tool_calls(messages: &[Message]) -> Vec<Message> {
 			},
 			Role::Tool => {
 				if let Some(id) = &msg.tool_call_id
-					&& let Some(pos) = drop_queue.iter().position(|drop_id| drop_id == id)
+					&& let Some(pos) = drop_queue.iter().position(|(queued, _)| queued == id)
 				{
-					drop_queue.remove(pos);
-					continue;
+					let (_, malformed) = drop_queue.remove(pos);
+					if malformed {
+						continue;
+					}
 				}
 				sanitized.push(msg.clone());
 			},
@@ -523,14 +558,14 @@ impl OllamaProvider {
 			top_p: None,
 			provider_id: None,
 			on_payload: None,
-			first_event_timeout: resolve_env_timeout(
+			first_event_timeout: resolve_env_timeout_setting(
 				&[
 					"PI_OPENAI_STREAM_FIRST_EVENT_TIMEOUT_MS",
 					"PI_STREAM_FIRST_EVENT_TIMEOUT_MS",
 				],
 				DEFAULT_STREAM_FIRST_EVENT_TIMEOUT_MS,
 			),
-			idle_timeout: resolve_env_timeout(
+			idle_timeout: resolve_env_timeout_setting(
 				&[
 					"PI_OPENAI_STREAM_IDLE_TIMEOUT_MS",
 					"PI_STREAM_IDLE_TIMEOUT_MS",
@@ -616,30 +651,39 @@ impl OllamaProvider {
 	}
 
 	/// Override first-event and idle stream watchdog timeouts (`idle-iterator.ts`).
+	/// `None` disables that watchdog (TS `0` sentinel).
 	pub fn with_stream_timeouts(
 		mut self,
 		first_event_timeout: Option<Duration>,
 		idle_timeout: Option<Duration>,
 	) -> Self {
-		self.first_event_timeout = first_event_timeout;
-		self.idle_timeout = idle_timeout;
+		self.first_event_timeout = first_event_timeout
+			.map(StreamTimeout::Value)
+			.unwrap_or(StreamTimeout::Disabled);
+		self.idle_timeout = idle_timeout
+			.map(StreamTimeout::Value)
+			.unwrap_or(StreamTimeout::Disabled);
 		self
 	}
 
 	/// Effective first-event budget (floored at idle timeout per `idle-iterator.ts:90`).
 	/// `None` disables the watchdog exactly like the TS `0` sentinel.
 	fn effective_first_event_timeout(&self) -> Option<Duration> {
-		match (self.first_event_timeout, self.idle_timeout) {
-			(Some(first), Some(idle)) => Some(first.max(idle)),
-			(Some(first), None) => Some(first),
-			(None, Some(idle)) => Some(idle),
-			(None, None) => None,
+		match self.first_event_timeout {
+			StreamTimeout::Disabled => None,
+			StreamTimeout::Value(first) => match self.idle_timeout {
+				StreamTimeout::Disabled => Some(first),
+				StreamTimeout::Value(idle) => Some(first.max(idle)),
+			},
 		}
 	}
 
 	/// Effective stream idle gap budget; `None` disables the watchdog.
 	fn effective_idle_timeout(&self) -> Option<Duration> {
-		self.idle_timeout
+		match self.idle_timeout {
+			StreamTimeout::Disabled => None,
+			StreamTimeout::Value(idle) => Some(idle),
+		}
 	}
 
 
@@ -782,36 +826,78 @@ impl OllamaProvider {
 		}
 
 		// Pass 2: tool-call and tool-result pairing (`transform-messages.ts:845-1083`).
-		let mut output = Vec::with_capacity(preprocessed.len());
+		//
+		// Results are preindexed and consumed at most once: a delayed real
+		// result after an intervening turn is pulled into the assistant's
+		// flush window instead of being replaced by a synthetic note.
+		let mut slots: Vec<Option<Message>> = preprocessed.into_iter().map(Some).collect();
+		let mut valid_calls: Vec<String> = Vec::new();
+		for slot in slots.iter().flatten() {
+			if slot.role == Role::Assistant {
+				for part in &slot.parts {
+					if let ContentPart::ToolCall { id, .. } = part {
+						valid_calls.push(id.clone());
+					}
+				}
+				for call in &slot.tool_calls {
+					valid_calls.push(call.id.clone());
+				}
+			}
+		}
+		let mut consumed = vec![false; slots.len()];
+		let mut output = Vec::with_capacity(slots.len());
 		let mut pending: Vec<(String, String)> = Vec::new();
 		let mut aborted = false;
+		let mut last_assistant = 0usize;
 
 		fn flush_pending(
 			pending: &mut Vec<(String, String)>,
 			aborted: bool,
+			slots: &[Option<Message>],
+			consumed: &mut [bool],
+			from: usize,
 			output: &mut Vec<Message>,
 		) {
 			let text = if aborted { "aborted" } else { "No result provided" };
 			for (id, name) in pending.drain(..) {
-				output.push(Message::tool_with_status(id, name, text, true));
+				let real = (from..slots.len()).find(|index| {
+					if consumed[*index] {
+						return false;
+					}
+					match &slots[*index] {
+						Some(msg) => {
+							msg.role == Role::Tool
+								&& msg.tool_call_id.as_deref() == Some(id.as_str())
+						},
+						None => false,
+					}
+				});
+				match real {
+					Some(index) => {
+						consumed[index] = true;
+						if let Some(msg) = slots[index].clone() {
+							output.push(msg);
+						}
+					},
+					None => output.push(Message::tool_with_status(id, name, text, true)),
+				}
 			}
 		}
 
-		for msg in preprocessed {
+		for index in 0..slots.len() {
+			let Some(msg) = slots[index].take() else {
+				continue;
+			};
 			if msg.role == Role::Tool {
-				if let Some(id) = msg.tool_call_id.as_deref()
-					&& let Some(pos) = pending.iter().position(|(pending_id, _)| pending_id == id)
-				{
-					pending.remove(pos);
-					output.push(msg);
+				if consumed[index] {
 					continue;
 				}
-				// An orphan result inside an open call window cannot be paired.
-				if !pending.is_empty() {
+				let id = msg.tool_call_id.clone().unwrap_or_default();
+				// The call survives elsewhere in history, so this result is a
+				// duplicate/stale note rather than an orphan to replay.
+				if valid_calls.iter().any(|call_id| call_id == &id) {
 					continue;
 				}
-				// `convertMessages`: a result with no preceding call becomes a
-				// user-role `<stale-tool-result>` block for this dialect.
 				let tool_name = msg.name.as_deref().unwrap_or("unknown");
 				let id = msg.tool_call_id.as_deref().unwrap_or("unknown");
 				let error_attr = if msg.is_error { " is-error=\"true\"" } else { "" };
@@ -824,13 +910,21 @@ impl OllamaProvider {
 			}
 
 			if !pending.is_empty() {
-				flush_pending(&mut pending, aborted, &mut output);
+				flush_pending(
+					&mut pending,
+					aborted,
+					&slots,
+					&mut consumed,
+					last_assistant + 1,
+					&mut output,
+				);
 			}
 			if msg.role == Role::Assistant {
 				aborted = matches!(
 					msg.stop_reason,
 					Some(StopReason::Error) | Some(StopReason::Aborted)
 				);
+				last_assistant = index;
 				for part in &msg.parts {
 					if let ContentPart::ToolCall { id, name, .. } = part
 						&& !pending.iter().any(|(pending_id, _)| pending_id == id)
@@ -848,7 +942,14 @@ impl OllamaProvider {
 		}
 
 		if !pending.is_empty() {
-			flush_pending(&mut pending, aborted, &mut output);
+			flush_pending(
+				&mut pending,
+				aborted,
+				&slots,
+				&mut consumed,
+				last_assistant + 1,
+				&mut output,
+			);
 		}
 
 		output
@@ -1021,15 +1122,21 @@ impl OllamaProvider {
 			let is_retryable = should_retry_ollama_response(status.as_u16(), &body_info.text);
 			if is_retryable && attempt + 1 < max_attempts {
 				let retry_hint = extract_retry_hint(&headers, &body_info.text);
+				// TS `fetch-retry`: a hint above the ceiling returns the response
+				// so the caller fails fast instead of sleeping a clamped budget.
+				if retry_hint.is_some_and(|hint| hint > Duration::from_millis(MAX_RETRY_DELAY_MS))
+				{
+					let redacted =
+						bounded_redaction(&body_info.text, &secrets, body_info.truncated);
+					return Err(ProviderError::HttpStatus(status.as_u16(), redacted));
+				}
 				let default_delay = Duration::from_millis(
 					OLLAMA_RETRY_DELAYS_MS
 						.get(attempt)
 						.copied()
 						.unwrap_or(10_000),
 				);
-				let delay = retry_hint
-					.map(|hint| hint.min(Duration::from_millis(MAX_RETRY_DELAY_MS)))
-					.unwrap_or(default_delay);
+				let delay = retry_hint.unwrap_or(default_delay);
 				tokio::time::sleep(delay).await;
 				continue;
 			}
@@ -1049,7 +1156,13 @@ impl OllamaProvider {
 	) -> Result<ChunkStream, ProviderError> {
 		let mut payload = self.request_value(messages, tools, tool_choice, true)?;
 		if let Some(hook) = &self.on_payload {
-			if let Some(replaced) = hook(&payload, &self.model).await? {
+			let context = OllamaPayloadModel {
+				provider: self.provider().unwrap_or(""),
+				api: self.api().unwrap_or("ollama-chat"),
+				model: &self.model,
+				base_url: &self.base_url,
+			};
+			if let Some(replaced) = hook(&payload, &context).await? {
 				payload = replaced;
 			}
 		}
@@ -1060,11 +1173,13 @@ impl OllamaProvider {
 			.bytes_stream()
 			.map(|item| item.map_err(|err| err.to_string()));
 
-		let raw_stream = ndjson_stream(body, secrets);
-		let pattern = get_stream_markup_healing_pattern(self.provider().unwrap_or(""), &self.model);
-		let healed_stream = with_markup_healing(raw_stream, pattern);
+		let raw_stream = ndjson_stream(
+			body,
+			secrets,
+			get_stream_markup_healing_pattern(self.provider().unwrap_or(""), &self.model),
+		);
 		let watched_stream = with_stream_watchdog(
-			healed_stream,
+			raw_stream,
 			self.effective_first_event_timeout(),
 			self.effective_idle_timeout(),
 		);
@@ -1637,9 +1752,14 @@ pub fn normalize_kimi_function_name(raw_id: &str) -> String {
 fn partial_suffix_overlap(text: &str, tag: &str) -> usize {
 	let text = text.as_bytes();
 	let tag = tag.as_bytes();
-	let max_len = text.len().saturating_sub(1).min(tag.len().saturating_sub(1));
+	// A one-scalar prefix (`<`) must be held too, so the upper bound is the
+	// full text length capped below the whole tag.
+	let max_len = text.len().min(tag.len().saturating_sub(1));
 	for len in (1..=max_len).rev() {
-		if text.ends_with(&tag[..len]) {
+		// Byte prefix match: slicing the tag at `len` could split a multi-byte
+		// scalar (fullwidth DSML `｜`), and a byte suffix that matched a valid
+		// UTF-8 prefix is necessarily on a scalar boundary.
+		if tag.get(..len).is_some_and(|prefix| text.ends_with(prefix)) {
 			return len;
 		}
 	}
@@ -2425,11 +2545,20 @@ impl DeepSeekInbandScanner {
 			};
 			let attr_part = &after_op[..tag_end];
 			let name = extract_attr(attr_part, "name").unwrap_or_default();
-			if let Some(val_str) = extract_attr(attr_part, "string") {
-				map.insert(name, Value::String(val_str));
+			// Legacy self-closing form: `<parameter name="x" string="v"/>`.
+			// Kept permissive; the real grammar carries the value in the body.
+			if attr_part.trim_end().ends_with('/') {
+				let value = extract_attr(attr_part, "string").unwrap_or_default();
+				map.insert(name, Value::String(value));
 				rest = &after_op[tag_end + 1..];
 				continue;
 			}
+			// Real DSML grammar: `string` is a boolean mode flag, the value is
+			// always the element body. Absent flag means string coercion.
+			let string_mode = match extract_attr(attr_part, "string").as_deref() {
+				Some("false") => false,
+				_ => true,
+			};
 			let body_start = &after_op[tag_end + 1..];
 			if let Some((close_pos, close_tag)) = DSML_PARAM_CLOSES
 				.iter()
@@ -2437,8 +2566,12 @@ impl DeepSeekInbandScanner {
 				.min_by_key(|(idx, _)| *idx)
 			{
 				let raw_val = body_start[..close_pos].trim();
-				let parsed = serde_json::from_str(raw_val)
-					.unwrap_or_else(|_| Value::String(raw_val.to_string()));
+				let parsed = if string_mode {
+					Value::String(raw_val.to_string())
+				} else {
+					serde_json::from_str(raw_val)
+						.unwrap_or_else(|_| Value::String(raw_val.to_string()))
+				};
 				map.insert(name, parsed);
 				rest = &body_start[close_pos + close_tag.len()..];
 			} else {
@@ -2583,178 +2716,177 @@ impl MarkupHealer {
 	}
 }
 
-fn with_markup_healing(
-	stream: ChunkStream,
-	pattern: StreamMarkupHealingPattern,
-) -> ChunkStream {
-	struct HealingState {
-		stream: ChunkStream,
-		healer: MarkupHealer,
-		saw_native_tool_calls: bool,
-		saw_healed_tool_calls: bool,
-		tool_index: usize,
-		pending_queue: VecDeque<StreamChunk>,
-		finished: bool,
+/// Per-record markup healer and block-index allocator.
+///
+/// Healing happens per NDJSON record so a structured `tool_calls` payload is
+/// visible to the healer before its sibling content (TS `structuredCalls`), and
+/// healed text/thinking/tool blocks get fresh content indices instead of
+/// reusing the parser's index for a different block kind.
+struct RecordHealer {
+	healer: MarkupHealer,
+	next_block: usize,
+	text_block: Option<usize>,
+	thinking_block: Option<usize>,
+	/// Raw parser tool slot -> allocated content block.
+	tool_blocks: HashMap<usize, usize>,
+	saw_native_thinking: bool,
+	saw_healed_tool_calls: bool,
+	/// Post-healing visible content: text or tool call only, never thinking.
+	visible: bool,
+}
+
+impl RecordHealer {
+	fn new(pattern: StreamMarkupHealingPattern) -> Self {
+		Self {
+			healer: MarkupHealer::new(pattern),
+			next_block: 0,
+			text_block: None,
+			thinking_block: None,
+			tool_blocks: HashMap::new(),
+			saw_native_thinking: false,
+			saw_healed_tool_calls: false,
+			visible: false,
+		}
 	}
 
-	let state = HealingState {
-		stream,
-		healer: MarkupHealer::new(pattern),
-		saw_native_tool_calls: false,
-		saw_healed_tool_calls: false,
-		tool_index: 0,
-		pending_queue: VecDeque::new(),
-		finished: false,
-	};
+	fn alloc_block(&mut self) -> usize {
+		let block = self.next_block;
+		self.next_block += 1;
+		block
+	}
 
-	Box::pin(futures::stream::unfold(Some(state), |state| async move {
-		let mut state = state?;
-		loop {
-			if let Some(chunk) = state.pending_queue.pop_front() {
-				return Some((Ok(chunk), Some(state)));
+	fn ensure_text(&mut self) -> usize {
+		match self.text_block {
+			Some(block) => block,
+			None => {
+				let block = self.alloc_block();
+				self.text_block = Some(block);
+				block
+			},
+		}
+	}
+
+	fn ensure_thinking(&mut self) -> usize {
+		match self.thinking_block {
+			Some(block) => block,
+			None => {
+				let block = self.alloc_block();
+				self.thinking_block = Some(block);
+				block
+			},
+		}
+	}
+
+	fn ensure_tool_block(&mut self, raw_index: usize) -> usize {
+		if let Some(block) = self.tool_blocks.get(&raw_index) {
+			return *block;
+		}
+		let block = self.alloc_block();
+		self.tool_blocks.insert(raw_index, block);
+		block
+	}
+
+	fn push_events(&mut self, events: Vec<MarkupHealingEvent>, out: &mut Vec<StreamChunk>) {
+		for event in events {
+			match event {
+				MarkupHealingEvent::Text(text) => {
+					if !text.trim().is_empty() {
+						self.visible = true;
+					}
+					let block = self.ensure_text();
+					out.push(delta_chunk(Some(text), None, Vec::new(), block));
+				},
+				MarkupHealingEvent::Thinking(thinking) => {
+					// TS `suppressHealedThinking`: once the provider streams a
+					// native thinking channel, healed reasoning would double-count.
+					if self.saw_native_thinking {
+						continue;
+					}
+					let block = self.ensure_thinking();
+					out.push(delta_chunk(None, Some(thinking), Vec::new(), block));
+				},
+				MarkupHealingEvent::ToolCall(call) => {
+					self.saw_healed_tool_calls = true;
+					self.visible = true;
+					let block = self.alloc_block();
+					out.push(delta_chunk(
+						None,
+						None,
+						vec![ToolCallDelta {
+							index: block,
+							id: Some(call.id),
+							name: Some(call.name),
+							arguments_delta: Some(call.arguments),
+							content_index: Some(block),
+						}],
+						block,
+					));
+				},
 			}
-			if state.finished {
-				return None;
+		}
+	}
+
+	fn process_record(
+		&mut self,
+		chunks: Vec<StreamChunk>,
+	) -> Result<Vec<StreamChunk>, ProviderError> {
+		// The parser emits a record's tool-call chunks after its content chunk;
+		// scanning the record first mirrors TS `structuredCalls` so leaked
+		// markup never synthesizes a duplicate call.
+		let has_structured_calls = chunks
+			.iter()
+			.any(|chunk| !chunk.tool_call_deltas.is_empty());
+		let mut out = Vec::new();
+		for chunk in chunks {
+			if chunk.is_done {
+				out.push(chunk);
+				continue;
 			}
-
-			match state.stream.next().await {
-				Some(Ok(chunk)) => {
-					if chunk.is_done {
-						let flush_events = match state.healer.flush_events() {
-							Ok(events) => events,
-							Err(err) => {
-								state.finished = true;
-								return Some((Err(err), None));
-							},
-						};
-						for ev in flush_events {
-							match ev {
-								MarkupHealingEvent::Text(t) => {
-									state.pending_queue.push_back(delta_chunk(Some(t), None, Vec::new(), 0));
-								}
-								MarkupHealingEvent::Thinking(th) => {
-									state.pending_queue.push_back(delta_chunk(None, Some(th), Vec::new(), 0));
-								}
-								MarkupHealingEvent::ToolCall(call) => {
-									state.saw_healed_tool_calls = true;
-									let idx = state.tool_index;
-									state.tool_index += 1;
-									state.pending_queue.push_back(delta_chunk(
-										None,
-										None,
-										vec![ToolCallDelta {
-											index: idx,
-											id: Some(call.id),
-											name: Some(call.name),
-											arguments_delta: Some(call.arguments),
-											content_index: Some(0),
-										}],
-										0,
-									));
-								}
-							}
-						}
-
-						let final_stop_reason = if state.saw_healed_tool_calls
-							&& chunk.stop_reason == Some(StopReason::Stop)
-						{
-							StopReason::ToolUse
-						} else {
-							chunk.stop_reason.unwrap_or(StopReason::Stop)
-						};
-
-						state.pending_queue.push_back(done_chunk(
-							chunk.usage,
-							final_stop_reason,
-							chunk.error_message,
-						));
-						state.finished = true;
-						if let Some(c) = state.pending_queue.pop_front() {
-							return Some((Ok(c), Some(state)));
-						}
-						return None;
-					}
-
-					if !chunk.tool_call_deltas.is_empty() {
-						state.saw_native_tool_calls = true;
-					}
-					let content_idx = chunk.content_index.unwrap_or(0);
-					let events = if let Some(text) = &chunk.content {
-						let result = if state.saw_native_tool_calls {
-							state.healer.feed_events_without_calls(text)
-						} else {
-							state.healer.feed_events(text)
-						};
-						match result {
-							Ok(events) => events,
-							Err(err) => {
-								state.finished = true;
-								return Some((Err(err), None));
-							},
-						}
-					} else {
-						Vec::new()
-					};
-
-					let mut emitted = false;
-					for ev in events {
-						match ev {
-							MarkupHealingEvent::Text(t) => {
-								state.pending_queue.push_back(delta_chunk(Some(t), None, Vec::new(), content_idx));
-								emitted = true;
-							}
-							MarkupHealingEvent::Thinking(th) => {
-								state.pending_queue.push_back(delta_chunk(None, Some(th), Vec::new(), content_idx));
-								emitted = true;
-							}
-							MarkupHealingEvent::ToolCall(call) => {
-								state.saw_healed_tool_calls = true;
-								let idx = state.tool_index;
-								state.tool_index += 1;
-								state.pending_queue.push_back(delta_chunk(
-									None,
-									None,
-									vec![ToolCallDelta {
-										index: idx,
-										id: Some(call.id),
-										name: Some(call.name),
-										arguments_delta: Some(call.arguments),
-										content_index: Some(content_idx),
-									}],
-									content_idx,
-								));
-								emitted = true;
-							}
-						}
-					}
-
-					if chunk.reasoning.is_some() || !chunk.tool_call_deltas.is_empty() {
-						state.pending_queue.push_back(delta_chunk(
-							None,
-							chunk.reasoning,
-							chunk.tool_call_deltas,
-							content_idx,
-						));
-						emitted = true;
-					}
-
-					if emitted {
-						if let Some(c) = state.pending_queue.pop_front() {
-							return Some((Ok(c), Some(state)));
-						}
-					}
-				}
-				Some(Err(err)) => {
-					state.finished = true;
-					return Some((Err(err), None));
-				}
-				None => {
-					state.finished = true;
-					return None;
+			if let Some(content) = chunk.content.as_deref() {
+				let events = if has_structured_calls {
+					self.healer.feed_events_without_calls(content)?
+				} else {
+					self.healer.feed_events(content)?
+				};
+				self.push_events(events, &mut out);
+			}
+			if let Some(reasoning) = chunk.reasoning {
+				self.saw_native_thinking = true;
+				let block = self.ensure_thinking();
+				out.push(delta_chunk(None, Some(reasoning), Vec::new(), block));
+			}
+			if !chunk.tool_call_deltas.is_empty() {
+				for mut delta in chunk.tool_call_deltas {
+					let block = self.ensure_tool_block(delta.index);
+					delta.index = block;
+					delta.content_index = Some(block);
+					self.visible = true;
+					out.push(delta_chunk(None, None, vec![delta], block));
 				}
 			}
 		}
-	}))
+		Ok(out)
+	}
+
+	/// Flush held markup and append the terminal chunk, promoting `stop` to
+	/// `toolUse` when healing reconstructed a call.
+	fn finish(
+		&mut self,
+		usage: Option<TokenUsage>,
+		stop: StopReason,
+		error_message: Option<String>,
+	) -> Result<Vec<StreamChunk>, ProviderError> {
+		let mut out = Vec::new();
+		let events = self.healer.flush_events()?;
+		self.push_events(events, &mut out);
+		let stop = if self.saw_healed_tool_calls && stop == StopReason::Stop {
+			StopReason::ToolUse
+		} else {
+			stop
+		};
+		out.push(done_chunk(usage, stop, error_message));
+		Ok(out)
+	}
 }
 
 fn is_progress_chunk(chunk: &StreamChunk) -> bool {
@@ -2869,7 +3001,8 @@ pub fn should_retry_ollama_response(status: u16, body_text: &str) -> bool {
 	if (500..=599).contains(&status) {
 		return !is_llama_cpp_parse_error(body_text);
 	}
-	status == 429
+	// TS `isRetryableStatus`: 408, 429 (and 5xx).
+	status == 408 || status == 429
 }
 
 pub fn extract_retry_hint(headers: &reqwest::header::HeaderMap, body: &str) -> Option<Duration> {
@@ -2999,8 +3132,6 @@ struct ParseState {
 	active: Option<BlockKind>,
 	tool_index: usize,
 	saw_tool_calls: bool,
-	/// Cumulative `hasVisibleAssistantContent` (text/thinking/tool call).
-	visible: bool,
 	/// Last `done` record's usage and raw done-reason. The terminal event is
 	/// only emitted at EOF so a later record can still add content, matching
 	/// TS's post-loop finalization.
@@ -3037,13 +3168,17 @@ impl ParseState {
 
 /// TS post-stream finalization: tool calls always mean "execute and continue",
 /// then the empty-`length` and `load` records become terminal errors that keep
-/// the partial message.
-fn finalize_stop(state: &ParseState, stop: StopReason) -> (StopReason, Option<String>) {
+/// the partial message. `visible` is post-healing text/tool content only.
+fn finalize_stop(
+	stop: StopReason,
+	visible: bool,
+	saw_tool_calls: bool,
+) -> (StopReason, Option<String>) {
 	let mut stop = stop;
-	if matches!(stop, StopReason::Stop) && state.saw_tool_calls {
+	if matches!(stop, StopReason::Stop) && saw_tool_calls {
 		stop = StopReason::ToolUse;
 	}
-	if matches!(stop, StopReason::Length) && !state.visible {
+	if matches!(stop, StopReason::Length) && !visible {
 		return (
 			StopReason::Error,
 			Some(EMPTY_OLLAMA_LENGTH_COMPLETION_MESSAGE.to_string()),
@@ -3066,6 +3201,7 @@ struct NdjsonState<S> {
 	pending_record: usize,
 	queue: VecDeque<Result<StreamChunk, ProviderError>>,
 	parse: ParseState,
+	healer: RecordHealer,
 	finished: bool,
 	/// Effective bearer credential(s) scrubbed from parser diagnostics.
 	secrets: Vec<String>,
@@ -3177,16 +3313,10 @@ fn process_line(
 		// TS pushes one event per block delta, thinking before text and tool
 		// calls after both, so each chunk carries exactly one content index.
 		if let Some(thinking) = message.thinking.filter(|value| !value.is_empty()) {
-			if !thinking.trim().is_empty() {
-				state.visible = true;
-			}
 			let index = state.open(BlockKind::Thinking);
 			output.push(delta_chunk(None, Some(thinking), Vec::new(), index));
 		}
 		if let Some(delta) = message.content.filter(|value| !value.is_empty()) {
-			if !delta.trim().is_empty() {
-				state.visible = true;
-			}
 			let index = state.open(BlockKind::Text);
 			output.push(delta_chunk(Some(delta), None, Vec::new(), index));
 		}
@@ -3209,7 +3339,6 @@ fn process_line(
 				};
 				state.tool_index += 1;
 				state.saw_tool_calls = true;
-				state.visible = true;
 				output.push(delta_chunk(None, None, vec![delta], index));
 			}
 		}
@@ -3245,7 +3374,11 @@ fn process_line(
 /// record, an incomplete EOF tail or a transport failure ends the turn with a
 /// terminal [`StopReason::Error`] chunk that keeps the partial output, matching
 /// the TS adapter's `error` event.
-fn ndjson_stream<S, B, E>(body: S, secrets: Vec<String>) -> ChunkStream
+fn ndjson_stream<S, B, E>(
+	body: S,
+	secrets: Vec<String>,
+	pattern: StreamMarkupHealingPattern,
+) -> ChunkStream
 where
 	S: Stream<Item = Result<B, E>> + Send + 'static,
 	B: AsRef<[u8]> + Send + 'static,
@@ -3257,6 +3390,7 @@ where
 		pending_record: 0,
 		queue: VecDeque::new(),
 		parse: ParseState::default(),
+		healer: RecordHealer::new(pattern),
 		finished: false,
 		secrets,
 	};
@@ -3304,7 +3438,14 @@ where
 					}
 					for line in take_lines(&mut state.buffer) {
 						match process_line(&line, &mut state.parse, &state.secrets) {
-							Ok(chunks) => state.queue.extend(chunks.into_iter().map(Ok)),
+							Ok(chunks) => match state.healer.process_record(chunks) {
+								Ok(healed) => state.queue.extend(healed.into_iter().map(Ok)),
+								Err(err) => {
+									state.queue.push_back(Ok(error_chunk(err.to_string())));
+									state.finished = true;
+									break;
+								},
+							},
 							Err(err) => {
 								state.queue.push_back(Ok(error_chunk(err.to_string())));
 								state.finished = true;
@@ -3322,7 +3463,13 @@ where
 					if !state.buffer.is_empty() {
 						let tail = std::mem::take(&mut state.buffer);
 						match process_line(&tail, &mut state.parse, &state.secrets) {
-							Ok(chunks) => state.queue.extend(chunks.into_iter().map(Ok)),
+							Ok(chunks) => match state.healer.process_record(chunks) {
+								Ok(healed) => state.queue.extend(healed.into_iter().map(Ok)),
+								Err(err) => {
+									state.queue.push_back(Ok(error_chunk(err.to_string())));
+									fatal = true;
+								},
+							},
 							Err(err) => {
 								state.queue.push_back(Ok(error_chunk(err.to_string())));
 								fatal = true;
@@ -3335,10 +3482,14 @@ where
 							.terminal
 							.take()
 							.unwrap_or((None, StopReason::Stop));
-						let (stop, error_message) = finalize_stop(&state.parse, raw_stop);
-						state
-							.queue
-							.push_back(Ok(done_chunk(usage, stop, error_message)));
+						let visible = state.healer.visible;
+						let saw_tool_calls = state.parse.saw_tool_calls;
+						let (stop, error_message) =
+							finalize_stop(raw_stop, visible, saw_tool_calls);
+						match state.healer.finish(usage, stop, error_message) {
+							Ok(chunks) => state.queue.extend(chunks.into_iter().map(Ok)),
+							Err(err) => state.queue.push_back(Ok(error_chunk(err.to_string()))),
+						}
 					}
 					state.finished = true;
 				},
@@ -3350,6 +3501,7 @@ where
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::state::ToolCall;
 
 	fn message_tool(name: Option<&str>, call_id: &str) -> Message {
 		let mut message = Message::tool(call_id, "result");
@@ -3444,18 +3596,21 @@ mod tests {
 		let mut with_tools = ParseState::default();
 		with_tools.saw_tool_calls = true;
 		assert_eq!(
-			finalize_stop(&with_tools, StopReason::Stop),
+			finalize_stop(StopReason::Stop, true, with_tools.saw_tool_calls),
 			(StopReason::ToolUse, None)
 		);
 
-		let empty_length = finalize_stop(&ParseState::default(), StopReason::Length);
+		let empty_length = finalize_stop(StopReason::Length, false, false);
 		assert_eq!(empty_length.0, StopReason::Error);
 		assert_eq!(
 			empty_length.1.as_deref(),
 			Some(EMPTY_OLLAMA_LENGTH_COMPLETION_MESSAGE)
 		);
 
-		let load = finalize_stop(&ParseState::default(), StopReason::Error);
+		let thinking_only_length = finalize_stop(StopReason::Length, true, false);
+		assert_eq!(thinking_only_length.0, StopReason::Length);
+
+		let load = finalize_stop(StopReason::Error, false, false);
 		assert_eq!(load.0, StopReason::Error);
 		assert_eq!(
 			load.1.as_deref(),
@@ -3502,5 +3657,91 @@ mod tests {
 		assert_eq!(converted.role, "assistant");
 		assert_eq!(converted.content, "answer");
 		assert_eq!(converted.thinking.as_deref(), Some("plan"));
+	}
+
+	#[test]
+	fn stream_timeout_settings_keep_explicit_disable() {
+		let provider = OllamaProvider::new("http://127.0.0.1:9", "", "m").expect("provider");
+		let provider = provider.with_stream_timeouts(None, Some(Duration::from_millis(1_000)));
+		assert_eq!(provider.effective_first_event_timeout(), None);
+		assert_eq!(
+			provider.effective_idle_timeout(),
+			Some(Duration::from_millis(1_000))
+		);
+
+		let provider = provider.with_stream_timeouts(
+			Some(Duration::from_millis(500)),
+			Some(Duration::from_millis(1_000)),
+		);
+		assert_eq!(
+			provider.effective_first_event_timeout(),
+			Some(Duration::from_millis(1_000)),
+			"first event floors at the idle budget"
+		);
+
+		let provider = provider
+			.with_stream_timeouts(Some(Duration::from_millis(2_000)), None);
+		assert_eq!(
+			provider.effective_first_event_timeout(),
+			Some(Duration::from_millis(2_000))
+		);
+		assert_eq!(provider.effective_idle_timeout(), None);
+	}
+
+	#[test]
+	fn delayed_real_result_is_pulled_and_duplicates_dropped() {
+		let provider = OllamaProvider::new("http://127.0.0.1:9", "", "m").expect("provider");
+		let mut assistant = Message::assistant_with_tools(
+			"",
+			vec![ToolCall {
+				id: "c1".to_string(),
+				name: "t".to_string(),
+				arguments: serde_json::json!({}),
+			}],
+		);
+		assistant.parts = vec![ContentPart::tool_call("c1", "t", serde_json::json!({}))];
+		assistant.stop_reason = Some(StopReason::ToolUse);
+		let messages = vec![
+			assistant,
+			Message::user("between"),
+			Message::tool_with_status("c1", "t", "real", false),
+			Message::tool_with_status("c1", "t", "duplicate", false),
+		];
+		let transformed = provider.transform_messages(&messages);
+		let roles: Vec<Role> = transformed.iter().map(|msg| msg.role).collect();
+		assert_eq!(roles, vec![Role::Assistant, Role::Tool, Role::User]);
+		assert_eq!(transformed[1].content, "real");
+		assert!(
+			transformed
+				.iter()
+				.all(|msg| !msg.content.contains("stale-tool-result")
+					&& msg.content != "No result provided")
+		);
+	}
+
+	#[test]
+	fn malformed_duplicate_ids_consume_results_in_declaration_order() {
+		let valid = ToolCall {
+			id: "dup".to_string(),
+			name: "ok".to_string(),
+			arguments: serde_json::json!({}),
+		};
+		let malformed = ToolCall {
+			id: "dup".to_string(),
+			name: " ".to_string(),
+			arguments: serde_json::json!({}),
+		};
+		let mut assistant = Message::assistant_with_tools("", vec![valid, malformed]);
+		assistant.stop_reason = Some(StopReason::ToolUse);
+		let messages = vec![
+			assistant,
+			Message::tool_with_status("dup", "ok", "first", false),
+			Message::tool_with_status("dup", "ok", "second", false),
+		];
+		let sanitized = sanitize_malformed_tool_calls(&messages);
+		// The first (valid) entry keeps its result; the malformed entry drops
+		// the next matching result instead of the valid one.
+		assert_eq!(sanitized.len(), 2);
+		assert_eq!(sanitized[1].content, "first");
 	}
 }

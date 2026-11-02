@@ -395,6 +395,7 @@ impl ModelProvider for FailingAfterUsageProvider {
 				usage: Some(usage),
 				reasoning: None,
 				is_done: false,
+				disabled_features: None,
 				content_index: None,
 				signature: None,
 				redacted: None,

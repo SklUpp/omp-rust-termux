@@ -42,6 +42,7 @@ fn chunk(content: Option<&str>, deltas: Vec<ToolCallDelta>) -> StreamChunk {
 		usage: None,
 		reasoning: None,
 		is_done: false,
+		disabled_features: None,
 		content_index: None,
 		signature: None,
 		redacted: None,

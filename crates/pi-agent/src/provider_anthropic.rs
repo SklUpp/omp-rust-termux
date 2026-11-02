@@ -3414,6 +3414,7 @@ fn empty_chunk() -> StreamChunk {
 		tool_call_deltas: Vec::new(),
 		usage: None,
 		is_done: false,
+		disabled_features: None,
 		content_index: None,
 		signature: None,
 		redacted: None,

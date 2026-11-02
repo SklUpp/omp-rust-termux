@@ -130,6 +130,11 @@ pub struct StreamChunk {
 	/// Provider error/refusal text paired with `stop_reason == error`.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub error_message: Option<String>,
+	/// Features the provider silently dropped after a server rejection and
+	/// retried without (TS `disabledFeatures`), e.g. `["priority"]`. Terminal
+	/// chunk only; absent means the provider reported nothing.
+	#[serde(default, rename = "disabledFeatures", skip_serializing_if = "Option::is_none")]
+	pub disabled_features: Option<Vec<String>>,
 }
 
 /// Incremental delta for a tool call.
@@ -570,6 +575,8 @@ impl ModelProvider for OpenAiCompatibleProvider {
 /// request, and the terminal usage-only trailer repeats the counters.
 #[derive(Debug, Default)]
 pub struct StreamAssembler {
+	/// Terminal `disabledFeatures` carried by the done chunk.
+	disabled_features: Option<Vec<String>>,
 	/// Assistant content blocks keyed by their stream `contentIndex` (TS
 	/// `output.content`). One map holds text, thinking, redacted and tool-call
 	/// blocks, so a call that precedes later text keeps its boundary instead of
@@ -681,6 +688,9 @@ impl StreamAssembler {
 		}
 		if let Some(message) = &chunk.error_message {
 			self.error_message = Some(message.clone());
+		}
+		if let Some(features) = &chunk.disabled_features {
+			self.disabled_features = Some(features.clone());
 		}
 		for delta in &chunk.tool_call_deltas {
 			self.push_tool_delta(delta)?;
@@ -931,6 +941,7 @@ impl StreamAssembler {
 		message.usage = self.usage;
 		message.stop_reason = self.stop_reason;
 		message.error_message = self.error_message;
+		message.disabled_features = self.disabled_features;
 		Ok(message)
 	}
 
@@ -942,6 +953,7 @@ impl StreamAssembler {
 		let mut message = Message::assistant(self.text());
 		message.parts = self.parts(false).unwrap_or_default();
 		message.usage = self.usage;
+		message.disabled_features = self.disabled_features.clone();
 		message.stop_reason = self.stop_reason;
 		message.error_message = self.error_message.clone();
 		message
@@ -1552,6 +1564,7 @@ pub fn parse_sse_line(line: &str) -> Option<Result<StreamChunk, ProviderError>> 
 			tool_call_deltas: Vec::new(),
 			usage: None,
 			is_done: true,
+			disabled_features: None,
 			content_index: None,
 			signature: None,
 			redacted: None,
@@ -1613,6 +1626,7 @@ pub fn parse_sse_line(line: &str) -> Option<Result<StreamChunk, ProviderError>> 
 				tool_call_deltas,
 				usage,
 				is_done: false,
+				disabled_features: None,
 				// OpenAI-compatible deltas carry no explicit block index, so the
 				// assembler keeps its legacy flip order for them.
 				content_index: None,
@@ -1673,6 +1687,7 @@ where
 			tool_call_deltas: Vec::new(),
 			usage: None,
 			is_done: true,
+			disabled_features: None,
 			content_index: None,
 			signature: None,
 			redacted: None,
@@ -1794,6 +1809,7 @@ mod tests {
 			usage: None,
 			reasoning: None,
 			is_done: false,
+			disabled_features: None,
 			content_index: None,
 			signature: None,
 			redacted: None,
@@ -1819,6 +1835,7 @@ mod tests {
 			usage: None,
 			reasoning: None,
 			is_done: false,
+			disabled_features: None,
 			content_index: None,
 			signature: None,
 			redacted: None,
@@ -1844,6 +1861,7 @@ mod tests {
 			usage: None,
 			reasoning: None,
 			is_done: false,
+			disabled_features: None,
 			content_index: None,
 			signature: None,
 			redacted: None,

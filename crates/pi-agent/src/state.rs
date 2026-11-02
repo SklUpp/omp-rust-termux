@@ -580,6 +580,10 @@ pub struct Message {
 	/// journal it as a `custom_message` instead of a user turn.
 	#[serde(rename = "customType", default, skip_serializing_if = "Option::is_none")]
 	pub custom_type: Option<String>,
+	/// Features the provider dropped and retried without (TS `disabledFeatures`).
+	/// Absent stays omitted so older journals keep parsing.
+	#[serde(rename = "disabledFeatures", default, skip_serializing_if = "Option::is_none")]
+	pub disabled_features: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -618,6 +622,8 @@ struct RawMessage {
 	attribution: Option<Attribution>,
 	#[serde(rename = "customType", default)]
 	custom_type: Option<String>,
+	#[serde(rename = "disabledFeatures", default)]
+	disabled_features: Option<Vec<String>>,
 }
 
 impl<'de> Deserialize<'de> for Message {
@@ -662,6 +668,7 @@ impl<'de> Deserialize<'de> for Message {
 			model: raw.model,
 			attribution: raw.attribution,
 			custom_type: raw.custom_type,
+			disabled_features: raw.disabled_features,
 		})
 	}
 }
@@ -683,6 +690,7 @@ impl Message {
 			model: None,
 			attribution: None,
 			custom_type: None,
+			disabled_features: None,
 		}
 	}
 
@@ -704,6 +712,7 @@ impl Message {
 			model: None,
 			attribution: None,
 			custom_type: None,
+			disabled_features: None,
 		}
 	}
 
@@ -748,6 +757,7 @@ impl Message {
 			model: None,
 			attribution: None,
 			custom_type: None,
+			disabled_features: None,
 		}
 	}
 
@@ -776,6 +786,7 @@ impl Message {
 			model: None,
 			attribution: None,
 			custom_type: None,
+			disabled_features: None,
 		}
 	}
 
@@ -807,6 +818,7 @@ impl Message {
 			model: None,
 			attribution: None,
 			custom_type: None,
+			disabled_features: None,
 		}
 	}
 
@@ -835,6 +847,7 @@ impl Message {
 			model: None,
 			attribution: None,
 			custom_type: None,
+			disabled_features: None,
 		}
 	}
 
@@ -855,6 +868,7 @@ impl Message {
 			model: None,
 			attribution: None,
 			custom_type: None,
+			disabled_features: None,
 		}
 	}
 
@@ -875,6 +889,7 @@ impl Message {
 			model: None,
 			attribution: None,
 			custom_type: None,
+			disabled_features: None,
 		}
 	}
 
@@ -900,6 +915,7 @@ impl Message {
 			model: None,
 			attribution: None,
 			custom_type: None,
+			disabled_features: None,
 		}
 	}
 	pub fn tool_with_status_and_parts(
@@ -925,6 +941,7 @@ impl Message {
 			model: None,
 			attribution: None,
 			custom_type: None,
+			disabled_features: None,
 		}
 	}
 }

@@ -1824,12 +1824,14 @@ impl RpcSession {
 			self.refresh_history_from_store();
 		} else if rewound {
 			// Same as headless: the rewind turn is abandoned, so its record must
-			// not become the session's last turn (todo fallback, last text).
-			self.last_assistant_text = self
-				.history
-				.last()
-				.map(|turn| turn.assistant.clone())
-				.filter(|text| !text.is_empty());
+			// not become the session's last turn (todo fallback). The flushed
+			// wire mirror already follows the cut, so its last answer is the
+			// post-rewind one — or the retained checkpoint answer when the run
+			// ended on the rewound turn itself. `history` never received this
+			// run's record, so it cannot answer that.
+			if let Some(text) = wire_last_assistant_text(&self.messages) {
+				self.last_assistant_text = Some(text);
+			}
 		} else {
 			self.history.push(record);
 		}
@@ -2644,6 +2646,32 @@ fn now_ms() -> u64 {
 		.as_millis() as u64
 }
 
+/// Latest non-empty assistant text on a wire mirror. The mirror follows the
+/// retained branch after a cut, so a rewound run's abandoned answer never wins.
+fn wire_last_assistant_text(messages: &[Value]) -> Option<String> {
+	messages
+		.iter()
+		.rev()
+		.filter(|message| message.get("role").and_then(Value::as_str) == Some("assistant"))
+		.find_map(wire_assistant_text)
+}
+
+/// Assistant text of one serialized message: a plain string, or the `text`
+/// parts joined the way `pi_agent` joins them when it rebuilds `content`.
+fn wire_assistant_text(message: &Value) -> Option<String> {
+	let text = match message.get("content")? {
+		Value::String(text) => text.clone(),
+		Value::Array(parts) => parts
+			.iter()
+			.filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
+			.filter_map(|part| part.get("text").and_then(Value::as_str))
+			.collect::<Vec<_>>()
+			.join("\n"),
+		_ => return None,
+	};
+	(!text.is_empty()).then_some(text)
+}
+
 /// Wire counterpart of the no-session retained-branch cut: truncate the
 /// serialized mirror after the checkpoint batch's tool results, matching the
 /// persisted branch's view. The summary/report stay loop-only context, exactly
@@ -2774,5 +2802,233 @@ fn render_html(session: &RpcSession) -> String {
 		 .user h2{{color:#0b6}}.assistant h2{{color:#06c}}</style></head><body>\
 		 <h1>{title}</h1>\n{body}</body></html>\n"
 	)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	struct NoopRunner;
+
+	impl AgentRunner for NoopRunner {
+		fn run(&self, _request: &RunRequest) -> Result<crate::agent::EventStream> {
+			Err(Error::new("test runner never streams"))
+		}
+	}
+
+	struct NoopObserver;
+
+	impl SubagentObserver for NoopObserver {
+		fn observe(&self, _event: &pi_agent::supervisor::SubagentEvent) {}
+	}
+
+	struct NoopResolver;
+
+	impl crate::rpc::auth::CredentialResolver for NoopResolver {
+		fn api_key(
+			&self,
+			_provider: &str,
+			_session_id: Option<&str>,
+			_cancel: &crate::auth::http::Cancel,
+		) -> std::result::Result<Option<String>, crate::auth::error::AuthError> {
+			Ok(None)
+		}
+
+		fn peek_api_key(
+			&self,
+			_provider: &str,
+		) -> std::result::Result<Option<String>, crate::auth::error::AuthError> {
+			Ok(None)
+		}
+	}
+
+	struct NullSink;
+
+	impl FrameSink for NullSink {
+		fn send(&self, _frame: Value) {}
+	}
+
+	/// `--no-session` session: every turn lives in the in-memory mirror only.
+	fn no_session() -> RpcSession {
+		let sink: Arc<dyn FrameSink> = Arc::new(NullSink);
+		let mut config = Config::default();
+		config.checkpoint.enabled = Some(true);
+		let cwd = std::env::temp_dir();
+		RpcSession::open(
+			RpcLaunch {
+				runner: Arc::new(NoopRunner),
+				config,
+				cwd: cwd.clone(),
+				prompts: Prompts::default(),
+				skills: Vec::new(),
+				catalog: Arc::new(Catalog::default()),
+				agent_db: cwd.join("agent.db"),
+				approval_mode: ApprovalMode::Yolo,
+				allow: Vec::new(),
+				model: Some("local/mock-model".to_string()),
+				provider: Some("local".to_string()),
+				api_key: Some("sk-test".to_string()),
+				thinking: None,
+				max_time: None,
+				max_turns: 8,
+				tools_enabled: true,
+				prompt_cache_key: None,
+				provider_session_id: None,
+				store_options: SessionOptions {
+					enabled: false,
+					cwd: cwd.clone(),
+					model: None,
+					provider: None,
+					dir: None,
+					id: None,
+					continue_latest: false,
+					parent_session: None,
+					no_title: true,
+				},
+				steer: None,
+			},
+			Approvals::new(ApprovalMode::Yolo, Vec::new()),
+			Arc::new(HostToolBridge::new(Arc::clone(&sink))),
+			Arc::new(HostUriBridge::new(Arc::clone(&sink))),
+			Arc::new(InternalUrlRouter::new()),
+			Arc::new(NoopObserver),
+			Arc::new(NoopResolver),
+		)
+		.expect("no-session RPC session")
+	}
+
+	fn start_turn(session: &mut RpcSession, text: &str) -> PreparedTurn {
+		let input = TurnInput { text: text.to_string(), images: Vec::new(), continuation: false };
+		let (_, prepared) = session.prepare_turn(&input).expect("prepare turn");
+		prepared
+	}
+
+	fn tool_start(id: &str, tool: &str) -> AgentEvent {
+		AgentEvent::ToolStart { id: id.to_string(), tool: tool.to_string(), args: json!({}) }
+	}
+
+	/// Route metadata is present so the assistant/tool entries pass validation
+	/// and reach the wire mirror, exactly like a provider-reported turn.
+	fn turn_end(
+		message: pi_agent::Message,
+		tool_results: Vec<pi_agent::ToolResult>,
+		stop_reason: &str,
+	) -> AgentEvent {
+		AgentEvent::TurnEnd {
+			message,
+			tool_results,
+			stop_reason: stop_reason.to_string(),
+			api: Some("chat".to_string()),
+			provider: Some("local".to_string()),
+			model: Some("mock-model".to_string()),
+		}
+	}
+
+	fn tool_result(id: &str, content: &str, details: Value) -> pi_agent::ToolResult {
+		pi_agent::ToolResult {
+			tool_call_id: id.to_string(),
+			content: content.to_string(),
+			is_error: false,
+			terminate: false,
+			details: Some(details),
+		}
+	}
+
+	fn checkpoint_turn(call_id: &str) -> AgentEvent {
+		turn_end(
+			pi_agent::Message::assistant_with_tools(
+				"CHECKPOINT-ACK",
+				vec![pi_agent::ToolCall {
+					id: call_id.to_string(),
+					name: "checkpoint".to_string(),
+					arguments: json!({ "goal": "map it" }),
+				}],
+			),
+			vec![tool_result(
+				call_id,
+				"checkpoint saved",
+				json!({ "goal": "map it", "startedAt": "2026-01-01T00:00:00.000Z" }),
+			)],
+			"toolUse",
+		)
+	}
+
+	fn rewind_turn(call_id: &str) -> AgentEvent {
+		turn_end(
+			pi_agent::Message::assistant_with_tools(
+				"REWIND-ACK",
+				vec![pi_agent::ToolCall {
+					id: call_id.to_string(),
+					name: "rewind".to_string(),
+					arguments: json!({ "report": "FINDINGS" }),
+				}],
+			),
+			vec![tool_result(call_id, "FINDINGS", json!({ "report": "FINDINGS" }))],
+			"toolUse",
+		)
+	}
+
+	/// checkpoint → exploratory turn → rewind → post-rewind answer, then the
+	/// successful turn commit the loop's ack expects.
+	fn run_rewind_cycle(
+		session: &mut RpcSession,
+		checkpoint_id: &str,
+		rewind_id: &str,
+		final_text: &str,
+	) {
+		let mut prepared = start_turn(session, "investigate");
+		for event in [
+			tool_start(checkpoint_id, "checkpoint"),
+			checkpoint_turn(checkpoint_id),
+			turn_end(pi_agent::Message::assistant("EXPLORATORY-SECRET"), Vec::new(), "stop"),
+			tool_start(rewind_id, "rewind"),
+			rewind_turn(rewind_id),
+			turn_end(pi_agent::Message::assistant(final_text), Vec::new(), "stop"),
+		] {
+			session.observe_event(&mut prepared, &event);
+		}
+		session.finish_turn(&mut prepared, &TurnOutcome::default());
+	}
+
+	/// Regression: the rewound branch must not answer from `history` (empty for
+	/// a no-session session); the settled wire mirror holds the retained branch.
+	#[test]
+	fn no_session_rewind_reports_the_post_rewind_answer_across_runs() {
+		let mut session = no_session();
+		run_rewind_cycle(&mut session, "call-1", "call-2", "FINAL-ONE");
+		assert_eq!(
+			session.last_assistant_text(),
+			Some("FINAL-ONE"),
+			"the answer streamed after the cut must survive the abandoned rewind turn"
+		);
+		run_rewind_cycle(&mut session, "call-3", "call-4", "FINAL-TWO");
+		assert_eq!(
+			session.last_assistant_text(),
+			Some("FINAL-TWO"),
+			"a later run reports its own post-rewind answer, never a stale one"
+		);
+	}
+
+	/// A run that ends on the rewound turn has no answer after the cut: the last
+	/// retained assistant is the checkpoint batch's own message.
+	#[test]
+	fn no_session_rewind_ending_on_the_cut_turn_reports_the_retained_answer() {
+		let mut session = no_session();
+		let mut prepared = start_turn(&mut session, "investigate");
+		for event in [
+			tool_start("call-1", "checkpoint"),
+			checkpoint_turn("call-1"),
+			tool_start("call-2", "rewind"),
+			rewind_turn("call-2"),
+		] {
+			session.observe_event(&mut prepared, &event);
+		}
+		session.finish_turn(&mut prepared, &TurnOutcome::default());
+		assert_eq!(
+			session.last_assistant_text(),
+			Some("CHECKPOINT-ACK"),
+			"the cut abandoned the rewind turn, so the retained answer stands"
+		);
+	}
 }
 

@@ -1353,6 +1353,14 @@ fn test_history_thinking_demotion_target_dialects() {
 		demote_thinking("hermes-3", "\x3cthink\x3epartial"),
 		"\x3cthink\x3e\n\x3cthink\x3epartial\n\x3c/think\x3e"
 	);
+	// Inner mixed body returns its own slice unchanged, not the outer input.
+	assert_eq!(
+		demote_thinking(
+			"hermes-3",
+			"\x3cthink\x3e\x3cthink\x3ea\x3c/think\x3eplain\x3c/think\x3e"
+		),
+		"\x3cthink\x3e\n\x3cthink\x3ea\x3c/think\x3eplain\n\x3c/think\x3e"
+	);
 	assert_eq!(
 		demote_thinking("random-model", "step 1"),
 		"\x3cthinking\x3e\nstep 1\n\x3c/thinking\x3e"

@@ -603,14 +603,18 @@ fn unwrap_delimited_thinking(open: &str, close: &str, text: &str) -> String {
 	}
 	let pairs = delimiter_pairs(text, open, close, start, end);
 	struct Level {
+		start: usize,
 		end: usize,
 		cursor: usize,
 		segments: Vec<String>,
+		root: bool,
 	}
 	let mut stack = vec![Level {
+		start,
 		end,
 		cursor: start,
 		segments: Vec::new(),
+		root: true,
 	}];
 	loop {
 		let Some(level) = stack.last_mut() else {
@@ -630,17 +634,18 @@ fn unwrap_delimited_thinking(open: &str, close: &str, text: &str) -> String {
 			continue;
 		}
 		if !text[level.cursor..].starts_with(open) {
-			// A plain body is a leaf: recursive TS unwrap returns it unchanged.
-			if stack.len() == 1 {
-				return text.to_string();
-			}
+			// TS returns *this call's* text: the whole root input at depth 0,
+			// otherwise the trimmed body slice handed to the recursive call.
 			let level = stack.pop().expect("level");
-			let body = text[level.cursor..level.end].to_string();
-			stack
-				.last_mut()
-				.expect("parent")
-				.segments
-				.push(body);
+			let fallback = if level.root {
+				text.to_string()
+			} else {
+				text[level.start..level.end].to_string()
+			};
+			match stack.last_mut() {
+				Some(parent) => parent.segments.push(fallback),
+				None => return fallback,
+			}
 			continue;
 		}
 		let Some(&(_, close_at)) = pairs
@@ -648,19 +653,41 @@ fn unwrap_delimited_thinking(open: &str, close: &str, text: &str) -> String {
 			.ok()
 			.map(|index| &pairs[index])
 		else {
-			return text.to_string();
+			let level = stack.pop().expect("level");
+			let fallback = if level.root {
+				text.to_string()
+			} else {
+				text[level.start..level.end].to_string()
+			};
+			match stack.last_mut() {
+				Some(parent) => parent.segments.push(fallback),
+				None => return fallback,
+			}
+			continue;
 		};
 		if close_at + close.len() > level.end {
-			return text.to_string();
+			let level = stack.pop().expect("level");
+			let fallback = if level.root {
+				text.to_string()
+			} else {
+				text[level.start..level.end].to_string()
+			};
+			match stack.last_mut() {
+				Some(parent) => parent.segments.push(fallback),
+				None => return fallback,
+			}
+			continue;
 		}
 		let body_start = level.cursor + open.len();
 		let body_end = trim_ascii_end(text, body_start, close_at);
 		let body_start = trim_ascii_start(text, body_start, body_end);
 		level.cursor = trim_ascii_start(text, close_at + close.len(), level.end);
 		stack.push(Level {
+			start: body_start,
 			end: body_end,
 			cursor: body_start,
 			segments: Vec::new(),
+			root: false,
 		});
 	}
 }

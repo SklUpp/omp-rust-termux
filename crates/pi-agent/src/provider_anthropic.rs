@@ -441,6 +441,29 @@ impl AnthropicMessagesProvider {
 			is_oauth: None,
 			supports_images: true,
 			replay_unsigned_thinking: false,
+			supports_sampling_params: true,
+			adaptive_only_thinking: false,
+			supports_forced_tool_choice: true,
+			temperature: None,
+			top_p: None,
+			top_k: None,
+			stop_sequences: Vec::new(),
+			cache_retention: CacheRetention::None,
+			supports_long_cache_retention: false,
+			max_retries: 2,
+			first_event_timeout: None,
+			idle_timeout: None,
+			claude_code_session_id: None,
+			custom_headers: Vec::new(),
+			allow_anthropic_header_overrides: false,
+			provider_id: None,
+			requires_tool_result_id: false,
+			escape_builtin_tool_names: false,
+			supports_mid_conversation_system: false,
+			cache_scope: None,
+			strict_tools: false,
+			disable_strict_tools: false,
+			request_max_tokens: None,
 		}
 	}
 
@@ -450,7 +473,7 @@ impl AnthropicMessagesProvider {
 		if let Some(max_tokens) = config.max_tokens {
 			provider = provider.with_max_tokens(max_tokens);
 		}
-		provider
+		Ok(provider
 			.with_request_max_tokens(config.request_max_tokens)
 			.with_thinking(config.thinking)
 			.with_output_effort(config.output_effort)
@@ -480,7 +503,7 @@ impl AnthropicMessagesProvider {
 			.with_escape_builtin_tool_names(config.escape_builtin_tool_names)
 			.with_mid_conversation_system(config.supports_mid_conversation_system)
 			.with_cache_scope(config.cache_scope)
-			.with_strict_tools(config.strict_tools, config.disable_strict_tools)
+			.with_strict_tools(config.strict_tools, config.disable_strict_tools))
 	}
 
 	/// `max_tokens` for every request. Anthropic requires the field.
@@ -2510,7 +2533,7 @@ fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
 	let year_of_era = year - era * 400;
 	let month_prime = if month > 2 { month - 3 } else { month + 9 };
 	let day_of_year = (153 * month_prime + 2) / 5 + day - 1;
-	let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+		let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year as i32;
 	i64::from(era * 146_097 + day_of_era - 719_468)
 }
 

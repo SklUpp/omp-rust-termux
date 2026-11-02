@@ -465,7 +465,8 @@ impl OllamaProvider {
 		// `done_reason: "load"` is returned when no `user` turn reaches the model;
 		// demote the last non-prefix system turn so the request can produce output.
 		if !converted.iter().any(|message| message.role == "user") {
-			for message in converted[prefix.min(converted.len())..].iter_mut().rev() {
+			let prefix = prefix.min(converted.len());
+			for message in converted[prefix..].iter_mut().rev() {
 				if message.role == "system" {
 					message.role = "user";
 					break;
@@ -1184,6 +1185,7 @@ fn process_line(
 			cache_write: 0,
 			total_tokens: input.saturating_add(output_tokens),
 			reasoning_tokens: None,
+			..TokenUsage::default()
 		};
 		state.terminal = Some((
 			Some(usage),

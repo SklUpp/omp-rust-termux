@@ -50,6 +50,11 @@ struct LaunchArgs {
 	#[arg(long, value_name = "NAME")]
 	alias: Option<String>,
 
+	/// Export a session log to standalone HTML and exit; the first positional
+	/// operand is the output path.
+	#[arg(long, value_name = "SESSION")]
+	export: Option<String>,
+
 	/// Model id (`provider/model` or bare id).
 	#[arg(long)]
 	model: Option<String>,
@@ -242,6 +247,9 @@ pub struct Cli {
 
 	/// Create a shell shortcut for the selected profile and exit.
 	pub alias: Option<String>,
+
+	/// Export a session log to standalone HTML and exit.
+	pub export: Option<String>,
 
 	/// Model id (`provider/model` or bare id).
 	pub model: Option<String>,
@@ -438,6 +446,7 @@ impl Cli {
 			cwd: raw.cwd,
 			profile: raw.profile,
 			alias: raw.alias,
+			export: raw.export,
 			model: raw.model,
 			smol: raw.smol,
 			slow: raw.slow,
@@ -566,11 +575,17 @@ const MISSING_VERBS: [&str; 20] = [
 /// clap definition, so it cannot drift from the real surface, including combined
 /// short flags and attached values), the scan stops at `--` and at `-` (POSIX
 /// literal operands), and only exact verb matches refuse. Help and version
-/// requests stay with clap's own actions, and arbitrary prompt text — including a
+/// requests stay with clap's own actions, a root `--export` request owns its
+/// operands as a session and output path, and arbitrary prompt text — including a
 /// first word that merely resembles a verb — passes through untouched.
 pub fn refused_verb_message(argv: &[std::ffi::OsString]) -> Option<String> {
 	let command = RawCli::command();
 	if requests_help_or_version(&command, argv, 1) {
+		return None;
+	}
+	// Root `--export` is a startup fast-path like help/version: its first
+	// operand is an output path (`omp --export log.jsonl share`), never a verb.
+	if export_requested(&command, argv) {
 		return None;
 	}
 	let verb = verb_slot(&command, argv)?;
@@ -588,6 +603,29 @@ pub fn refused_verb_message(argv: &[std::ffi::OsString]) -> Option<String> {
 		));
 	}
 	None
+}
+
+/// Whether the leading flag region requests root `--export <SESSION>`.
+///
+/// Like the verb scan, the flag/value categories come from the clap surface, so
+/// a `--export` used as another flag's value is not a request, and the scan
+/// stops at the first operand. The attached form (`--export=log.jsonl`) counts.
+fn export_requested(command: &clap::Command, argv: &[std::ffi::OsString]) -> bool {
+	let mut index = 1;
+	while index < argv.len() {
+		let Some(text) = argv[index].to_str() else {
+			return false;
+		};
+		if text == "--" || text == "-" || !text.starts_with('-') {
+			return false;
+		}
+		if text == "--export" || text.starts_with("--export=") {
+			return true;
+		}
+		let next = argv.get(index + 1).and_then(|next| next.to_str());
+		index += if flag_consumes_value(command, text, next) { 2 } else { 1 };
+	}
+	false
 }
 
 /// Leading `--help`/`-h`/`--version`/`-V` (also inside a leading short-flag
@@ -656,11 +694,22 @@ fn short_cluster_help(command: &clap::Command, flag: &str) -> bool {
 /// region, or at the head of the launch remainder, stays on the root surface so
 /// clap prints the real help text (`omp launch --help`, `omp --help launch`).
 ///
-/// Without a leading `launch` this is exactly [`Cli::parse_from`].
+/// A root `--export` request is the TS startup fast-path: its operands are the
+/// session and output path, so it also parses on the subcommand-free surface.
+///
+/// Without a leading `launch` or root `--export` this is exactly
+/// [`Cli::parse_from`].
 pub fn parse_cli(argv: Vec<std::ffi::OsString>) -> Cli {
 	let command = RawCli::command();
 	if requests_help_or_version(&command, &argv, 1) {
 		return parse_matches(command, argv);
+	}
+	// Root `--export <session> [output]`: the TS startup fast-path reads the
+	// first operand as the output path. Parse it on the subcommand-free launch
+	// surface so a subcommand-shaped output name stays an operand
+	// (`omp --export log.jsonl repl` writes `./repl`).
+	if export_requested(&command, &argv) {
+		return parse_launch(argv);
 	}
 	let launch = launch_slot(&command, &argv);
 	if let Some(index) = launch {

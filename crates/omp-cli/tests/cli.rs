@@ -534,3 +534,101 @@ fn interrupted_stream_persists_aborted_turn_and_history_excludes_assistant() {
 	drop(store);
 	std::fs::remove_dir_all(dir).ok();
 }
+
+#[test]
+fn root_export_flag_matches_the_export_subcommand_and_fails_before_stdout() {
+	let root = std::env::temp_dir().join(format!("omp-cli-root-export-{}", std::process::id()));
+	let share = root.join("share");
+	let work = root.join("work");
+	std::fs::create_dir_all(&share).expect("share dir");
+	std::fs::create_dir_all(&work).expect("work dir");
+	// `current_dir` yields the physical path; compare against the same.
+	let work = std::fs::canonicalize(&work).expect("canonical work dir");
+	let session = work.join("session.jsonl");
+	std::fs::copy(
+		PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v3_session.jsonl"),
+		&session,
+	)
+	.expect("copy session fixture");
+	let run = |args: &[&std::ffi::OsStr]| {
+		omp()
+			.args(args)
+			.current_dir(&work)
+			.env("PI_CONFIG_DIR", root.join("config"))
+			.env("PI_CODING_AGENT_DIR", root.join("config/agent"))
+			.env("OMP_SHARE_DIR", &share)
+			.stdin(Stdio::null())
+			.output()
+			.expect("run omp")
+	};
+	fn os(value: &str) -> &std::ffi::OsStr {
+		std::ffi::OsStr::new(value)
+	}
+
+	// Root flag: the first positional is the output path.
+	let flagged = run(&[os("--export"), session.as_os_str(), os("root.html")]);
+	assert_eq!(
+		flagged.status.code(),
+		Some(i32::from(EXIT_SUCCESS)),
+		"stderr: {}",
+		String::from_utf8_lossy(&flagged.stderr)
+	);
+	let stdout = String::from_utf8(flagged.stdout).expect("utf8");
+	let exported = format!("Exported to: {}", work.join("root.html").display());
+	assert_eq!(stdout.trim_end(), exported);
+
+	// Without a positional the log's own `.html` sibling is the output.
+	let defaulted = run(&[os("--export"), session.as_os_str()]);
+	assert_eq!(
+		defaulted.status.code(),
+		Some(i32::from(EXIT_SUCCESS)),
+		"stderr: {}",
+		String::from_utf8_lossy(&defaulted.stderr)
+	);
+	let stdout = String::from_utf8(defaulted.stdout).expect("utf8");
+	let default_html = work.join("session.html");
+	assert_eq!(stdout.trim_end(), format!("Exported to: {}", default_html.display()));
+
+	// Subcommand surface stays intact and renders the same bytes.
+	let sub = run(&[os("export"), session.as_os_str(), os("--output"), os("sub.html")]);
+	assert_eq!(
+		sub.status.code(),
+		Some(i32::from(EXIT_SUCCESS)),
+		"stderr: {}",
+		String::from_utf8_lossy(&sub.stderr)
+	);
+	let flag_html = std::fs::read(work.join("root.html")).expect("root export html");
+	let sub_html = std::fs::read(work.join("sub.html")).expect("subcommand export html");
+	assert_eq!(flag_html, sub_html, "root --export must render the same HTML");
+	assert_eq!(
+		std::fs::read(&default_html).expect("default export html"),
+		sub_html,
+		"default output must render the same HTML"
+	);
+	let html = String::from_utf8(flag_html).expect("utf8");
+	assert!(html.contains("hello from test user"), "html lost the transcript");
+
+	// TS treats the first operand as an output path even when it reads like a
+	// command: `repl` is a real subcommand and `share` is a refused verb, but
+	// both must stay operands here.
+	for name in ["repl", "share"] {
+		let named = run(&[os("--export"), session.as_os_str(), std::ffi::OsStr::new(name)]);
+		assert_eq!(
+			named.status.code(),
+			Some(i32::from(EXIT_SUCCESS)),
+			"{name} stderr: {}",
+			String::from_utf8_lossy(&named.stderr)
+		);
+		assert!(work.join(name).is_file(), "{name} must be the output path");
+	}
+
+	// Corrupt input fails before any success line or output file.
+	std::fs::write(work.join("broken.jsonl"), "{not json}\n").expect("write corrupt session");
+	let broken = run(&[os("--export"), os("broken.jsonl")]);
+	assert_eq!(broken.status.code(), Some(i32::from(EXIT_FAILURE)));
+	assert!(broken.stdout.is_empty(), "corrupt export must not print success");
+	assert!(!broken.stderr.is_empty(), "corrupt export must report the failure");
+	assert!(!work.join("broken.html").exists(), "corrupt export must not write HTML");
+
+	std::fs::remove_dir_all(&root).ok();
+}

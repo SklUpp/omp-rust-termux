@@ -158,6 +158,25 @@ fn run() -> std::result::Result<(), CliError> {
 		);
 		return Ok(());
 	}
+	// TS `--export` startup fast-path: export the named session log and exit
+	// before config, auth, provider, or live session startup. The first
+	// positional operand is the output path (`parsedArgs.messages[0]` in TS).
+	// A parsed subcommand owns its own surface (`omp export ...`), so it wins.
+	if let (Some(session), None) = (cli.export.as_deref(), &cli.command) {
+		let base = match &cli.cwd {
+			Some(cwd) => dirs::absolute(&std::env::current_dir()?, cwd),
+			None => std::env::current_dir()?,
+		};
+		let output = cli.prompt.first().map(PathBuf::from);
+		let path = run_export_command(
+			Some(session),
+			output.as_deref(),
+			&base,
+			cli.session_dir.as_deref(),
+		)?;
+		println!("Exported to: {path}");
+		return Ok(());
+	}
 	// `agents`, `models`, read/grep, and completion commands run before the agent
 	// runtime, config, and sessions are loaded: unpacking definitions, listing
 	// the catalog, or generating a script must never boot a session, read config,

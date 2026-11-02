@@ -33,6 +33,7 @@ fn temp_dir(prefix: &str) -> PathBuf {
 struct MockWireServer {
 	port: u16,
 	requests: Arc<Mutex<Vec<serde_json::Value>>>,
+	authorizations: Arc<Mutex<Vec<Option<String>>>>,
 	stop_tx: mpsc::Sender<()>,
 	handle: Option<thread::JoinHandle<()>>,
 }
@@ -45,6 +46,8 @@ impl MockWireServer {
 		let (stop_tx, stop_rx) = mpsc::channel::<()>();
 		let requests = Arc::new(Mutex::new(Vec::new()));
 		let reqs_clone = Arc::clone(&requests);
+		let authorizations = Arc::new(Mutex::new(Vec::new()));
+		let auths_clone = Arc::clone(&authorizations);
 		let bodies = Arc::new(bodies);
 
 		let handle = thread::spawn(move || {
@@ -75,7 +78,13 @@ impl MockWireServer {
 							}
 						}
 						if let Some(pos) = header_pos {
-							let len: usize = String::from_utf8_lossy(&buf[..pos])
+							let head = String::from_utf8_lossy(&buf[..pos]);
+							let authorization = head.lines().find_map(|line| {
+								let (name, value) = line.split_once(':')?;
+								name.eq_ignore_ascii_case("authorization")
+									.then(|| value.trim().to_string())
+							});
+							let len: usize = head
 								.lines()
 								.find(|line| {
 									line.to_ascii_lowercase().starts_with("content-length:")
@@ -98,6 +107,10 @@ impl MockWireServer {
 									serde_json::from_slice::<serde_json::Value>(&buf[pos + 4..pos + 4 + len])
 							{
 								reqs_clone.lock().expect("lock").push(json);
+								auths_clone
+									.lock()
+									.expect("lock")
+									.push(authorization.clone());
 							}
 						}
 						let index = reqs_clone.lock().expect("lock").len().saturating_sub(1);
@@ -122,7 +135,16 @@ impl MockWireServer {
 			}
 		});
 
-		Self { port, requests, stop_tx, handle: Some(handle) }
+		Self { port, requests, authorizations, stop_tx, handle: Some(handle) }
+	}
+
+	fn authorization(&self, index: usize) -> Option<String> {
+		self.authorizations
+			.lock()
+			.expect("lock")
+			.get(index)
+			.cloned()
+			.flatten()
 	}
 
 	fn request_count(&self) -> usize {
@@ -578,6 +600,34 @@ fn setup_two_providers(
 	(agent_dir, cwd, sessions)
 }
 
+/// One provider id with two per-model `baseUrl`s: the root key must not follow
+/// the switch to the alternate origin.
+fn setup_same_provider_two_endpoints(
+	base: &Path,
+	a_port: u16,
+	b_port: u16,
+) -> (PathBuf, PathBuf, PathBuf) {
+	let agent_dir = base.join("agent");
+	let cwd = base.join("work");
+	let sessions = base.join("sessions");
+	fs::create_dir_all(&agent_dir).expect("agent dir");
+	fs::create_dir_all(&cwd).expect("cwd");
+	fs::create_dir_all(&sessions).expect("sessions dir");
+	fs::write(
+		agent_dir.join("config.yml"),
+		"defaultModel: mockA/model-a\nproviders:\n  mockA:\n    api: openai-completions\n    apiKey: target-key\n",
+	)
+	.expect("config.yml");
+	fs::write(
+		agent_dir.join("models.yml"),
+		format!(
+			"providers:\n  mockA:\n    api: openai-completions\n    apiKey: target-key\n    models:\n      - id: model-a\n        contextWindow: 128000\n        baseUrl: \"http://127.0.0.1:{a_port}/v1\"\n      - id: model-b\n        contextWindow: 128000\n        baseUrl: \"http://127.0.0.1:{b_port}/v1\"\n"
+		),
+	)
+	.expect("models.yml");
+	(agent_dir, cwd, sessions)
+}
+
 fn selectable_extra() -> &'static str {
 	"modelRoles:\n  smol: mockB/model-b\nprewalk:\n  enabled: true\n"
 }
@@ -935,6 +985,64 @@ fn prewalk_explicit_into_switches_on_first_write_when_todo_is_not_offered() {
 	assert!(stored.iter().any(|entry| {
 		entry["type"] == "model_change" && entry["role"] == "fallback"
 	}));
+
+	a.stop();
+	b.stop();
+	fs::remove_dir_all(base).ok();
+}
+
+/// Same provider id, different effective endpoints: the explicit root secret
+/// must never reach the alternate origin; the independently configured target
+/// key must.
+#[test]
+fn prewalk_does_not_carry_the_root_secret_to_an_alternate_endpoint() {
+	let a = MockWireServer::start(vec![tool_sse(&[(
+		"call-write",
+		"write",
+		serde_json::json!({"path": ".", "content": "x"}),
+	)])]);
+	let b = MockWireServer::start(vec![text_sse("alternate endpoint")]);
+	let base = temp_dir("prewalk-alternate-endpoint");
+	let (agent_dir, cwd, sessions) =
+		setup_same_provider_two_endpoints(&base, a.port, b.port);
+	let run_out = run(
+		omp(&agent_dir, &cwd, &sessions).args([
+			"--yolo",
+			"--tools",
+			"write,read",
+			"--api-key",
+			"root-secret",
+			"--prewalk-into",
+			"mockA/model-b",
+			"--session-id",
+			"prewalk-alternate-endpoint",
+			"-p",
+			"write now",
+		]),
+	);
+	assert!(
+		run_out.status.success(),
+		"alternate-endpoint run failed: {}",
+		String::from_utf8_lossy(&run_out.stderr)
+	);
+	assert_eq!(a.request_count(), 1);
+	assert_eq!(b.request_count(), 1, "the switch must reach the alternate endpoint");
+	assert!(
+		a.authorization(0)
+			.as_deref()
+			.is_some_and(|value| value.contains("root-secret")),
+		"root request keeps its explicit key: {:?}",
+		a.authorization(0)
+	);
+	let target_auth = b.authorization(0).expect("target authorization header");
+	assert!(
+		target_auth.contains("target-key"),
+		"target endpoint must resolve its own configured key: {target_auth}"
+	);
+	assert!(
+		!target_auth.contains("root-secret"),
+		"root secret leaked to the alternate endpoint: {target_auth}"
+	);
 
 	a.stop();
 	b.stop();

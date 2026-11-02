@@ -904,6 +904,7 @@ fn run() -> std::result::Result<(), CliError> {
 		model: None,
 		provider: None,
 		api_key: None,
+		root_base_url: None,
 		thinking,
 		provider_session_id: None,
 		prompt_cache_key: None,
@@ -932,6 +933,7 @@ fn run() -> std::result::Result<(), CliError> {
 	if requested_api_key.is_some() {
 		session.api_key = requested_api_key;
 	}
+	session.refresh_root_endpoint();
 
 	let mut explicitly_existing = chosen_file.is_some();
 	// TS `main.ts` truthiness: any non-empty `PI_NO_TITLE` disables titles,
@@ -1447,6 +1449,10 @@ struct Session<'a> {
 	model: Option<String>,
 	provider: Option<String>,
 	api_key: Option<String>,
+	/// Effective endpoint the current root credential belongs to, resolved
+	/// exactly like request planning. Mid-session switches reuse the root key
+	/// only for the same provider **and** this endpoint.
+	root_base_url: Option<String>,
 	/// Validated `--thinking` selector; wins over a model `:level` suffix.
 	thinking: Option<runtime::CliThinking>,
 	/// Provider-side sticky session id from `--provider-session-id`.
@@ -1537,9 +1543,26 @@ impl Session<'_> {
 					&mut self.prompt_cache_key_source,
 				);
 			}
+			self.root_base_url = runtime::effective_endpoint(
+				&self.catalog,
+				&self.config,
+				provider,
+				id,
+			)
+			.ok();
 			return Some(candidate);
 		}
 		None
+	}
+
+	fn refresh_root_endpoint(&mut self) {
+		self.root_base_url = self
+			.provider
+			.as_deref()
+			.zip(self.model.as_deref())
+			.and_then(|(provider, model)| {
+				runtime::effective_endpoint(&self.catalog, &self.config, provider, model).ok()
+			});
 	}
 
 	fn select_model(&mut self, id: String) {
@@ -1557,6 +1580,13 @@ impl Session<'_> {
 			.as_deref()
 			.and_then(|provider| self.config.resolve_api_key(provider));
 		self.model = Some(id);
+		self.root_base_url = self
+			.provider
+			.as_deref()
+			.zip(self.model.as_deref())
+			.and_then(|(provider, model)| {
+				runtime::effective_endpoint(&self.catalog, &self.config, provider, model).ok()
+			});
 	}
 
 	fn change_cwd(&mut self, path: PathBuf) -> Result<()> {
@@ -2012,6 +2042,7 @@ impl Session<'_> {
 		let mut prewalk_switch: Option<prewalk::AppliedSwitch> = None;
 		let prewalk_catalog = Arc::clone(&self.catalog);
 		let prewalk_api_key = self.api_key.clone();
+		let prewalk_root_base_url = self.root_base_url.clone();
 		let prewalk_model = self.model.clone();
 		let prewalk_provider = self.provider.clone();
 		let prewalk_thinking = self.thinking;
@@ -2343,13 +2374,44 @@ impl Session<'_> {
 						}
 						let mut guidance = action.guidance;
 						if let Some(target) = action.switch {
-							let api_key = if prewalk_provider.as_deref()
+							// A root credential follows a switch only to the same
+							// provider **and** the same effective endpoint. Target
+							// models may override `baseUrl`, so a provider id match
+							// alone would leak the root secret to another origin.
+							let target_endpoint = runtime::effective_endpoint(
+								&prewalk_catalog,
+								session_config,
+								&target.provider,
+								&target.model,
+							)
+							.ok();
+							let reuses_root = prewalk_provider.as_deref()
 								== Some(target.provider.as_str())
-							{
+								&& target_endpoint.is_some()
+								&& target_endpoint.as_deref() == prewalk_root_base_url.as_deref();
+							let api_key = if reuses_root {
 								prewalk_api_key.clone()
 							} else {
 								session_config.resolve_api_key(&target.provider)
 							};
+							let target_auth = reuses_root
+								|| api_key.as_deref().is_some_and(|key| !key.trim().is_empty())
+								|| runtime::provider_has_configured_auth(
+									&prewalk_catalog,
+									session_config,
+									&target.provider,
+									None,
+								);
+							if !target_auth {
+								// The root key was not copied across origins and no
+								// independent target credential exists: disarm
+								// loudly instead of calling the endpoint unauthenticated.
+								eprintln!(
+									"warning: prewalk switch skipped — no independent credential for {}/{}",
+									target.provider, target.model
+								);
+								guidance.clear();
+							} else {
 							let cache_key = if prewalk_cache_inherited {
 								None
 							} else {
@@ -2416,6 +2478,7 @@ impl Session<'_> {
 									eprintln!("warning: prewalk switch failed — {err}");
 									guidance.clear();
 								},
+							}
 							}
 						} else {
 							for (custom_type, content) in &action.journal {
@@ -2519,6 +2582,13 @@ impl Session<'_> {
 			self.model = Some(applied.target.model);
 			self.thinking = applied.thinking.or(self.thinking);
 			self.api_key = applied.api_key;
+			self.root_base_url = self
+				.provider
+				.as_deref()
+				.zip(self.model.as_deref())
+				.and_then(|(provider, model)| {
+					runtime::effective_endpoint(&self.catalog, &self.config, provider, model).ok()
+				});
 			// The sticky provider session and an inherited cache key belonged to
 			// the previous route (TS `setModelWithProviderSessionReset`).
 			self.provider_session_id = None;

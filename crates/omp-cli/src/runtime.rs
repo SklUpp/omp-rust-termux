@@ -2702,6 +2702,20 @@ fn candidate_for(
 	Ok(RootCandidate { provider, model, effort, connection, dialect, base_url })
 }
 
+/// Effective endpoint for a provider/model, resolved through the same
+/// config-over-catalog precedence as root and child planning. Used to decide
+/// whether a root credential may follow a mid-session switch: the guard is
+/// provider **and** endpoint identity, never provider id alone.
+pub fn effective_endpoint(
+	catalog: &crate::catalog::Catalog,
+	config: &crate::config::Config,
+	provider: &str,
+	model: &str,
+) -> std::result::Result<String, String> {
+	let pattern = format!("{provider}/{model}");
+	candidate_for(catalog, config, Some(provider), &pattern).map(|candidate| candidate.base_url)
+}
+
 /// Startup-resolved mid-session switch target (prewalk and, later, plan-yolo).
 ///
 /// Carries the wire identity only: credentials, endpoint and dialect are

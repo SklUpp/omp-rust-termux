@@ -276,6 +276,8 @@ pub struct RpcSession {
 	pub(crate) model:    Option<String>,
 	pub(crate) provider: Option<String>,
 	pub(crate) api_key:  Option<String>,
+	/// Effective endpoint the active root credential belongs to.
+	pub(crate) root_base_url: Option<String>,
 	pub(crate) thinking: Option<runtime::CliThinking>,
 	pub(crate) thinking_level: Option<String>,
 	pub(crate) prompt_cache_key: Option<String>,
@@ -422,6 +424,7 @@ impl RpcSession {
 			model,
 			provider,
 			api_key,
+			root_base_url: None,
 			thinking,
 			thinking_level,
 			prompt_cache_key,
@@ -465,6 +468,7 @@ impl RpcSession {
 		{
 			eprintln!("Restored session model: {restored}");
 		}
+		session.refresh_root_endpoint();
 		session.reconcile_goal_mode();
 		Ok(session)
 	}
@@ -535,9 +539,23 @@ impl RpcSession {
 			if changed {
 				self.prompt_cache_key_inherited = false;
 			}
+			self.refresh_root_endpoint();
 			return Some(candidate);
 		}
 		None
+	}
+
+	/// Recompute the effective endpoint of the active route. Called whenever
+	/// provider/model changes; the prewalk switch guard compares it with the
+	/// target endpoint before reusing the root credential.
+	fn refresh_root_endpoint(&mut self) {
+		self.root_base_url = self
+			.provider
+			.as_deref()
+			.zip(self.model.as_deref())
+			.and_then(|(provider, model)| {
+				runtime::effective_endpoint(&self.catalog, &self.config, provider, model).ok()
+			});
 	}
 
 	// ---------------------------------------------------------------- state --
@@ -996,6 +1014,7 @@ impl RpcSession {
 		self.model = Some(model_id.to_string());
 		self.provider = Some(provider.to_string());
 		self.api_key = self.config.resolve_api_key(provider);
+		self.refresh_root_endpoint();
 		self.thinking_level = match self.thinking {
 			Some(runtime::CliThinking::Effort(effort)) => Some(effort.to_string()),
 			Some(runtime::CliThinking::Off) => Some("off".to_string()),
@@ -2391,7 +2410,20 @@ impl RpcSession {
 			}
 			let mut guidance = action.guidance;
 			if let Some(target) = action.switch {
-				let api_key = if self.provider.as_deref() == Some(target.provider.as_str()) {
+				// Root credential reuse requires the same provider **and** the
+				// same effective endpoint; a per-model `baseUrl` override makes a
+				// provider id match insufficient.
+				let target_endpoint = runtime::effective_endpoint(
+					&self.catalog,
+					&self.config,
+					&target.provider,
+					&target.model,
+				)
+				.ok();
+				let reuses_root = self.provider.as_deref() == Some(target.provider.as_str())
+					&& target_endpoint.is_some()
+					&& target_endpoint.as_deref() == self.root_base_url.as_deref();
+				let api_key = if reuses_root {
 					self.api_key.clone()
 				} else {
 					self.config.resolve_api_key(&target.provider).or_else(|| {
@@ -2402,6 +2434,23 @@ impl RpcSession {
 							.filter(|key| !key.trim().is_empty())
 					})
 				};
+				let stored_auth = reuses_root
+					|| api_key.as_deref().is_some_and(|key| !key.trim().is_empty())
+					|| runtime::provider_has_configured_auth(
+						&self.catalog,
+						&self.config,
+						&target.provider,
+						None,
+					);
+				if !stored_auth {
+					// Never copy the root secret to another origin; disarm loudly
+					// when no independent target credential exists.
+					eprintln!(
+						"warning: prewalk switch skipped — no independent credential for {}/{}",
+						target.provider, target.model
+					);
+					guidance.clear();
+				} else {
 				let cache_key = if self.prompt_cache_key_inherited {
 					None
 				} else {
@@ -2469,6 +2518,7 @@ impl RpcSession {
 							self.prompt_cache_key = None;
 							self.prompt_cache_key_inherited = false;
 						}
+						self.refresh_root_endpoint();
 					},
 					Err(err) => {
 						// Startup resolved this target; a setup failure here must
@@ -2476,6 +2526,7 @@ impl RpcSession {
 						eprintln!("warning: prewalk switch failed — {err}");
 						guidance.clear();
 					},
+				}
 				}
 			} else {
 				for (custom_type, content) in &action.journal {

@@ -608,10 +608,9 @@ fn root_export_flag_matches_the_export_subcommand_and_fails_before_stdout() {
 	let html = String::from_utf8(flag_html).expect("utf8");
 	assert!(html.contains("hello from test user"), "html lost the transcript");
 
-	// TS treats the first operand as an output path even when it reads like a
-	// command: `repl` is a real subcommand and `share` is a refused verb, but
-	// both must stay operands here.
-	for name in ["repl", "share"] {
+	// Only Rust-only operand names stay output paths: `repl` and `export` are
+	// this binary's surfaces, not TypeScript registry verbs.
+	for name in ["repl", "export"] {
 		let named = run(&[os("--export"), session.as_os_str(), std::ffi::OsStr::new(name)]);
 		assert_eq!(
 			named.status.code(),
@@ -621,6 +620,47 @@ fn root_export_flag_matches_the_export_subcommand_and_fails_before_stdout() {
 		);
 		assert!(work.join(name).is_file(), "{name} must be the output path");
 	}
+
+	// A registered TypeScript verb dispatches instead of becoming the output
+	// path: `share` is not implemented in this build, so it refuses before any
+	// file is written.
+	let refused = run(&[os("--export"), session.as_os_str(), os("share")]);
+	assert_eq!(refused.status.code(), Some(i32::from(EXIT_USAGE)));
+	assert!(refused.stdout.is_empty());
+	let stderr = String::from_utf8_lossy(&refused.stderr);
+	assert!(stderr.contains("`omp share` is not implemented"), "{stderr}");
+	assert!(!work.join("share").exists(), "share must not become an output path");
+
+	// A supported verb runs on its own surface: `completions bash` prints the
+	// script and never writes `./completions`.
+	let dispatched = run(&[
+		os("--export"),
+		session.as_os_str(),
+		os("completions"),
+		os("bash"),
+	]);
+	assert_eq!(
+		dispatched.status.code(),
+		Some(i32::from(EXIT_SUCCESS)),
+		"stderr: {}",
+		String::from_utf8_lossy(&dispatched.stderr)
+	);
+	let script = String::from_utf8(dispatched.stdout).expect("utf8");
+	assert!(script.contains("_omp"), "completions script expected: {script}");
+	assert!(!work.join("completions").exists(), "completions must not become an output path");
+
+	// `launch` is the TS default command: the verb wins, so the export keeps the
+	// log's `.html` sibling instead of writing `./launch`.
+	let launched = run(&[os("--export"), session.as_os_str(), os("launch")]);
+	assert_eq!(
+		launched.status.code(),
+		Some(i32::from(EXIT_SUCCESS)),
+		"stderr: {}",
+		String::from_utf8_lossy(&launched.stderr)
+	);
+	let stdout = String::from_utf8(launched.stdout).expect("utf8");
+	assert_eq!(stdout.trim_end(), format!("Exported to: {}", default_html.display()));
+	assert!(!work.join("launch").exists(), "launch must not become an output path");
 
 	// Corrupt input fails before any success line or output file.
 	std::fs::write(work.join("broken.jsonl"), "{not json}\n").expect("write corrupt session");

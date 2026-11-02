@@ -614,6 +614,37 @@ const MISSING_VERBS: [&str; 20] = [
 	"ttsr",
 ];
 
+/// The two Rust surfaces that are not TypeScript registry verbs. Every other
+/// clap subcommand also exists upstream (`packages/coding-agent/src/cli-commands.ts`),
+/// where `resolveCliArgv` hoists it ahead of the default `launch` command.
+const RUST_ONLY_VERBS: [&str; 2] = ["repl", "export"];
+
+/// Whether the first operand names a verb the TypeScript runner dispatches.
+///
+/// `resolveCliArgv` (`packages/coding-agent/src/cli-commands.ts`) hoists any
+/// registered subcommand found by `leadingSubcommandIndex` — skipping
+/// `--export` plus its value, since `--export` is a `STRING_VALUE_FLAGS`
+/// member — so a leading `--export` supplies that command's messages instead of
+/// turning the verb into an output path. The registered set is this binary's
+/// clap subcommands minus the Rust-only ones, plus the refused upstream verbs.
+fn dispatch_verb(command: &clap::Command, verb: &str) -> bool {
+	if RUST_ONLY_VERBS.contains(&verb) {
+		return false;
+	}
+	verb == "launch"
+		|| EXCLUDED_VERBS.iter().any(|(name, _)| *name == verb)
+		|| MISSING_VERBS.contains(&verb)
+		|| command
+			.get_subcommands()
+			.any(|sub| sub.get_name() == verb || sub.get_all_aliases().any(|alias| alias == verb))
+}
+
+/// Whether a root `--export` request's first operand dispatches as a subcommand
+/// rather than naming the output path.
+fn export_operand_dispatches(command: &clap::Command, argv: &[std::ffi::OsString]) -> bool {
+	verb_slot(command, argv).is_some_and(|verb| dispatch_verb(command, verb))
+}
+
 /// Refusal for a known upstream verb that would otherwise be absorbed as prompt
 /// text, or `None` when argv is not such an invocation.
 ///
@@ -626,17 +657,14 @@ const MISSING_VERBS: [&str; 20] = [
 /// clap definition, so it cannot drift from the real surface, including combined
 /// short flags and attached values), the scan stops at `--` and at `-` (POSIX
 /// literal operands), and only exact verb matches refuse. Help and version
-/// requests stay with clap's own actions, a root `--export` request owns its
-/// operands as a session and output path, and arbitrary prompt text — including a
-/// first word that merely resembles a verb — passes through untouched.
+/// requests stay with clap's own actions, a root `--export` request owns only
+/// Rust-only operands (`repl`, `export`) as its session and output path — a
+/// registered verb such as `share` still refuses — and arbitrary prompt text —
+/// including a first word that merely resembles a verb — passes through
+/// untouched.
 pub fn refused_verb_message(argv: &[std::ffi::OsString]) -> Option<String> {
 	let command = RawCli::command();
 	if requests_help_or_version(&command, argv, 1) {
-		return None;
-	}
-	// Root `--export` is a startup fast-path like help/version: its first
-	// operand is an output path (`omp --export log.jsonl share`), never a verb.
-	if export_requested(&command, argv) {
 		return None;
 	}
 	let verb = verb_slot(&command, argv)?;
@@ -745,8 +773,13 @@ fn short_cluster_help(command: &clap::Command, flag: &str) -> bool {
 /// region, or at the head of the launch remainder, stays on the root surface so
 /// clap prints the real help text (`omp launch --help`, `omp --help launch`).
 ///
-/// A root `--export` request is the TS startup fast-path: its operands are the
-/// session and output path, so it also parses on the subcommand-free surface.
+/// A root `--export` request whose first operand is not a dispatching verb is
+/// the TS startup fast-path: its operands are the session and output path, so
+/// it also parses on the subcommand-free surface. When that operand names a
+/// registered verb, the verb dispatches exactly as in `resolveCliArgv`
+/// (`omp --export log.jsonl launch` runs `launch` with no messages, so the log's
+/// own `.html` sibling is the output; `omp --export log.jsonl models` runs
+/// `models`).
 ///
 /// Without a leading `launch` or root `--export` this is exactly
 /// [`Cli::parse_from`].
@@ -757,9 +790,9 @@ pub fn parse_cli(argv: Vec<std::ffi::OsString>) -> Cli {
 	}
 	// Root `--export <session> [output]`: the TS startup fast-path reads the
 	// first operand as the output path. Parse it on the subcommand-free launch
-	// surface so a subcommand-shaped output name stays an operand
-	// (`omp --export log.jsonl repl` writes `./repl`).
-	if export_requested(&command, &argv) {
+	// surface so a Rust-only output name stays an operand (`omp --export
+	// log.jsonl repl` writes `./repl`), but let a registered verb dispatch.
+	if export_requested(&command, &argv) && !export_operand_dispatches(&command, &argv) {
 		return parse_launch(argv);
 	}
 	let launch = launch_slot(&command, &argv);
@@ -1924,5 +1957,40 @@ mod tests {
 			parse(&["models", "launch"]).command,
 			Some(Command::Models { .. })
 		));
+	}
+
+	#[test]
+	fn a_root_export_operand_dispatches_registered_verbs_only() {
+		fn parse(args: &[&str]) -> Cli {
+			let mut argv = vec![std::ffi::OsString::from("omp")];
+			argv.extend(args.iter().map(|arg| std::ffi::OsString::from(*arg)));
+			parse_cli(argv)
+		}
+		// Rust-only operand names stay the output path.
+		for name in ["repl", "export"] {
+			let cli = parse(&["--export", "log.jsonl", name]);
+			assert!(cli.command.is_none(), "{name} must not dispatch");
+			assert_eq!(cli.export.as_deref(), Some("log.jsonl"));
+			assert_eq!(cli.prompt, [name]);
+		}
+		// A registered verb dispatches: clap owns it, not the export operand.
+		let models = parse(&["--export", "log.jsonl", "models"]);
+		assert!(matches!(models.command, Some(Command::Models { .. })));
+		let completions = parse(&["--export", "log.jsonl", "completions", "bash"]);
+		assert!(matches!(
+			&completions.command,
+			Some(Command::Completions { shell: Some(shell) }) if shell == "bash"
+		));
+		// `launch` keeps its surface, so the export has no positional operand.
+		let launch = parse(&["--export", "log.jsonl", "launch"]);
+		assert!(launch.command.is_none());
+		assert_eq!(launch.export.as_deref(), Some("log.jsonl"));
+		assert!(launch.prompt.is_empty());
+		// Refused verbs refuse even behind a root `--export`, while the verb slot
+		// still skips the export value (so the value itself never refuses).
+		assert!(refusal(&["--export", "log.jsonl", "share"]).is_some());
+		assert!(refusal(&["--export", "log.jsonl", "git"]).is_some());
+		assert_eq!(refusal(&["--export", "log.jsonl", "repl"]), None);
+		assert_eq!(refusal(&["--export", "share"]), None);
 	}
 }

@@ -169,8 +169,11 @@ fn run() -> std::result::Result<(), CliError> {
 	}
 	// TS `--export` startup fast-path: export the named session log and exit
 	// before config, auth, provider, or live session startup. The first
-	// positional operand is the output path (`parsedArgs.messages[0]` in TS).
-	// A parsed subcommand owns its own surface (`omp export ...`), so it wins.
+	// positional operand is the output path (`parsedArgs.messages[0]` in TS). A
+	// parsed subcommand owns its own surface (`omp export ...`), so it wins;
+	// `parse_cli` has already dispatched any registered verb found behind the
+	// flag (`omp --export log.jsonl launch`), leaving the log's own `.html`
+	// sibling as the output.
 	if let (Some(session), None) = (cli.export.as_deref(), &cli.command) {
 		maybe_auto_chdir(&cli);
 		let base = match &cli.cwd {

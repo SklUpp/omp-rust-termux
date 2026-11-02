@@ -28,6 +28,14 @@ use omp_cli::{
 
 const FAST_REJECTION: &str = r#"{"type":"error","error":{"type":"invalid_request_error","message":"speed is not supported for this model"}}"#;
 
+/// A 200 stream whose first event is an error (TS `streamFailure` before
+/// `firstTokenTime`), which must take the same one-shot downgrade path as an
+/// HTTP rejection.
+const SSE_ERROR: &str = concat!(
+	"event: error\n",
+	"data: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"speed is not supported for this model\"}}\n\n"
+);
+
 const TURN: &str = concat!(
 	"event: message_start\n",
 	"data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{\"input_tokens\":3,\"output_tokens\":0}}}\n\n",
@@ -450,4 +458,37 @@ fn cli_priority_downgrade_reports_once_and_persists_the_reset() {
 	assert_eq!(body_field(&body, "speed"), None, "the reset survived resume");
 	server.join().expect("server");
 	let _ = std::fs::remove_dir_all(&root);
+}
+
+/// TS `anthropic.ts:2764-2783` also retries when the rejection arrives as a
+/// stream error before any observable output.
+#[test]
+fn streamed_rejection_before_first_token_retries_without_fast_mode() {
+	let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+	let addr = listener.local_addr().expect("addr");
+	let (captured_tx, captured_rx) = mpsc::channel::<(String, String)>();
+	let server = std::thread::spawn(move || {
+		let (mut socket, _) = listener.accept().expect("accept");
+		let captured = read_request(&mut socket);
+		captured_tx.send(captured).expect("capture reject");
+		respond(&mut socket, "200 OK", "text/event-stream", SSE_ERROR);
+		let (mut socket, _) = listener.accept().expect("accept");
+		let captured = read_request(&mut socket);
+		captured_tx.send(captured).expect("capture retry");
+		respond(&mut socket, "200 OK", "text/event-stream", TURN);
+	});
+
+	let (stops, disabled) = run(request(catalog(addr), &[("anthropic", "priority")]));
+	assert_eq!(stops.last().map(String::as_str), Some("stop"));
+	assert_eq!(
+		disabled.as_deref(),
+		Some(["priority".to_string()].as_slice()),
+		"the stream-level downgrade is reported"
+	);
+	let (_head, reject_body) = captured_rx.recv().expect("reject request");
+	assert_eq!(body_field(&reject_body, "speed"), Some(&serde_json::json!("fast")));
+	let (retry_head, retry_body) = captured_rx.recv().expect("retry request");
+	assert!(!retry_head.to_ascii_lowercase().contains("fast-mode-2026-02-01"));
+	assert_eq!(body_field(&retry_body, "speed"), None);
+	server.join().expect("server");
 }

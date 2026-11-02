@@ -2461,6 +2461,19 @@ impl RpcSession {
 					);
 					guidance.clear();
 				} else {
+				let switch_thinking = action.switch_thinking.or_else(|| {
+					runtime::model_default_thinking(
+						&self.catalog,
+						&target.provider,
+						&target.model,
+					)
+				});
+				let mut switch_target = target.clone();
+				if switch_target.effort.is_none()
+					&& let Some(runtime::CliThinking::Effort(effort)) = switch_thinking
+				{
+					switch_target.effort = Some(effort.to_string());
+				}
 				let cache_key = if self.prompt_cache_key_inherited {
 					None
 				} else {
@@ -2469,7 +2482,7 @@ impl RpcSession {
 				match runtime::build_switch_provider(
 					&self.catalog,
 					&self.config,
-					&target,
+					&switch_target,
 					api_key.clone(),
 					// Provider session belongs to the previous route.
 					None,
@@ -2513,7 +2526,7 @@ impl RpcSession {
 						self.provider = Some(target.provider);
 						self.model = Some(target.model);
 						self.api_key = api_key;
-						if let Some(level) = action.switch_thinking {
+						if let Some(level) = switch_thinking {
 							self.thinking = Some(level);
 							self.thinking_level = match level {
 								runtime::CliThinking::Off => Some("off".to_string()),

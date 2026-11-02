@@ -1682,6 +1682,104 @@ fn rpc_branch_rehydrates_checkpoint_state_for_the_selected_branch() {
 	fs::remove_dir_all(&root).ok();
 }
 
+/// RPC transport, same provider id, two model endpoints: the explicit root
+/// secret must stay on the root endpoint and the switch must resolve its own
+/// configured key for the alternate endpoint.
+#[test]
+fn rpc_prewalk_does_not_carry_the_root_secret_to_an_alternate_endpoint() {
+	let (a_port, a_requests, a_auth) = spawn_tool_model_with_auth(vec![ToolScript {
+		text: String::new(),
+		tool: Some(("write", json!({ "path": ".", "content": "x" }))),
+	}]);
+	let (b_port, b_requests, b_auth) = spawn_tool_model_with_auth(vec![ToolScript {
+		text: "alternate endpoint".to_string(),
+		tool: None,
+	}]);
+	let mut catalog = Catalog::default();
+	let mut models = std::collections::BTreeMap::new();
+	models.insert(
+		"model-a".to_string(),
+		ModelInfo {
+			provider: "mock".to_string(),
+			base_url: Some(format!("http://127.0.0.1:{a_port}/v1")),
+			context_window: Some(128_000),
+			..ModelInfo::default()
+		},
+	);
+	models.insert(
+		"model-b".to_string(),
+		ModelInfo {
+			provider: "mock".to_string(),
+			base_url: Some(format!("http://127.0.0.1:{b_port}/v1")),
+			context_window: Some(128_000),
+			reasoning: true,
+			efforts: Some(vec!["low".to_string(), "high".to_string()]),
+			thinking: Some(json!({
+				"efforts": ["low", "high"],
+				"defaultLevel": "high"
+			})),
+			..ModelInfo::default()
+		},
+	);
+	catalog.providers.insert("mock".to_string(), models);
+
+	let mut launch = launch(a_port, "mock/model-a", "mock");
+	launch.catalog = Arc::new(catalog);
+	{
+		let provider = launch
+			.config
+			.providers
+			.get_mut("mock")
+			.expect("mock provider");
+		provider.api_key = Some("target-key".to_string());
+		provider.base_url = None;
+	}
+	launch.api_key = Some("root-secret".to_string());
+	launch.tools_enabled = true;
+	launch.max_turns = 8;
+	launch.prewalk = Some(PrewalkArm {
+		target: ModelSwitch {
+			provider: "mock".to_string(),
+			model: "model-b".to_string(),
+			effort: None,
+			thinking: None,
+		},
+		thinking: None,
+	});
+	let harness = Harness::start(launch);
+	harness.send(json!({ "type": "prompt", "id": "p1", "message": "write" }));
+	harness.wait_frame("agent_end", timeout());
+
+	assert_eq!(a_requests.lock().expect("lock").len(), 1);
+	assert_eq!(b_requests.lock().expect("lock").len(), 1);
+	let root_auth = a_auth
+		.lock()
+		.expect("lock")
+		.first()
+		.cloned()
+		.flatten()
+		.expect("root authorization");
+	assert!(root_auth.contains("root-secret"), "{root_auth}");
+	let target_auth = b_auth
+		.lock()
+		.expect("lock")
+		.first()
+		.cloned()
+		.flatten()
+		.expect("target authorization");
+	assert!(target_auth.contains("target-key"), "{target_auth}");
+	assert!(
+		!target_auth.contains("root-secret"),
+		"RPC root secret leaked to the alternate endpoint: {target_auth}"
+	);
+	assert_eq!(
+		b_requests.lock().expect("lock")[0]["reasoning_effort"],
+		"high",
+		"RPC switch must apply the target model defaultLevel"
+	);
+	drop(harness);
+}
+
 /// Prewalk through the RPC transport: the *same* session owner must journal
 /// the ephemeral role, actually continue on the target provider, and keep the
 /// switch out of the user's conversation (plan guidance scrubbed).

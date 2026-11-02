@@ -1938,12 +1938,16 @@ impl SessionStore {
 
 	/// TS `buildSessionContext` `models` map (`session-context.ts:250-276`):
 	/// role -> newest recorded model on the branch. Explicit `model_change`
-	/// entries win; assistant messages only infer `default` while no explicit
-	/// default exists (the pre-model_change legacy fallback).
+	/// entries win. Assistant messages infer `default` only while the branch
+	/// has no explicit model change; TS always journals an initial default
+	/// entry, so in this binary the first explicit change (including the
+	/// ephemeral prewalk `fallback` role) freezes inference and the configured
+	/// default supplies the missing `default` role. A fast-model assistant
+	/// message therefore cannot overwrite the user's default on resume.
 	#[must_use]
 	pub fn session_model_roles(&self) -> BTreeMap<String, String> {
 		let mut models = BTreeMap::new();
-		let mut has_explicit_default = false;
+		let mut has_explicit_model = false;
 		for entry in self.branch_entries() {
 			match entry.kind.as_str() {
 				"model_change" => {
@@ -1960,9 +1964,9 @@ impl SessionStore {
 						.and_then(serde_json::Value::as_str)
 						.unwrap_or("default");
 					models.insert(role.to_string(), model.to_string());
-					has_explicit_default |= role == "default";
+					has_explicit_model = true;
 				},
-				"message" if !has_explicit_default => {
+				"message" if !has_explicit_model => {
 					let Some(message) = entry.extra.get("message") else {
 						continue;
 					};
@@ -5554,10 +5558,28 @@ mod tests {
 		store
 			.append_model_change("fast/small", "fallback")
 			.expect("fallback change");
+		// The fast provider's assistant message must not overwrite the default
+		// after the explicit ephemeral role: TS journals an initial default
+		// entry, and the configured default stands in for it here.
+		let assistant = MessageEntry::new(
+			"msg-fast",
+			store.leaf_id().map(str::to_string),
+			"t",
+			SessionMessage::assistant(
+				MessageContent::Text("fast answer".to_string()),
+				"openai-completions",
+				"fast",
+				"small",
+				None,
+				"stop",
+				0,
+			),
+		);
+		store.append_message(&assistant).expect("fast assistant");
 		assert_eq!(
 			store.restorable_models(Some("configured/default")),
 			vec!["configured/default".to_string()],
-			"the ephemeral prewalk role must not restore the fast model"
+			"the ephemeral prewalk role must not restore the fast model, even after a fast assistant message"
 		);
 		store
 			.append_model_change("local/main", "default")

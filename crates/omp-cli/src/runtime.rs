@@ -3472,6 +3472,26 @@ pub fn thinking_suffix(model: &str) -> Option<CliThinking> {
 	split_thinking(model, -1).1.and_then(parse_cli_thinking)
 }
 
+/// Model-configured default thinking level (`thinking.defaultLevel`), applied
+/// on a model change when the target carries no explicit `:suffix`
+/// (`model-controls.ts:285-291`; explicit selectors always win).
+#[must_use]
+pub fn model_default_thinking(
+	catalog: &crate::catalog::Catalog,
+	provider: &str,
+	model: &str,
+) -> Option<CliThinking> {
+	catalog
+		.providers
+		.get(provider)?
+		.get(model)?
+		.thinking
+		.as_ref()?
+		.get("defaultLevel")?
+		.as_str()
+		.and_then(parse_cli_thinking)
+}
+
 /// TS `resolveThinkingLevelForModel` (`thinking.ts:119-130`) over catalog
 /// metadata: `None`/`auto` resolve to no concrete level, `off` stays `off`,
 /// and an effort is clamped against the **target** model's declared efforts

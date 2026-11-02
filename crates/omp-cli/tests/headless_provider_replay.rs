@@ -621,7 +621,7 @@ fn setup_same_provider_two_endpoints(
 	fs::write(
 		agent_dir.join("models.yml"),
 		format!(
-			"providers:\n  mockA:\n    api: openai-completions\n    apiKey: target-key\n    models:\n      - id: model-a\n        contextWindow: 128000\n        baseUrl: \"http://127.0.0.1:{a_port}/v1\"\n      - id: model-b\n        contextWindow: 128000\n        baseUrl: \"http://127.0.0.1:{b_port}/v1\"\n"
+			"providers:\n  mockA:\n    api: openai-completions\n    apiKey: target-key\n    models:\n      - id: model-a\n        contextWindow: 128000\n        baseUrl: \"http://127.0.0.1:{a_port}/v1\"\n      - id: model-b\n        contextWindow: 128000\n        baseUrl: \"http://127.0.0.1:{b_port}/v1\"\n        reasoning: true\n        thinking:\n          efforts: [\"low\", \"high\"]\n          defaultLevel: high\n"
 		),
 	)
 	.expect("models.yml");
@@ -1042,6 +1042,51 @@ fn prewalk_does_not_carry_the_root_secret_to_an_alternate_endpoint() {
 	assert!(
 		!target_auth.contains("root-secret"),
 		"root secret leaked to the alternate endpoint: {target_auth}"
+	);
+	assert_eq!(
+		b.request(0)["reasoning_effort"], "high",
+		"target without a suffix must apply its configured defaultLevel"
+	);
+
+	a.stop();
+	b.stop();
+	fs::remove_dir_all(base).ok();
+}
+
+/// An explicit `:suffix` wins over the target model's configured default.
+#[test]
+fn prewalk_explicit_suffix_overrides_the_target_default_level() {
+	let a = MockWireServer::start(vec![tool_sse(&[(
+		"call-write",
+		"write",
+		serde_json::json!({"path": ".", "content": "x"}),
+	)])]);
+	let b = MockWireServer::start(vec![text_sse("suffix endpoint")]);
+	let base = temp_dir("prewalk-suffix-effort");
+	let (agent_dir, cwd, sessions) =
+		setup_same_provider_two_endpoints(&base, a.port, b.port);
+	let run_out = run(
+		omp(&agent_dir, &cwd, &sessions).args([
+			"--yolo",
+			"--tools",
+			"write,read",
+			"--prewalk-into",
+			"mockA/model-b:low",
+			"--session-id",
+			"prewalk-suffix-effort",
+			"-p",
+			"write now",
+		]),
+	);
+	assert!(
+		run_out.status.success(),
+		"suffix-effort run failed: {}",
+		String::from_utf8_lossy(&run_out.stderr)
+	);
+	assert_eq!(b.request_count(), 1);
+	assert_eq!(
+		b.request(0)["reasoning_effort"], "low",
+		"the explicit suffix must win over defaultLevel=high"
 	);
 
 	a.stop();

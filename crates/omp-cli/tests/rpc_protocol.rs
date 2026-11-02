@@ -2266,12 +2266,23 @@ fn fast_mode_toggle_rearms_priority_after_an_anthropic_downgrade() {
 		.unwrap_or_else(std::sync::PoisonError::into_inner)
 		.clone();
 	assert_eq!(bodies.len(), 4, "one rejected and one retried request per turn");
-	let has_speed = |body: &[u8]| String::from_utf8_lossy(body).contains("\"speed\":\"fast\"");
-	assert!(has_speed(&bodies[0]), "first attempt requests fast mode");
-	assert!(!has_speed(&bodies[1]), "the downgraded retry does not");
-	assert!(
-		has_speed(&bodies[2]),
+	let body = |raw: &[u8]| -> Value {
+		let start = raw
+			.windows(4)
+			.position(|window| window == b"\r\n\r\n")
+			.map_or(raw.len(), |head| head + 4);
+		serde_json::from_slice(&raw[start..]).expect("anthropic json body")
+	};
+	assert_eq!(body(&bodies[0])["speed"].as_str(), Some("fast"), "first attempt requests fast mode");
+	assert_eq!(body(&bodies[1])["speed"].as_str(), None, "the downgraded retry does not");
+	assert_eq!(
+		body(&bodies[2])["speed"].as_str(),
+		Some("fast"),
 		"an explicit toggle rearms fast mode after the downgrade"
 	);
-	assert!(!has_speed(&bodies[3]), "rejected again, retried without fast mode");
+	assert_eq!(
+		body(&bodies[3])["speed"].as_str(),
+		None,
+		"rejected again, retried without fast mode"
+	);
 }

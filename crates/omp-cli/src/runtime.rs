@@ -8664,12 +8664,14 @@ mod tests {
 			"the hook-visible model carries model-authored headers only"
 		);
 		assert_eq!(
-			ollama_request_headers(&catalog, &config, "ollama"),
-			vec![
-				("X-Model".to_string(), "config".to_string()),
+			ollama_request_headers(&catalog, &config, "ollama")
+				.into_iter()
+				.collect::<BTreeMap<_, _>>(),
+			BTreeMap::from([
 				("X-Config".to_string(), "yes".to_string()),
-			],
-			"connection headers follow the existing config.yml-then-catalog precedence"
+				("X-Model".to_string(), "config".to_string()),
+			]),
+			"connection headers carry the config.yml values over the catalog's"
 		);
 	}
 

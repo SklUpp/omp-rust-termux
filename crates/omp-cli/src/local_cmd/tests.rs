@@ -891,13 +891,22 @@ fn python_candidates_use_reported_managed_env_order() {
 	base.insert("PATH".to_string(), String::new());
 	let cwd = dir.path().join("project");
 	let candidates = python_candidates(&cwd, &base, None, &managed);
-	assert_eq!(candidates.first().map(|runtime| runtime.program.clone()), Some(venv_python));
-	assert_eq!(candidates.get(1).map(|runtime| runtime.program.clone()), Some(managed_python));
+	assert_eq!(
+		candidates.first().map(|runtime| runtime.program.as_path()),
+		Some(venv_python.as_path())
+	);
+	assert_eq!(
+		candidates.get(1).map(|runtime| runtime.program.as_path()),
+		Some(managed_python.as_path())
+	);
 
 	let no_venv = dir.path().join("no-venv");
 	fs::create_dir_all(&no_venv).expect("cwd");
 	let candidates = python_candidates(&no_venv, &base, None, &managed);
-	assert_eq!(candidates.first().map(|runtime| runtime.program.clone()), Some(managed_python));
+	assert_eq!(
+		candidates.first().map(|runtime| runtime.program.as_path()),
+		Some(managed_python.as_path())
+	);
 }
 
 #[test]

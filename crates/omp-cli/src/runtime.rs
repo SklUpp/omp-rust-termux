@@ -2567,7 +2567,6 @@ fn wire_provider(
 			// Built once per provider: the hook only borrows it per request.
 			let model = ollama_model_context(
 				catalog,
-				config,
 				target,
 				info,
 				reasoning.clone(),
@@ -2803,7 +2802,6 @@ fn ollama_request_headers(
 /// `onPayload` hook, with no intermediate mirror.
 fn ollama_model_context(
 	catalog: &crate::catalog::Catalog,
-	config: &crate::config::Config,
 	target: &WireTarget<'_>,
 	info: Option<&crate::catalog::ModelInfo>,
 	effort: Option<String>,
@@ -8549,10 +8547,6 @@ mod tests {
 		assert_eq!(child.provider.model(), Some("claude-child"));
 	}
 
-	/// `config.yml` is the CLI's own override: a gateway base URL there must not
-	/// be shadowed by the catalog's (usually bundled, vendor-default) route.
-	#[test]
-
 	/// The adapter payload context is the resolved TS model shape, built
 	/// directly in the adapter types: materialized thinking with authored
 	/// optionality, parsed cost, honest limits, model-only headers, and the
@@ -8621,7 +8615,7 @@ mod tests {
 		};
 		let info = catalog.providers["ollama"].get("qwen3");
 		let context =
-			ollama_model_context(&catalog, &config, &target, info, Some("high".to_string()));
+			ollama_model_context(&catalog, &target, info, Some("high".to_string()));
 		assert_eq!(context.provider, "ollama");
 		assert_eq!(context.api, "ollama-chat");
 		assert_eq!(context.id, "qwen3");
@@ -8679,6 +8673,9 @@ mod tests {
 		);
 	}
 
+	/// `config.yml` is the CLI's own override: a gateway base URL there must not
+	/// be shadowed by the catalog's (usually bundled, vendor-default) route.
+	#[test]
 	fn cli_base_url_outranks_the_catalog_route() {
 		let catalog = catalog_with_model("childprov", "claude-child", ModelInfo {
 			provider: "childprov".to_string(),

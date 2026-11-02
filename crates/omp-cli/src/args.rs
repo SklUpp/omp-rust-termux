@@ -83,6 +83,18 @@ struct LaunchArgs {
 	#[arg(long, value_name = "MODEL")]
 	plan: Option<String>,
 
+	/// Arm the one-way prewalk switch (wins over `prewalk.enabled`).
+	#[arg(long = "prewalk")]
+	prewalk: bool,
+
+	/// Disable prewalk even when the settings enable it.
+	#[arg(long = "no-prewalk")]
+	no_prewalk: bool,
+
+	/// Model or role to switch to at the first edit/write (default `@smol`).
+	#[arg(long = "prewalk-into", value_name = "MODEL")]
+	prewalk_into: Option<String>,
+
 	/// Private think scratchpad; disables supported native provider reasoning.
 	#[arg(long = "external-thinking")]
 	external_thinking: bool,
@@ -292,6 +304,15 @@ pub struct Cli {
 	/// Plan model for architectural planning (or `PI_PLAN_MODEL`).
 	pub plan: Option<String>,
 
+	/// Arm the one-way prewalk switch (wins over `prewalk.enabled`).
+	pub prewalk: bool,
+
+	/// Disable prewalk even when the settings enable it.
+	pub no_prewalk: bool,
+
+	/// Model or role to switch to at the first edit/write (default `@smol`).
+	pub prewalk_into: Option<String>,
+
 	/// Private think scratchpad; disables supported native provider reasoning.
 	pub external_thinking: bool,
 
@@ -500,6 +521,9 @@ impl Cli {
 			smol: raw.smol,
 			slow: raw.slow,
 			plan: raw.plan,
+			prewalk: raw.prewalk,
+			no_prewalk: raw.no_prewalk,
+			prewalk_into: raw.prewalk_into,
 			external_thinking: raw.external_thinking,
 			service_tier: raw.service_tier,
 			provider: raw.provider,

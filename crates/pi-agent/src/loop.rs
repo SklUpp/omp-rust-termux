@@ -137,13 +137,57 @@ pub enum TurnRewrite {
 }
 
 /// Result of the async turn-end handshake. `Default` means unchanged.
-#[derive(Debug, Clone, Default, PartialEq)]
+///
+/// Besides journaling/rewind, the session owner may steer the dialog at this
+/// boundary: replace the provider for the rest of the dialog, inject hidden
+/// guidance with a stable identity, or scrub guidance it consumed. The loop
+/// keeps the replacement in a dialog-local variable; `AgentLoop::provider`
+/// is never mutated, so concurrent turns cannot observe each other's switch.
+#[derive(Clone)]
 pub struct TurnAckDecision {
 	pub rewrite: Option<TurnRewrite>,
 	/// Run another provider request instead of ending the dialog.
 	pub continue_turn: bool,
 	/// Warning to append for the continuation turn.
 	pub warning: Option<String>,
+	/// Hidden guidance appended after the journaled batch and before the next
+	/// provider request, in this order.
+	pub guidance: Vec<Message>,
+	/// Remove live guidance carrying this identity (consumed steering).
+	pub scrub_custom_type: Option<String>,
+	/// Provider for the remaining requests of this dialog.
+	pub provider: Option<Arc<dyn ModelProvider>>,
+	/// Context budget of the replacement model, when it differs from the one
+	/// the run started with.
+	pub context_limit: Option<usize>,
+}
+
+impl Default for TurnAckDecision {
+	fn default() -> Self {
+		Self {
+			rewrite: None,
+			continue_turn: false,
+			warning: None,
+			guidance: Vec::new(),
+			scrub_custom_type: None,
+			provider: None,
+			context_limit: None,
+		}
+	}
+}
+
+impl std::fmt::Debug for TurnAckDecision {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("TurnAckDecision")
+			.field("rewrite", &self.rewrite)
+			.field("continue_turn", &self.continue_turn)
+			.field("warning", &self.warning)
+			.field("guidance", &self.guidance)
+			.field("scrub_custom_type", &self.scrub_custom_type)
+			.field("provider", &self.provider.as_ref().map(|_| "<provider>"))
+			.field("context_limit", &self.context_limit)
+			.finish()
+	}
 }
 
 #[derive(Debug)]
@@ -463,9 +507,13 @@ pub fn repair_tool_batch_boundary(messages: &[Message], keep: usize) -> usize {
 /// Apply a session-owner reply to the live conversation. `Replace` restores
 /// the owner's retained context wholesale (no dependency on a pruned anchor);
 /// `InMemory` cuts at the checkpoint result when still present.
-fn apply_turn_decision(messages: &mut Vec<Message>, decision: TurnAckDecision) -> bool {
-	let mut continue_turn = decision.continue_turn;
-	match decision.rewrite {
+fn apply_turn_decision(
+	messages: &mut Vec<Message>,
+	rewrite: Option<TurnRewrite>,
+	warning: Option<String>,
+) -> bool {
+	let mut continue_turn = false;
+	match rewrite {
 		Some(TurnRewrite::Replace(mut replacement)) => {
 			if let Some(system) = messages
 				.first()
@@ -488,13 +536,38 @@ fn apply_turn_decision(messages: &mut Vec<Message>, decision: TurnAckDecision) -
 		},
 		None => {},
 	}
-	if let Some(warning) = decision.warning
+	if let Some(warning) = warning
 		&& !warning.is_empty()
 	{
 		messages.push(Message::system(warning));
 		continue_turn = true;
 	}
 	continue_turn
+}
+
+/// Apply the dialog-steering half of a turn-end reply: scrub consumed guidance
+/// first (so a re-injected identity survives), then move to the replacement
+/// provider, then append the new guidance. Provider replacement is local to
+/// the running dialog; no shared loop state is mutated.
+fn apply_turn_boundary(
+	messages: &mut Vec<Message>,
+	active_provider: &mut Arc<dyn ModelProvider>,
+	context_limit: &mut usize,
+	guidance: Vec<Message>,
+	scrub_custom_type: Option<String>,
+	provider: Option<Arc<dyn ModelProvider>>,
+	replacement_context_limit: Option<usize>,
+) {
+	if let Some(custom_type) = scrub_custom_type.as_deref() {
+		messages.retain(|message| message.custom_type.as_deref() != Some(custom_type));
+	}
+	if let Some(provider) = provider {
+		*active_provider = provider;
+	}
+	if let Some(limit) = replacement_context_limit {
+		*context_limit = limit;
+	}
+	messages.extend(guidance);
 }
 
 /// Synthetic result for a call that must never run (TS
@@ -764,8 +837,13 @@ impl AgentLoop {
 	/// Apply a session-owner rewrite to the live conversation. A replacement
 	/// keeps the leading system message; an in-memory cut prefers the
 	/// checkpoint tool-call anchor and falls back to a pair-safe `keep`.
-	fn apply_turn_rewrite(&self, messages: &mut Vec<Message>, decision: TurnAckDecision) -> bool {
-		apply_turn_decision(messages, decision)
+	fn apply_turn_rewrite(
+		&self,
+		messages: &mut Vec<Message>,
+		rewrite: Option<TurnRewrite>,
+		warning: Option<String>,
+	) -> bool {
+		apply_turn_decision(messages, rewrite, warning)
 	}
 
 	/// Run turns without emitting live events.
@@ -862,6 +940,12 @@ impl AgentLoop {
 		let mut turn_results = Vec::new();
 		let mut soft = SoftRequirementState::default();
 		let mut continuation_pending = self.continuation;
+		// Dialog-local provider: a turn-end decision may replace it for the rest
+		// of this dialog. `self.provider` stays the initial value, so concurrent
+		// turns of the same loop never observe one another's switch.
+		let mut active_provider: Arc<dyn ModelProvider> = Arc::clone(&self.provider);
+		// Context budget follows a provider replacement for the rest of the dialog.
+		let mut context_limit = self.config.context_limit;
 
 		while state.total_turns < self.config.max_turns {
 			if let Some(rx) = &mut steering_rx {
@@ -900,7 +984,7 @@ impl AgentLoop {
 			}
 
 			state.messages =
-				Compactor::compact(&state.messages, self.config.context_limit, MIN_RECENT_MESSAGES);
+				Compactor::compact(&state.messages, context_limit, MIN_RECENT_MESSAGES);
 
 			if cancellation_token.is_cancelled() {
 				return Err(AgentError::Interrupted);
@@ -934,6 +1018,7 @@ impl AgentLoop {
 			let mut pending_injections = Vec::new();
 			let assistant = self
 				.next_assistant(
+					&active_provider,
 					&state.messages,
 					&schemas,
 					&tool_choice,
@@ -1005,7 +1090,10 @@ impl AgentLoop {
 					state.messages.push(Message::user_with_parts(parts));
 				}
 				let decision = self.await_turn_ack(ack_rx, &cancellation_token).await;
-				let _ = self.apply_turn_rewrite(&mut state.messages, decision);
+				// A terminal provider turn ends the dialog: journaling/rewind still
+				// apply, but a provider swap or guidance must not start another turn.
+				let TurnAckDecision { rewrite, warning, .. } = decision;
+				let _ = self.apply_turn_rewrite(&mut state.messages, rewrite, warning);
 				turn_results.push(TurnResult {
 					message: assistant,
 					tool_results: results,
@@ -1109,7 +1197,25 @@ impl AgentLoop {
 					state.messages.push(Message::user_with_parts(parts));
 				}
 				let decision = self.await_turn_ack(ack_rx, &cancellation_token).await;
-				self.apply_turn_rewrite(&mut state.messages, decision);
+				let TurnAckDecision {
+					rewrite,
+					warning,
+					continue_turn: _,
+					guidance,
+					scrub_custom_type,
+					provider,
+					context_limit: replacement_context_limit,
+				} = decision;
+				let _ = self.apply_turn_rewrite(&mut state.messages, rewrite, warning);
+				apply_turn_boundary(
+					&mut state.messages,
+					&mut active_provider,
+					&mut context_limit,
+					guidance,
+					scrub_custom_type,
+					provider,
+					replacement_context_limit,
+				);
 				turn_results.push(TurnResult {
 					message: assistant,
 					tool_results: results,
@@ -1149,7 +1255,25 @@ impl AgentLoop {
 					state.messages.push(Message::user_with_parts(parts));
 				}
 				let decision = self.await_turn_ack(ack_rx, &cancellation_token).await;
-				let _ = self.apply_turn_rewrite(&mut state.messages, decision);
+				let TurnAckDecision {
+					rewrite,
+					warning,
+					continue_turn: _,
+					guidance,
+					scrub_custom_type,
+					provider,
+					context_limit: replacement_context_limit,
+				} = decision;
+				let _ = self.apply_turn_rewrite(&mut state.messages, rewrite, warning);
+				apply_turn_boundary(
+					&mut state.messages,
+					&mut active_provider,
+					&mut context_limit,
+					guidance,
+					scrub_custom_type,
+					provider,
+					replacement_context_limit,
+				);
 				turn_results.push(TurnResult {
 					message: assistant,
 					tool_results: results,
@@ -1183,7 +1307,26 @@ impl AgentLoop {
 					state.messages.push(Message::user_with_parts(parts));
 				}
 				let decision = self.await_turn_ack(ack_rx, &cancellation_token).await;
-				let continue_turn = self.apply_turn_rewrite(&mut state.messages, decision);
+				let TurnAckDecision {
+					rewrite,
+					warning,
+					continue_turn,
+					guidance,
+					scrub_custom_type,
+					provider,
+					context_limit: replacement_context_limit,
+				} = decision;
+				let mut continue_turn = continue_turn;
+				continue_turn |= self.apply_turn_rewrite(&mut state.messages, rewrite, warning);
+				apply_turn_boundary(
+					&mut state.messages,
+					&mut active_provider,
+					&mut context_limit,
+					guidance,
+					scrub_custom_type,
+					provider,
+					replacement_context_limit,
+				);
 				turn_results.push(TurnResult {
 					message: assistant,
 					tool_results: Vec::new(),
@@ -1294,7 +1437,25 @@ impl AgentLoop {
 				state.messages.push(Message::user_with_parts(parts));
 			}
 			let decision = self.await_turn_ack(ack_rx, &cancellation_token).await;
-			let _ = self.apply_turn_rewrite(&mut state.messages, decision);
+			let TurnAckDecision {
+				rewrite,
+				warning,
+				continue_turn: _,
+				guidance,
+				scrub_custom_type,
+				provider,
+				context_limit: replacement_context_limit,
+			} = decision;
+			let _ = self.apply_turn_rewrite(&mut state.messages, rewrite, warning);
+			apply_turn_boundary(
+				&mut state.messages,
+				&mut active_provider,
+				&mut context_limit,
+				guidance,
+				scrub_custom_type,
+				provider,
+				replacement_context_limit,
+			);
 
 			let should_terminate = outcome.results.iter().any(|r| r.terminate);
 
@@ -1393,16 +1554,17 @@ impl AgentLoop {
 	///
 	/// Signed/redacted reasoning is only replayable to the provider/model that
 	/// issued it, so the route must travel with the message instead of being
-	/// inferred later from a session default.
-	fn with_source(&self, mut message: Message) -> Message {
+	/// inferred later from a session default. The provider is the dialog-local
+	/// active one, not necessarily the one the loop was constructed with.
+	fn with_source(provider: &Arc<dyn ModelProvider>, mut message: Message) -> Message {
 		if message.api.is_none() {
-			message.api = self.provider.api().map(str::to_string);
+			message.api = provider.api().map(str::to_string);
 		}
 		if message.provider.is_none() {
-			message.provider = self.provider.provider().map(str::to_string);
+			message.provider = provider.provider().map(str::to_string);
 		}
 		if message.model.is_none() {
-			message.model = self.provider.model().map(str::to_string);
+			message.model = provider.model().map(str::to_string);
 		}
 		message
 	}
@@ -1414,6 +1576,7 @@ impl AgentLoop {
 	/// and nothing but the final message is produced.
 	async fn next_assistant(
 		&self,
+		provider: &Arc<dyn ModelProvider>,
 		messages: &[Message],
 		schemas: &[serde_json::Value],
 		tool_choice: &ToolChoice,
@@ -1426,7 +1589,7 @@ impl AgentLoop {
 			return Err(AgentError::Interrupted);
 		}
 		let Some(events) = events else {
-			let complete_fut = self.provider.complete(messages, schemas, tool_choice);
+			let complete_fut = provider.complete(messages, schemas, tool_choice);
 			tokio::pin!(complete_fut);
 			loop {
 				match steering_rx.as_deref_mut() {
@@ -1444,24 +1607,24 @@ impl AgentLoop {
 								None => {
 									tokio::select! {
 										_ = cancellation_token.cancelled() => return Err(AgentError::Interrupted),
-										res = &mut complete_fut => return Ok(self.with_source(res?)),
+										res = &mut complete_fut => return Ok(Self::with_source(provider, res?)),
 									}
 								}
 							},
-							res = &mut complete_fut => return Ok(self.with_source(res?)),
+							res = &mut complete_fut => return Ok(Self::with_source(provider, res?)),
 						}
 					}
 					None => {
 						tokio::select! {
 							_ = cancellation_token.cancelled() => return Err(AgentError::Interrupted),
-							res = &mut complete_fut => return Ok(self.with_source(res?)),
+							res = &mut complete_fut => return Ok(Self::with_source(provider, res?)),
 						}
 					}
 				}
 			}
 		};
 
-		let stream_fut = self.provider.stream(messages, schemas, tool_choice);
+		let stream_fut = provider.stream(messages, schemas, tool_choice);
 		tokio::pin!(stream_fut);
 		let mut stream = loop {
 			match steering_rx.as_deref_mut() {
@@ -1529,7 +1692,7 @@ impl AgentLoop {
 				Some(rx) if rx_open => {
 					tokio::select! {
 						_ = cancellation_token.cancelled() => {
-							let partial = self.with_source(assembler.finish_partial());
+							let partial = Self::with_source(provider, assembler.finish_partial());
 							let _ = events.send(AgentEvent::MessageEnd { message: partial.clone(), status: TurnStatus::Aborted }).await;
 							let _ = events.send(AgentEvent::TurnEnd {
 								message: partial,
@@ -1541,7 +1704,7 @@ impl AgentLoop {
 						event = rx.recv() => match event {
 							Some(SteeringEvent::Interrupt) => {
 								cancellation_token.cancel();
-								let partial = self.with_source(assembler.finish_partial());
+								let partial = Self::with_source(provider, assembler.finish_partial());
 								let _ = events.send(AgentEvent::MessageEnd { message: partial.clone(), status: TurnStatus::Aborted }).await;
 								let _ = events.send(AgentEvent::TurnEnd {
 									message: partial,
@@ -1565,7 +1728,7 @@ impl AgentLoop {
 				_ => {
 					tokio::select! {
 						_ = cancellation_token.cancelled() => {
-							let partial = self.with_source(assembler.finish_partial());
+							let partial = Self::with_source(provider, assembler.finish_partial());
 							let _ = events.send(AgentEvent::MessageEnd { message: partial.clone(), status: TurnStatus::Aborted }).await;
 							let _ = events.send(AgentEvent::TurnEnd {
 								message: partial,
@@ -1585,7 +1748,7 @@ impl AgentLoop {
 			let chunk = match chunk {
 				Ok(c) => c,
 				Err(err) => {
-					let partial = self.with_source(assembler.finish_partial());
+					let partial = Self::with_source(provider, assembler.finish_partial());
 					let _ = events.send(AgentEvent::MessageEnd { message: partial.clone(), status: TurnStatus::Error(err.to_string()) }).await;
 					let _ = events.send(AgentEvent::TurnEnd {
 						message: partial,
@@ -1614,7 +1777,7 @@ impl AgentLoop {
 			}
 			done = chunk.is_done;
 			if let Err(err) = assembler.push(&chunk) {
-				let partial = self.with_source(assembler.finish_partial());
+				let partial = Self::with_source(provider, assembler.finish_partial());
 				let _ = events.send(AgentEvent::MessageEnd { message: partial.clone(), status: TurnStatus::Error(err.to_string()) }).await;
 				let _ = events.send(AgentEvent::TurnEnd {
 					message: partial,
@@ -1629,7 +1792,7 @@ impl AgentLoop {
 		}
 
 		if !done {
-			let partial = self.with_source(assembler.finish_partial());
+			let partial = Self::with_source(provider, assembler.finish_partial());
 			let err_msg = "stream ended before completion".to_string();
 			let _ = events.send(AgentEvent::MessageEnd { message: partial.clone(), status: TurnStatus::Error(err_msg.clone()) }).await;
 			let _ = events.send(AgentEvent::TurnEnd {
@@ -1639,9 +1802,9 @@ impl AgentLoop {
 			}).await;
 			return Err(ProviderError::Protocol(err_msg).into());
 		}
-		let partial = self.with_source(assembler.finish_partial());
+		let partial = Self::with_source(provider, assembler.finish_partial());
 		let message = match assembler.finish() {
-			Ok(message) => self.with_source(message),
+			Ok(message) => Self::with_source(provider, message),
 			Err(err) => {
 				let _ = events.send(AgentEvent::MessageEnd { message: partial.clone(), status: TurnStatus::Error(err.to_string()) }).await;
 				let _ = events.send(AgentEvent::TurnEnd {
@@ -1795,10 +1958,9 @@ mod live_cut_tests {
 		);
 		let decision = TurnAckDecision {
 			rewrite: Some(TurnRewrite::Replace(retained.clone())),
-			continue_turn: false,
-			warning: None,
+			..TurnAckDecision::default()
 		};
-		assert!(apply_turn_decision(&mut live, decision));
+		assert!(apply_turn_decision(&mut live, decision.rewrite, decision.warning));
 		assert_eq!(live.first().expect("system").content, "sys");
 		let text = live
 			.iter()
@@ -1845,6 +2007,58 @@ mod live_cut_tests {
 		assert!(results[1].is_error, "invalid image fails closed");
 		assert!(results[1].content.contains("image payload rejected"));
 		assert!(!parts.contains_key("bad"));
+	}
+
+	#[test]
+	fn turn_boundary_scrubs_consumed_guidance_then_injects_and_swaps_provider() {
+		let first: Arc<dyn ModelProvider> = Arc::new(
+			crate::provider::OpenAiCompatibleProvider::new(
+				"http://127.0.0.1:9/v1",
+				"key",
+				"model-a",
+			)
+			.expect("first provider"),
+		);
+		let replacement: Arc<dyn ModelProvider> = Arc::new(
+			crate::provider::OpenAiCompatibleProvider::new(
+				"http://127.0.0.1:9/v1",
+				"key",
+				"model-b",
+			)
+			.expect("replacement provider"),
+		);
+		let mut active = Arc::clone(&first);
+		let mut context_limit = 100_000;
+		let mut messages = vec![
+			Message::user("go"),
+			Message::guidance("prewalk-plan", "consumed nudge"),
+			Message::guidance("prewalk-continue", "keep me"),
+		];
+		apply_turn_boundary(
+			&mut messages,
+			&mut active,
+			&mut context_limit,
+			vec![
+				Message::guidance("prewalk-checklist", "checklist"),
+				Message::guidance("prewalk-plan", "fresh nudge"),
+			],
+			Some("prewalk-plan".to_string()),
+			Some(Arc::clone(&replacement)),
+			Some(32_000),
+		);
+		assert_eq!(context_limit, 32_000, "replacement budget follows the provider");
+		assert!(Arc::ptr_eq(&active, &replacement), "dialog switched provider");
+		assert!(!Arc::ptr_eq(&active, &first));
+		let identities: Vec<Option<&str>> = messages
+			.iter()
+			.map(|message| message.custom_type.as_deref())
+			.collect();
+		assert_eq!(
+			identities,
+			vec![None, Some("prewalk-continue"), Some("prewalk-checklist"), Some("prewalk-plan")],
+			"scrub precedes injection, so a refreshed identity survives"
+		);
+		assert_eq!(messages.last().expect("fresh nudge").content, "fresh nudge");
 	}
 }
 

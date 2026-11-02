@@ -27,6 +27,7 @@ use omp_cli::{
 	local_cmd,
 	local_models,
 	output::{self, OutputMode, Reporter, session_id},
+	prewalk,
 	process_cli,
 	profile,
 	prompts::{self, Prompts},
@@ -728,6 +729,35 @@ fn run() -> std::result::Result<(), CliError> {
 		.as_ref()
 		.map(|dir| dirs::absolute(&cwd, dir));
 
+	// Prewalk is wired to the local CLI session owner only. The RPC/ACP
+	// transports have no host-side turn ack here, so an explicit flag would be
+	// inert and fails loudly; a settings-only enablement is ignored there.
+	let prewalk_requested = cli.prewalk || cli.prewalk_into.is_some();
+	let prewalk_transport_unsupported = matches!(cli.mode, OutputMode::Rpc)
+		|| matches!(cli.command.as_ref(), Some(Command::Acp { .. }));
+	if prewalk_transport_unsupported && prewalk_requested {
+		return Err(CliError::usage(
+			"--prewalk is only available for local CLI sessions, not --mode rpc or `omp acp`",
+		));
+	}
+	// TS `main.ts:1234-1264`: prewalk conflicts fail startup; an optional target
+	// that cannot be resolved or has no configured auth only warns and leaves
+	// prewalk unarmed. Config enablement never applies to a restored session.
+	let mut prewalk_policy = prewalk::PrewalkPolicy::default();
+	if !prewalk_transport_unsupported {
+		prewalk_policy = prewalk::resolve_policy(
+			&cli,
+			&config,
+			&catalog,
+			restoring_session,
+			requested_api_key.as_deref(),
+		)
+		.map_err(CliError::fail)?;
+		for warning in &prewalk_policy.warnings {
+			eprintln!("{warning}");
+		}
+	}
+
 	// Pre-resolve session target
 	let mut chosen_file: Option<PathBuf> = None;
 
@@ -903,6 +933,7 @@ fn run() -> std::result::Result<(), CliError> {
 		in_memory_messages: None,
 		session_dir: session_dir.clone(),
 		goal: Arc::new(GoalRuntime::new()),
+		prewalk: prewalk::PrewalkState::new(prewalk_policy.arm),
 	};
 	if let Some(model) = requested_model.or(default_model) {
 		session.select_model(model);
@@ -1422,8 +1453,10 @@ struct Session<'a> {
 	/// message). Rewinds rewrite it; each later request replays it verbatim.
 	in_memory_messages: Option<Vec<pi_agent::Message>>,
 	session_dir: Option<PathBuf>,
-	/// Session goal/budget controller (Goal Mode accounting + `+Nk` window).
+	/// Session goal/budget controller (Goal Mode accounting and `+Nk` window).
 	goal: Arc<GoalRuntime>,
+	/// One-way prewalk state machine; disarmed after a switch or no-op target.
+	prewalk: prewalk::PrewalkState,
 }
 
 impl Session<'_> {
@@ -1891,6 +1924,20 @@ impl Session<'_> {
 		let mut reporter_failed = false;
 
 		let session_config = &self.config;
+		// Prewalk state is taken out of the session for the duration of the run
+		// (the turn-end handler owns it), then restored below.
+		let mut prewalk_state = std::mem::take(&mut self.prewalk);
+		let mut prewalk_switch: Option<prewalk::AppliedSwitch> = None;
+		let prewalk_catalog = Arc::clone(&self.catalog);
+		let prewalk_api_key = self.api_key.clone();
+		let prewalk_model = self.model.clone();
+		let prewalk_provider = self.provider.clone();
+		let prewalk_thinking = self.thinking;
+		let prewalk_cache_key = self.prompt_cache_key.clone();
+		let prewalk_cache_inherited =
+			self.prompt_cache_key_source == Some(PromptCacheKeySource::Inherited);
+		let prewalk_todo_available =
+			prewalk::todo_available(self.tools_enabled, self.config.tools.as_deref());
 		let mut handle_event = |event: &agent::Event,
 		                        store: &mut SessionStore,
 		                        host: &CheckpointHost,
@@ -1900,7 +1947,9 @@ impl Session<'_> {
 		                        parent: &mut Option<String>,
 		                        tools: &mut std::collections::HashMap<String, String>,
 		                        model_fallback: Option<&str>,
-		                        provider_fallback: Option<&str>| -> Result<()> {
+		                        provider_fallback: Option<&str>,
+		                        prewalk_state: &mut prewalk::PrewalkState,
+		                        prewalk_switch: &mut Option<prewalk::AppliedSwitch>| -> Result<()> {
 			match event {
 				agent::Event::ToolStart { id, tool, .. } => {
 					tools.insert(id.clone(), tool.clone());
@@ -2160,6 +2209,154 @@ impl Session<'_> {
 					{
 						messages.push(pi_agent::Message::system(warning));
 					}
+
+					// Prewalk: advance the one-way switch at this settled boundary.
+					// A terminal provider turn (error/aborted) never starts another
+					// request, so it must not swap the provider or inject guidance.
+					let terminal = matches!(
+						message.stop_reason,
+						Some(pi_agent::StopReason::Error | pi_agent::StopReason::Aborted)
+					);
+					if !terminal
+						&& let Some(arm) = prewalk_state.target().cloned()
+					{
+						let noop = prewalk::would_be_noop(
+							&arm.target,
+							arm.thinking,
+							prewalk_provider.as_deref(),
+							prewalk_model.as_deref(),
+							prewalk_thinking,
+						);
+						let action_tool = tool_results.iter().find_map(|result| {
+							let name =
+								tools.get(&result.tool_call_id).map(String::as_str)?;
+							(!result.is_error
+								&& prewalk::is_implementation_action(
+									name,
+									result.details.as_ref(),
+								))
+							.then_some(name)
+						});
+						let todo_succeeded = tool_results.iter().any(|result| {
+							!result.is_error
+								&& tools.get(&result.tool_call_id).map(String::as_str)
+									== Some("todo")
+						});
+						let boundary = prewalk::TurnBoundary {
+							has_tool_results: !tool_results.is_empty(),
+							todo_succeeded,
+							action: action_tool,
+							todo_available: prewalk_todo_available,
+							noop,
+						};
+						let action = prewalk_state.advance(&boundary);
+						for notice in &action.notices {
+							eprintln!("{notice}");
+						}
+						if action.scrub_plan {
+							decision.scrub_custom_type =
+								Some(prewalk::PREWALK_PLAN_TYPE.to_string());
+						}
+						let mut guidance = action.guidance;
+						if let Some(target) = action.switch {
+							let api_key = if prewalk_provider.as_deref()
+								== Some(target.provider.as_str())
+							{
+								prewalk_api_key.clone()
+							} else {
+								session_config.resolve_api_key(&target.provider)
+							};
+							let cache_key = if prewalk_cache_inherited {
+								None
+							} else {
+								prewalk_cache_key.clone()
+							};
+							match runtime::build_switch_provider(
+								&prewalk_catalog,
+								session_config,
+								&target,
+								api_key.clone(),
+								// Provider session belongs to the previous route.
+								None,
+								cache_key,
+							) {
+								Ok(provider) => {
+									// Ephemeral role: resume/fork fall back to the
+									// configured default instead of the fast model.
+									if store.enabled() {
+										match store.append_model_change(
+											&format!("{}/{}", target.provider, target.model),
+											"fallback",
+										) {
+											Ok(id) => *parent = Some(id),
+											Err(err) => eprintln!(
+												"warning: cannot record prewalk model change: {err}"
+											),
+										}
+									}
+									for (custom_type, content) in &action.journal {
+										if store.enabled() {
+											match store.append_custom_message(
+												custom_type,
+												content,
+												false,
+												serde_json::Value::Null,
+											) {
+												Ok(id) => *parent = Some(id),
+												Err(err) => eprintln!("warning: {err}"),
+											}
+										} else if let Some(messages) = in_memory.as_mut() {
+											messages.push(pi_agent::Message::guidance(
+												*custom_type,
+												*content,
+											));
+										}
+									}
+									decision.provider = Some(provider);
+									decision.context_limit = Some(
+										prewalk_catalog
+											.context_window(&target.provider, &target.model)
+											.unwrap_or(runtime::DEFAULT_CONTEXT_LIMIT),
+									);
+									*prewalk_switch = Some(prewalk::AppliedSwitch {
+										target,
+										thinking: action.switch_thinking,
+										api_key,
+									});
+									decision.continue_turn |= action.continue_turn;
+									decision.guidance = guidance;
+								},
+								Err(err) => {
+									// Startup already resolved this target; a setup
+									// failure here must not silently claim a switch.
+									eprintln!("warning: prewalk switch failed — {err}");
+									guidance.clear();
+								},
+							}
+						} else {
+							for (custom_type, content) in &action.journal {
+								if store.enabled() {
+									match store.append_custom_message(
+										custom_type,
+										content,
+										false,
+										serde_json::Value::Null,
+									) {
+										Ok(id) => *parent = Some(id),
+										Err(err) => eprintln!("warning: {err}"),
+									}
+								} else if let Some(messages) = in_memory.as_mut() {
+									messages.push(pi_agent::Message::guidance(
+										*custom_type,
+										*content,
+									));
+								}
+							}
+							decision.continue_turn |= action.continue_turn;
+							decision.guidance = guidance;
+						}
+					}
+
 					if let Some((_, reply)) = pending {
 						let _ = reply.send(decision);
 					}
@@ -2190,6 +2387,8 @@ impl Session<'_> {
 					&mut tool_name_by_id,
 					model_opt.as_deref(),
 					provider_opt.as_deref(),
+					&mut prewalk_state,
+					&mut prewalk_switch,
 				)?;
 				// A goal tool transition queued during this event lands before the
 				// turn-end entries, like TS `appendModeChange` during execution.
@@ -2218,12 +2417,31 @@ impl Session<'_> {
 						&mut tool_name_by_id,
 						model_opt.as_deref(),
 						provider_opt.as_deref(),
+						&mut prewalk_state,
+						&mut prewalk_switch,
 					);
 					if !reporter_failed {
 						let _ = reporter.event(&event);
 					}
 				}
 			}
+		}
+		drop(handle_event);
+		self.prewalk = prewalk_state;
+		// A switch applied mid-turn reaches later prompts through the session
+		// fields; the journal already carries the ephemeral `fallback` role.
+		if let Some(applied) = prewalk_switch.take() {
+			self.provider = Some(applied.target.provider);
+			self.model = Some(applied.target.model);
+			self.thinking = applied.thinking.or(self.thinking);
+			self.api_key = applied.api_key;
+			// The sticky provider session and an inherited cache key belonged to
+			// the previous route (TS `setModelWithProviderSessionReset`).
+			self.provider_session_id = None;
+			invalidate_inherited_cache_key(
+				&mut self.prompt_cache_key,
+				&mut self.prompt_cache_key_source,
+			);
 		}
 		// Drain the final goal writes (agent-end flush, interrupt pause) and, if
 		// the goal tool completed this goal, write `none` + the terminal metric.

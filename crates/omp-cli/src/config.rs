@@ -413,6 +413,29 @@ impl PlanConfig {
 	}
 }
 
+/// `prewalk` settings group: the one-way model switch armed on fresh sessions.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PrewalkConfig {
+	/// `prewalk.enabled`; absent means [`Self::DEFAULT_ENABLED`] (`false`).
+	pub enabled: Option<bool>,
+}
+
+impl PrewalkConfig {
+	/// Upstream `prewalk.enabled` default (`settings-schema.ts:538-548`).
+	pub const DEFAULT_ENABLED: bool = false;
+
+	#[must_use]
+	pub fn enabled(&self) -> bool {
+		self.enabled.unwrap_or(Self::DEFAULT_ENABLED)
+	}
+
+	fn merge(&mut self, overlay: Self) {
+		if overlay.enabled.is_some() {
+			self.enabled = overlay.enabled;
+		}
+	}
+}
+
 /// `goal` settings group: Goal Mode and its headless continuation policy.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GoalConfig {
@@ -536,6 +559,8 @@ pub struct Config {
 	pub goal:                 GoalConfig,
 	/// `plan.*`: ACP plan-mode enablement.
 	pub plan:                 PlanConfig,
+	/// `prewalk.*`: one-way model switch for fresh sessions.
+	pub prewalk:              PrewalkConfig,
 	/// `eval.*` backend enablement and interpreter groups.
 	pub eval_config:          EvalConfig,
 	/// `searxng.*`: the web-search endpoint and its credentials.
@@ -617,6 +642,7 @@ impl Config {
 		self.checkpoint.merge(overlay.checkpoint);
 		self.goal.merge(overlay.goal);
 		self.plan.merge(overlay.plan);
+		self.prewalk.merge(overlay.prewalk);
 		self.eval_config.merge(overlay.eval_config);
 		// `searxng.*` merges per leaf so an explicit host overlay can add
 		// credentials to a globally configured endpoint (and vice versa).
@@ -1145,6 +1171,9 @@ fn apply_nested_settings(config: &mut Config, value: &Value, path: &Path) -> Res
 	}
 	if let Some(enabled) = settings_leaf(value, "plan", "enabled", "plan.enabled") {
 		config.plan.enabled = expect_bool(enabled, "plan.enabled", path)?;
+	}
+	if let Some(enabled) = settings_leaf(value, "prewalk", "enabled", "prewalk.enabled") {
+		config.prewalk.enabled = expect_bool(enabled, "prewalk.enabled", path)?;
 	}
 	// `searxng.*` feeds the `web_search` tool; environment fallbacks are applied
 	// by the runtime, which is the only place that may read `SEARXNG_*`.

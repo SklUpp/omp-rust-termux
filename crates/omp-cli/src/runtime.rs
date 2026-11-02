@@ -2652,7 +2652,21 @@ fn root_candidate(
 	request: &RunRequest,
 	pattern: &str,
 ) -> std::result::Result<RootCandidate, String> {
-	let (provider, model, effort) = match request.provider.as_deref() {
+	candidate_for(
+		&request.catalog,
+		&request.config,
+		request.provider.as_deref(),
+		pattern,
+	)
+}
+
+fn candidate_for(
+	catalog: &crate::catalog::Catalog,
+	config: &crate::config::Config,
+	provider_pin: Option<&str>,
+	pattern: &str,
+) -> std::result::Result<RootCandidate, String> {
+	let (provider, model, effort) = match provider_pin {
 		Some(provider) => {
 			let prefix = format!("{provider}/");
 			let raw = pattern.strip_prefix(prefix.as_str()).unwrap_or(pattern);
@@ -2666,32 +2680,144 @@ fn root_candidate(
 			},
 			_ => {
 				let (id, parsed) = split_effort(pattern);
-				let provider = request.catalog.provider_of(id).map(str::to_string).ok_or_else(
-					|| {
-						format!(
-							"no provider for model `{id}`: pass --provider or use `provider/{id}`"
-						)
-					},
-				)?;
+				let provider = catalog.provider_of(id).map(str::to_string).ok_or_else(|| {
+					format!("no provider for model `{id}`: pass --provider or use `provider/{id}`")
+				})?;
 				(provider, id.to_string(), parsed.map(str::to_string))
 			},
 		},
 	};
 	// Connection block: config.yml first, then models.yml providers.<id>.
-	let connection = request
-		.config
+	let connection = config
 		.providers
 		.get(&provider)
 		.cloned()
-		.or_else(|| request.catalog.connections.get(&provider).cloned());
-	let dialect = wire_dialect(&request.catalog, &provider, &model, connection.as_ref())?;
-	let cli_base_url = request
-		.config
+		.or_else(|| catalog.connections.get(&provider).cloned());
+	let dialect = wire_dialect(catalog, &provider, &model, connection.as_ref())?;
+	let cli_base_url = config
 		.providers
 		.get(&provider)
 		.and_then(|provider| provider.base_url.as_deref());
-	let base_url = wire_base_url(&request.catalog, &provider, &model, cli_base_url, dialect)?;
+	let base_url = wire_base_url(catalog, &provider, &model, cli_base_url, dialect)?;
 	Ok(RootCandidate { provider, model, effort, connection, dialect, base_url })
+}
+
+/// Startup-resolved mid-session switch target (prewalk and, later, plan-yolo).
+///
+/// Carries the wire identity only: credentials, endpoint and dialect are
+/// re-derived from the live catalog/config when the switch actually fires, so a
+/// session never pins a stale key or base URL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelSwitch {
+	pub provider: String,
+	pub model:    String,
+	/// Provider effort selected by the pattern suffix (`off`/`auto` map to
+	/// `None`, matching [`split_effort`]).
+	pub effort:   Option<String>,
+	/// Thinking selector spelled by the pattern suffix, kept separately because
+	/// `off`/`auto` are selector states and not wire efforts.
+	pub thinking: Option<CliThinking>,
+}
+
+/// Resolve a model/role pattern for a mid-session switch, mirroring the root
+/// candidate order. `provider_pin` forces a provider exactly like `--provider`
+/// does for the root model; without it `@role` and comma chains expand through
+/// [`model_patterns`].
+pub fn resolve_model_switch(
+	catalog: &crate::catalog::Catalog,
+	config: &crate::config::Config,
+	requested: &str,
+	provider_pin: Option<&str>,
+) -> std::result::Result<ModelSwitch, String> {
+	let candidates = match provider_pin {
+		Some(_) => vec![requested.to_string()],
+		None => model_patterns(config, requested, None)?,
+	};
+	let mut last_error = None;
+	for pattern in &candidates {
+		match candidate_for(catalog, config, provider_pin, pattern) {
+			Ok(candidate) => {
+				let thinking = split_thinking(pattern, -1)
+					.1
+					.and_then(parse_cli_thinking);
+				return Ok(ModelSwitch {
+					provider: candidate.provider,
+					model:    candidate.model,
+					effort:   candidate.effort,
+					thinking,
+				});
+			},
+			Err(error) => last_error = Some(error),
+		}
+	}
+	Err(last_error.unwrap_or_else(|| format!("no model candidate for `{requested}`")))
+}
+
+/// Whether a provider can be used for a switch target without a startup abort:
+/// an explicit key, a keyless (`auth: none`) endpoint, or a configured key from
+/// either `config.yml` or `models.yml`.
+#[must_use]
+pub fn provider_has_configured_auth(
+	catalog: &crate::catalog::Catalog,
+	config: &crate::config::Config,
+	provider: &str,
+	api_key_override: Option<&str>,
+) -> bool {
+	if api_key_override.is_some_and(|key| !key.trim().is_empty()) {
+		return true;
+	}
+	let keyless = |connection: &crate::config::ProviderConfig| {
+		connection.auth.as_deref() == Some("none")
+	};
+	let configured = config.providers.get(provider);
+	let catalog_connection = catalog.connections.get(provider);
+	configured.is_some_and(keyless)
+		|| catalog_connection.is_some_and(keyless)
+		|| configured
+			.and_then(crate::config::ProviderConfig::resolve_api_key)
+			.is_some_and(|key| !key.trim().is_empty())
+		|| catalog_connection
+			.and_then(crate::config::ProviderConfig::resolve_api_key)
+			.is_some_and(|key| !key.trim().is_empty())
+}
+
+/// Build the provider for a resolved switch target. The caller supplies the
+/// credential it resolved for this route (explicit CLI key or config key);
+/// `None` falls back to the connection block, and keyless endpoints get an
+/// empty bearer token exactly like the root run.
+///
+/// `provider_session_id` is `None` on a model switch: the sticky provider
+/// session belonged to the previous route (TS
+/// `setModelWithProviderSessionReset`), so it must not leak to the new one.
+pub fn build_switch_provider(
+	catalog: &crate::catalog::Catalog,
+	config: &crate::config::Config,
+	target: &ModelSwitch,
+	api_key: Option<String>,
+	provider_session_id: Option<String>,
+	prompt_cache_key: Option<String>,
+) -> std::result::Result<Arc<dyn ModelProvider>, String> {
+	let pattern = format!("{}/{}", target.provider, target.model);
+	let candidate = candidate_for(catalog, config, Some(&target.provider), &pattern)?;
+	let api_key = api_key
+		.filter(|key| !key.trim().is_empty())
+		.or_else(|| candidate.connection.as_ref().and_then(|connection| connection.resolve_api_key()))
+		.unwrap_or_default();
+	let wire_target = WireTarget {
+		dialect: candidate.dialect,
+		provider: &candidate.provider,
+		model: &candidate.model,
+		base_url: &candidate.base_url,
+		api_key: &api_key,
+		effort: target.effort.as_deref(),
+		supports_images: catalog.supports_images(&candidate.provider, &candidate.model).unwrap_or(true),
+		usage_in_streaming: Some(
+			catalog
+				.supports_usage_in_streaming(&candidate.provider, &candidate.model)
+				.unwrap_or(candidate.provider != "cerebras"),
+		),
+	};
+	wire_provider(catalog, config, &wire_target, provider_session_id, prompt_cache_key)
 }
 
 

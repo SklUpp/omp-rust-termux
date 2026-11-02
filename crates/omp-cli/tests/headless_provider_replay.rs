@@ -519,3 +519,424 @@ data: [DONE]
 	server.stop();
 	fs::remove_dir_all(base).ok();
 }
+
+// ---------------------------------------------------------------------------
+// Prewalk: one-way model switch at the first implementation action.
+// ---------------------------------------------------------------------------
+
+fn text_sse(text: &str) -> String {
+	format!(
+		"data: {}\n\ndata: [DONE]\n\n",
+		serde_json::json!({"choices":[{"delta":{"content":text},"finish_reason":"stop"}]})
+	)
+}
+
+fn tool_sse(calls: &[(&str, &str, serde_json::Value)]) -> String {
+	let mut body = String::new();
+	for (index, (id, name, args)) in calls.iter().enumerate() {
+		let call = serde_json::json!({
+			"index": index,
+			"id": id,
+			"type": "function",
+			"function": {"name": name, "arguments": args.to_string()},
+		});
+		body.push_str(&format!(
+			"data: {}\n\n",
+			serde_json::json!({"choices":[{"delta":{"tool_calls":[call]},"finish_reason":null}]})
+		));
+	}
+	body.push_str("data: [DONE]\n\n");
+	body
+}
+
+/// Two independent provider endpoints so a model switch is observable by which
+/// server receives the next request.
+fn setup_two_providers(
+	base: &Path,
+	a_port: u16,
+	b_port: u16,
+	extra_config: &str,
+) -> (PathBuf, PathBuf, PathBuf) {
+	let agent_dir = base.join("agent");
+	let cwd = base.join("work");
+	let sessions = base.join("sessions");
+	fs::create_dir_all(&agent_dir).expect("agent dir");
+	fs::create_dir_all(&cwd).expect("cwd");
+	fs::create_dir_all(&sessions).expect("sessions dir");
+	let mut config = format!(
+		"defaultModel: mockA/model-a\nproviders:\n  mockA:\n    baseUrl: \"http://127.0.0.1:{a_port}/v1\"\n    api: openai-completions\n    apiKey: test-key\n  mockB:\n    baseUrl: \"http://127.0.0.1:{b_port}/v1\"\n    api: openai-completions\n    apiKey: test-key\n"
+	);
+	config.push_str(extra_config);
+	fs::write(agent_dir.join("config.yml"), config).expect("config.yml");
+	fs::write(
+		agent_dir.join("models.yml"),
+		format!(
+			"providers:\n  mockA:\n    baseUrl: \"http://127.0.0.1:{a_port}/v1\"\n    api: openai-completions\n    apiKey: test-key\n    models:\n      - id: model-a\n        contextWindow: 128000\n  mockB:\n    baseUrl: \"http://127.0.0.1:{b_port}/v1\"\n    api: openai-completions\n    apiKey: test-key\n    models:\n      - id: model-b\n        contextWindow: 128000\n"
+		),
+	)
+	.expect("models.yml");
+	(agent_dir, cwd, sessions)
+}
+
+fn selectable_extra() -> &'static str {
+	"modelRoles:\n  smol: mockB/model-b\nprewalk:\n  enabled: true\n"
+}
+
+#[test]
+fn prewalk_switches_to_smol_after_todo_and_first_write_then_resumes_on_default() {
+	let a = MockWireServer::start(vec![
+		text_sse("exploring"),
+		tool_sse(&[(
+			"call-todo",
+			"todo",
+			serde_json::json!({"op": "init", "list": [{"phase": "P", "items": ["Do it"]}]}),
+		)]),
+		tool_sse(&[(
+			"call-write",
+			"write",
+			serde_json::json!({"path": "probe.txt", "content": "done"}),
+		)]),
+		text_sse("resumed follow-up"),
+	]);
+	let b = MockWireServer::start(vec![text_sse("switched response")]);
+	let base = temp_dir("prewalk-switch");
+	let (agent_dir, cwd, sessions) = setup_two_providers(&base, a.port, b.port, selectable_extra());
+
+	let first = run(
+		omp(&agent_dir, &cwd, &sessions)
+			.args([
+				"--yolo",
+				"--prewalk",
+				"--session-id",
+				"prewalk-1",
+				"-p",
+				"PLAN-TOKEN start",
+			]),
+	);
+	assert!(
+		first.status.success(),
+		"prewalk run failed: {}",
+		String::from_utf8_lossy(&first.stderr)
+	);
+	assert_eq!(a.request_count(), 3, "three primary turns before the switch");
+	assert_eq!(b.request_count(), 1, "the switched request reaches the fast endpoint");
+	// The plan nudge is injected after the first text-only turn and reaches the
+	// primary model, never the fast one.
+	assert!(
+		occurrences(&a.request(1), "STOP: In NEXT reply") >= 1,
+		"primary follow-up must carry the deep-plan nudge"
+	);
+	let fast = b.request(0);
+	assert_eq!(fast["model"], "model-b");
+	assert_eq!(
+		occurrences(&fast, "Before task complete, verify:"),
+		1,
+		"fast request carries exactly one checklist"
+	);
+	assert_eq!(
+		occurrences(&fast, "STOP: In NEXT reply"),
+		0,
+		"consumed plan nudge must be scrubbed before the switch"
+	);
+
+	let log = session_file(&sessions, "prewalk-1");
+	let stored = entries(&log);
+	let model_change = stored
+		.iter()
+		.position(|entry| entry["type"] == "model_change")
+		.expect("ephemeral model change must be journaled");
+	assert_eq!(stored[model_change]["model"], "mockB/model-b");
+	assert_eq!(
+		stored[model_change]["role"], "fallback",
+		"prewalk must use the ephemeral role, not `temporary`"
+	);
+	let checklist = stored
+		.iter()
+		.position(|entry| {
+			entry["type"] == "custom_message" && entry["customType"] == "prewalk-checklist"
+		})
+		.expect("checklist guidance must be journaled");
+	assert!(
+		model_change < checklist,
+		"model change is recorded before the checklist it introduces"
+	);
+	assert!(
+		stored.iter().all(|entry| entry["customType"] != "prewalk-plan"),
+		"the one-run plan nudge must never be persisted"
+	);
+
+	// Resume restores the default model (`fallback` is ephemeral) while the
+	// persisted checklist still replays as hidden guidance.
+	let resumed = run(
+		omp(&agent_dir, &cwd, &sessions)
+			.args(["--resume", "prewalk-1", "-p", "RESUME-TOKEN again"]),
+	);
+	assert!(
+		resumed.status.success(),
+		"resume failed: {}",
+		String::from_utf8_lossy(&resumed.stderr)
+	);
+	assert_eq!(a.request_count(), 4, "resume stays on the default provider");
+	assert_eq!(b.request_count(), 1, "an ephemeral switch must not survive resume");
+	let replay = a.request(3);
+	assert_eq!(occurrences(&replay, "RESUME-TOKEN"), 1);
+	assert!(
+		occurrences(&replay, "Before task complete, verify:") >= 1,
+		"checklist guidance replays on resume"
+	);
+
+	a.stop();
+	b.stop();
+	fs::remove_dir_all(base).ok();
+}
+
+#[test]
+fn prewalk_noop_target_disarms_with_a_notice() {
+	let a = MockWireServer::start(vec![text_sse("working")]);
+	let b = MockWireServer::start(vec![text_sse("unused")]);
+	let base = temp_dir("prewalk-noop");
+	let (agent_dir, cwd, sessions) = setup_two_providers(
+		&base,
+		a.port,
+		b.port,
+		"modelRoles:\n  smol: mockA/model-a\nprewalk:\n  enabled: true\n",
+	);
+	let run_out = run(
+		omp(&agent_dir, &cwd, &sessions)
+			.args(["--session-id", "prewalk-noop", "-p", "hi"]),
+	);
+	assert!(
+		run_out.status.success(),
+		"noop run failed: {}",
+		String::from_utf8_lossy(&run_out.stderr)
+	);
+	assert_eq!(a.request_count(), 1);
+	assert_eq!(b.request_count(), 0);
+	assert!(
+		String::from_utf8_lossy(&run_out.stderr).contains("nothing to switch"),
+		"noop target must announce the disarm"
+	);
+	let stored = entries(&session_file(&sessions, "prewalk-noop"));
+	assert!(stored.iter().all(|entry| entry["type"] != "model_change"));
+	assert!(
+		stored
+			.iter()
+			.all(|entry| entry["customType"] != "prewalk-plan"),
+		"a noop target injects no plan nudge"
+	);
+
+	a.stop();
+	b.stop();
+	fs::remove_dir_all(base).ok();
+}
+
+#[test]
+fn prewalk_read_only_tools_do_not_switch() {
+	let a = MockWireServer::start(vec![
+		text_sse("exploring"),
+		tool_sse(&[(
+			"call-todo",
+			"todo",
+			serde_json::json!({"op": "init", "list": [{"phase": "P", "items": ["Read"]}]}),
+		)]),
+		tool_sse(&[(
+			"call-read",
+			"read",
+			serde_json::json!({"path": "note.txt"}),
+		)]),
+		text_sse("still exploring"),
+		text_sse("done"),
+	]);
+	let b = MockWireServer::start(vec![text_sse("must stay unused")]);
+	let base = temp_dir("prewalk-readonly");
+	let (agent_dir, cwd, sessions) =
+		setup_two_providers(&base, a.port, b.port, selectable_extra());
+	fs::write(cwd.join("note.txt"), "note body").expect("note");
+
+	let run_out = run(
+		omp(&agent_dir, &cwd, &sessions)
+			.args(["--session-id", "prewalk-readonly", "-p", "read first"]),
+	);
+	assert!(
+		run_out.status.success(),
+		"readonly run failed: {}",
+		String::from_utf8_lossy(&run_out.stderr)
+	);
+	assert_eq!(a.request_count(), 5, "primary keeps the dialog after reads");
+	assert_eq!(b.request_count(), 0, "read-only tools must never switch");
+	let stored = entries(&session_file(&sessions, "prewalk-readonly"));
+	assert!(stored.iter().all(|entry| entry["type"] != "model_change"));
+	assert!(
+		stored.iter().any(|entry| entry["customType"] == "prewalk-continue"),
+		"the tool-free turn consumes the pending continue nudge"
+	);
+	assert!(
+		stored
+			.iter()
+			.all(|entry| entry["customType"] != "prewalk-checklist"),
+		"no checklist without a switch"
+	);
+
+	a.stop();
+	b.stop();
+	fs::remove_dir_all(base).ok();
+}
+
+#[test]
+fn prewalk_conflict_exits_before_any_provider_request() {
+	let a = MockWireServer::start(vec![text_sse("unused")]);
+	let b = MockWireServer::start(vec![text_sse("unused")]);
+	let base = temp_dir("prewalk-conflict");
+	let (agent_dir, cwd, sessions) = setup_two_providers(&base, a.port, b.port, "");
+	let run_out = run(
+		omp(&agent_dir, &cwd, &sessions).args(["--no-prewalk", "--prewalk", "-p", "hi"]),
+	);
+	assert!(!run_out.status.success());
+	assert!(
+		String::from_utf8_lossy(&run_out.stderr)
+			.contains("--no-prewalk cannot be combined with --prewalk or --prewalk-into"),
+		"conflict must fail with the TS message: {}",
+		String::from_utf8_lossy(&run_out.stderr)
+	);
+	assert_eq!(a.request_count(), 0);
+	assert_eq!(b.request_count(), 0);
+
+	a.stop();
+	b.stop();
+	fs::remove_dir_all(base).ok();
+}
+
+#[test]
+fn prewalk_unresolved_target_warns_and_stays_disabled() {
+	let a = MockWireServer::start(vec![text_sse("working")]);
+	let b = MockWireServer::start(vec![text_sse("unused")]);
+	let base = temp_dir("prewalk-unresolved");
+	let (agent_dir, cwd, sessions) = setup_two_providers(&base, a.port, b.port, "");
+	let run_out = run(
+		omp(&agent_dir, &cwd, &sessions).args([
+			"--prewalk",
+			"--prewalk-into",
+			"model-absent",
+			"--session-id",
+			"prewalk-unresolved",
+			"-p",
+			"hi",
+		]),
+	);
+	assert!(
+		run_out.status.success(),
+		"an optional prewalk target must not abort startup: {}",
+		String::from_utf8_lossy(&run_out.stderr)
+	);
+	assert!(
+		String::from_utf8_lossy(&run_out.stderr).contains("prewalk disabled —"),
+		"unresolved target must warn: {}",
+		String::from_utf8_lossy(&run_out.stderr)
+	);
+	assert_eq!(a.request_count(), 1);
+	assert_eq!(b.request_count(), 0);
+	let stored = entries(&session_file(&sessions, "prewalk-unresolved"));
+	assert!(stored.iter().all(|entry| entry["type"] != "model_change"));
+
+	a.stop();
+	b.stop();
+	fs::remove_dir_all(base).ok();
+}
+
+#[test]
+fn prewalk_config_setting_is_ignored_on_resume() {
+	let a = MockWireServer::start(vec![
+		text_sse("first session"),
+		tool_sse(&[(
+			"call-write",
+			"write",
+			serde_json::json!({"path": "probe.txt", "content": "x"}),
+		)]),
+		text_sse("resumed without prewalk"),
+	]);
+	let b = MockWireServer::start(vec![text_sse("must stay unused")]);
+	let base = temp_dir("prewalk-restore");
+	let (agent_dir, cwd, sessions) =
+		setup_two_providers(&base, a.port, b.port, selectable_extra());
+
+	let first = run(
+		omp(&agent_dir, &cwd, &sessions)
+			.args(["--no-prewalk", "--session-id", "prewalk-restore", "-p", "first"]),
+	);
+	assert!(
+		first.status.success(),
+		"first run failed: {}",
+		String::from_utf8_lossy(&first.stderr)
+	);
+	assert_eq!(a.request_count(), 1);
+	assert_eq!(b.request_count(), 0);
+
+	let resumed = run(
+		omp(&agent_dir, &cwd, &sessions)
+			.args(["--resume", "prewalk-restore", "--yolo", "-p", "second"]),
+	);
+	assert!(
+		resumed.status.success(),
+		"resume failed: {}",
+		String::from_utf8_lossy(&resumed.stderr)
+	);
+	assert!(
+		!String::from_utf8_lossy(&resumed.stderr).contains("Prewalk:"),
+		"settings enablement must not arm a restored session"
+	);
+	assert_eq!(b.request_count(), 0, "restored session stays on the default model");
+	let stored = entries(&session_file(&sessions, "prewalk-restore"));
+	assert!(stored.iter().all(|entry| entry["type"] != "model_change"));
+
+	a.stop();
+	b.stop();
+	fs::remove_dir_all(base).ok();
+}
+
+#[test]
+fn prewalk_explicit_into_switches_on_first_write_when_todo_is_not_offered() {
+	let a = MockWireServer::start(vec![tool_sse(&[(
+		"call-write",
+		"write",
+		serde_json::json!({"path": "probe.txt", "content": "x"}),
+	)])]);
+	let b = MockWireServer::start(vec![text_sse("switched immediately")]);
+	let base = temp_dir("prewalk-explicit");
+	let (agent_dir, cwd, sessions) = setup_two_providers(&base, a.port, b.port, "");
+	let run_out = run(
+		omp(&agent_dir, &cwd, &sessions).args([
+			"--yolo",
+			"--tools",
+			"write,read",
+			"--prewalk-into",
+			"mockB/model-b",
+			"--session-id",
+			"prewalk-explicit",
+			"-p",
+			"write now",
+		]),
+	);
+	assert!(
+		run_out.status.success(),
+		"explicit prewalk run failed: {}",
+		String::from_utf8_lossy(&run_out.stderr)
+	);
+	assert_eq!(a.request_count(), 1, "no todo gate when todo is not offered");
+	assert_eq!(b.request_count(), 1);
+	let fast = b.request(0);
+	assert_eq!(fast["model"], "model-b");
+	assert_eq!(occurrences(&fast, "Before task complete, verify:"), 1);
+	assert_eq!(
+		occurrences(&fast, "STOP: In NEXT reply"),
+		0,
+		"an immediate switch never injects the plan nudge"
+	);
+	let stored = entries(&session_file(&sessions, "prewalk-explicit"));
+	assert!(stored.iter().any(|entry| {
+		entry["type"] == "model_change" && entry["role"] == "fallback"
+	}));
+
+	a.stop();
+	b.stop();
+	fs::remove_dir_all(base).ok();
+}

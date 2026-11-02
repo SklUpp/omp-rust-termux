@@ -521,6 +521,17 @@ impl CheckpointHost {
 				// just one custom type. Keep their order among the turns.
 				"custom_message" => {
 					let custom_type = entry.extra.get("customType").and_then(Value::as_str);
+					// Prewalk's plan nudge is a one-run instruction: it is never
+					// persisted, and a historical entry (older writer) must not
+					// resurrect on resume. Other prewalk guidance replays as the
+					// hidden developer message it was live, identity intact.
+					if custom_type == Some(crate::prewalk::PREWALK_PLAN_TYPE) {
+						continue;
+					}
+					let is_prewalk = custom_type.is_some_and(|kind| {
+						kind == crate::prewalk::PREWALK_CONTINUE_TYPE
+							|| kind == crate::prewalk::PREWALK_CHECKLIST_TYPE
+					});
 					// A reminder whose checkpoint was already cut is history;
 					// replaying it would claim the checkpoint is still active.
 					let superseded = custom_type == Some(CHECKPOINT_ACTIVE_REMINDER_TYPE)
@@ -536,7 +547,11 @@ impl CheckpointHost {
 						&& let Some(content) = custom_message_text(entry)
 						&& !content.is_empty()
 					{
-						messages.push(Message::system(content));
+						match (is_prewalk, custom_type) {
+							(true, Some(custom_type)) => messages
+								.push(Message::guidance(custom_type.to_string(), content)),
+							_ => messages.push(Message::system(content)),
+						}
 					}
 				},
 				_ => {},

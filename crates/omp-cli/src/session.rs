@@ -2038,6 +2038,27 @@ impl SessionStore {
 		Ok(id)
 	}
 
+	/// TS `SessionManager.appendModelChange`: records a mid-session model
+	/// transition. `role` is the selector lane that caused it; the ephemeral
+	/// prewalk/plan-yolo hand-off writes `"fallback"`
+	/// (`EPHEMERAL_MODEL_CHANGE_ROLE`), which restore treats as "use the
+	/// configured default", so the fast model never survives resume/fork.
+	pub fn append_model_change(&mut self, model: &str, role: &str) -> Result<String, String> {
+		let id = format!("entry-{}", output::session_id());
+		let extra = serde_json::json!({
+			"model": model,
+			"role": role,
+		});
+		self.append_entry(SessionEntry {
+			kind: "model_change".to_string(),
+			id: id.clone(),
+			parent_id: self.leaf_id().map(str::to_string),
+			timestamp: output::iso8601(SystemTime::now()),
+			extra,
+		})?;
+		Ok(id)
+	}
+
 	/// TS `SessionManager.appendCustomMessageEntry` for the checkpoint lane:
 	/// persisted `custom_message` with `display` control and details.
 	pub fn append_custom_message(

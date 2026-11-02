@@ -574,6 +574,12 @@ pub struct Message {
 	pub model: Option<String>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub attribution: Option<Attribution>,
+	/// Identity of host-injected hidden guidance (TS `role:"custom"` plus
+	/// `customType`). `None` on every provider-authored message. The identity
+	/// lets a turn-boundary consumer scrub guidance it injected earlier and
+	/// journal it as a `custom_message` instead of a user turn.
+	#[serde(rename = "customType", default, skip_serializing_if = "Option::is_none")]
+	pub custom_type: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -610,6 +616,8 @@ struct RawMessage {
 	model: Option<String>,
 	#[serde(default)]
 	attribution: Option<Attribution>,
+	#[serde(rename = "customType", default)]
+	custom_type: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for Message {
@@ -653,6 +661,7 @@ impl<'de> Deserialize<'de> for Message {
 			provider: raw.provider,
 			model: raw.model,
 			attribution: raw.attribution,
+			custom_type: raw.custom_type,
 		})
 	}
 }
@@ -673,6 +682,7 @@ impl Message {
 			provider: None,
 			model: None,
 			attribution: None,
+			custom_type: None,
 		}
 	}
 
@@ -693,6 +703,31 @@ impl Message {
 			provider: None,
 			model: None,
 			attribution: None,
+			custom_type: None,
+		}
+	}
+
+	/// Hidden host guidance with a stable identity (TS `role:"custom"` +
+	/// `customType`, `display:false`). Providers receive it in the developer
+	/// slot, exactly like `custom` messages upstream; the identity is what a
+	/// turn-boundary consumer scrubs and journals.
+	pub fn guidance(custom_type: impl Into<String>, content: impl Into<String>) -> Self {
+		Self {
+			role: Role::Developer,
+			content: content.into(),
+			parts: Vec::new(),
+			name: None,
+			tool_calls: Vec::new(),
+			tool_call_id: None,
+			is_error: false,
+			usage: None,
+			stop_reason: None,
+			error_message: None,
+			api: None,
+			provider: None,
+			model: None,
+			attribution: Some(Attribution::Agent),
+			custom_type: Some(custom_type.into()),
 		}
 	}
 
@@ -712,6 +747,7 @@ impl Message {
 			provider: None,
 			model: None,
 			attribution: None,
+			custom_type: None,
 		}
 	}
 
@@ -739,6 +775,7 @@ impl Message {
 			provider: None,
 			model: None,
 			attribution: None,
+			custom_type: None,
 		}
 	}
 
@@ -769,6 +806,7 @@ impl Message {
 			provider: None,
 			model: None,
 			attribution: None,
+			custom_type: None,
 		}
 	}
 
@@ -796,6 +834,7 @@ impl Message {
 			provider: None,
 			model: None,
 			attribution: None,
+			custom_type: None,
 		}
 	}
 
@@ -815,6 +854,7 @@ impl Message {
 			provider: None,
 			model: None,
 			attribution: None,
+			custom_type: None,
 		}
 	}
 
@@ -834,6 +874,7 @@ impl Message {
 			provider: None,
 			model: None,
 			attribution: None,
+			custom_type: None,
 		}
 	}
 
@@ -858,6 +899,7 @@ impl Message {
 			provider: None,
 			model: None,
 			attribution: None,
+			custom_type: None,
 		}
 	}
 	pub fn tool_with_status_and_parts(
@@ -882,6 +924,7 @@ impl Message {
 			provider: None,
 			model: None,
 			attribution: None,
+			custom_type: None,
 		}
 	}
 }

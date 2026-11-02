@@ -3514,6 +3514,7 @@ fn directly_constructed_message_with_content_and_image_part_preserves_both_on_wi
 		provider: None,
 		model: None,
 		attribution: None,
+		custom_type: None,
 	};
 	let wire = pi_agent::to_openai_messages(&[msg]).expect("openai messages");
 	let val = serde_json::to_value(&wire[0]).expect("serialize");

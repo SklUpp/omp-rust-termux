@@ -144,6 +144,9 @@ pub fn assistant_message(
 	if let Some(error) = &message.error_message {
 		wire["errorMessage"] = json!(error);
 	}
+	if let Some(features) = &message.disabled_features {
+		wire["disabledFeatures"] = json!(features);
+	}
 	wire
 }
 

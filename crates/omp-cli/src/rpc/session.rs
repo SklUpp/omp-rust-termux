@@ -899,6 +899,16 @@ impl RpcSession {
 		service_tier_family(&provider, api.as_deref(), &id)
 	}
 
+	/// TS `ServiceTierByFamily` view of the RPC owner's boolean selection:
+	/// `true` becomes `"priority"`, absent families stay absent.
+	pub(crate) fn service_tier_by_family(&self) -> std::collections::BTreeMap<String, String> {
+		self.priority_families
+			.iter()
+			.filter(|(_, enabled)| **enabled)
+			.map(|(family, _)| (family.clone(), "priority".to_string()))
+			.collect()
+	}
+
 	/// Whether the user selected priority for the active model's family
 	/// (TS `isFastModeEnabled`).
 	#[must_use]
@@ -910,7 +920,7 @@ impl RpcSession {
 
 	/// Whether priority will actually be realized on the wire for the active
 	/// model (TS `isFastModeActive`). Until the runner forwards
-	/// `RunRequest.service_tier`, the selection is stored but not realized, so
+	/// `RunRequest.service_tier_by_family`, the selection is stored but not realized, so
 	/// this stays `false` instead of claiming a wire effect that did not happen.
 	#[must_use]
 	pub fn fast_mode_active(&self) -> bool {
@@ -2248,6 +2258,26 @@ impl RpcSession {
 			(canon_stop == "aborted").then(|| "Interrupted by user".to_string())
 		});
 		asst_msg.attribution = message.attribution.map(|value| value.as_str().to_string());
+		asst_msg.disabled_features = message.disabled_features.clone();
+		if message
+			.disabled_features
+			.as_deref()
+			.is_some_and(|features| features.contains("priority"))
+			&& self.priority_families.get("anthropic").copied().unwrap_or(false)
+		{
+			// TS `agent-session.ts:2880-2889`: the server rejected priority, so
+			// the family selection drops, the journal records the new state and
+			// the user is told once.
+			self.priority_families.remove("anthropic");
+			if self.store.enabled()
+				&& let Err(err) = self.store.append_service_tier_change(&self.service_tier_by_family())
+			{
+				eprintln!("warning: cannot record service tier change: {err}");
+			}
+			eprintln!(
+				"warning: Priority/fast mode rejected for this model; retried without it. Fast mode is now off."
+			);
+		}
 		let asst_id = format!("msg-{}", output::session_id());
 		let asst_entry = MessageEntry::new(
 			asst_id.clone(),
@@ -2543,6 +2573,7 @@ impl RpcSession {
 					// Provider session belongs to the previous route.
 					None,
 					cache_key,
+					&self.store.service_tier_by_family(),
 				) {
 					Ok(provider) => {
 						// Ephemeral role: resume/fork fall back to the configured

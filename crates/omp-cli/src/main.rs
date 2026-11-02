@@ -916,6 +916,7 @@ fn run() -> std::result::Result<(), CliError> {
 		prompt_inputs,
 		skills_filter,
 		store: SessionStore::default(),
+		service_tier_by_family: store.service_tier_by_family(),
 		history: Vec::new(),
 		checkpoint_host: CheckpointHost::new(),
 		in_memory_messages: None,
@@ -1471,6 +1472,10 @@ struct Session<'a> {
 	prompt_inputs: (Option<String>, Option<String>),
 	skills_filter: (bool, Vec<String>),
 	store: SessionStore,
+	/// TS `ServiceTierByFamily`: restored live selection, kept in memory even
+	/// when `--no-session` disables persistence so a downgrade sticks across
+	/// prompts in this process.
+	service_tier_by_family: std::collections::BTreeMap<String, String>,
 	history: Vec<TurnRecord>,
 	checkpoint_host: CheckpointHost,
 	/// Live branch conversation for `--no-session` runs (no leading system
@@ -1834,7 +1839,7 @@ impl Session<'_> {
 			plan_mode: Default::default(),
 			continuation: false,
 			plan_context: None,
-			service_tier_by_family: std::collections::BTreeMap::new(),
+			service_tier_by_family: self.service_tier_by_family.clone(),
 })
 	}
 
@@ -2171,6 +2176,25 @@ impl Session<'_> {
 					});
 					asst_msg.attribution =
 						message.attribution.map(|value| value.as_str().to_string());
+					asst_msg.disabled_features = message.disabled_features.clone();
+					if message
+						.disabled_features
+						.as_deref()
+						.is_some_and(|features| features.contains("priority"))
+						&& self.service_tier_by_family.get("anthropic").map(String::as_str)
+							== Some("priority")
+					{
+						self.service_tier_by_family.remove("anthropic");
+						if self.store.enabled()
+							&& let Err(err) =
+								self.store.append_service_tier_change(&self.service_tier_by_family)
+						{
+							eprintln!("warning: cannot record service tier change: {err}");
+						}
+						eprintln!(
+							"warning: Priority/fast mode rejected for this model; retried without it. Fast mode is now off."
+						);
+					}
 					let asst_entry = MessageEntry::new(
 						asst_id.clone(),
 						parent.take(),
@@ -2451,6 +2475,7 @@ impl Session<'_> {
 								// Provider session belongs to the previous route.
 								None,
 								cache_key,
+								&store.service_tier_by_family(),
 							) {
 								Ok(provider) => {
 									// Ephemeral role: resume/fork fall back to the

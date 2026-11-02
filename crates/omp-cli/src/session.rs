@@ -728,6 +728,10 @@ pub struct SessionMessage {
 	pub stop_reason: Option<String>,
 	#[serde(default, rename = "errorMessage", skip_serializing_if = "Option::is_none")]
 	pub error_message: Option<String>,
+	/// TS `Message.disabledFeatures`: features the provider dropped this turn
+	/// after a server rejection (e.g. `["priority"]`).
+	#[serde(default, rename = "disabledFeatures", skip_serializing_if = "Option::is_none")]
+	pub disabled_features: Option<Vec<String>>,
 	#[serde(default, rename = "timestamp", skip_serializing_if = "Option::is_none")]
 	pub timestamp_ms: Option<u64>,
 	#[serde(default, rename = "isError", skip_serializing_if = "Option::is_none")]
@@ -767,6 +771,7 @@ impl SessionMessage {
 			error_message: None,
 			timestamp_ms: Some(timestamp_ms),
 			is_error: None,
+			disabled_features: None,
 			extra: serde_json::Map::new(),
 		}
 	}
@@ -807,6 +812,7 @@ impl SessionMessage {
 			error_message: None,
 			timestamp_ms: Some(timestamp_ms),
 			is_error: None,
+			disabled_features: None,
 			extra: serde_json::Map::new(),
 		}
 	}
@@ -833,6 +839,7 @@ impl SessionMessage {
 			error_message: None,
 			timestamp_ms: Some(timestamp_ms),
 			is_error: Some(is_error),
+			disabled_features: None,
 			extra: serde_json::Map::new(),
 		}
 	}
@@ -2139,6 +2146,58 @@ impl SessionStore {
 		Ok(id)
 	}
 
+	/// TS `SessionManager.appendServiceTierChange`: persists the full
+	/// per-family selection (`serviceTier: {...} | null`), never a boolean.
+	pub fn append_service_tier_change(
+		&mut self,
+		tiers: &std::collections::BTreeMap<String, String>,
+	) -> Result<String, String> {
+		let id = format!("entry-{}", output::session_id());
+		let value = if tiers.is_empty() {
+			serde_json::Value::Null
+		} else {
+			serde_json::json!(tiers)
+		};
+		let extra = serde_json::json!({ "serviceTier": value });
+		self.append_entry(SessionEntry {
+			kind: "service_tier_change".to_string(),
+			id: id.clone(),
+			parent_id: self.leaf_id().map(str::to_string),
+			timestamp: output::iso8601(SystemTime::now()),
+			extra,
+		})?;
+		Ok(id)
+	}
+
+	/// TS `session-context` restore: the last `service_tier_change` entry on
+	/// the active branch, or an empty map when the session never recorded one.
+	pub fn service_tier_by_family(&self) -> std::collections::BTreeMap<String, String> {
+		self.branch_entries()
+			.iter()
+			.rev()
+			.find(|entry| entry.kind == "service_tier_change")
+			.and_then(|entry| entry.extra.get("serviceTier"))
+			.and_then(serde_json::Value::as_object)
+			.map(|map| {
+				map.iter()
+					.filter_map(|(family, tier)| {
+						tier.as_str().map(|tier| (family.clone(), tier.to_string()))
+					})
+					.collect()
+			})
+			.unwrap_or_default()
+	}
+
+	/// TS `agent-session` resume precedence: a session that recorded any
+	/// service-tier entry restores that selection; otherwise the configured
+	/// value applies. An explicit reset entry restores an empty map and must
+	/// not fall back to configuration.
+	pub fn has_service_tier_entry(&self) -> bool {
+		self.branch_entries()
+			.iter()
+			.any(|entry| entry.kind == "service_tier_change")
+	}
+
 	/// TS `SessionManager.appendModelChange`: records a mid-session model
 	/// transition. `role` is the selector lane that caused it; the ephemeral
 	/// prewalk/plan-yolo hand-off writes `"fallback"`
@@ -2605,6 +2664,7 @@ impl SessionStore {
 						.then(|| USER_INTERRUPT_LABEL.to_string()),
 					timestamp_ms: Some(now_ms),
 					is_error: None,
+			disabled_features: None,
 					extra: serde_json::Map::new(),
 				},
 			));
@@ -4370,6 +4430,7 @@ pub fn import_legacy_v1(
 					error_message: None,
 					timestamp_ms: import_ms,
 					is_error: None,
+			disabled_features: None,
 					extra: serde_json::Map::new(),
 				},
 			);
@@ -4431,6 +4492,7 @@ pub fn import_legacy_v1(
 				error_message: None,
 				timestamp_ms: import_ms,
 				is_error: None,
+			disabled_features: None,
 				extra: serde_json::Map::new(),
 			},
 		);

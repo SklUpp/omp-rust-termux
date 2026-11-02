@@ -1404,6 +1404,7 @@ impl AgentRunner for PiAgentRunner {
 			credential_resolver: request.credential_resolver.clone(),
 			session_id: request.session_id.clone(),
 			cancel: Some(cancellation_token.clone()),
+			service_tier_by_family: request.service_tier_by_family.clone(),
 		});
 		let child_factory: Option<Arc<dyn ChildModelFactory>> =
 			allow_task.then(|| Arc::clone(&model_factory));
@@ -1470,12 +1471,20 @@ impl AgentRunner for PiAgentRunner {
 			supports_images: plan.supports_images,
 			usage_in_streaming: Some(plan.supports_usage_in_streaming),
 		};
+		let service_tier = crate::service_tier::resolve(
+			&request.service_tier_by_family,
+			target.provider,
+			Some(target.dialect.api()),
+			target.model,
+		)
+		.map(str::to_string);
 		let provider = wire_provider(
 			&request.catalog,
 			&request.config,
 			&target,
 			request.provider_session_id.clone(),
 			request.prompt_cache_key.clone(),
+			service_tier,
 		)
 		.map_err(Error::new)?;
 		let config = AgentConfig {
@@ -2531,6 +2540,7 @@ struct WireTarget<'a> {
 /// Build the provider the resolved dialect names. This is the only place the
 /// CLI chooses an adapter, so the root turn and every child share one mapping.
 fn wire_provider(
+	service_tier: Option<String>,
 	catalog: &crate::catalog::Catalog,
 	config: &crate::config::Config,
 	target: &WireTarget<'_>,
@@ -2617,6 +2627,7 @@ fn wire_provider(
 				.map(|tokens| u32::try_from(tokens).unwrap_or(u32::MAX));
 			anthropic.supports_images = target.supports_images;
 			anthropic.provider_id = Some(target.provider.to_string());
+			anthropic.service_tier = service_tier;
 			anthropic.claude_code_session_id = session_id;
 			// Caller headers from `config.yml` (the CLI's own override) or the
 			// catalog provider block; enforced credential/beta headers still win.
@@ -3014,6 +3025,7 @@ pub fn provider_has_configured_auth(
 /// session belonged to the previous route (TS
 /// `setModelWithProviderSessionReset`), so it must not leak to the new one.
 pub fn build_switch_provider(
+	service_tier_by_family: &std::collections::BTreeMap<String, String>,
 	catalog: &crate::catalog::Catalog,
 	config: &crate::config::Config,
 	target: &ModelSwitch,
@@ -3041,7 +3053,21 @@ pub fn build_switch_provider(
 				.unwrap_or(candidate.provider != "cerebras"),
 		),
 	};
-	wire_provider(catalog, config, &wire_target, provider_session_id, prompt_cache_key)
+	let service_tier = crate::service_tier::resolve(
+		service_tier_by_family,
+		&wire_target.provider,
+		Some(wire_target.dialect.api()),
+		&wire_target.model,
+	)
+	.map(str::to_string);
+	wire_provider(
+		catalog,
+		config,
+		&wire_target,
+		provider_session_id,
+		prompt_cache_key,
+		service_tier,
+	)
 }
 
 
@@ -3201,6 +3227,8 @@ struct CliChildModelFactory {
 	/// The turn's own cancellation token, so a cancelled child credential
 	/// lookup fails closed instead of hitting the store.
 	cancel:              Option<pi_agent::CancellationToken>,
+	/// Resolved per-family selection inherited by every child at spawn.
+	service_tier_by_family: std::collections::BTreeMap<String, String>,
 }
 
 impl CliChildModelFactory {
@@ -3348,8 +3376,21 @@ impl ChildModelFactory for CliChildModelFactory {
 				supports_images: target.supports_images,
 				usage_in_streaming: target.usage_in_streaming,
 			};
-			let provider =
-				match wire_provider(&self.catalog, &self.config, &selection, None, None) {
+			let service_tier = crate::service_tier::resolve(
+				&self.service_tier_by_family,
+				&selection.provider,
+				Some(selection.dialect.api()),
+				&selection.model,
+			)
+			.map(str::to_string);
+			let provider = match wire_provider(
+				&self.catalog,
+				&self.config,
+				&selection,
+				None,
+				None,
+				service_tier,
+			) {
 					Ok(provider) => provider,
 					Err(error) => {
 						last_error = Some(error);
@@ -6111,6 +6152,7 @@ mod tests {
 				credential_resolver: None,
 				session_id: None,
 				cancel: None,
+			service_tier_by_family: Default::default(),
 			}
 		};
 
@@ -6198,6 +6240,7 @@ mod tests {
 			credential_resolver: None,
 			session_id: None,
 			cancel: None,
+			service_tier_by_family: Default::default(),
 		};
 
 		let key = factory.target("otherprov/model").expect("other provider").api_key;
@@ -6277,6 +6320,7 @@ mod tests {
 			)),
 			session_id: Some("session-1".to_string()),
 			cancel: None,
+			service_tier_by_family: Default::default(),
 		};
 
 		// Same provider+base URL: reuse the root key, never touch the store.
@@ -8541,6 +8585,7 @@ mod tests {
 			credential_resolver: None,
 			session_id: None,
 			cancel: None,
+			service_tier_by_family: Default::default(),
 		};
 		let target = factory.target("childprov/claude-child").expect("child target");
 		assert_eq!(
@@ -8715,6 +8760,7 @@ mod tests {
 			credential_resolver: None,
 			session_id: None,
 			cancel: None,
+			service_tier_by_family: Default::default(),
 		};
 		let target = factory.target("childprov/claude-child").expect("child target");
 		assert_eq!(

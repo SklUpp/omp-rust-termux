@@ -604,7 +604,7 @@ fn run() -> std::result::Result<(), CliError> {
 			}
 			parsed
 		})
-		.or_else(|| scope_thinking.as_deref().and_then(runtime::parse_cli_thinking));
+		.or_else(|| scoped_thinking.as_deref().and_then(runtime::parse_cli_thinking));
 	let session_dir = cli
 		.session_dir
 		.as_ref()

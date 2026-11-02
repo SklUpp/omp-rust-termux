@@ -37,10 +37,10 @@ const PLAN_YOLO_HANDOFF_PROMPT: &str = include_str!(
 /// not take a private path around that public tool limit.
 const MAX_INLINE_PLAN_BYTES: usize = 1024 * 1024;
 
-/// `read_local_artifact` caps at `SNAPSHOT_MAX_BYTES + 1` bytes and discards
-/// the true length. A decoded read longer than the cap is therefore truncated
-/// (or exactly at the ambiguous cap+1 boundary); approving its prefix would
-/// let a suffix change escape revalidation.
+/// Defense in depth: the shared reader rejects capped/truncated artifacts
+/// before UTF-8 decoding, so approval never sees a prefix. Keep this check so
+/// a caller that substitutes a different reader still cannot approve a plan
+/// whose reviewed text is at or beyond the bounded read size.
 fn ensure_plan_fully_read(path: &str, content: &str) -> Result<(), String> {
 	if content.len() > pi_agent::tools::hashline::snapshot::SNAPSHOT_MAX_BYTES {
 		return Err(format!(

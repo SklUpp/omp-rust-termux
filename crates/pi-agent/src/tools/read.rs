@@ -45,6 +45,7 @@ use super::{
 	Tool, ToolError,
 	edit_variants::mode::{EditMode, FileDisplayMode, resolve_file_display_mode},
 	internal_urls::{self, InternalResource, InternalUrlRouter},
+	internal_urls_artifact,
 	tool_result,
 };
 use crate::state::{AcpClientBridge, AcpClientError, AgentContext, ToolResult};
@@ -218,6 +219,100 @@ impl ReadTool {
 		}
 	}
 
+	/// Read `artifact://<id>` through the backing file instead of the router's
+	/// text resolution: selectors stream from disk, so an artifact over the
+	/// 8 MiB full-content cap is still addressable, and an unbounded `:raw`
+	/// over the normal 50 KiB cap is refused instead of materialized.
+	async fn read_artifact(
+		&self,
+		url: &str,
+		parsed: &Sel,
+		ctx: &AgentContext,
+	) -> Result<ToolResult, ToolError> {
+		let parsed_url = internal_urls::InternalUrl::parse(url)
+			.ok_or_else(|| ToolError::Rejected(format!("Invalid internal URL: {url}")))?;
+		let context = self.scope.resolve_context(&ctx.cwd, &ctx.cancellation_token);
+		let artifact = match internal_urls_artifact::resolve_artifact(&parsed_url, &context).await {
+			Ok(artifact) => artifact,
+			Err(message) => return Ok(tool_result(message, true)),
+		};
+		let pointer = format!("artifact://{}", artifact.id);
+		let raw_selector = is_raw(parsed);
+		let display_mode = self.display_mode(raw_selector, true);
+		let source = TextSource::Artifact {
+			path: &artifact.path,
+			size: artifact.size,
+			url,
+		};
+		if matches!(parsed, Sel::Raw) && artifact.size > DEFAULT_MAX_BYTES {
+			let notice = format!(
+				"Unbounded raw read blocked for {pointer} ({}). Reading the whole artifact \
+				 verbatim can exhaust memory. Use {pointer}:raw:1-3000 for bounded verbatim \
+				 chunks, {pointer}:1-3000 for numbered exploration, and the artifact file path \
+				 for search/copy workflows: {}",
+				format_bytes(artifact.size),
+				artifact.path.display(),
+			);
+			let mut details = Some(json!({
+				"resolvedPath": artifact.path.display().to_string()
+			}));
+			attach_artifact_resource(&mut details, url, &artifact);
+			return Ok(result_with_details(
+				notice,
+				details.unwrap_or(Value::Null),
+				false,
+			));
+		}
+		let outcome = match parsed {
+			Sel::Lines { ranges, raw } if ranges.len() > 1 => {
+				read_multi_range(
+					&source,
+					ranges,
+					*raw,
+					self.sink.as_deref(),
+					display_mode,
+					ctx,
+				)
+				.await
+			},
+			Sel::Lines { ranges, raw } => {
+				read_single_range(
+					&source,
+					ranges[0],
+					*raw,
+					self.sink.as_deref(),
+					display_mode,
+					ctx,
+				)
+				.await
+			},
+			Sel::Raw | Sel::None => {
+				read_single_range(
+					&source,
+					LineRange { start_line: 1, end_line: None },
+					raw_selector,
+					self.sink.as_deref(),
+					display_mode,
+					ctx,
+				)
+				.await
+			},
+			Sel::Conflicts | Sel::Image => unreachable!("rejected before artifact resolution"),
+		};
+		match outcome {
+			Ok(mut result) => {
+				if !raw_selector && artifact.size > DEFAULT_MAX_BYTES {
+					result
+						.content
+						.push_str(&format!("\n\n[{}]", artifact_workflow_notice(&artifact, &pointer)));
+				}
+				attach_artifact_resource(&mut result.details, url, &artifact);
+				Ok(result)
+			},
+			Err(message) => Ok(tool_result(message, true)),
+		}
+	}
+
 	/// Render a `conflict://<N>` (or `conflict://<N>/<scope>`) region as
 	/// regular file content. Lines keep their original file numbers so hashline
 	/// anchors line up with the source file; no truncation footer is appended.
@@ -359,6 +454,12 @@ impl Tool for ReadTool {
 					),
 					true,
 				));
+			}
+			// `artifact://` pages the backing file directly: the router's full
+			// resolution refuses >8 MiB artifacts, while ranged reads must stay
+			// available at any size.
+			if scheme == internal_urls_artifact::ARTIFACT_SCHEME {
+				return self.read_artifact(base, &parsed, ctx).await;
 			}
 			let resource = match router
 				.resolve(base, &self.scope.resolve_context(&ctx.cwd, &ctx.cancellation_token))
@@ -1189,6 +1290,10 @@ fn internal_scheme(raw: &str) -> Option<String> {
 /// 50 KiB limits nor return a resource's unbounded `content` verbatim.
 pub(super) enum TextSource<'a> {
 	File { path: &'a Path, size: u64 },
+	/// A resolved `artifact://` file. Ranges stream from the file exactly like
+	/// a plain-file read, so an artifact over the snapshot cap is never
+	/// materialized just to page it.
+	Artifact { path: &'a Path, size: u64, url: &'a str },
 	Memory {
 		url:   &'a str,
 		bytes: &'a [u8],
@@ -1203,32 +1308,40 @@ pub(super) enum TextSource<'a> {
 impl<'a> TextSource<'a> {
 	fn size(&self) -> u64 {
 		match self {
-			Self::File { size, .. } => *size,
+			Self::File { size, .. } | Self::Artifact { size, .. } => *size,
 			Self::Memory { bytes, .. } => bytes.len() as u64,
 		}
 	}
 
 	fn path(&self) -> Option<&Path> {
 		match self {
-			Self::File { path, .. } => Some(path),
+			Self::File { path, .. } | Self::Artifact { path, .. } => Some(path),
 			Self::Memory { path, .. } => *path,
 		}
 	}
 
 	/// Whether writing back through this source's addressing scheme is
 	/// authorized. On-disk reads are writable; internal resources inherit the
-	/// handler capability only.
+	/// handler capability only, and artifacts are always read-only.
 	fn writable(&self) -> bool {
 		match self {
 			Self::File { .. } => true,
+			Self::Artifact { .. } => false,
 			Self::Memory { writable, .. } => *writable,
 		}
+	}
+
+	/// Immutable artifact reads must not register merge-conflict blocks: those
+	/// entries promise an editable target this source does not have.
+	fn is_immutable_artifact(&self) -> bool {
+		matches!(self, Self::Artifact { .. })
 	}
 
 	/// Label shown as `resolvedPath` / in errors.
 	/// Authored URL of an internal resource, when this source came from one.
 	fn memory_url(&self) -> Option<&str> {
 		match self {
+			Self::Artifact { url, .. } => Some(url),
 			Self::Memory { url, .. } => Some(url),
 			Self::File { .. } => None,
 		}
@@ -1236,7 +1349,7 @@ impl<'a> TextSource<'a> {
 
 	fn label(&self) -> String {
 		match self {
-			Self::File { path, .. } => path.display().to_string(),
+			Self::File { path, .. } | Self::Artifact { path, .. } => path.display().to_string(),
 			Self::Memory { url, .. } => (*url).to_string(),
 		}
 	}
@@ -1247,6 +1360,7 @@ impl<'a> TextSource<'a> {
 			Self::File { path, .. } => {
 				json!({ "type": "path", "value": path.display().to_string() })
 			},
+			Self::Artifact { url, .. } => json!({ "type": "internal", "value": url }),
 			Self::Memory { url, .. } => json!({ "type": "internal", "value": url }),
 		}
 	}
@@ -1315,6 +1429,43 @@ fn attach_internal_resource(details: &mut Option<Value>, resource: &InternalReso
 			"notes": resource.notes,
 		}),
 	);
+}
+
+/// Attach the artifact's routing metadata. `internalUrl` is never derived from
+/// the path: the scheme stays read-only and the caller's span stays the URL.
+fn attach_artifact_resource(
+	details: &mut Option<Value>,
+	url: &str,
+	artifact: &internal_urls_artifact::ResolvedArtifact,
+) {
+	let map = details.get_or_insert_with(|| json!({})).as_object_mut().expect("details object");
+	map.insert(
+		"internalUrl".into(),
+		json!({
+			"url": url,
+			"contentType": "text/plain",
+			"size": artifact.size,
+			"immutable": true,
+			"writable": false,
+			"isDirectory": false,
+			"sourcePath": artifact.path.display().to_string(),
+			"notes": Value::Null,
+		}),
+	);
+}
+
+/// TS `#formatArtifactWorkflowNotice`: how to page a large artifact without
+/// loading it whole.
+fn artifact_workflow_notice(
+	artifact: &internal_urls_artifact::ResolvedArtifact,
+	pointer: &str,
+) -> String {
+	format!(
+		"Artifact storage: {} ({}). Use {pointer}:N-M to page, {pointer}:raw:N-M for verbatim \
+		 chunks, and the artifact file path for search/copy workflows.",
+		artifact.path.display(),
+		format_bytes(artifact.size),
+	)
 }
 
 fn lower_path(path: &Path) -> String {
@@ -1601,11 +1752,13 @@ pub(super) async fn read_single_range(
 	let max_bytes = DEFAULT_MAX_BYTES.max(max_lines_to_collect * 512);
 
 	let buffered = match source {
-		TextSource::File { path, size } if *size <= SNAPSHOT_MAX_BYTES => {
+		TextSource::File { path, size } | TextSource::Artifact { path, size, .. }
+			if *size <= SNAPSHOT_MAX_BYTES =>
+		{
 			read_bounded_regular(path, SNAPSHOT_MAX_BYTES).await
 		},
 		TextSource::Memory { bytes, .. } => Some(bytes.to_vec()),
-		TextSource::File { .. } => None,
+		_ => None,
 	};
 	let (window, snapshot_text) = match buffered {
 		Some(bytes) => {
@@ -1624,11 +1777,14 @@ pub(super) async fn read_single_range(
 			(window, Some(text))
 		},
 		None => {
-			let TextSource::File { path, .. } = source else {
-				return Err(format!(
-					"Internal resource is too large to read ({}); use a line selector.",
-					format_bytes(file_size)
-				));
+			let path = match source {
+				TextSource::File { path, .. } | TextSource::Artifact { path, .. } => path,
+				TextSource::Memory { .. } => {
+					return Err(format!(
+						"Internal resource is too large to read ({}); use a line selector.",
+						format_bytes(file_size)
+					));
+				},
 			};
 			(
 			scan_window(
@@ -1813,7 +1969,7 @@ pub(super) async fn read_single_range(
 	// A window that surfaced a complete marker block registers it for
 	// `conflict://<N>` resolution and appends a compact footer.
 	let mut conflict_count: Option<usize> = None;
-	if !first_line_exceeds && !window.lines.is_empty() {
+	if !first_line_exceeds && !window.lines.is_empty() && !source.is_immutable_artifact() {
 		if let Some(path) = source.path() {
 			let writable = source.writable();
 			let blocks = super::conflict::scan_conflict_lines(&window.lines, display_start);
@@ -1895,11 +2051,13 @@ pub(super) async fn read_multi_range(
 	let mut total_lines: Option<u64> = None;
 
 	let buffered = match source {
-		TextSource::File { path, size } if *size <= SNAPSHOT_MAX_BYTES => {
+		TextSource::File { path, size } | TextSource::Artifact { path, size, .. }
+			if *size <= SNAPSHOT_MAX_BYTES =>
+		{
 			read_bounded_regular(path, SNAPSHOT_MAX_BYTES).await
 		},
 		TextSource::Memory { bytes, .. } => Some(bytes.to_vec()),
-		TextSource::File { .. } => None,
+		_ => None,
 	};
 	let snapshot_text = buffered.as_ref().map(|bytes| normalize_snapshot_text(bytes));
 
@@ -1922,11 +2080,14 @@ pub(super) async fn read_multi_range(
 				scan_bytes(source, range.start_line - 1, max_lines, max_bytes, max_lines, raw)
 			},
 			_ => {
-				let TextSource::File { path, .. } = source else {
-					return Err(format!(
-						"Internal resource is too large to read ({}); use a line selector.",
-						format_bytes(file_size)
-					));
+				let path = match source {
+					TextSource::File { path, .. } | TextSource::Artifact { path, .. } => path,
+					TextSource::Memory { .. } => {
+						return Err(format!(
+							"Internal resource is too large to read ({}); use a line selector.",
+							format_bytes(file_size)
+						));
+					},
 				};
 				scan_window(
 					path,
@@ -2908,6 +3069,7 @@ mod display_tests {
 
 	use super::*;
 	use crate::{
+		CancellationToken,
 		state::ToolResult,
 		tools::Tool as _,
 		tools::internal_urls::{InternalUrl, ProtocolHandler, ResolveContext, UrlScope},
@@ -3057,13 +3219,20 @@ mod display_tests {
 		let dir = TempDir::new("immutable");
 		let sink = Arc::new(TestSink::default());
 		let router = Arc::new(InternalUrlRouter::new());
-		for scheme in ["artifact", "agent", "memory"] {
+		// `artifact://` is built in and reserved; only the custom schemes mount
+		// a handler here.
+		for scheme in ["agent", "memory"] {
 			router.register(Arc::new(ImmutableHandler(scheme))).expect("register");
 		}
+		let artifacts = dir.0.join("artifacts");
+		fs::create_dir_all(&artifacts).expect("artifacts dir");
+		fs::write(artifacts.join("0.eval.log"), "alpha\nbeta\n").expect("artifact");
+		let mut scope = UrlScope::default();
+		scope.local_roots.insert("local".to_string(), artifacts);
 		let tool = ReadTool::with_snapshot_sink(sink.clone())
 			.with_display_inputs(FileDisplayInputs::new(EditMode::Hashline, true, true))
-			.with_internal_urls(router, Arc::new(UrlScope::default()));
-		for path in ["artifact://x", "agent://x", "memory://x"] {
+			.with_internal_urls(router, Arc::new(scope));
+		for path in ["artifact://0", "agent://x", "memory://x"] {
 			let result = read_with(&tool, &dir, path).await;
 			assert!(!result.is_error, "{}", result.content);
 			assert_eq!(result.content, "1|alpha\n2|beta");
@@ -3073,6 +3242,154 @@ mod display_tests {
 			assert_eq!(details["internalUrl"]["immutable"], json!(true));
 		}
 		assert!(sink.files.lock().expect("files").is_empty());
+	}
+
+	fn artifact_tool(roots: &[(&str, &Path)]) -> ReadTool {
+		let mut scope = UrlScope::default();
+		for (scheme, root) in roots {
+			scope.local_roots.insert((*scheme).to_string(), root.to_path_buf());
+		}
+		ReadTool::new().with_internal_urls(Arc::new(InternalUrlRouter::new()), Arc::new(scope))
+	}
+
+	#[tokio::test]
+	async fn artifact_same_id_prefers_shared_producer_root_over_child_local_dir() {
+		// A subagent adopts the parent's artifact manager (upstream `sdk.ts`
+		// subagent wiring), so the same id in the child's own directory must not
+		// shadow the shared producer file.
+		let dir = TempDir::new("artifact-priority");
+		let child_local = dir.0.join("subagents").join("task-1");
+		let producer = dir.0.join("artifacts");
+		fs::create_dir_all(&child_local).expect("child dir");
+		fs::create_dir_all(&producer).expect("producer dir");
+		fs::write(child_local.join("0.eval.log"), "child-local\n").expect("child artifact");
+		fs::write(producer.join("0.eval.log"), "root-producer\n").expect("producer artifact");
+		let tool = artifact_tool(&[("artifact", producer.as_path()), ("local", child_local.as_path())]);
+
+		let result = read_with(&tool, &dir, "artifact://0:raw:1-1").await;
+		assert!(!result.is_error, "{}", result.content);
+		assert_eq!(result.content, "root-producer");
+		let details = result.details.expect("details");
+		assert_eq!(
+			details["internalUrl"]["sourcePath"],
+			json!(producer.join("0.eval.log").display().to_string())
+		);
+		assert_eq!(details["meta"]["source"], json!({ "type": "internal", "value": "artifact://0" }));
+	}
+
+	#[tokio::test]
+	async fn artifact_same_id_is_scoped_to_the_calling_session() {
+		let left = TempDir::new("artifact-left");
+		let right = TempDir::new("artifact-right");
+		fs::write(left.0.join("0.eval.log"), "left\n").expect("left artifact");
+		fs::write(right.0.join("0.eval.log"), "right\n").expect("right artifact");
+		let left_tool = artifact_tool(&[("local", left.0.as_path())]);
+		let right_tool = artifact_tool(&[("local", right.0.as_path())]);
+
+		assert_eq!(read_with(&left_tool, &left, "artifact://0:raw").await.content, "left\n");
+		assert_eq!(read_with(&right_tool, &right, "artifact://0:raw").await.content, "right\n");
+	}
+
+	#[tokio::test]
+	async fn artifact_read_errors_are_exact_and_scoped() {
+		let dir = TempDir::new("artifact-errors");
+		let unbound = ReadTool::new()
+			.with_internal_urls(Arc::new(InternalUrlRouter::new()), Arc::new(UrlScope::default()));
+		let result = read_with(&unbound, &dir, "artifact://0").await;
+		assert!(result.is_error);
+		assert_eq!(
+			result.content,
+			"No session - artifacts unavailable: artifact:// needs the session artifacts \
+			 directory bound in UrlScope::local_roots"
+		);
+
+		let artifacts = dir.0.join("artifacts");
+		fs::create_dir_all(&artifacts).expect("artifacts dir");
+		fs::write(artifacts.join("0.eval.log"), "zero\n").expect("artifact");
+		let tool = artifact_tool(&[("local", artifacts.as_path())]);
+		assert_eq!(
+			read_with(&tool, &dir, "artifact://").await.content,
+			"artifact:// URL requires a numeric ID: artifact://0"
+		);
+		assert_eq!(
+			read_with(&tool, &dir, "artifact://abc").await.content,
+			"artifact:// ID must be numeric, got: abc"
+		);
+		assert_eq!(
+			read_with(&tool, &dir, "artifact://7").await.content,
+			"Artifact 7 not found. Available: 0"
+		);
+
+		let ctx = AgentContext::new(dir.0.clone());
+		ctx.cancellation_token.cancel();
+		let result = tool
+			.execute(&json!({ "path": "artifact://0" }), &ctx)
+			.await
+			.expect("read executes");
+		assert_eq!(result.content, "Read cancelled");
+	}
+
+	#[tokio::test]
+	async fn large_artifact_streams_ranges_and_refuses_full_resolution() {
+		let dir = TempDir::new("artifact-large");
+		let artifacts = dir.0.join("artifacts");
+		fs::create_dir_all(&artifacts).expect("artifacts dir");
+		let path = artifacts.join("0.eval.log");
+		let mut body = Vec::from(&b"first-line\n"[..]);
+		while body.len() as u64 <= internal_urls_artifact::MAX_INLINE_ARTIFACT_BYTES {
+			body.extend_from_slice(b"pad-line\n");
+		}
+		fs::write(&path, &body).expect("large artifact");
+		let tool = artifact_tool(&[("local", artifacts.as_path())]);
+
+		// Ranged reads stream from the file and stay available past the cap.
+		let ranged = read_with(&tool, &dir, "artifact://0:raw:1-2").await;
+		assert!(!ranged.is_error, "{}", ranged.content);
+		assert_eq!(ranged.content, "first-line\npad-line");
+
+		// Bounded, non-raw paging works and points at the storage path.
+		let paged = read_with(&tool, &dir, "artifact://0:1-2").await;
+		assert!(!paged.is_error, "{}", paged.content);
+		assert!(paged.content.starts_with("1|first-line\n2|pad-line"), "{}", paged.content);
+		assert!(paged.content.contains("Artifact storage:"), "{}", paged.content);
+
+		// A bare `:raw` would materialize the whole artifact, so it is refused.
+		let blocked = read_with(&tool, &dir, "artifact://0:raw").await;
+		assert!(!blocked.is_error, "{}", blocked.content);
+		assert!(blocked.content.contains("Unbounded raw read blocked"), "{}", blocked.content);
+
+		// The router's full-text resolution stays capped at 8 MiB.
+		let router = InternalUrlRouter::new();
+		let scope = UrlScope {
+			local_roots: std::collections::BTreeMap::from([(internal_urls::LOCAL_SCHEME.to_string(), artifacts)]),
+			..UrlScope::default()
+		};
+		let error = router
+			.resolve(
+				"artifact://0",
+				&scope.resolve_context(&dir.0, &CancellationToken::new()),
+			)
+			.await
+			.expect_err("full resolution refused");
+		assert!(error.contains("full internal resolution is blocked"), "{error}");
+	}
+
+	#[tokio::test]
+	async fn artifact_scheme_rejects_writes() {
+		let router = InternalUrlRouter::new();
+		assert!(router.get_handler("artifact").is_some());
+		let error = router
+			.write(
+				"artifact://0",
+				"x",
+				&UrlScope::default().write_context(Path::new("/w"), &CancellationToken::new()),
+			)
+			.await
+			.expect_err("read-only");
+		assert_eq!(
+			error,
+			"artifact:// URLs are read-only for write; use the protocol-specific tool for mutations."
+		);
 	}
 
 	#[test]
@@ -3105,7 +3422,7 @@ mod display_tests {
 		let result = read_with(&tool, &dir, "nope://x").await;
 		assert_eq!(
 			result.content,
-			"Unknown protocol: nope://\nSupported: issue://, local://, mcp://, notes://, pr://, ssh://"
+			"Unknown protocol: nope://\nSupported: artifact://, issue://, local://, mcp://, notes://, pr://, ssh://"
 		);
 	}
 

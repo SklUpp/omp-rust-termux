@@ -27,7 +27,8 @@ use crate::{
 		YieldTool,
 		edit_variants::{ResolvedSessionTools, SessionDisplayResolver, default_session_tools},
 		hashline::{self, NativeSnapshotSink, SnapshotStore},
-		internal_urls::{InternalUrlRouter, UrlScope},
+		internal_urls::{InternalUrlRouter, LOCAL_SCHEME, UrlScope},
+		internal_urls_artifact::ARTIFACT_SCHEME,
 		process::{ProcessBackend, ProcessManager},
 		read::ReadTool,
 		registry::ToolRegistry,
@@ -762,7 +763,16 @@ impl Supervisor {
 	}
 
 	/// Scope for one registry rebuild. A child gets its own transcript file and
-	/// artifacts directory; roots get the session scope installed above.
+	/// `local://` directory; roots get the session scope installed above.
+	///
+	/// Children mount eval with the root's shared `artifacts_dir`
+	/// (`CliEvalHost` clones one context for every owner), so their
+	/// `artifact://` root is the owning session's producer directory, pinned
+	/// ahead of the child's own `local://` root. This mirrors upstream, where a
+	/// subagent adopts the parent's artifact manager and `getArtifactsDir()`
+	/// returns that root (`sdk.ts` subagent wiring). The `local://` binding
+	/// itself is untouched: plan containment keeps resolving against the
+	/// child's directory.
 	fn url_scope_for(&self, owner: Option<&str>) -> Arc<UrlScope> {
 		if let Some(id) = owner
 			&& let Some(path) = self.child_session_file(id)
@@ -771,10 +781,19 @@ impl Supervisor {
 				.parent()
 				.map(std::path::Path::to_path_buf)
 				.unwrap_or_else(|| PathBuf::from("."));
-			return Arc::new(UrlScope {
-				session_file: Some(path),
-				local_roots:  BTreeMap::from([("local".to_string(), local_root)]),
-			});
+			let producer_root = {
+				let root_scope = self.url_scope.lock().unwrap_or_else(|poison| poison.into_inner());
+				root_scope
+					.local_roots
+					.get(ARTIFACT_SCHEME)
+					.or_else(|| root_scope.local_roots.get(LOCAL_SCHEME))
+					.cloned()
+			};
+			let mut local_roots = BTreeMap::from([(LOCAL_SCHEME.to_string(), local_root)]);
+			if let Some(producer_root) = producer_root {
+				local_roots.insert(ARTIFACT_SCHEME.to_string(), producer_root);
+			}
+			return Arc::new(UrlScope { session_file: Some(path), local_roots });
 		}
 		Arc::clone(&self.url_scope.lock().unwrap_or_else(|poison| poison.into_inner()))
 	}

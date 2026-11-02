@@ -13,6 +13,10 @@
 //! to the native OpenSSH client instead of routing frames through a host.
 //! The `mcp://` handler is built in and resolves live MCP sessions from
 //! [`crate::mcp::client`]'s process-wide registry.
+//! The `artifact://` handler is built in and lives in
+//! [`super::internal_urls_artifact`]: it reads a session's spilled tool output
+//! from roots bound in [`UrlScope::local_roots`], never a process-global
+//! registry.
 
 use std::{
 	collections::BTreeMap,
@@ -31,10 +35,11 @@ pub const LOCAL_SCHEME: &str = "local";
 
 /// OMP-owned namespaces a host may never replace: `security://` is reserved for
 /// the security review surface, `local://` for the built-in root handler,
-/// `ssh://` for the built-in native OpenSSH read handler, `mcp://` for the
-/// built-in MCP resource consumer, and `issue://`/`pr://` for the built-in
-/// native GitHub handlers.
-pub const RESERVED_SCHEMES: [&str; 6] = ["issue", "local", "mcp", "pr", "security", "ssh"];
+/// `artifact://` for the built-in spilled-output reader, `ssh://` for the
+/// built-in native OpenSSH read handler, `mcp://` for the built-in MCP resource
+/// consumer, and `issue://`/`pr://` for the built-in native GitHub handlers.
+pub const RESERVED_SCHEMES: [&str; 7] =
+	["artifact", "issue", "local", "mcp", "pr", "security", "ssh"];
 
 /// One parsed internal URL (`skill://plugin:name` style colons are preserved in
 /// the path because only the first `://` separates the scheme).
@@ -242,13 +247,17 @@ pub struct InternalUrlRouter {
 }
 
 impl Default for InternalUrlRouter {
-	/// Every constructor starts with the built-in `local://`, `ssh://`,
-	/// `mcp://`, `issue://`, and `pr://` handlers, so a session scope root, a
-	/// remote read, an MCP resource, and a GitHub issue or PR resolve without
-	/// an extra mount step.
+	/// Every constructor starts with the built-in `local://`, `artifact://`,
+	/// `ssh://`, `mcp://`, `issue://`, and `pr://` handlers, so a session scope
+	/// root, a spilled artifact, a remote read, an MCP resource, and a GitHub
+	/// issue or PR resolve without an extra mount step.
 	fn default() -> Self {
 		let mut handlers: BTreeMap<String, Arc<dyn ProtocolHandler>> = BTreeMap::new();
 		handlers.insert(LOCAL_SCHEME.to_string(), Arc::new(LocalRootHandler));
+		handlers.insert(
+			super::internal_urls_artifact::ARTIFACT_SCHEME.to_string(),
+			Arc::new(super::internal_urls_artifact::ArtifactUrlHandler),
+		);
 		handlers.insert(
 			super::ssh::SSH_SCHEME.to_string(),
 			Arc::new(super::ssh::SshProtocolHandler::new()),
@@ -584,7 +593,7 @@ impl ProtocolHandler for LocalRootHandler {
 
 /// Decode resource bytes as UTF-8; a capped read is cut back to the last valid
 /// character boundary instead of failing the whole read.
-fn decode_utf8(bytes: &[u8], truncated: bool, href: &str) -> Result<String, String> {
+pub(super) fn decode_utf8(bytes: &[u8], truncated: bool, href: &str) -> Result<String, String> {
 	match std::str::from_utf8(bytes) {
 		Ok(text) => Ok(text.to_string()),
 		Err(error) if truncated => Ok(std::str::from_utf8(&bytes[..error.valid_up_to()])
@@ -793,7 +802,7 @@ mod tests {
 			.expect_err("unknown");
 		assert_eq!(
 			error,
-			"Unknown protocol: nope://\nSupported: issue://, local://, mcp://, pr://, ssh://"
+			"Unknown protocol: nope://\nSupported: artifact://, issue://, local://, mcp://, pr://, ssh://"
 		);
 		router.register(Echo::new("notes", false, false)).expect("register");
 		let error = runtime()
@@ -801,7 +810,7 @@ mod tests {
 			.expect_err("unknown");
 		assert_eq!(
 			error,
-			"Unknown protocol: nope://\nSupported: issue://, local://, mcp://, notes://, pr://, ssh://"
+			"Unknown protocol: nope://\nSupported: artifact://, issue://, local://, mcp://, notes://, pr://, ssh://"
 		);
 		assert!(!router.can_handle("nope://x"));
 		assert!(router.can_handle("notes://x"));
@@ -833,6 +842,7 @@ mod tests {
 		assert_eq!(
 			router.schemes(),
 			vec![
+				"artifact".to_string(),
 				"issue".to_string(),
 				"local".to_string(),
 				"mcp".to_string(),
@@ -865,19 +875,33 @@ mod tests {
 	}
 
 	#[test]
-	fn builtin_local_is_reserved_and_cannot_be_replaced() {
+	fn builtin_local_and_artifact_are_reserved_and_cannot_be_replaced() {
 		let router = InternalUrlRouter::new();
 		assert_eq!(
 			router.schemes(),
-			vec!["issue".to_string(), "local".to_string(), "mcp".to_string(), "pr".to_string(), "ssh".to_string()]
+			vec![
+				"artifact".to_string(),
+				"issue".to_string(),
+				"local".to_string(),
+				"mcp".to_string(),
+				"pr".to_string(),
+				"ssh".to_string()
+			]
 		);
 		let error = router
 			.register(Echo::new("local", false, false))
 			.err()
 			.expect("reserved");
 		assert_eq!(error, "local:// is reserved for built-in handlers");
-		assert!(!router.unregister("local"));
-		assert!(router.get_handler("local").is_some());
+		let error = router
+			.register(Echo::new("artifact", false, false))
+			.err()
+			.expect("reserved");
+		assert_eq!(error, "artifact:// is reserved for built-in handlers");
+		for scheme in ["local", "artifact"] {
+			assert!(!router.unregister(scheme));
+			assert!(router.get_handler(scheme).is_some());
+		}
 	}
 
 	#[test]

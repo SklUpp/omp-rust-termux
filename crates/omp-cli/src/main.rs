@@ -1930,6 +1930,22 @@ impl Session<'_> {
 		// The launch resolved the live selection once; later prompts read that
 		// single owner, so a downgrade or reset is never re-armed by the flag.
 		let service_tier_by_family = self.service_tier_by_family.clone();
+		let session_file = session_persisted
+			.then(|| self.store.file().map(std::path::Path::to_path_buf))
+			.flatten();
+		// Session URLs resolve from this scope only: `local://` and `artifact://`
+		// both address the session's own artifacts directory, exactly as the RPC
+		// session scope does. An unpersisted run keeps the empty scope rather
+		// than inventing a directory.
+		let local_root = session_file
+			.as_deref()
+			.and_then(crate::session::artifacts_directory_for);
+		let url_scope = pi_agent::tools::internal_urls::UrlScope {
+			session_file: session_file.clone(),
+			local_roots:  local_root
+				.map(|dir| std::collections::BTreeMap::from([("local".to_string(), dir)]))
+				.unwrap_or_default(),
+		};
 		Ok(RunRequest {
 			prompt,
 			parts,
@@ -1950,9 +1966,7 @@ impl Session<'_> {
 			turn_ack: None,
 			todo_phases,
 			session_persisted,
-			session_file: session_persisted
-				.then(|| self.store.file().map(std::path::Path::to_path_buf))
-				.flatten(),
+			session_file,
 			session_id: session_persisted.then(|| self.store.id().to_string()),
 			config: self.config.clone(),
 			catalog: Arc::clone(&self.catalog),
@@ -1965,7 +1979,7 @@ impl Session<'_> {
 			acp_bridge: None,
 			extra_mcp_servers: Vec::new(),
 			internal_urls: Some(Arc::new(pi_agent::tools::InternalUrlRouter::new())),
-			url_scope: None,
+			url_scope: Some(Arc::new(url_scope)),
 			subagent_observer: None,
 			child_session_root: None,
 			goal: Some(Arc::clone(&self.goal)),

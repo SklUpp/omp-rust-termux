@@ -795,8 +795,26 @@ fn plan_yolo_guards_then_switches_and_resumes_on_default() {
 	assert!(!cwd.join("blocked.txt").exists(), "guard must block working-tree writes");
 	let plan = b.request(0);
 	assert_eq!(plan["model"], "model-b");
-	assert_eq!(occurrences(&plan, "Plan approved: **Plan**"), 1);
-	assert_eq!(occurrences(&plan, "local://plan-plan.md"), 1);
+	assert_eq!(
+		occurrences(&plan, "Plan approved: **Plan**"),
+		1,
+		"the typed plan-yolo handoff is injected exactly once"
+	);
+	let handoff = plan["messages"]
+		.as_array()
+		.expect("messages")
+		.iter()
+		.find(|message| {
+			message
+				.to_string()
+				.contains("Plan approved: **Plan**")
+		})
+		.expect("plan-yolo handoff message");
+	assert_eq!(
+		occurrences(handoff, "local://plan-plan.md"),
+		1,
+		"the handoff points at the plan once; history may legitimately repeat the path"
+	);
 	assert_eq!(fs::read_to_string(cwd.join("probe.txt")).expect("probe"), "done");
 
 	let log = session_file(&sessions, "plan-yolo-1");

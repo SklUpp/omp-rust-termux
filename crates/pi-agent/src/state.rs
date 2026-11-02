@@ -737,6 +737,7 @@ impl Message {
 			model: None,
 			attribution: Some(Attribution::Agent),
 			custom_type: Some(custom_type.into()),
+			disabled_features: None,
 		}
 	}
 

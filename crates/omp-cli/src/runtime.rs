@@ -8237,6 +8237,7 @@ mod tests {
 				timestamp_ms: None,
 				is_error: None,
 				extra: serde_json::Map::new(),
+				disabled_features: None,
 			},
 		);
 		let history = history_messages_from_entries(&[entry]).expect("history");

@@ -680,6 +680,7 @@ impl CodexSessionStore {
 						"message": message
 					}));
 					parent_id = Some(id);
+					disabled_features: None,
 				},
 				CodexConvertedItem::Model { model: item_model, .. } => {
 					entries.push(json!({
@@ -1443,6 +1444,7 @@ impl CodexConvertedItem {
 	fn timestamp(&self) -> u64 {
 		match self {
 			Self::Message { timestamp, .. }
+				disabled_features: None,
 			| Self::Model { timestamp, .. }
 			| Self::Compaction { timestamp, .. } => *timestamp,
 			Self::Pair { primary, .. } => primary.timestamp(),
@@ -2089,6 +2091,7 @@ fn rollback_codex_records(records: &mut Vec<CodexConvertedItem>, mut turns: usiz
 					user_index = Some(index);
 					break;
 				}
+				disabled_features: None,
 			}
 		}
 		let Some(idx) = user_index else {

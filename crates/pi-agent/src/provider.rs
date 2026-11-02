@@ -2028,6 +2028,7 @@ mod tests {
 			model: None,
 			attribution: None,
 			custom_type: None,
+			disabled_features: None,
 		};
 		let err = to_openai_messages(&[t1]).unwrap_err();
 		assert!(matches!(err, ProviderError::UnsupportedImage(_)));

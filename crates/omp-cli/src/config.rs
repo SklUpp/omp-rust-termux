@@ -1093,10 +1093,22 @@ impl Config {
 fn apply_nested_settings(config: &mut Config, value: &Value, path: &Path) -> Result<()> {
 	if let Some(tier) = value.get("tier").and_then(Value::as_map) {
 		for (family, item) in tier {
-			let Some(value) = expect_text(item, &format!("tier.{family}"), path)? else {
+			if !matches!(family.as_str(), "openai" | "anthropic" | "google") {
 				continue;
+			}
+			// TS `settings.ts:2650 deepMerge`: an explicit "none" or null in a
+			// higher layer must clear a lower layer's configured tier. We store
+			// "none" as a sentinel; `configured_service_tiers()` ignores it because
+			// `family_value` returns None.
+			let parsed = match item {
+				Value::Null => Some("none"),
+				_ => match expect_text(item, &format!("tier.{family}"), path)? {
+					Some(value) if value == "none" => Some("none"),
+					Some(value) => crate::service_tier::family_value(family, &value),
+					None => None,
+				},
 			};
-			let Some(tier) = crate::service_tier::family_value(family, &value) else {
+			let Some(tier) = parsed else {
 				continue;
 			};
 			match family.as_str() {
@@ -2325,6 +2337,37 @@ mod tests {
 		assert_eq!(base.tier_anthropic.as_deref(), Some("priority"));
 		assert_eq!(base.tier_openai.as_deref(), Some("flex"));
 		assert_eq!(base.tier_google, None);
+	}
+
+	#[test]
+	fn config_merge_clears_lower_tier_with_explicit_none_or_null() {
+		let mut base = Config::default();
+		base.tier_anthropic = Some("priority".to_string());
+		base.tier_openai = Some("flex".to_string());
+
+		let mut overlay = Config::default();
+		overlay.tier_anthropic = Some("none".to_string());
+		base.merge(overlay);
+		assert_eq!(base.tier_anthropic.as_deref(), Some("none"));
+		assert_eq!(base.tier_openai.as_deref(), Some("flex"));
+		// configured_service_tiers() drops "none" so the family is omitted
+		let live = base.configured_service_tiers();
+		assert_eq!(live.get("anthropic"), None);
+		assert_eq!(live.get("openai").map(String::as_str), Some("flex"));
+	}
+
+	#[test]
+	fn apply_nested_settings_preserves_none_and_null_clears() {
+		let yaml_val: Value =
+			yaml::parse("tier:
+  anthropic: none
+  openai: null
+").expect("yaml");
+		let mut config = Config::default();
+		apply_nested_settings(&mut config, &yaml_val, Path::new("settings.json")).expect("parse");
+		assert_eq!(config.tier_anthropic.as_deref(), Some("none"));
+		assert_eq!(config.tier_openai.as_deref(), Some("none"));
+		assert!(config.configured_service_tiers().is_empty());
 	}
 
 	fn parse_config(text: &str) -> Result<Config> {

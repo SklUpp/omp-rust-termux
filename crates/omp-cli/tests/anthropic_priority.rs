@@ -479,7 +479,7 @@ fn cli_priority_downgrade_reports_once_and_persists_the_reset() {
 	assert_eq!(body_field(&retry_body, "speed"), None);
 
 	// Resume with the same settings: the recorded reset still wins over configuration.
-	let second = run(&[]);
+	let second = run(&["--continue"]);
 	assert!(second.status.success(), "second run failed: {}", String::from_utf8_lossy(&second.stderr));
 	let (_head, body) = captured_rx.recv().expect("resumed request");
 	assert_eq!(body_field(&body, "speed"), None, "the reset survived resume");
@@ -662,7 +662,7 @@ fn downgrade_survives_a_tool_continuation_and_resume() {
 		assert_eq!(body_field(&body, "speed"), None, "{label} must omit speed");
 	}
 
-	let second = run(&[]);
+	let second = run(&["--continue"]);
 	assert!(
 		second.status.success(),
 		"second run failed: {}",
@@ -673,6 +673,94 @@ fn downgrade_survives_a_tool_continuation_and_resume() {
 		body_field(&resumed, "speed"),
 		None,
 		"resume walks the reset entry and stays downgraded"
+	);
+	server.join().expect("server");
+	let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Project-level `tier.anthropic: none` clears a global `priority` selection,
+/// matching TS `deepMerge` (settings.ts:2650) where an explicit "none" clears
+/// the lower layer. Consumer-observable check: no fast mode is requested.
+#[test]
+fn project_layer_explicit_none_clears_global_priority_and_omits_fast_mode() {
+	let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+	let addr = listener.local_addr().expect("addr");
+	let (captured_tx, captured_rx) = mpsc::channel::<(String, String)>();
+	let server = std::thread::spawn(move || {
+		let (mut socket, _) = listener.accept().expect("accept");
+		let captured = read_request(&mut socket);
+		captured_tx.send(captured).expect("capture");
+		respond(&mut socket, "200 OK", "text/event-stream", TURN);
+	});
+
+	let root = std::env::temp_dir().join(format!(
+		"omp-anthropic-priority-project-clear-{}-{}",
+		std::process::id(),
+		std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.expect("clock")
+			.as_nanos()
+	));
+	let agent = root.join("agent");
+	let cwd = root.join("work");
+	let sessions = root.join("sessions");
+	std::fs::create_dir_all(&agent).expect("agent dir");
+	std::fs::create_dir_all(&cwd).expect("cwd");
+
+	// Global/agent layer sets priority.
+	std::fs::write(
+		agent.join("config.yml"),
+		format!(
+			"defaultModel: anthropic/claude-priority\n\
+			 tier:\n  anthropic: priority\n\
+			 providers:\n  anthropic:\n    \
+			 baseUrl: \"http://{addr}/v1\"\n    api: anthropic-messages\n    apiKey: test-key\n"
+		),
+	)
+	.expect("config.yml");
+	std::fs::write(
+		agent.join("models.yml"),
+		format!(
+			"providers:\n  anthropic:\n    baseUrl: \"http://{addr}/v1\"\n    \
+			 api: anthropic-messages\n    apiKey: test-key\n    models:\n      - id: claude-priority\n\
+			 \x20       contextWindow: 200000\n"
+		),
+	)
+	.expect("models.yml");
+
+	// Project layer explicitly clears priority with "none".
+	std::fs::create_dir_all(cwd.join(".omp")).expect("project config dir");
+	std::fs::write(
+		cwd.join(".omp").join("settings.json"),
+		"{\"tier\":{\"anthropic\":\"none\"}}",
+	)
+	.expect("project settings.json");
+
+	let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_omp"));
+	command
+		.env("HOME", root.join("home"))
+		.env("PI_CODING_AGENT_DIR", &agent)
+		.args(["--cwd", cwd.to_str().expect("cwd")])
+		.args(["--session-dir", sessions.to_str().expect("sessions")])
+		.args(["--no-title", "--approval-mode", "yolo"])
+		.args(["-p", "answer quickly"])
+		.stdin(std::process::Stdio::null());
+	let output = command.output().expect("run omp");
+	assert!(
+		output.status.success(),
+		"run failed: {}",
+		String::from_utf8_lossy(&output.stderr)
+	);
+
+	let (head, body) = captured_rx.recv().expect("captured request");
+	assert!(
+		!head.to_ascii_lowercase().contains("fast-mode-2026-02-01"),
+		"fast-mode beta must be omitted when project layer clears priority: {head}"
+	);
+	assert_eq!(
+		body_field(&body, "speed"),
+		None,
+		"project layer 'none' must clear global priority tier"
 	);
 	server.join().expect("server");
 	let _ = std::fs::remove_dir_all(&root);

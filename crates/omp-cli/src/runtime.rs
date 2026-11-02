@@ -9027,4 +9027,114 @@ mod process_scope_tests {
 		);
 	}
 
+	/// A child spawned with the parent's live map resolves its own model and
+	/// inherits the selection: an Anthropic child provider sends fast mode.
+	#[tokio::test]
+	async fn child_provider_inherits_the_resolved_priority_tier() {
+		use std::io::{Read, Write};
+		use std::net::TcpListener;
+
+		let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+		let addr = listener.local_addr().expect("addr");
+		let (tx, rx) = std::sync::mpsc::channel::<String>();
+		let server = std::thread::spawn(move || {
+			let (mut socket, _) = listener.accept().expect("accept");
+			let mut buffer = Vec::new();
+			let mut chunk = [0u8; 4096];
+			let header_end = loop {
+				let read = socket.read(&mut chunk).expect("read");
+				assert!(read > 0, "client closed before the headers");
+				buffer.extend_from_slice(&chunk[..read]);
+				if let Some(position) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
+					break position + 4;
+				}
+			};
+			let head = String::from_utf8_lossy(&buffer[..header_end]).to_string();
+			let length = head
+				.lines()
+				.find_map(|line| {
+					let (name, value) = line.split_once(':')?;
+					name.eq_ignore_ascii_case("content-length")
+						.then(|| value.trim().parse::<usize>().ok())?
+				})
+				.unwrap_or(0);
+			while buffer.len() < header_end + length {
+				let read = socket.read(&mut chunk).expect("read body");
+				assert!(read > 0, "client closed before the body");
+				buffer.extend_from_slice(&chunk[..read]);
+			}
+			tx.send(format!(
+				"{head}\n---\n{}",
+				String::from_utf8_lossy(&buffer[header_end..header_end + length])
+			))
+			.expect("capture");
+			let body = "{\"id\":\"m\",\"type\":\"message\",\"role\":\"assistant\",\
+				\"content\":[{\"type\":\"text\",\"text\":\"ok\"}],\
+				\"stop_reason\":\"end_turn\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}";
+			let response = format!(
+				"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+				 Connection: close\r\n\r\n{body}",
+				body.len()
+			);
+			socket.write_all(response.as_bytes()).expect("write response");
+		});
+
+		let mut models = std::collections::BTreeMap::new();
+		models.insert("claude-child".to_string(), crate::catalog::ModelInfo {
+			provider: "anthropic".to_string(),
+			api: Some("anthropic-messages".to_string()),
+			base_url: Some(format!("http://{addr}/v1")),
+			max_tokens: Some(1024),
+			..crate::catalog::ModelInfo::default()
+		});
+		let mut providers = std::collections::BTreeMap::new();
+		providers.insert("anthropic".to_string(), models);
+		let catalog = crate::catalog::Catalog {
+			providers,
+			connections: std::collections::BTreeMap::new(),
+			source: std::path::PathBuf::from("models.json"),
+		};
+		let mut config = crate::config::Config::default();
+		config.providers.insert("anthropic".to_string(), crate::config::ProviderConfig {
+			api_key: Some("sk-ant-child-tier".to_string()),
+			..crate::config::ProviderConfig::default()
+		});
+
+		let factory = CliChildModelFactory {
+			config,
+			catalog: std::sync::Arc::new(catalog),
+			explicit_provider: None,
+			api_key: None,
+			default_model: None,
+			root_provider: None,
+			root_base_url: None,
+			credential_resolver: None,
+			session_id: None,
+			cancel: None,
+			service_tier_by_family: std::collections::BTreeMap::from([(
+				"anthropic".to_string(),
+				"priority".to_string(),
+			)]),
+		};
+		let child = factory
+			.resolve("anthropic/claude-child", None, None)
+			.expect("child provider");
+		let message = child
+			.provider
+			.complete(
+				&[pi_agent::Message::user("hi")],
+				&[],
+				&pi_agent::ToolChoice::Auto,
+			)
+			.await
+			.expect("child turn");
+		assert_eq!(message.content, "ok");
+		let captured = rx.recv().expect("captured request");
+		server.join().expect("server");
+		assert!(
+			captured.contains("\"speed\":\"fast\""),
+			"the child inherits the parent's priority tier: {captured}"
+		);
+	}
+
 }

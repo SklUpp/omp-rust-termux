@@ -46,17 +46,43 @@ pub struct ResolvedArtifact {
 }
 
 impl ResolvedArtifact {
-	/// Read the whole artifact from the verified descriptor. Callers check
-	/// [`Self::size`] against [`MAX_INLINE_ARTIFACT_BYTES`] first.
-	pub fn read_text(mut self, href: &str) -> Result<String, String> {
-		let capacity = usize::try_from(self.size)
-			.unwrap_or(0)
-			.min(MAX_INLINE_ARTIFACT_BYTES as usize);
-		let mut bytes = Vec::with_capacity(capacity);
-		self
-			.file
-			.read_to_end(&mut bytes)
-			.map_err(|error| format!("{href}: {error}"))?;
+	/// The verified leaf descriptor. Ranged readers consume this handle
+	/// instead of reopening [`Self::path`].
+	pub fn file(&self) -> &fs::File {
+		&self.file
+	}
+
+	/// Read the whole artifact from the verified descriptor in bounded chunks.
+	///
+	/// The metadata size checked before this call is stale: a same-UID writer
+	/// can grow the file after resolution, so the actual byte count is enforced
+	/// here. Cancellation is checked between chunks.
+	pub fn read_text(self, href: &str, signal: &crate::CancellationToken) -> Result<String, String> {
+		let Self { id, path, mut file, .. } = self;
+		let cap = MAX_INLINE_ARTIFACT_BYTES as usize;
+		let mut bytes: Vec<u8> = Vec::new();
+		let mut chunk = [0u8; 64 * 1024];
+		loop {
+			if signal.is_cancelled() {
+				return Err("aborted".to_string());
+			}
+			let read = file
+				.read(&mut chunk)
+				.map_err(|error| format!("{href}: {error}"))?;
+			if read == 0 {
+				break;
+			}
+			if bytes.len() + read > cap {
+				return Err(format!(
+					"Artifact {id} grew past the {cap} byte full-content cap while reading; full \
+					 internal resolution is blocked. Use read selectors such as artifact://{id}:1-3000 \
+					 or artifact://{id}:raw:1-3000, and use the artifact file path for search/copy \
+					 workflows: {}",
+					path.display()
+				));
+			}
+			bytes.extend_from_slice(&chunk[..read]);
+		}
 		decode_utf8(&bytes, false, href)
 	}
 }
@@ -269,7 +295,8 @@ impl ProtocolHandler for ArtifactUrlHandler {
 			));
 		}
 		let href = url.href.clone();
-		let content = tokio::task::spawn_blocking(move || artifact.read_text(&href))
+		let signal = context.signal.clone();
+		let content = tokio::task::spawn_blocking(move || artifact.read_text(&href, &signal))
 			.await
 			.map_err(|error| format!("{href}: artifact read task failed: {error}"))??;
 		let mut resource = InternalResource::text(&url.href, content);
@@ -335,7 +362,12 @@ mod tests {
 		assert_eq!(artifact.id, "2");
 		assert_eq!(artifact.path, root.join("2.eval.log"));
 		assert_eq!(artifact.size, 4);
-		assert_eq!(artifact.read_text("artifact://2").expect("text"), "two\n");
+		assert_eq!(
+			artifact
+				.read_text("artifact://2", &CancellationToken::new())
+				.expect("text"),
+			"two\n"
+		);
 
 		let error = runtime()
 			.block_on(resolve_artifact(&parse("artifact://1"), &context))
@@ -362,7 +394,12 @@ mod tests {
 			.block_on(resolve_artifact(&parse("artifact://0"), &context))
 			.expect("resolve");
 		assert_eq!(artifact.path, producer.join("0.eval.log"));
-		assert!(artifact.read_text("artifact://0").expect("text").contains("producer"));
+		assert!(
+			artifact
+				.read_text("artifact://0", &CancellationToken::new())
+				.expect("text")
+				.contains("producer")
+		);
 		fs::remove_dir_all(&local).ok();
 		fs::remove_dir_all(&producer).ok();
 	}
@@ -450,6 +487,38 @@ mod tests {
 			.block_on(resolve_artifact(&parse("artifact://0"), &context))
 			.expect("lookup still works");
 		assert_eq!(artifact.size, big.len() as u64);
+		fs::remove_dir_all(&root).ok();
+	}
+
+	#[test]
+	fn full_read_enforces_actual_bytes_after_growth_and_cancellation() {
+		let root = temp_dir("growth");
+		let path = root.join("0.eval.log");
+		fs::write(&path, "small\n").expect("small artifact");
+		let context = scope(&root);
+		let artifact = runtime()
+			.block_on(resolve_artifact(&parse("artifact://0"), &context))
+			.expect("resolve");
+		assert_eq!(artifact.size, 6);
+
+		// Same-UID growth after the metadata check: the descriptor sees the new
+		// bytes, so the bounded read must reject instead of allocating to EOF.
+		fs::write(&path, vec![b'x'; MAX_INLINE_ARTIFACT_BYTES as usize + 1])
+			.expect("grow artifact");
+		let error = artifact
+			.read_text("artifact://0", &CancellationToken::new())
+			.expect_err("growth cap");
+		assert!(error.contains("grew past"), "{error}");
+
+		let artifact = runtime()
+			.block_on(resolve_artifact(&parse("artifact://0"), &context))
+			.expect("re-resolve");
+		let signal = CancellationToken::new();
+		signal.cancel();
+		assert_eq!(
+			artifact.read_text("artifact://0", &signal).expect_err("cancelled"),
+			"aborted"
+		);
 		fs::remove_dir_all(&root).ok();
 	}
 }

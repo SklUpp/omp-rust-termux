@@ -236,11 +236,25 @@ impl ReadTool {
 			Ok(artifact) => artifact,
 			Err(message) => return Ok(tool_result(message, true)),
 		};
+		self.read_resolved_artifact(url, artifact, parsed, ctx).await
+	}
+
+	/// Render a read from an artifact whose leaf descriptor was already
+	/// verified. Splitting this from [`Self::read_artifact`] keeps the
+	/// descriptor authoritative: no read below reopens `artifact.path`.
+	async fn read_resolved_artifact(
+		&self,
+		url: &str,
+		artifact: internal_urls_artifact::ResolvedArtifact,
+		parsed: &Sel,
+		ctx: &AgentContext,
+	) -> Result<ToolResult, ToolError> {
 		let pointer = format!("artifact://{}", artifact.id);
 		let raw_selector = is_raw(parsed);
 		let display_mode = self.display_mode(raw_selector, true);
 		let source = TextSource::Artifact {
 			path: &artifact.path,
+			file: artifact.file(),
 			size: artifact.size,
 			url,
 		};
@@ -1271,6 +1285,19 @@ async fn read_bounded_regular(path: &Path, cap: u64) -> Option<Vec<u8>> {
 	((bytes.len() as u64) <= cap).then_some(bytes)
 }
 
+/// Read at most `cap` bytes from the artifact descriptor the resolver already
+/// verified. A clone is rewound first, so the source descriptor's offset is
+/// untouched and no pathname is reopened.
+async fn read_bounded_artifact(file: &std::fs::File, cap: u64) -> Option<Vec<u8>> {
+	let clone = file.try_clone().ok()?;
+	let mut file = tokio::fs::File::from_std(clone);
+	file.seek(io::SeekFrom::Start(0)).await.ok()?;
+	let mut limited = file.take(cap + 1);
+	let mut bytes = Vec::new();
+	limited.read_to_end(&mut bytes).await.ok()?;
+	((bytes.len() as u64) <= cap).then_some(bytes)
+}
+
 /// Sources with no edit path: hashline anchors would be dead weight, so
 /// `resolve_file_display_mode` drops them while still allowing line numbers.
 /// Mirrors upstream's `immutable` flag for `artifact://`, `agent://`, and
@@ -1290,10 +1317,15 @@ fn internal_scheme(raw: &str) -> Option<String> {
 /// 50 KiB limits nor return a resource's unbounded `content` verbatim.
 pub(super) enum TextSource<'a> {
 	File { path: &'a Path, size: u64 },
-	/// A resolved `artifact://` file. Ranges stream from the file exactly like
-	/// a plain-file read, so an artifact over the snapshot cap is never
-	/// materialized just to page it.
-	Artifact { path: &'a Path, size: u64, url: &'a str },
+	/// A resolved `artifact://` file. Reads consume the leaf descriptor the
+	/// resolver verified (`O_NOFOLLOW`, regular-file check) and never reopen a
+	/// pathname, so a leaf swapped after resolution cannot redirect the read.
+	Artifact {
+		path: &'a Path,
+		file: &'a std::fs::File,
+		size: u64,
+		url:  &'a str,
+	},
 	Memory {
 		url:   &'a str,
 		bytes: &'a [u8],
@@ -1675,9 +1707,38 @@ async fn scan_window(
 	raw: bool,
 	cancel: &CancellationToken,
 ) -> Result<Window, String> {
-	let mut file = open_regular(path)
+	let origin = path.display().to_string();
+	let file = open_regular(path)
 		.await
-		.map_err(|err| format!("Failed to read {}: {err}", path.display()))?;
+		.map_err(|err| format!("Failed to read {origin}: {err}"))?;
+	scan_reader(
+		file,
+		&origin,
+		file_size,
+		start_line,
+		max_lines,
+		max_bytes,
+		selected_limit,
+		raw,
+		cancel,
+	)
+	.await
+}
+
+/// Stream one range from an already-open handle. Artifact reads pass the leaf
+/// descriptor verified by the resolver, so no pathname is ever reopened.
+#[allow(clippy::too_many_arguments)]
+async fn scan_reader(
+	mut file: tokio::fs::File,
+	origin: &str,
+	file_size: u64,
+	start_line: u64,
+	max_lines: u64,
+	max_bytes: u64,
+	selected_limit: u64,
+	raw: bool,
+	cancel: &CancellationToken,
+) -> Result<Window, String> {
 	let mut state = ScanState::new(start_line, max_lines, max_bytes, selected_limit);
 	let stop_after_collect = file_size > SNAPSHOT_MAX_BYTES;
 	let mut chunk = [0u8; READ_CHUNK_SIZE];
@@ -1692,7 +1753,7 @@ async fn scan_window(
 		let read = file
 			.read(&mut chunk)
 			.await
-			.map_err(|err| format!("Failed to read {}: {err}", path.display()))?;
+			.map_err(|err| format!("Failed to read {origin}: {err}"))?;
 		if read == 0 {
 			break;
 		}
@@ -1726,6 +1787,40 @@ async fn scan_window(
 	})
 }
 
+/// Stream one artifact range from the verified leaf descriptor. The clone is
+/// rewound, and the pathname is never consulted again.
+#[allow(clippy::too_many_arguments)]
+async fn scan_artifact_window(
+	file: &std::fs::File,
+	file_size: u64,
+	start_line: u64,
+	max_lines: u64,
+	max_bytes: u64,
+	selected_limit: u64,
+	raw: bool,
+	cancel: &CancellationToken,
+) -> Result<Window, String> {
+	let clone = file
+		.try_clone()
+		.map_err(|err| format!("artifact descriptor: {err}"))?;
+	let mut file = tokio::fs::File::from_std(clone);
+	file.seek(io::SeekFrom::Start(0))
+		.await
+		.map_err(|err| format!("artifact descriptor: {err}"))?;
+	scan_reader(
+		file,
+		"artifact",
+		file_size,
+		start_line,
+		max_lines,
+		max_bytes,
+		selected_limit,
+		raw,
+		cancel,
+	)
+	.await
+}
+
 pub(super) async fn read_single_range(
 	source: &TextSource<'_>,
 	range: LineRange,
@@ -1752,10 +1847,11 @@ pub(super) async fn read_single_range(
 	let max_bytes = DEFAULT_MAX_BYTES.max(max_lines_to_collect * 512);
 
 	let buffered = match source {
-		TextSource::File { path, size } | TextSource::Artifact { path, size, .. }
-			if *size <= SNAPSHOT_MAX_BYTES =>
-		{
+		TextSource::File { path, size } if *size <= SNAPSHOT_MAX_BYTES => {
 			read_bounded_regular(path, SNAPSHOT_MAX_BYTES).await
+		},
+		TextSource::Artifact { file, size, .. } if *size <= SNAPSHOT_MAX_BYTES => {
+			read_bounded_artifact(file, SNAPSHOT_MAX_BYTES).await
 		},
 		TextSource::Memory { bytes, .. } => Some(bytes.to_vec()),
 		_ => None,
@@ -1776,30 +1872,41 @@ pub(super) async fn read_single_range(
 			);
 			(window, Some(text))
 		},
-		None => {
-			let path = match source {
-				TextSource::File { path, .. } | TextSource::Artifact { path, .. } => path,
-				TextSource::Memory { .. } => {
-					return Err(format!(
-						"Internal resource is too large to read ({}); use a line selector.",
-						format_bytes(file_size)
-					));
-				},
-			};
-			(
-			scan_window(
-				path,
-				file_size,
-				start_line,
-				max_lines_to_collect,
-				max_bytes,
-				selected_line_limit,
-				raw,
-				&ctx.cancellation_token,
-			)
-			.await?,
-			None,
-			)
+		None => match source {
+			TextSource::File { path, .. } => (
+				scan_window(
+					path,
+					file_size,
+					start_line,
+					max_lines_to_collect,
+					max_bytes,
+					selected_line_limit,
+					raw,
+					&ctx.cancellation_token,
+				)
+				.await?,
+				None,
+			),
+			TextSource::Artifact { file, .. } => (
+				scan_artifact_window(
+					file,
+					file_size,
+					start_line,
+					max_lines_to_collect,
+					max_bytes,
+					selected_line_limit,
+					raw,
+					&ctx.cancellation_token,
+				)
+				.await?,
+				None,
+			),
+			TextSource::Memory { .. } => {
+				return Err(format!(
+					"Internal resource is too large to read ({}); use a line selector.",
+					format_bytes(file_size)
+				));
+			},
 		},
 	};
 
@@ -2051,10 +2158,11 @@ pub(super) async fn read_multi_range(
 	let mut total_lines: Option<u64> = None;
 
 	let buffered = match source {
-		TextSource::File { path, size } | TextSource::Artifact { path, size, .. }
-			if *size <= SNAPSHOT_MAX_BYTES =>
-		{
+		TextSource::File { path, size } if *size <= SNAPSHOT_MAX_BYTES => {
 			read_bounded_regular(path, SNAPSHOT_MAX_BYTES).await
+		},
+		TextSource::Artifact { file, size, .. } if *size <= SNAPSHOT_MAX_BYTES => {
+			read_bounded_artifact(file, SNAPSHOT_MAX_BYTES).await
 		},
 		TextSource::Memory { bytes, .. } => Some(bytes.to_vec()),
 		_ => None,
@@ -2079,27 +2187,39 @@ pub(super) async fn read_multi_range(
 				let source: &[u8] = if raw { bytes } else { text.as_bytes() };
 				scan_bytes(source, range.start_line - 1, max_lines, max_bytes, max_lines, raw)
 			},
-			_ => {
-				let path = match source {
-					TextSource::File { path, .. } | TextSource::Artifact { path, .. } => path,
-					TextSource::Memory { .. } => {
-						return Err(format!(
-							"Internal resource is too large to read ({}); use a line selector.",
-							format_bytes(file_size)
-						));
-					},
-				};
-				scan_window(
-					path,
-					file_size,
-					range.start_line - 1,
-					max_lines,
-					max_bytes,
-					max_lines,
-					raw,
-					&ctx.cancellation_token,
-				)
-				.await?
+			_ => match source {
+				TextSource::File { path, .. } => {
+					scan_window(
+						path,
+						file_size,
+						range.start_line - 1,
+						max_lines,
+						max_bytes,
+						max_lines,
+						raw,
+						&ctx.cancellation_token,
+					)
+					.await?
+				},
+				TextSource::Artifact { file, .. } => {
+					scan_artifact_window(
+						file,
+						file_size,
+						range.start_line - 1,
+						max_lines,
+						max_bytes,
+						max_lines,
+						raw,
+						&ctx.cancellation_token,
+					)
+					.await?
+				},
+				TextSource::Memory { .. } => {
+					return Err(format!(
+						"Internal resource is too large to read ({}); use a line selector.",
+						format_bytes(file_size)
+					));
+				},
 			},
 		};
 		if window.stopped_by_bytes {
@@ -3288,6 +3408,48 @@ mod display_tests {
 
 		assert_eq!(read_with(&left_tool, &left, "artifact://0:raw").await.content, "left\n");
 		assert_eq!(read_with(&right_tool, &right, "artifact://0:raw").await.content, "right\n");
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn artifact_leaf_swap_cannot_redirect_a_resolved_read() {
+		let dir = TempDir::new("artifact-swap");
+		let artifacts = dir.0.join("artifacts");
+		fs::create_dir_all(&artifacts).expect("artifacts dir");
+		let leaf = artifacts.join("0.eval.log");
+		let outside = dir.0.join("outside.txt");
+		fs::write(&leaf, "inside\n").expect("artifact");
+		fs::write(&outside, "outside\n").expect("outside");
+		let mut scope = UrlScope::default();
+		scope.local_roots.insert("local".to_string(), artifacts.clone());
+		let scope = Arc::new(scope);
+		let tool = ReadTool::new()
+			.with_internal_urls(Arc::new(InternalUrlRouter::new()), Arc::clone(&scope));
+		let ctx = AgentContext::new(dir.0.clone());
+		let parsed_url = InternalUrl::parse("artifact://0").expect("url");
+		let resolved = internal_urls_artifact::resolve_artifact(
+			&parsed_url,
+			&scope.resolve_context(&dir.0, &CancellationToken::new()),
+		)
+		.await
+		.expect("resolve");
+
+		// Swap the verified leaf for a symlink to a file outside the artifact
+		// root. The resolved descriptor still names the original inode, so the
+		// read must return that content and never reopen the pathname.
+		fs::remove_file(&leaf).expect("unlink leaf");
+		std::os::unix::fs::symlink(&outside, &leaf).expect("symlink leaf");
+
+		let result = tool
+			.read_resolved_artifact("artifact://0", resolved, &Sel::Raw, &ctx)
+			.await
+			.expect("read executes");
+		assert!(!result.is_error, "{}", result.content);
+		assert_eq!(result.content, "inside\n");
+
+		// A fresh resolution rejects the swapped leaf instead of following it.
+		let fresh = read_with(&tool, &dir, "artifact://0:raw").await;
+		assert!(fresh.is_error, "{}", fresh.content);
 	}
 
 	#[tokio::test]

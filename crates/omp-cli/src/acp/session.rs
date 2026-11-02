@@ -176,6 +176,20 @@ impl AcpRecipe {
 			plan_enabled: true,
 		}
 	}
+
+	/// Reject two effective one-way startup switches before ACP opens any
+	/// session. Loaded sessions use `prewalk`; fresh ones use `prewalk_fresh`.
+	pub fn validate_startup_arms(&self) -> Result<(), String> {
+		if self.plan_yolo.is_some()
+			&& (self.prewalk.is_some() || self.prewalk_fresh.is_some())
+		{
+			return Err(
+				"--plan-yolo cannot be combined with an effective prewalk arm; choose one startup switch"
+					.to_string(),
+			);
+		}
+		Ok(())
+	}
 }
 
 /// Connection-scoped driver shared by every ACP session.

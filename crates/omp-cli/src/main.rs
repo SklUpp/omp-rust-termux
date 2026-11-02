@@ -1049,6 +1049,7 @@ fn run() -> std::result::Result<(), CliError> {
 		recipe.prewalk_fresh = fresh_prewalk.arm;
 		recipe.prewalk_explicit = cli.prewalk || cli.prewalk_into.is_some();
 		recipe.plan_yolo = plan_yolo_arm.clone();
+		recipe.validate_startup_arms().map_err(CliError::fail)?;
 		recipe.max_time = session.max_time;
 		recipe.max_turns = session.max_turns;
 		recipe.tools_enabled = session.tools_enabled;

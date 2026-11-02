@@ -68,7 +68,7 @@ struct LaunchArgs {
 	model: Option<String>,
 
 	/// Comma-separated model patterns defining the session's model scope.
-	#[arg(long, value_name = "MODELS")]
+	#[arg(long, value_name = "MODELS", overrides_with = "models")]
 	models: Option<String>,
 
 	/// Smol/fast model for lightweight tasks (or `PI_SMOL_MODEL`).

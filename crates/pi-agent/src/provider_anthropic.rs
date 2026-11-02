@@ -2708,18 +2708,12 @@ fn merge_metadata(into: &mut StreamChunk, chunk: StreamChunk) {
 	}
 }
 
-/// Fast-mode classification for a failure surfaced by the SSE stream rather
-/// than the HTTP status (`firstTokenTime === undefined` in TS).
+/// TS `matchesFastModeUnsupported` requires a concrete 400/429 status. An SSE
+/// `error` event carries no status, so it is surfaced, never retried.
 fn stream_error_is_fast_mode_unsupported(error: &ProviderError) -> bool {
 	match error {
 		ProviderError::HttpStatus(status, text) => is_fast_mode_unsupported(*status, text),
-		other => {
-			let text = other.to_string().to_ascii_lowercase();
-			(text.contains("invalid_request_error")
-				&& contains_word(&text, "speed")
-				&& text.contains("not support"))
-				|| (text.contains("rate_limit_error") && text.contains("fast mode"))
-		},
+		_ => false,
 	}
 }
 

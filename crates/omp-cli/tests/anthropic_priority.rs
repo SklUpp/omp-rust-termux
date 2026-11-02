@@ -439,6 +439,11 @@ fn cli_priority_downgrade_reports_once_and_persists_the_reset() {
 		),
 	)
 	.expect("models.yml");
+	std::fs::write(
+		agent.join("settings.json"),
+		"{\"tier\":{\"anthropic\":\"priority\"}}",
+	)
+	.expect("settings.json");
 
 	let run = |extra: &[&str]| {
 		let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_omp"));
@@ -454,7 +459,7 @@ fn cli_priority_downgrade_reports_once_and_persists_the_reset() {
 		command.output().expect("run omp")
 	};
 
-	let first = run(&["--service-tier", "priority"]);
+	let first = run(&[]);
 	assert!(first.status.success(), "first run failed: {}", String::from_utf8_lossy(&first.stderr));
 	let stderr = String::from_utf8_lossy(&first.stderr);
 	const NOTICE: &str =
@@ -477,36 +482,37 @@ fn cli_priority_downgrade_reports_once_and_persists_the_reset() {
 	let _ = std::fs::remove_dir_all(&root);
 }
 
-/// TS `anthropic.ts:2764-2783` also retries when the rejection arrives as a
-/// stream error before any observable output.
+/// TS `matchesFastModeUnsupported` needs a 400/429 status. An SSE `error`
+/// event carries none, so it is surfaced to the caller, never silently retried.
 #[test]
-fn streamed_rejection_before_first_token_retries_without_fast_mode() {
+fn streamed_rejection_is_surfaced_without_retry() {
 	let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
 	let addr = listener.local_addr().expect("addr");
 	let (captured_tx, captured_rx) = mpsc::channel::<(String, String)>();
 	let server = std::thread::spawn(move || {
 		let (mut socket, _) = listener.accept().expect("accept");
 		let captured = read_request(&mut socket);
-		captured_tx.send(captured).expect("capture reject");
+		captured_tx.send(captured).expect("capture");
 		respond(&mut socket, "200 OK", "text/event-stream", SSE_ERROR);
-		let (mut socket, _) = listener.accept().expect("accept");
-		let captured = read_request(&mut socket);
-		captured_tx.send(captured).expect("capture retry");
-		respond(&mut socket, "200 OK", "text/event-stream", TURN);
 	});
 
-	let (stops, disabled) = run(request(catalog(addr), &[("anthropic", "priority")]));
-	assert_eq!(stops.last().map(String::as_str), Some("stop"));
-	assert_eq!(
-		disabled.as_deref(),
-		Some(["priority".to_string()].as_slice()),
-		"the stream-level downgrade is reported"
+	let runner = PiAgentRunner::new().expect("runner");
+	let mut errors = 0usize;
+	let mut disabled = None;
+	for event in runner.run(&request(catalog(addr), &[("anthropic", "priority")])).expect("stream") {
+		match event {
+			Ok(Event::MessageEnd { message, .. }) => disabled = message.disabled_features,
+			Err(_) => errors += 1,
+			_ => {},
+		}
+	}
+	assert!(errors > 0, "the stream error must reach the caller");
+	assert!(disabled.is_none(), "no downgrade annotation without a status gate");
+	let _first = captured_rx.recv().expect("first request");
+	assert!(
+		captured_rx.try_recv().is_err(),
+		"no retry request is issued for a statusless stream error"
 	);
-	let (_head, reject_body) = captured_rx.recv().expect("reject request");
-	assert_eq!(body_field(&reject_body, "speed"), Some(&serde_json::json!("fast")));
-	let (retry_head, retry_body) = captured_rx.recv().expect("retry request");
-	assert!(!retry_head.to_ascii_lowercase().contains("fast-mode-2026-02-01"));
-	assert_eq!(body_field(&retry_body, "speed"), None);
 	server.join().expect("server");
 }
 
@@ -611,6 +617,11 @@ fn downgrade_survives_a_tool_continuation_and_resume() {
 		),
 	)
 	.expect("models.yml");
+	std::fs::write(
+		agent.join("settings.json"),
+		"{\"tier\":{\"anthropic\":\"priority\"}}",
+	)
+	.expect("settings.json");
 
 	let run = |extra: &[&str]| {
 		let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_omp"));
@@ -626,7 +637,7 @@ fn downgrade_survives_a_tool_continuation_and_resume() {
 		command.output().expect("run omp")
 	};
 
-	let first = run(&["--service-tier", "priority"]);
+	let first = run(&[]);
 	assert!(
 		first.status.success(),
 		"first run failed: {}",

@@ -1601,7 +1601,12 @@ impl Session<'_> {
 		Ok(())
 	}
 
-	fn request(&self, prompt: String, parts: Vec<ContentPart>, output_mode: OutputMode) -> RunRequest {
+	fn request(
+		&self,
+		prompt: String,
+		parts: Vec<ContentPart>,
+		output_mode: OutputMode,
+	) -> Result<RunRequest> {
 		let model = match (self.model.as_deref(), self.thinking) {
 			(Some(model), Some(level)) => Some(runtime::apply_thinking(model, level)),
 			(model, _) => model.map(str::to_string),
@@ -1614,13 +1619,9 @@ impl Session<'_> {
 			if let Some(warning) = self.store.branch_chain_warning() {
 				eprintln!("warning: {warning}");
 			}
-			match CheckpointHost::context_messages(&self.store) {
-				Ok(messages) => Some(messages),
-				Err(err) => {
-					eprintln!("warning: cannot rebuild branch context: {err}");
-					None
-				},
-			}
+			// Fail closed: a damaged journal must surface before the provider
+			// call instead of silently replaying a degraded conversation.
+			Some(CheckpointHost::context_messages(&self.store).map_err(Error::new)?)
 		} else {
 			None
 		};
@@ -1639,7 +1640,7 @@ impl Session<'_> {
 			runtime::latest_todo_phases_from_turns(&self.history)
 		};
 		let goal_context = self.goal_mode_context(&todo_phases);
-		RunRequest {
+		Ok(RunRequest {
 			prompt,
 			parts,
 			cwd: self.cwd.clone(),
@@ -1682,7 +1683,7 @@ impl Session<'_> {
 			credential_resolver: None,
 			plan_mode: Default::default(),
 			continuation: false,
-		}
+		})
 	}
 
 	fn turn<W: Write, E: Write>(
@@ -1856,7 +1857,7 @@ impl Session<'_> {
 			std::collections::HashMap::new();
 
 		let cancel_token = pi_agent::CancellationToken::new();
-		let mut request = self.request(full_prompt.clone(), turn_parts.clone(), mode);
+		let mut request = self.request(full_prompt.clone(), turn_parts.clone(), mode)?;
 		if !self.store.enabled() {
 			let user_message = runtime::user_message_from_parts(&full_prompt, &turn_parts)?;
 			self
@@ -1917,36 +1918,32 @@ impl Session<'_> {
 
 					let mut parts = Vec::new();
 					// Keep the streamed block order end to end: the persisted
-					// content array is the same order the deltas indexed.
+					// content array is the same order the deltas indexed, and
+					// signatures/redactions survive so a resume replays them.
+					let mut has_tool_part = false;
 					for part in &message.parts {
-						match part {
-							pi_agent::ContentPart::Thinking { thinking } => {
-								parts.push(ContentPart::thinking(thinking.clone()));
-							},
-							pi_agent::ContentPart::Text { text } => {
-								parts.push(ContentPart::text(text.clone()));
-							},
-							pi_agent::ContentPart::Image { .. } => {},
-						}
+						// Assistant content never persisted images before; keep
+						// that shape.
+						let Some(part) = ContentPart::from_agent_part(part) else {
+							continue;
+						};
+						has_tool_part |= part.kind == "toolCall";
+						parts.push(part);
 					}
-					if message.parts.is_empty() && !message.content.is_empty() {
+					if parts.is_empty() && !message.content.is_empty() {
 						parts.push(ContentPart::text(message.content.clone()));
 					}
-					for tc in &message.tool_calls {
-						let mut part = ContentPart {
-							kind: "toolCall".to_string(),
-							text: None,
-							data: None,
-							mime_type: None,
-							extra: serde_json::Map::new(),
-						};
-						part.extra
-							.insert("id".to_string(), serde_json::json!(tc.id));
-						part.extra
-							.insert("name".to_string(), serde_json::json!(tc.name));
-						part.extra
-							.insert("arguments".to_string(), tc.arguments.clone());
-						parts.push(part);
+					// Only legacy/completion messages lack ToolCall parts; append
+					// their execution projection at the end, never alongside
+					// ordered blocks.
+					if !has_tool_part {
+						for tc in &message.tool_calls {
+							parts.push(ContentPart::tool_call(
+								tc.id.clone(),
+								tc.name.clone(),
+								tc.arguments.clone(),
+							));
+						}
 					}
 					let content = if parts.is_empty() {
 						MessageContent::Text(String::new())
@@ -1954,8 +1951,12 @@ impl Session<'_> {
 						MessageContent::Parts(parts)
 					};
 
-					let asst_api = api
+					// The assembled message knows the route that actually served
+					// it; the event/config values only cover adapters that omit it.
+					let asst_api = message
+						.api
 						.clone()
+						.or_else(|| api.clone())
 						.or_else(|| {
 							provider
 								.as_deref()
@@ -1963,29 +1964,40 @@ impl Session<'_> {
 								.and_then(|p| session_config.providers.get(p).and_then(|c| c.api.clone()))
 						})
 						.unwrap_or_default();
-					let asst_provider = provider
+					let asst_provider = message
+						.provider
 						.clone()
+						.or_else(|| provider.clone())
 						.or_else(|| provider_fallback.map(str::to_string))
 						.unwrap_or_default();
-					let asst_model = model
+					let asst_model = message
+						.model
 						.clone()
+						.or_else(|| model.clone())
 						.or_else(|| model_fallback.map(str::to_string))
 						.unwrap_or_default();
 
 					let asst_id = format!("msg-{}", output::session_id());
-					let canon_stop = session::canonical_stop_reason(&stop_reason);
+					// The message's own terminal reason is authoritative; the
+					// event string only covers adapters that do not report one.
+					let canon_stop = message
+						.stop_reason
+						.map(pi_agent::StopReason::as_str)
+						.unwrap_or_else(|| session::canonical_stop_reason(&stop_reason));
 					let mut asst_msg = SessionMessage::assistant(
 						content,
 						asst_api,
 						asst_provider,
 						asst_model,
-						session::reported_usage(&message),
+						session::reported_usage(message),
 						canon_stop,
 						evt_ms,
 					);
-					if canon_stop == "aborted" {
-						asst_msg.error_message = Some("Interrupted by user".to_string());
-					}
+					asst_msg.error_message = message.error_message.clone().or_else(|| {
+						(canon_stop == "aborted").then(|| "Interrupted by user".to_string())
+					});
+					asst_msg.attribution =
+						message.attribution.map(|value| value.as_str().to_string());
 					let asst_entry = MessageEntry::new(
 						asst_id.clone(),
 						parent.take(),
@@ -2079,14 +2091,13 @@ impl Session<'_> {
 									Ok(messages) => {
 										decision.rewrite = Some(pi_agent::TurnRewrite::Replace(messages));
 									},
-									Err(err) => {
-										eprintln!("warning: {err}; falling back to branch history");
-										if let Ok(history) = store.branch_history()
-											&& let Ok(messages) = runtime::history_messages(&history)
-										{
-											decision.rewrite = Some(pi_agent::TurnRewrite::Replace(messages));
-										}
-									},
+									// A journal rebuild failure must not be papered over
+									// with the lossy TurnRecord projection: leave the
+									// loop unreplayed and let the next request fail
+									// closed instead of sending degraded context.
+									Err(err) => eprintln!(
+										"warning: cannot rebuild branch context after rewind: {err}"
+									),
 								}
 								*rewind_history = Some(applied.history);
 								*parent = store.leaf_id().map(str::to_string);

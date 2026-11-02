@@ -606,14 +606,17 @@ fn unwrap_delimited_thinking(open: &str, close: &str, text: &str) -> String {
 		start: usize,
 		end: usize,
 		cursor: usize,
-		segments: Vec<String>,
+		segments: usize,
+		piece_start: usize,
 		root: bool,
 	}
+	let mut pieces: Vec<String> = Vec::new();
 	let mut stack = vec![Level {
 		start,
 		end,
 		cursor: start,
-		segments: Vec::new(),
+		segments: 0,
+		piece_start: 0,
 		root: true,
 	}];
 	loop {
@@ -621,15 +624,13 @@ fn unwrap_delimited_thinking(open: &str, close: &str, text: &str) -> String {
 			return text.to_string();
 		};
 		if level.cursor >= level.end {
-			let mut level = stack.pop().expect("level");
-			let joined = match level.segments.len() {
-				0 => String::new(),
-				1 => level.segments.pop().expect("segment"),
-				_ => level.segments.join("\n"),
-			};
-			match stack.last_mut() {
-				Some(parent) => parent.segments.push(joined),
-				None => return joined,
+			let level = stack.pop().expect("level");
+			if stack.is_empty() {
+				// One final materialization; ancestors never re-copy subtrees.
+				return pieces.join("\n");
+			}
+			if level.segments == 0 {
+				pieces.push(String::new());
 			}
 			continue;
 		}
@@ -638,14 +639,12 @@ fn unwrap_delimited_thinking(open: &str, close: &str, text: &str) -> String {
 			// otherwise the trimmed body slice handed to the recursive call.
 			let level = stack.pop().expect("level");
 			let fallback = if level.root {
-				text.to_string()
+				return text.to_string();
 			} else {
 				text[level.start..level.end].to_string()
 			};
-			match stack.last_mut() {
-				Some(parent) => parent.segments.push(fallback),
-				None => return fallback,
-			}
+			pieces.truncate(level.piece_start);
+			pieces.push(fallback);
 			continue;
 		}
 		let Some(&(_, close_at)) = pairs
@@ -655,38 +654,37 @@ fn unwrap_delimited_thinking(open: &str, close: &str, text: &str) -> String {
 		else {
 			let level = stack.pop().expect("level");
 			let fallback = if level.root {
-				text.to_string()
+				return text.to_string();
 			} else {
 				text[level.start..level.end].to_string()
 			};
-			match stack.last_mut() {
-				Some(parent) => parent.segments.push(fallback),
-				None => return fallback,
-			}
+			pieces.truncate(level.piece_start);
+			pieces.push(fallback);
 			continue;
 		};
 		if close_at + close.len() > level.end {
 			let level = stack.pop().expect("level");
 			let fallback = if level.root {
-				text.to_string()
+				return text.to_string();
 			} else {
 				text[level.start..level.end].to_string()
 			};
-			match stack.last_mut() {
-				Some(parent) => parent.segments.push(fallback),
-				None => return fallback,
-			}
+			pieces.truncate(level.piece_start);
+			pieces.push(fallback);
 			continue;
 		}
 		let body_start = level.cursor + open.len();
 		let body_end = trim_ascii_end(text, body_start, close_at);
 		let body_start = trim_ascii_start(text, body_start, body_end);
 		level.cursor = trim_ascii_start(text, close_at + close.len(), level.end);
+		level.segments += 1;
+		let piece_start = pieces.len();
 		stack.push(Level {
 			start: body_start,
 			end: body_end,
 			cursor: body_start,
-			segments: Vec::new(),
+			segments: 0,
+			piece_start,
 			root: false,
 		});
 	}

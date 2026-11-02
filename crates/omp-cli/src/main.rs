@@ -2421,16 +2421,21 @@ impl Session<'_> {
 								);
 								guidance.clear();
 							} else {
-							let switch_thinking = action.switch_thinking.or_else(|| {
-								runtime::model_default_thinking(
+							// Explicit suffix wins; otherwise apply the target's
+							// declared default clamped through the same resolver.
+							let switch_thinking = action.switch_thinking.map(Some).or_else(|| {
+								match runtime::model_default_thinking(
 									&prewalk_catalog,
 									&target.provider,
 									&target.model,
-								)
+								) {
+									runtime::DefaultThinking::Unspecified => None,
+									runtime::DefaultThinking::Resolved(level) => Some(level),
+								}
 							});
 							let mut switch_target = target.clone();
 							if switch_target.effort.is_none()
-								&& let Some(runtime::CliThinking::Effort(effort)) =
+								&& let Some(Some(runtime::CliThinking::Effort(effort))) =
 									switch_thinking
 							{
 								switch_target.effort = Some(effort.to_string());
@@ -2603,7 +2608,9 @@ impl Session<'_> {
 		if let Some(applied) = prewalk_switch.take() {
 			self.provider = Some(applied.target.provider);
 			self.model = Some(applied.target.model);
-			self.thinking = applied.thinking.or(self.thinking);
+			if let Some(level) = applied.thinking {
+				self.thinking = level;
+			}
 			self.api_key = applied.api_key;
 			self.root_base_url = self
 				.provider

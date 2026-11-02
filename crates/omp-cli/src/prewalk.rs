@@ -245,7 +245,10 @@ impl PrewalkState {
 #[derive(Debug, Clone)]
 pub struct AppliedSwitch {
 	pub target: ModelSwitch,
-	pub thinking: Option<CliThinking>,
+	/// `None` preserves the previous selection; `Some(None)` clears it (the
+	/// target default resolved to no concrete level); `Some(Some(level))` sets
+	/// the explicit suffix or clamped target default.
+	pub thinking: Option<Option<CliThinking>>,
 	/// Credential the new provider was built with.
 	pub api_key: Option<String>,
 }

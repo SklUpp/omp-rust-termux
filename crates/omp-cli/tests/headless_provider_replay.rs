@@ -621,7 +621,7 @@ fn setup_same_provider_two_endpoints(
 	fs::write(
 		agent_dir.join("models.yml"),
 		format!(
-			"providers:\n  mockA:\n    api: openai-completions\n    apiKey: target-key\n    models:\n      - id: model-a\n        contextWindow: 128000\n        baseUrl: \"http://127.0.0.1:{a_port}/v1\"\n      - id: model-b\n        contextWindow: 128000\n        baseUrl: \"http://127.0.0.1:{b_port}/v1\"\n        reasoning: true\n        thinking:\n          efforts: [\"low\", \"high\"]\n          defaultLevel: high\n"
+			"providers:\n  mockA:\n    api: openai-completions\n    apiKey: target-key\n    models:\n      - id: model-a\n        contextWindow: 128000\n        baseUrl: \"http://127.0.0.1:{a_port}/v1\"\n      - id: model-b\n        contextWindow: 128000\n        baseUrl: \"http://127.0.0.1:{b_port}/v1\"\n        reasoning: true\n        thinking:\n          efforts: [\"low\", \"high\"]\n          defaultLevel: max\n"
 		),
 	)
 	.expect("models.yml");

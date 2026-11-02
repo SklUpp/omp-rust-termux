@@ -2461,16 +2461,20 @@ impl RpcSession {
 					);
 					guidance.clear();
 				} else {
-				let switch_thinking = action.switch_thinking.or_else(|| {
-					runtime::model_default_thinking(
+				let switch_thinking = action.switch_thinking.map(Some).or_else(|| {
+					match runtime::model_default_thinking(
 						&self.catalog,
 						&target.provider,
 						&target.model,
-					)
+					) {
+						runtime::DefaultThinking::Unspecified => None,
+						runtime::DefaultThinking::Resolved(level) => Some(level),
+					}
 				});
 				let mut switch_target = target.clone();
 				if switch_target.effort.is_none()
-					&& let Some(runtime::CliThinking::Effort(effort)) = switch_thinking
+					&& let Some(Some(runtime::CliThinking::Effort(effort))) =
+						switch_thinking
 				{
 					switch_target.effort = Some(effort.to_string());
 				}
@@ -2527,13 +2531,13 @@ impl RpcSession {
 						self.model = Some(target.model);
 						self.api_key = api_key;
 						if let Some(level) = switch_thinking {
-							self.thinking = Some(level);
+							self.thinking = level;
 							self.thinking_level = match level {
-								runtime::CliThinking::Off => Some("off".to_string()),
-								runtime::CliThinking::Auto => None,
-								runtime::CliThinking::Effort(effort) => {
+								Some(runtime::CliThinking::Off) => Some("off".to_string()),
+								Some(runtime::CliThinking::Effort(effort)) => {
 									Some(effort.to_string())
 								},
+								Some(runtime::CliThinking::Auto) | None => None,
 							};
 						}
 						self.provider_session_id = None;

@@ -3472,24 +3472,41 @@ pub fn thinking_suffix(model: &str) -> Option<CliThinking> {
 	split_thinking(model, -1).1.and_then(parse_cli_thinking)
 }
 
-/// Model-configured default thinking level (`thinking.defaultLevel`), applied
-/// on a model change when the target carries no explicit `:suffix`
-/// (`model-controls.ts:285-291`; explicit selectors always win).
+/// Declared target default thinking (`thinking.defaultLevel`) after the same
+/// clamping `setThinkingLevel` performs (`model-controls.ts:285-291,505-554`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DefaultThinking {
+	/// The model declares no `defaultLevel`: preserve the current selection.
+	Unspecified,
+	/// Declared default, clamped by [`resolve_thinking_effort`]. `None` is the
+	/// resolver's `undefined` result (e.g. a non-reasoning target), which clears
+	/// the selection rather than preserving it.
+	Resolved(Option<CliThinking>),
+}
+
+/// Model-configured default thinking level, clamped exactly through the
+/// existing resolver before the host applies it to the request and session.
 #[must_use]
 pub fn model_default_thinking(
 	catalog: &crate::catalog::Catalog,
 	provider: &str,
 	model: &str,
-) -> Option<CliThinking> {
-	catalog
+) -> DefaultThinking {
+	let Some(level) = catalog
 		.providers
-		.get(provider)?
-		.get(model)?
-		.thinking
-		.as_ref()?
-		.get("defaultLevel")?
-		.as_str()
+		.get(provider)
+		.and_then(|models| models.get(model))
+		.and_then(|info| info.thinking.as_ref())
+		.and_then(|thinking| thinking.get("defaultLevel"))
+		.and_then(serde_json::Value::as_str)
 		.and_then(parse_cli_thinking)
+	else {
+		return DefaultThinking::Unspecified;
+	};
+	DefaultThinking::Resolved(
+		resolve_thinking_effort(catalog, provider, model, Some(level))
+			.and_then(|effort| parse_cli_thinking(&effort)),
+	)
 }
 
 /// TS `resolveThinkingLevelForModel` (`thinking.ts:119-130`) over catalog

@@ -1740,7 +1740,7 @@ fn rpc_prewalk_does_not_carry_the_root_secret_to_an_alternate_endpoint() {
 			efforts: Some(vec!["low".to_string(), "high".to_string()]),
 			thinking: Some(json!({
 				"efforts": ["low", "high"],
-				"defaultLevel": "high"
+				"defaultLevel": "max"
 			})),
 			..ModelInfo::default()
 		},
@@ -1760,6 +1760,9 @@ fn rpc_prewalk_does_not_carry_the_root_secret_to_an_alternate_endpoint() {
 	}
 	launch.api_key = Some("root-secret".to_string());
 	launch.tools_enabled = true;
+	// Same gate as the CLI fixture: todo is not offered, so the switch does not
+	// wait for a todo call before the first write.
+	launch.config.tools = Some(vec!["write".to_string(), "read".to_string()]);
 	launch.max_turns = 8;
 	launch.prewalk = Some(PrewalkArm {
 		target: ModelSwitch {
@@ -1772,10 +1775,15 @@ fn rpc_prewalk_does_not_carry_the_root_secret_to_an_alternate_endpoint() {
 	});
 	let harness = Harness::start(launch);
 	harness.send(json!({ "type": "prompt", "id": "p1", "message": "write" }));
-	harness.wait_frame("agent_end", timeout());
+	let frames = harness.wait_frame("agent_end", timeout());
 
-	assert_eq!(a_requests.lock().expect("lock").len(), 1);
-	assert_eq!(b_requests.lock().expect("lock").len(), 1);
+	let a_count = a_requests.lock().expect("lock").len();
+	let b_count = b_requests.lock().expect("lock").len();
+	assert_eq!(
+		(a_count, b_count),
+		(1, 1),
+		"root/target requests before assertions; frames: {frames:#?}"
+	);
 	let root_auth = a_auth
 		.lock()
 		.expect("lock")

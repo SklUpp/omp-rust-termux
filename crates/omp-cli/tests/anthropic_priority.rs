@@ -326,3 +326,39 @@ fn service_tier_change_journals_strings_and_reset_survives_resume() {
 	assert!(tiers_json[1].is_null(), "the reset is null, never false");
 	let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// TS `forkSession` copies the branch log, so a fork restores the recorded
+/// service-tier selection exactly like resume.
+#[test]
+fn fork_restores_the_recorded_service_tier() {
+	let dir = std::env::temp_dir().join(format!(
+		"omp-anthropic-priority-fork-{}-{}",
+		std::process::id(),
+		std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.expect("clock")
+			.as_nanos()
+	));
+	std::fs::create_dir_all(&dir).expect("temp dir");
+	let mut store = SessionStore::open(&tier_options(dir.clone(), "tier-origin"));
+	store
+		.append_service_tier_change(&tiers(&[("anthropic", "priority")]))
+		.expect("append selection");
+	let source = store.file().map(std::path::Path::to_path_buf).expect("session file");
+	let fork = omp_cli::session::fork_session(&source, None, Some(&dir)).expect("fork");
+	let contents = std::fs::read_to_string(&fork).expect("fork log");
+	assert!(
+		contents.contains("\"type\":\"service_tier_change\""),
+		"the fork carries the recorded selection"
+	);
+	let mut options = tier_options(dir.clone(), "unused");
+	options.id = None;
+	options.continue_latest = true;
+	let forked = SessionStore::open(&options);
+	assert_eq!(
+		forked.service_tier_by_family(),
+		tiers(&[("anthropic", "priority")]),
+		"the fork restores the same selection"
+	);
+	let _ = std::fs::remove_dir_all(&dir);
+}

@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use futures::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 
-use crate::state::{Message, Role, TokenUsage, ToolCall};
+use crate::state::{Message, Role, StopReason, TokenUsage, ToolCall};
 
 /// TCP/TLS connect budget for a provider endpoint.
 ///
@@ -513,8 +513,14 @@ impl ModelProvider for OpenAiCompatibleProvider {
 		let choice = parsed.choices.into_iter().next().ok_or_else(|| {
 			ProviderError::Protocol("chat completion contained no choices".to_string())
 		})?;
+		let finish_reason = choice.finish_reason.clone();
 		let mut message = from_openai_response(choice.message);
 		message.usage = usage;
+		if let Some(reason) = finish_reason.as_deref() {
+			let (stop_reason, error_message) = map_openai_finish_reason(reason);
+			message.stop_reason = Some(stop_reason);
+			message.error_message = error_message;
+		}
 		Ok(message)
 	}
 
@@ -696,9 +702,22 @@ impl StreamAssembler {
 	) -> Result<(), ProviderError> {
 		let index = match index {
 			Some(index) => index,
-			None => match self.blocks.last_key_value() {
-				Some((&last, block)) if block.matches(kind) => last,
-				_ => self.next_index(),
+			None => {
+				// Legacy OpenAI-compatible deltas carry no content index. Tool
+				// calls live in the same map now, so a text delta arriving after
+				// a call must still join the previous text block instead of
+				// splitting the answer; only trailing tool blocks are skipped.
+				let mut index = self.next_index();
+				for (&candidate, block) in self.blocks.iter().rev() {
+					if block.matches(kind) {
+						index = candidate;
+						break;
+					}
+					if !matches!(block, AssembledBlock::ToolCall(_)) {
+						break;
+					}
+				}
+				index
 			},
 		};
 		match self.blocks.get_mut(&index) {
@@ -752,6 +771,14 @@ impl StreamAssembler {
 				delta.index
 			)));
 		};
+		// Two distinct tool slots may not claim one content block: the second
+		// would overwrite the first call's identity and splice its arguments.
+		if pending.tool_index != delta.index {
+			return Err(ProviderError::Protocol(format!(
+				"tool call {} claims content index {content_index} already owned by tool call {}",
+				delta.index, pending.tool_index
+			)));
+		}
 		pending.tool_index = delta.index;
 		if let Some(id) = &delta.id {
 			pending.id = Some(id.clone());
@@ -1017,6 +1044,10 @@ pub struct OpenAiChatResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenAiChoice {
 	pub message: OpenAiResponseMessage,
+	/// OpenAI-compatible terminal reason (TS `finish_reason`); absent when the
+	/// host reports none, never synthesized.
+	#[serde(default)]
+	pub finish_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1048,6 +1079,9 @@ pub struct OpenAiStreamChunk {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenAiStreamChoice {
 	pub delta: OpenAiDelta,
+	/// Terminal reason carried by the final delta chunk; absent otherwise.
+	#[serde(default)]
+	pub finish_reason: Option<String>,
 	/// vLLM-style per-choice usage; only read when the chunk has no top-level
 	/// `usage` (TS `parseChunkUsage` choice fallback).
 	#[serde(default)]
@@ -1397,6 +1431,31 @@ pub fn from_openai_response(resp_msg: OpenAiResponseMessage) -> Message {
 	message
 }
 
+/// Map an OpenAI-compatible `finish_reason` to the domain stop reason,
+/// mirroring TS `mapStopReason` (`openai-completions.ts`). Reasons are folded
+/// to lowercase because some gateways fronting Gemini emit `STOP`/`MAX_TOKENS`.
+fn map_openai_finish_reason(reason: &str) -> (StopReason, Option<String>) {
+	match reason.to_ascii_lowercase().as_str() {
+		"stop" | "end" => (StopReason::Stop, None),
+		"length" | "max_tokens" => (StopReason::Length, None),
+		"function_call" | "tool_calls" => (StopReason::ToolUse, None),
+		"content_filter" => {
+			(StopReason::Error, Some("Provider finish_reason: content_filter".to_string()))
+		},
+		"network_error" => {
+			(StopReason::Error, Some("Provider finish_reason: network_error".to_string()))
+		},
+		"error" => {
+			(StopReason::Error, Some("Provider returned error finish_reason".to_string()))
+		},
+		"insufficient_system_resource" => (
+			StopReason::Error,
+			Some("Provider returned error finish_reason: insufficient_system_resource".to_string()),
+		),
+		_ => (StopReason::Error, Some(format!("Provider finish_reason: {reason}"))),
+	}
+}
+
 /// First public reasoning field a chunk carries, ignoring empty strings.
 fn first_nonempty<'a, const N: usize>(candidates: [Option<&'a str>; N]) -> Option<&'a str> {
 	candidates.into_iter().flatten().find(|value| !value.is_empty())
@@ -1432,6 +1491,8 @@ pub fn parse_sse_line(line: &str) -> Option<Result<StreamChunk, ProviderError>> 
 		Ok(chunk) => {
 			let mut content = None;
 			let mut reasoning = None;
+			let mut stop_reason = None;
+			let mut error_message = None;
 			let mut tool_call_deltas = Vec::new();
 			// TS reads the top-level payload first and only falls back to the
 			// first choice's usage (vLLM-style hosts).
@@ -1443,6 +1504,11 @@ pub fn parse_sse_line(line: &str) -> Option<Result<StreamChunk, ProviderError>> 
 				.map(normalize_usage);
 
 			for choice in chunk.choices {
+				if let Some(reason) = choice.finish_reason.as_deref() {
+					let (mapped, message) = map_openai_finish_reason(reason);
+					stop_reason = Some(mapped);
+					error_message = message;
+				}
 				if let Some(delta) = choice.delta.content {
 					content = Some(delta);
 				}
@@ -1479,8 +1545,8 @@ pub fn parse_sse_line(line: &str) -> Option<Result<StreamChunk, ProviderError>> 
 				content_index: None,
 				signature: None,
 				redacted: None,
-				stop_reason: None,
-				error_message: None,
+				stop_reason,
+				error_message,
 			}))
 		},
 		Err(err) => Some(Err(ProviderError::Serialization(err))),

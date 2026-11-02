@@ -497,6 +497,89 @@ fn apply_turn_decision(messages: &mut Vec<Message>, decision: TurnAckDecision) -
 	continue_turn
 }
 
+/// Synthetic result for a call that must never run (TS
+/// `createSyntheticToolResultMessage`). The assistant's tool_use still needs a
+/// paired tool_result, so truncated and terminal turns persist this instead of
+/// executing partial arguments or leaving an orphan call.
+fn synthetic_tool_result(call: &ToolCall, reason: &str, error_message: Option<&str>) -> ToolResult {
+	let text = match reason {
+		"aborted" => "Tool execution was aborted",
+		"length" => "Tool call was not executed because the assistant hit its output token limit (stop_reason: length) before the arguments could complete; the recorded arguments are truncated and unsafe to run. Do NOT retry by re-emitting the same large payload — split the work into several smaller tool calls (e.g. for `write`/`edit`, write the first chunk then append the rest with subsequent `edit` insert ops, or break the file into multiple `write` targets)",
+		"error" => "Tool call was not executed because the provider stream ended with an error before the tool could run",
+		_ => "Tool call was not executed because the assistant ended its turn",
+	};
+	let content = match error_message {
+		Some(error) => format!("{text}: {error}"),
+		None => format!("{text}."),
+	};
+	let source = match reason {
+		"aborted" => "assistant_stop_aborted",
+		"length" => "assistant_stop_length",
+		"error" => "assistant_stop_error",
+		_ => "assistant_stop_skipped",
+	};
+	let mut details = serde_json::json!({
+		"__synthetic": true,
+		"source": source,
+		"executed": false,
+	});
+	if reason == "error"
+		&& let Some(error) = error_message
+	{
+		details["upstreamError"] = serde_json::Value::String(error.to_string());
+	}
+	ToolResult {
+		tool_call_id: call.id.clone(),
+		content,
+		is_error: true,
+		terminate: false,
+		details: Some(details),
+	}
+}
+
+/// Pair every assistant tool_call with a synthetic result, emitting the same
+/// start/end frames a real execution would (TS `createAbortedToolResult`), so
+/// the host's tool counters and history stay consistent without side effects.
+async fn pair_skipped_tool_calls(
+	assistant: &Message,
+	reason: &str,
+	error_message: Option<&str>,
+	events: Option<&mpsc::Sender<AgentEvent>>,
+	messages: &mut Vec<Message>,
+) -> Vec<ToolResult> {
+	let mut results = Vec::with_capacity(assistant.tool_calls.len());
+	for call in &assistant.tool_calls {
+		let result = synthetic_tool_result(call, reason, error_message);
+		if let Some(events_sink) = events {
+			let _ = events_sink
+				.send(AgentEvent::ToolStart {
+					id: call.id.clone(),
+					name: call.name.clone(),
+					arguments: call.arguments.clone(),
+				})
+				.await;
+			let _ = events_sink
+				.send(AgentEvent::ToolEnd {
+					id: result.tool_call_id.clone(),
+					name: call.name.clone(),
+					result: result.content.clone(),
+					is_error: true,
+					images: Vec::new(),
+					details: result.details.clone(),
+				})
+				.await;
+		}
+		messages.push(Message::tool_with_status(
+			&result.tool_call_id,
+			&call.name,
+			&result.content,
+			true,
+		));
+		results.push(result);
+	}
+	results
+}
+
 /// Agent execution engine: provider turn, tool batch, repeat.
 pub struct AgentLoop {
 	config: AgentConfig,
@@ -888,6 +971,49 @@ impl AgentLoop {
 					.await;
 			}
 
+			// TS `agent-loop.ts`: a terminal provider turn never runs tools.
+			// `error`/`aborted` still pair every call with a synthetic result so
+			// history stays answerable, but no side effect runs and no further
+			// provider request is issued.
+			if matches!(assistant.stop_reason, Some(StopReason::Error | StopReason::Aborted)) {
+				let reason = if assistant.stop_reason == Some(StopReason::Aborted) {
+					"aborted"
+				} else {
+					"error"
+				};
+				let results = pair_skipped_tool_calls(
+					&assistant,
+					reason,
+					assistant.error_message.as_deref(),
+					events.as_ref(),
+					&mut state.messages,
+				)
+				.await;
+				let ack_rx =
+					self.begin_turn_ack(turn_start, state.messages.len() + pending_injections.len());
+				if let Some(events_sink) = events.as_ref() {
+					let _ = events_sink
+						.send(AgentEvent::TurnEnd {
+							message: assistant.clone(),
+							tool_results: results.clone(),
+							status: assistant_status(&assistant, false),
+						})
+						.await;
+				}
+				for parts in pending_injections {
+					announce_user_steer(&events, &parts).await;
+					state.messages.push(Message::user_with_parts(parts));
+				}
+				let decision = self.await_turn_ack(ack_rx, &cancellation_token).await;
+				let _ = self.apply_turn_rewrite(&mut state.messages, decision);
+				turn_results.push(TurnResult {
+					message: assistant,
+					tool_results: results,
+					is_completed: true,
+				});
+				return Ok(turn_results);
+			}
+
 			if soft_non_compliant
 				&& let Some(requirement) = &soft_req
 			{
@@ -991,6 +1117,45 @@ impl AgentLoop {
 				});
 					continue;
 				}
+			}
+
+			// A `length` truncation cannot be replayed: the trailing tool_use
+			// arguments may be incomplete. Pair each call with a synthetic
+			// skipped result and re-sample, exactly like TS `agent-loop.ts`.
+			if assistant.stop_reason == Some(StopReason::Length)
+				&& !assistant.tool_calls.is_empty()
+			{
+				let results = pair_skipped_tool_calls(
+					&assistant,
+					"length",
+					None,
+					events.as_ref(),
+					&mut state.messages,
+				)
+				.await;
+				let ack_rx =
+					self.begin_turn_ack(turn_start, state.messages.len() + pending_injections.len());
+				if let Some(events_sink) = events.as_ref() {
+					let _ = events_sink
+						.send(AgentEvent::TurnEnd {
+							message: assistant.clone(),
+							tool_results: results.clone(),
+							status: assistant_status(&assistant, true),
+						})
+						.await;
+				}
+				for parts in pending_injections {
+					announce_user_steer(&events, &parts).await;
+					state.messages.push(Message::user_with_parts(parts));
+				}
+				let decision = self.await_turn_ack(ack_rx, &cancellation_token).await;
+				let _ = self.apply_turn_rewrite(&mut state.messages, decision);
+				turn_results.push(TurnResult {
+					message: assistant,
+					tool_results: results,
+					is_completed: false,
+				});
+				continue;
 			}
 
 			if assistant.tool_calls.is_empty() {

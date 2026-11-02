@@ -13,8 +13,8 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use pi_agent::{
-	Message, ModelProvider, OpenAiCompatibleProvider, ProviderError, StreamAssembler, StreamChunk,
-	ToolCallDelta, ToolChoice, parse_sse_line, sse_stream,
+	Message, ModelProvider, OpenAiCompatibleProvider, ProviderError, StopReason, StreamAssembler,
+	StreamChunk, ToolCallDelta, ToolChoice, parse_sse_line, sse_stream,
 };
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -169,6 +169,54 @@ fn assembler_merges_duplicate_indices_and_keeps_content_order() {
 		})
 		.collect();
 	assert_eq!(kinds, ["toolCall", "text", "toolCall", "toolCall"]);
+
+	// Legacy unindexed text stays one contiguous block across interleaved
+	// tool-call deltas; the answer must not split into `A`, `B`, `C`.
+	let text_blocks: Vec<&str> = message
+		.parts
+		.iter()
+		.filter_map(|part| match part {
+			pi_agent::ContentPart::Text { text } => Some(text.as_str()),
+			_ => None,
+		})
+		.collect();
+	assert_eq!(text_blocks, ["ABC"], "user-facing answer stays contiguous");
+}
+
+#[test]
+fn assembler_rejects_two_tool_slots_sharing_an_explicit_content_index() {
+	let explicit = |index: usize, content_index: usize, id: &str, args: &str| ToolCallDelta {
+		index,
+		id: Some(id.to_string()),
+		name: Some("read".to_string()),
+		arguments_delta: Some(args.to_string()),
+		content_index: Some(content_index),
+	};
+
+	let mut assembler = StreamAssembler::new();
+	assembler
+		.push(&chunk(None, vec![explicit(0, 0, "call_a", "{\"path\":\"a")]))
+		.expect("first slot");
+	// The same slot may continue its own block.
+	assembler
+		.push(&chunk(None, vec![explicit(0, 0, "call_a", ".txt\"}")]))
+		.expect("same slot continuation");
+	let err = assembler
+		.push(&chunk(None, vec![explicit(1, 0, "call_b", "{}")]))
+		.expect_err("second slot claiming the same block must fail loudly");
+	match err {
+		ProviderError::Protocol(message) => {
+			assert!(message.contains("already owned by tool call 0"), "{message}");
+		},
+		other => panic!("expected protocol error, got {other:?}"),
+	}
+
+	let message = assembler
+		.finish()
+		.expect("the failed second slot must not corrupt the first call");
+	assert_eq!(message.tool_calls.len(), 1);
+	assert_eq!(message.tool_calls[0].id, "call_a");
+	assert_eq!(message.tool_calls[0].arguments, json!({ "path": "a.txt" }));
 }
 
 #[tokio::test]
@@ -266,6 +314,91 @@ async fn complete_reports_empty_choices_and_invalid_json_as_protocol_errors() {
 		},
 		other => panic!("expected protocol error, got {other:?}"),
 	}
+}
+
+#[test]
+fn sse_finish_reason_maps_exactly_like_ts() {
+	fn mapped(reason: &str) -> (Option<StopReason>, Option<String>) {
+		let line =
+			format!("data: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"{reason}\"}}]}}");
+		let chunk = parse_sse_line(&line).expect("data line").expect("valid payload");
+		(chunk.stop_reason, chunk.error_message)
+	}
+
+	assert_eq!(mapped("stop"), (Some(StopReason::Stop), None));
+	assert_eq!(mapped("end"), (Some(StopReason::Stop), None));
+	assert_eq!(mapped("STOP"), (Some(StopReason::Stop), None), "gateways uppercase reasons");
+	assert_eq!(mapped("length"), (Some(StopReason::Length), None));
+	assert_eq!(mapped("max_tokens"), (Some(StopReason::Length), None));
+	assert_eq!(mapped("tool_calls"), (Some(StopReason::ToolUse), None));
+	assert_eq!(mapped("function_call"), (Some(StopReason::ToolUse), None));
+	assert_eq!(
+		mapped("content_filter"),
+		(Some(StopReason::Error), Some("Provider finish_reason: content_filter".to_string()))
+	);
+	assert_eq!(
+		mapped("network_error"),
+		(Some(StopReason::Error), Some("Provider finish_reason: network_error".to_string()))
+	);
+	assert_eq!(
+		mapped("error"),
+		(Some(StopReason::Error), Some("Provider returned error finish_reason".to_string()))
+	);
+	assert_eq!(
+		mapped("insufficient_system_resource"),
+		(
+			Some(StopReason::Error),
+			Some("Provider returned error finish_reason: insufficient_system_resource".to_string())
+		)
+	);
+	assert_eq!(
+		mapped("mystery"),
+		(Some(StopReason::Error), Some("Provider finish_reason: mystery".to_string()))
+	);
+
+	let absent =
+		parse_sse_line("data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}").unwrap().unwrap();
+	assert_eq!(absent.stop_reason, None, "absence stays absence");
+	assert_eq!(absent.error_message, None);
+}
+
+#[tokio::test]
+async fn openai_finish_reason_reaches_complete_and_stream_messages() {
+	let complete_body = r#"{"choices":[{"message":{"content":"","tool_calls":[{"id":"call_len","type":"function","function":{"name":"read","arguments":"{\"path\":\"a\"}"}}]},"finish_reason":"length"}]}"#;
+	let stream_body = concat!(
+		"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":\"content_filter\"}]}\n\n",
+		"data: [DONE]\n\n",
+	);
+	let url = serve_responses(vec![
+		response("200 OK", "application/json", complete_body),
+		response("200 OK", "text/event-stream", stream_body),
+	])
+	.await;
+	let provider = OpenAiCompatibleProvider::new(url, "key", "model").expect("provider");
+
+	let message = provider
+		.complete(&[Message::user("hi")], &[], &ToolChoice::Auto)
+		.await
+		.expect("complete");
+	assert_eq!(message.stop_reason, Some(StopReason::Length));
+	assert_eq!(message.error_message, None);
+	assert_eq!(message.tool_calls.len(), 1, "truncated turn keeps its call for skip pairing");
+
+	let mut stream = provider
+		.stream(&[Message::user("hi")], &[], &ToolChoice::Auto)
+		.await
+		.expect("stream");
+	let mut assembler = StreamAssembler::new();
+	while let Some(item) = stream.next().await {
+		assembler.push(&item.expect("chunk")).expect("assemble");
+	}
+	let streamed = assembler.finish().expect("streamed turn");
+	assert_eq!(streamed.stop_reason, Some(StopReason::Error));
+	assert_eq!(
+		streamed.error_message.as_deref(),
+		Some("Provider finish_reason: content_filter")
+	);
+	assert_eq!(streamed.content, "partial");
 }
 
 #[tokio::test]

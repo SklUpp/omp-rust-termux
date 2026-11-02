@@ -13,8 +13,8 @@ use pi_agent::{
 	AgentConfig, AgentError, AgentError::Interrupted, AgentEvent, AgentLoop, AgentState,
 	CancellationToken, ChunkStream, ContentPart, DelegationLimits, EditTool, GlobTool, GrepTool,
 	ImagePart, Message, ModelProvider, OpenAiCompatibleProvider, ProviderError, ReadTool, Role,
-	SteeringEvent, StreamAssembler, StreamChunk, Supervisor, Tool, ToolCall, ToolCallDelta,
-	ToolChoice, ToolRegistry, TurnStatus, WriteTool, parse_sse_line, sse_stream,
+	SteeringEvent, StopReason, StreamAssembler, StreamChunk, Supervisor, Tool, ToolCall,
+	ToolCallDelta, ToolChoice, ToolRegistry, TurnStatus, WriteTool, parse_sse_line, sse_stream,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use serde_json::json;
@@ -3652,6 +3652,126 @@ impl ModelProvider for RecordingProvider {
 	) -> Result<ChunkStream, ProviderError> {
 		Err(ProviderError::Protocol("recording provider has no stream".to_string()))
 	}
+}
+
+/// Side-effecting tool used to prove that truncated/terminal turns never run.
+struct ProbeTool {
+	calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Tool for ProbeTool {
+	fn name(&self) -> &str {
+		"probe"
+	}
+
+	fn description(&self) -> &str {
+		"records that it ran"
+	}
+
+	fn schema(&self) -> serde_json::Value {
+		json!({ "type": "object" })
+	}
+
+	async fn execute(
+		&self,
+		_args: &serde_json::Value,
+		_ctx: &pi_agent::AgentContext,
+	) -> Result<pi_agent::ToolResult, pi_agent::ToolError> {
+		self.calls.fetch_add(1, Ordering::SeqCst);
+		Ok(pi_agent::ToolResult {
+			tool_call_id: String::new(),
+			content: "executed".to_string(),
+			is_error: false,
+			terminate: false,
+			details: None,
+		})
+	}
+}
+
+fn probe_call(id: &str) -> ToolCall {
+	ToolCall {
+		id: id.to_string(),
+		name: "probe".to_string(),
+		arguments: json!({}),
+	}
+}
+
+#[tokio::test]
+async fn terminal_provider_turns_pair_calls_without_executing_or_resampling() {
+	for reason in [StopReason::Error, StopReason::Aborted] {
+		let dir = TempDir::new("terminal-stop");
+		let calls = Arc::new(AtomicUsize::new(0));
+		let mut message = Message::assistant_with_tools("", vec![probe_call("call_probe")]);
+		message.stop_reason = Some(reason);
+		message.error_message =
+			(reason == StopReason::Error).then(|| "upstream failed".to_string());
+		let provider = Arc::new(RecordingProvider::new(vec![Ok(message)]));
+		let mut registry = ToolRegistry::new();
+		registry.register(Arc::new(ProbeTool { calls: Arc::clone(&calls) }));
+		let agent = AgentLoop::new(config(&dir.path, 3), provider.clone(), registry);
+		let mut state = AgentState::default();
+
+		let turns = agent
+			.run_dialog("go", &mut state, None)
+			.await
+			.expect("terminal turn still returns");
+
+		assert_eq!(calls.load(Ordering::SeqCst), 0, "{reason:?} must not run tools");
+		assert_eq!(provider.requests().len(), 1, "{reason:?} must not resample");
+		assert_eq!(turns.len(), 1);
+		assert!(turns[0].is_completed);
+		assert_eq!(turns[0].tool_results.len(), 1);
+		assert!(turns[0].tool_results[0].is_error);
+		if reason == StopReason::Error {
+			assert!(
+				turns[0].tool_results[0].content.contains("upstream failed"),
+				"terminal error metadata survives: {}",
+				turns[0].tool_results[0].content
+			);
+		}
+		assert_eq!(
+			state.messages.iter().filter(|message| message.role == Role::Tool).count(),
+			1
+		);
+		assert_no_orphan_tool_calls(&state);
+	}
+}
+
+#[tokio::test]
+async fn length_turn_skips_tool_execution_and_resamples_with_paired_results() {
+	let dir = TempDir::new("length-stop");
+	let calls = Arc::new(AtomicUsize::new(0));
+	let mut truncated = Message::assistant_with_tools("", vec![probe_call("call_probe")]);
+	truncated.stop_reason = Some(StopReason::Length);
+	let provider =
+		RecordingProvider::new(vec![Ok(truncated), Ok(Message::assistant("done"))]);
+	let mut registry = ToolRegistry::new();
+	registry.register(Arc::new(ProbeTool { calls: Arc::clone(&calls) }));
+	let agent = AgentLoop::new(config(&dir.path, 3), Arc::new(provider), registry);
+	let mut state = AgentState::default();
+
+	let turns = agent.run_dialog("go", &mut state, None).await.expect("dialog");
+
+	assert_eq!(calls.load(Ordering::SeqCst), 0, "truncated calls must never run");
+	assert_eq!(turns.len(), 2);
+	assert_eq!(turns[0].tool_results.len(), 1);
+	let skipped = &turns[0].tool_results[0];
+	assert!(skipped.is_error);
+	assert!(skipped.content.contains("output token limit"), "{}", skipped.content);
+	assert_eq!(
+		skipped
+			.details
+			.as_ref()
+			.and_then(|details| details.get("source"))
+			.and_then(serde_json::Value::as_str),
+		Some("assistant_stop_length")
+	);
+	assert_eq!(
+		state.messages.iter().filter(|message| message.role == Role::Tool).count(),
+		1
+	);
+	assert_no_orphan_tool_calls(&state);
 }
 
 /// Staged preview under test: records every apply and can stage a follow-up

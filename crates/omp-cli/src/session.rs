@@ -205,6 +205,16 @@ pub struct Usage {
 
 impl From<pi_agent::TokenUsage> for Usage {
 	fn from(usage: pi_agent::TokenUsage) -> Self {
+		let mut extra = serde_json::Map::new();
+		// Anthropic cache-creation TTLs and server-tool counts are part of the
+		// provider usage snapshot (TS `usage.cttl`/`usage.server`); persist and
+		// host them through the `extra` passthrough instead of dropping them.
+		if let Some(cttl) = usage.cttl {
+			extra.insert("cttl".to_string(), serde_json::json!(cttl));
+		}
+		if let Some(server) = usage.server {
+			extra.insert("server".to_string(), serde_json::json!(server));
+		}
 		Self {
 			input: usage.input,
 			output: usage.output,
@@ -212,6 +222,7 @@ impl From<pi_agent::TokenUsage> for Usage {
 			cache_write: usage.cache_write,
 			total_tokens: usage.total_tokens,
 			reasoning_tokens: usage.reasoning_tokens,
+			extra,
 			..Self::default()
 		}
 	}
@@ -4384,6 +4395,33 @@ mod tests {
 			parent_session: None,
 			no_title: false,
 		}
+	}
+
+	#[test]
+	fn usage_extras_survive_conversion_and_session_serde_roundtrip() {
+		let token = pi_agent::TokenUsage {
+			input: 3,
+			output: 2,
+			total_tokens: 5,
+			cttl: Some(pi_agent::CacheTtlUsage {
+				ephemeral_5m: Some(10),
+				ephemeral_1h: Some(4),
+			}),
+			server: Some(pi_agent::ServerToolUsage { web_search: Some(2), web_fetch: None }),
+			..pi_agent::TokenUsage::default()
+		};
+		let usage = Usage::from(token);
+		let json = serde_json::to_value(&usage).expect("serialize usage");
+		assert_eq!(json["cttl"], json!({ "ephemeral5m": 10, "ephemeral1h": 4 }));
+		assert_eq!(json["server"], json!({ "webSearch": 2 }));
+
+		let resumed: Usage = serde_json::from_value(json).expect("resume parse");
+		assert_eq!(resumed, usage, "extra fields survive persistence and reload");
+		assert_eq!(
+			resumed.extra.get("cttl"),
+			Some(&json!({ "ephemeral5m": 10, "ephemeral1h": 4 }))
+		);
+		assert_eq!(resumed.extra.get("server"), Some(&json!({ "webSearch": 2 })));
 	}
 
 	fn turn(prompt: &str, assistant: &str) -> TurnRecord {

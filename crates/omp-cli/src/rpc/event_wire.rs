@@ -114,13 +114,22 @@ pub fn assistant_message(
 		}
 	}
 	let usage = message.usage.as_ref().map_or(Value::Null, |usage| {
-		json!({
+		let mut frame = json!({
 			"input": usage.input,
 			"output": usage.output,
 			"cacheRead": usage.cache_read,
 			"cacheWrite": usage.cache_write,
 			"totalTokens": usage.total_tokens,
-		})
+		});
+		// Same optional shape as the persisted `Usage` extras: present only
+		// when the provider reported them, never zero-filled.
+		if let Some(cttl) = usage.cttl {
+			frame["cttl"] = json!(cttl);
+		}
+		if let Some(server) = usage.server {
+			frame["server"] = json!(server);
+		}
+		frame
 	});
 	let mut wire = json!({
 		"role": "assistant",
@@ -417,6 +426,23 @@ mod tests {
 			frame["usage"].get("reasoningTokens").is_none(),
 			"only the TS counters reach the host"
 		);
+	}
+
+	#[test]
+	fn assistant_usage_carries_cttl_and_server_when_reported() {
+		let mut message = assistant(vec![ContentPart::text("x")], "x");
+		message.usage = Some(TokenUsage {
+			cttl: Some(pi_agent::CacheTtlUsage {
+				ephemeral_5m: Some(5),
+				ephemeral_1h: None,
+			}),
+			server: Some(pi_agent::ServerToolUsage { web_search: Some(1), web_fetch: None }),
+			..TokenUsage::default()
+		});
+
+		let frame = assistant_message(&message, "", "", "", "endTurn", 0);
+		assert_eq!(frame["usage"]["cttl"], json!({ "ephemeral5m": 5 }));
+		assert_eq!(frame["usage"]["server"], json!({ "webSearch": 1 }));
 	}
 
 	#[test]

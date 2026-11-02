@@ -186,8 +186,9 @@ const ANTHROPIC_TURN_TWO: &str = concat!(
 );
 
 /// The model's `anthropic-messages` dialect wins over the connection fallback,
-/// the `/v1` base is normalized to the adapter's `/v1/messages` endpoint, the key
-/// rides `x-api-key`, the catalog `maxTokens` caps the request, and the signed
+/// the `/v1` base is normalized to the adapter's `/v1/messages` endpoint, a
+/// non-official endpoint gets a bearer credential (never `x-api-key`), the
+/// catalog `maxTokens` caps the request, and the signed
 /// thinking block is replayed on the next turn.
 #[test]
 fn root_anthropic_dispatch_posts_messages_and_replays_signatures() {
@@ -228,7 +229,14 @@ fn root_anthropic_dispatch_posts_messages_and_replays_signatures() {
 	let (head, body) = captured_rx.recv().expect("first request");
 	assert!(head.starts_with("POST /v1/messages HTTP/1.1"), "{head}");
 	let lower = head.to_ascii_lowercase();
-	assert!(lower.contains("x-api-key: sk-ant-rootkey"), "{head}");
+	// Non-official endpoints authenticate with a bearer token; `x-api-key` is
+	// reserved for the first-party host (adapter policy, see the native
+	// non-official bearer fixture).
+	assert!(
+		lower.contains("authorization: bearer sk-ant-rootkey"),
+		"non-official endpoint must send the bearer credential: {head}"
+	);
+	assert!(!lower.contains("x-api-key"), "non-official endpoint must not send x-api-key: {head}");
 	assert!(lower.contains("anthropic-version:"), "{head}");
 	let body: serde_json::Value = serde_json::from_str(&body).expect("json body");
 	assert_eq!(body["model"], "claude-test");

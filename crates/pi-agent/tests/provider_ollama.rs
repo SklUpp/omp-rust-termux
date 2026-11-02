@@ -306,6 +306,95 @@ async fn foreign_history_thinking_demotes_to_target_dialect_text() {
 }
 
 #[tokio::test]
+async fn foreign_history_for_hermes_target_demotes_as_think_block() {
+	let (base, request_rx) = serve_once(response(
+		"200 OK",
+		"application/x-ndjson",
+		"{\"message\":{\"content\":\"ok\"},\"done\":true}\n",
+	))
+	.await;
+
+	let mut assistant = Message::assistant("");
+	assistant.parts = vec![
+		ContentPart::thinking("plan"),
+		ContentPart::text("answer"),
+	];
+	assistant.provider = Some("anthropic".into());
+	assistant.api = Some("anthropic-messages".into());
+	assistant.model = Some("claude-3".into());
+
+	let provider = make_provider(&base, "hermes-3");
+	provider
+		.complete(&[Message::user("hi"), assistant], &[], &ToolChoice::Auto)
+		.await
+		.expect("complete");
+
+	let (_, body) = request_rx.await.expect("request");
+	let history = &body["messages"][1];
+	assert_eq!(history["role"], "assistant");
+	assert!(history.get("thinking").is_none());
+	assert_eq!(
+		history["content"], "\x3cthink\x3e\nplan\n\x3c/think\x3e\nanswer",
+		"Hermes target must receive a delimited think block, not <thinking>"
+	);
+}
+
+#[tokio::test]
+async fn hermes_wire_unwraps_nested_sibling_and_keeps_partial_wrapper() {
+	let (base, request_rx) = serve_once(response(
+		"200 OK",
+		"application/x-ndjson",
+		"{\"message\":{\"content\":\"ok\"},\"done\":true}\n",
+	))
+	.await;
+	let foreign = |thinking: &str| {
+		let mut message = Message::assistant("");
+		message.parts = vec![
+			ContentPart::thinking(thinking),
+			ContentPart::text("answer"),
+		];
+		message.provider = Some("anthropic".into());
+		message.api = Some("anthropic-messages".into());
+		message.model = Some("claude-3".into());
+		message
+	};
+	let messages = vec![
+		Message::user("hi"),
+		foreign("plan"),
+		foreign("\x3cthink\x3e\n\x3cthink\x3e\nnested\n\x3c/think\x3e\n\x3c/think\x3e"),
+		foreign("\x3cthink\x3ea\x3c/think\x3e\x3cthink\x3eb\x3c/think\x3e"),
+		foreign("\x3cthink\x3epartial"),
+	];
+	let provider = make_provider(&base, "hermes-3");
+	provider
+		.complete(&messages, &[], &ToolChoice::Auto)
+		.await
+		.expect("complete");
+
+	let (_, body) = request_rx.await.expect("request");
+	let wire = body["messages"].as_array().expect("messages");
+	assert_eq!(
+		wire[1]["content"],
+		"\x3cthink\x3e\nplan\n\x3c/think\x3e\nanswer"
+	);
+	assert_eq!(
+		wire[2]["content"],
+		"\x3cthink\x3e\nnested\n\x3c/think\x3e\nanswer"
+	);
+	assert_eq!(
+		wire[3]["content"],
+		"\x3cthink\x3e\na\nb\n\x3c/think\x3e\nanswer"
+	);
+	assert_eq!(
+		wire[4]["content"],
+		"\x3cthink\x3e\n\x3cthink\x3epartial\n\x3c/think\x3e\nanswer"
+	);
+	for message in &wire[1..] {
+		assert!(message.get("thinking").is_none());
+	}
+}
+
+#[tokio::test]
 async fn cloud_dialect_caps_tokens_strips_history_thinking_and_demotes_system() {
 	let (base, request_rx) = serve_once(response(
 		"200 OK",
@@ -551,6 +640,26 @@ async fn held_partial_tail_is_visible_so_length_stays_length() {
 		.expect("complete");
 	assert_eq!(message.stop_reason, Some(StopReason::Length));
 	assert_eq!(message.content, "<");
+}
+
+#[tokio::test]
+async fn done_record_does_not_end_stream_before_eof() {
+	// A `done:true` record mid-stream must not stop reading; content before the
+	// real EOF is still assembled and the terminal chunk waits for EOF.
+	let body = concat!(
+		"{\"message\":{\"content\":\"early\"},\"done\":false}\n",
+		"{\"done\":true,\"done_reason\":\"stop\",\"eval_count\":1}\n",
+		"{\"message\":{\"content\":\"late\"},\"done\":true}\n",
+	);
+	let (base, _request_rx) =
+		serve_once(response("200 OK", "application/x-ndjson", body)).await;
+	let provider = make_provider(&base, "m");
+	let message = provider
+		.complete(&[Message::user("hi")], &[], &ToolChoice::Auto)
+		.await
+		.expect("complete");
+	assert_eq!(message.stop_reason, Some(StopReason::Stop));
+	assert_eq!(message.content, "earlylate");
 }
 
 #[tokio::test]
@@ -1178,8 +1287,38 @@ fn test_history_thinking_demotion_target_dialects() {
 		"```thinking\nstep 1\n```"
 	);
 	assert_eq!(
+		demote_thinking("gemma-2-9b", "step 1"),
+		"\x3cthink\x3e\nstep 1\n\x3c/think\x3e"
+	);
+	assert_eq!(
+		demote_thinking("hermes-3", "step 1"),
+		"\x3cthink\x3e\nstep 1\n\x3c/think\x3e"
+	);
+	assert_eq!(
+		demote_thinking("hermes-3", "\x3cthink\x3e\nstep 1\n\x3c/think\x3e"),
+		"\x3cthink\x3e\nstep 1\n\x3c/think\x3e"
+	);
+	assert_eq!(
+		demote_thinking(
+			"hermes-3",
+			"\x3cthink\x3e\n\x3cthink\x3e\nnested\n\x3c/think\x3e\n\x3c/think\x3e"
+		),
+		"\x3cthink\x3e\nnested\n\x3c/think\x3e"
+	);
+	assert_eq!(
+		demote_thinking(
+			"hermes-3",
+			"\x3cthink\x3ea\x3c/think\x3e\x3cthink\x3eb\x3c/think\x3e"
+		),
+		"\x3cthink\x3e\na\nb\n\x3c/think\x3e"
+	);
+	assert_eq!(
+		demote_thinking("hermes-3", "\x3cthink\x3epartial"),
+		"\x3cthink\x3e\n\x3cthink\x3epartial\n\x3c/think\x3e"
+	);
+	assert_eq!(
 		demote_thinking("random-model", "step 1"),
-		"<thinking>\nstep 1\n</thinking>"
+		"\x3cthinking\x3e\nstep 1\n\x3c/thinking\x3e"
 	);
 }
 
@@ -1210,6 +1349,35 @@ fn test_retry_backoff_and_header_parsing() {
 		date_hint >= Duration::from_secs(60 * 60 * 24 * 365 * 60),
 		"future HTTP date must produce a long hint: {date_hint:?}"
 	);
+
+	let mut rfc850_headers = reqwest::header::HeaderMap::new();
+	rfc850_headers.insert(
+		"retry-after",
+		"Sunday, 06-Nov-49 08:49:37 GMT".parse().unwrap(),
+	);
+	let rfc850_hint = extract_retry_hint(&rfc850_headers, "").expect("RFC850 hint");
+	assert!(
+		rfc850_hint >= Duration::from_secs(60 * 60 * 24 * 365 * 15),
+		"RFC850 2049 date must be far future: {rfc850_hint:?}"
+	);
+
+	let mut asctime_headers = reqwest::header::HeaderMap::new();
+	asctime_headers.insert(
+		"retry-after",
+		"Sun Nov  6 08:49:37 2094".parse().unwrap(),
+	);
+	let asctime_hint = extract_retry_hint(&asctime_headers, "").expect("asctime hint");
+	assert!(
+		asctime_hint >= Duration::from_secs(60 * 60 * 24 * 365 * 60),
+		"asctime future date must produce a long hint: {asctime_hint:?}"
+	);
+
+	let mut invalid_headers = reqwest::header::HeaderMap::new();
+	invalid_headers.insert(
+		"retry-after",
+		"Sun, 32 Nov 2094 08:49:37 GMT".parse().unwrap(),
+	);
+	assert_eq!(extract_retry_hint(&invalid_headers, ""), None);
 
 	// Test parse error exclusion
 	assert!(is_llama_cpp_parse_error("Failed to parse tool call arguments as JSON: syntax error"));

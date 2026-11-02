@@ -575,8 +575,11 @@ pub fn demote_thinking(model_id: &str, thinking: &str) -> String {
 		"anthropic" => thinking.to_string(),
 		"harmony" | "gemma" => format!("\x3cthink\x3e\n{thinking}\n\x3c/think\x3e"),
 		"gemini" => format!("```thinking\n{thinking}\n```"),
-		"qwen3" | "deepseek" | "kimi" | "glm" => {
-			format!("\x3cthink\x3e\n{thinking}\n\x3c/think\x3e")
+		"qwen3" | "deepseek" | "kimi" | "glm" | "hermes" => {
+			// TS `renderDelimitedThinking`: never double-wrap an already-delimited
+			// block (`dialect/rendering.ts:270-273`, Hermes `THINK_OPEN <think>`).
+			let inner = unwrap_delimited_thinking("\x3cthink\x3e", "\x3c/think\x3e", thinking);
+			format!("\x3cthink\x3e\n{inner}\n\x3c/think\x3e")
 		},
 		_ => {
 			let inner = unwrap_delimited_thinking("<thinking>", "</thinking>", thinking);
@@ -585,16 +588,85 @@ pub fn demote_thinking(model_id: &str, thinking: &str) -> String {
 	}
 }
 
-/// TS `unwrapDelimitedThinking` for the single wrapped case: never double-wrap
-/// reasoning that already carries the target dialect's tags.
+/// TS `unwrapDelimitedThinking` (`dialect/rendering.ts:250-267`): strips
+/// recursive complete wrappers and joins sibling complete wrappers with `\n`.
+/// Any partial/unbalanced wrapper returns the original text unchanged. ASCII
+/// trimming only, matching the source helpers.
 fn unwrap_delimited_thinking(open: &str, close: &str, text: &str) -> String {
-	let trimmed = text.trim();
-	if let Some(rest) = trimmed.strip_prefix(open)
-		&& let Some(inner) = rest.strip_suffix(close)
-	{
-		return inner.trim().to_string();
+	let end = trim_ascii_end(text, 0, text.len());
+	let mut cursor = trim_ascii_start(text, 0, end);
+	if cursor >= end || !text[cursor..].starts_with(open) {
+		return text.to_string();
 	}
-	text.to_string()
+	let mut segments = Vec::new();
+	while cursor < end {
+		if !text[cursor..].starts_with(open) {
+			return text.to_string();
+		}
+		let inner_start = cursor + open.len();
+		let Some(inner_end) = find_delimited_thinking_close(open, close, text, inner_start, end)
+		else {
+			return text.to_string();
+		};
+		let trimmed_end = trim_ascii_end(text, inner_start, inner_end);
+		let trimmed_start = trim_ascii_start(text, inner_start, trimmed_end);
+		segments.push(unwrap_delimited_thinking(
+			open,
+			close,
+			&text[trimmed_start..trimmed_end],
+		));
+		cursor = trim_ascii_start(text, inner_end + close.len(), end);
+	}
+	segments.join("\n")
+}
+
+/// Index of the `close` balancing the wrapper whose body starts at `from`.
+fn find_delimited_thinking_close(
+	open: &str,
+	close: &str,
+	text: &str,
+	from: usize,
+	end: usize,
+) -> Option<usize> {
+	let mut depth = 1usize;
+	let mut cursor = from;
+	while cursor < end {
+		let next_open = text[cursor..end].find(open).map(|index| cursor + index);
+		let next_close = text[cursor..end].find(close).map(|index| cursor + index);
+		match (next_open, next_close) {
+			(Some(open_at), Some(close_at)) if open_at < close_at => {
+				depth += 1;
+				cursor = open_at + open.len();
+			},
+			(_, Some(close_at)) => {
+				depth -= 1;
+				if depth == 0 {
+					return Some(close_at);
+				}
+				cursor = close_at + close.len();
+			},
+			_ => return None,
+		}
+	}
+	None
+}
+
+fn is_ascii_web_whitespace(byte: u8) -> bool {
+	matches!(byte, 9..=13 | 32)
+}
+
+fn trim_ascii_start(text: &str, mut start: usize, end: usize) -> usize {
+	while start < end && is_ascii_web_whitespace(text.as_bytes()[start]) {
+		start += 1;
+	}
+	start
+}
+
+fn trim_ascii_end(text: &str, start: usize, mut end: usize) -> usize {
+	while end > start && is_ascii_web_whitespace(text.as_bytes()[end - 1]) {
+		end -= 1;
+	}
+	end
 }
 
 impl OllamaProvider {
@@ -3410,13 +3482,84 @@ fn retry_unit_to_ms(unit: &str) -> Option<u64> {
 }
 
 fn parse_http_date_epoch(value: &str) -> Option<u64> {
-	// IMF-fixdate: `Sun, 06 Nov 1994 08:49:37 GMT`.
-	let parts: Vec<&str> = value.split_whitespace().collect();
-	if parts.len() != 6 || !parts[5].eq_ignore_ascii_case("GMT") {
+	let value = value.trim();
+	// `Date.parse` accepts all three HTTP-date forms: IMF-fixdate, RFC 850 and
+	// asctime. Comma-delimited forms share `weekday, rest`.
+	if let Some(comma) = value.find(',') {
+		let rest = value[comma + 1..].trim();
+		// IMF-fixdate: `06 Nov 1994 08:49:37 GMT`.
+		if let Some(epoch) = parse_imf_date(rest) {
+			return Some(epoch);
+		}
+		// RFC 850: `06-Nov-94 08:49:37 GMT`.
+		return parse_rfc850_date(rest);
+	}
+	// asctime: `Nov  6 08:49:37 1994` (weekday consumes the first token).
+	parse_asctime_date(value)
+}
+
+fn parse_imf_date(rest: &str) -> Option<u64> {
+	let parts: Vec<&str> = rest.split_whitespace().collect();
+	if parts.len() != 5 || !parts[4].eq_ignore_ascii_case("GMT") {
 		return None;
 	}
-	let day: u32 = parts[1].parse().ok()?;
-	let month = match parts[2].to_ascii_lowercase().as_str() {
+	let day: u32 = parts[0].parse().ok()?;
+	let month = http_month(parts[1])?;
+	let year: i32 = parts[2].parse().ok()?;
+	let (hour, minute, second) = parse_http_time(parts[3])?;
+	assemble_http_epoch(year, month, day, hour, minute, second)
+}
+
+fn parse_rfc850_date(rest: &str) -> Option<u64> {
+	let parts: Vec<&str> = rest.split_whitespace().collect();
+	if parts.len() != 3 || !parts[2].eq_ignore_ascii_case("GMT") {
+		return None;
+	}
+	let date: Vec<&str> = parts[0].split('-').collect();
+	if date.len() != 3 {
+		return None;
+	}
+	let day: u32 = date[0].parse().ok()?;
+	let month = http_month(date[1])?;
+	let short_year: i32 = date[2].parse().ok()?;
+	// HTTP/1.1 two-digit window: 00-49 → 2000s, 50-99 → 1900s.
+	let year = if short_year <= 49 {
+		2000 + short_year
+	} else {
+		1900 + short_year
+	};
+	let (hour, minute, second) = parse_http_time(parts[1])?;
+	assemble_http_epoch(year, month, day, hour, minute, second)
+}
+
+fn parse_asctime_date(value: &str) -> Option<u64> {
+	let parts: Vec<&str> = value.split_whitespace().collect();
+	if parts.len() != 5 {
+		return None;
+	}
+	let month = http_month(parts[1])?;
+	let day: u32 = parts[2].parse().ok()?;
+	let (hour, minute, second) = parse_http_time(parts[3])?;
+	let year: i32 = parts[4].parse().ok()?;
+	assemble_http_epoch(year, month, day, hour, minute, second)
+}
+
+fn parse_http_time(value: &str) -> Option<(u64, u64, u64)> {
+	let parts: Vec<&str> = value.split(':').collect();
+	if parts.len() != 3 {
+		return None;
+	}
+	let hour: u64 = parts[0].parse().ok()?;
+	let minute: u64 = parts[1].parse().ok()?;
+	let second: u64 = parts[2].parse().ok()?;
+	if hour > 23 || minute > 59 || second > 59 {
+		return None;
+	}
+	Some((hour, minute, second))
+}
+
+fn http_month(value: &str) -> Option<u32> {
+	Some(match value.to_ascii_lowercase().as_str() {
 		"jan" => 1,
 		"feb" => 2,
 		"mar" => 3,
@@ -3430,15 +3573,20 @@ fn parse_http_date_epoch(value: &str) -> Option<u64> {
 		"nov" => 11,
 		"dec" => 12,
 		_ => return None,
-	};
-	let year: i32 = parts[3].parse().ok()?;
-	let time: Vec<&str> = parts[4].split(':').collect();
-	if time.len() != 3 {
+	})
+}
+
+fn assemble_http_epoch(
+	year: i32,
+	month: u32,
+	day: u32,
+	hour: u64,
+	minute: u64,
+	second: u64,
+) -> Option<u64> {
+	if !(1..=31).contains(&day) {
 		return None;
 	}
-	let hour: u64 = time[0].parse().ok()?;
-	let minute: u64 = time[1].parse().ok()?;
-	let second: u64 = time[2].parse().ok()?;
 	let days = days_from_civil(year, month, day);
 	let seconds = days
 		.checked_mul(86_400)?

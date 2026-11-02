@@ -2790,7 +2790,7 @@ impl SessionStore {
 	/// A persisted session owns the `local://` artifact directory, independent
 	/// of which tools are mounted. Plan writes fail at the root open otherwise.
 	fn ensure_artifacts_directory(&mut self) {
-		if !self.enabled {
+		if !self.enabled || self.is_v1 {
 			return;
 		}
 		let Some(artifacts) = self.file().and_then(artifacts_directory_for) else {

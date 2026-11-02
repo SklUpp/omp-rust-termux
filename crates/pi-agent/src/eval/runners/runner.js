@@ -372,13 +372,88 @@ async function pool(items, fn) {
 	return results;
 }
 
+const LOCAL_URL_RE = /^([a-z][a-z0-9+.-]*):\/\/(.*)$/i;
+
+function withinRoot(candidate, root) {
+	return candidate === root || candidate.startsWith(root.endsWith(path.sep) ? root : root + path.sep);
+}
+
+/** Resolve a path through its longest existing prefix, including dangling links. */
+function realpathLoose(target, hops = 0) {
+	if (hops > 40) throw new Error(`symlink depth exceeded: ${target}`);
+	try {
+		return fs.realpathSync(target);
+	} catch (error) {
+		if (error.code !== "ENOENT" && error.code !== "ENOTDIR") throw error;
+	}
+	let link = false;
+	try {
+		link = fs.lstatSync(target).isSymbolicLink();
+	} catch (error) {
+		if (error.code !== "ENOENT") throw error;
+	}
+	if (link) {
+		return realpathLoose(path.resolve(path.dirname(target), fs.readlinkSync(target)), hops + 1);
+	}
+	const parent = path.dirname(target);
+	if (parent === target) return target;
+	return path.join(realpathLoose(parent), path.basename(target));
+}
+
+/**
+ * Validate a root-mapped helper path and flatten an internal symlink to its
+ * real relative target so the host's `O_NOFOLLOW` walk does not reject it.
+ * Components stay literal, exactly as the host `local://` handler opens them:
+ * no percent decoding and no backslash normalization. Escapes (existing external
+ * link, dangling leaf, new file below a symlinked parent) throw before the
+ * bridge call. This is a best-effort path check, not race-proof containment: the
+ * host's descriptor traversal remains authoritative for bridged work, and plain
+ * paths / arbitrary eval are not sandboxed.
+ */
+function localHelperTarget(rawPath) {
+	const match = LOCAL_URL_RE.exec(rawPath);
+	if (!match) return rawPath;
+	const scheme = match[1].toLowerCase();
+	let roots = {};
+	try {
+		roots = JSON.parse(managedEnv.PI_EVAL_LOCAL_ROOTS ?? envSnapshot.PI_EVAL_LOCAL_ROOTS ?? "{}");
+	} catch {
+		roots = {};
+	}
+	const root = roots && typeof roots === "object" && !Array.isArray(roots) ? roots[scheme] : undefined;
+	if (typeof root !== "string" || root.length === 0) return rawPath;
+	const rootPath = path.resolve(root);
+	const relative = match[2];
+	if (relative === "") return rawPath;
+	if (path.isAbsolute(relative)) {
+		throw new Error(`Absolute paths are not allowed in ${scheme}:// URLs: ${rawPath}`);
+	}
+	const normalized = path.normalize(relative);
+	if (normalized === ".." || normalized.startsWith(`..${path.sep}`)) {
+		throw new Error(`Path traversal (..) is not allowed in ${scheme}:// URLs: ${rawPath}`);
+	}
+	const resolved = path.resolve(rootPath, normalized);
+	if (!withinRoot(resolved, rootPath)) throw new Error(`${scheme}:// path escapes its root: ${rawPath}`);
+	const realRoot = realpathLoose(rootPath);
+	const realParent = realpathLoose(path.dirname(resolved));
+	if (!withinRoot(realParent, realRoot)) throw new Error(`${scheme}:// path escapes its root: ${rawPath}`);
+	const realTarget = realpathLoose(resolved);
+	if (!withinRoot(realTarget, realRoot)) throw new Error(`${scheme}:// path escapes its root: ${rawPath}`);
+	if (realTarget === resolved) return rawPath;
+	const relativeTarget = path.relative(realRoot, realTarget);
+	if (relativeTarget === "") return rawPath;
+	// The host `local://` handler opens components literally (no percent
+	// decoding), so join the raw real-relative path instead of encoding it.
+	return `${scheme}://${relativeTarget.split(path.sep).join("/")}`;
+}
+
 const helpers = {
 	display,
 	log: message => status("log", { message: String(message) }),
 	phase: title => status("phase", { title: String(title) }),
 	status,
 	async read(file, options = {}) {
-		let target = String(file);
+		let target = localHelperTarget(String(file));
 		const offset = typeof options.offset === "number" ? options.offset : 1;
 		const limit = typeof options.limit === "number" ? options.limit : undefined;
 		if (offset > 1 || limit !== undefined) {
@@ -387,7 +462,10 @@ const helpers = {
 		return textFrom(await bridgeCall("read", { path: target }));
 	},
 	async write(file, data) {
-		return await bridgeCall("write", { path: String(file), content: String(data) });
+		return await bridgeCall("write", {
+			path: localHelperTarget(String(file)),
+			content: String(data),
+		});
 	},
 	env: (key, fallback) => {
 		const name = String(key);

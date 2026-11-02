@@ -5,7 +5,6 @@ if "__omp_prelude_loaded__" not in globals():
     __omp_prelude_loaded__ = True
     from pathlib import Path
     import os, json, math, re
-    from urllib.parse import unquote
 
     INTENT_FIELD = "i"
 
@@ -79,6 +78,30 @@ if "__omp_prelude_loaded__" not in globals():
             return result["text"]
         return result
 
+    def _within_root(path: str, root: str) -> bool:
+        return path == root or path.startswith(root if root.endswith(os.sep) else root + os.sep)
+
+    def _check_contained_realpath(root_path: str, resolved: str, scheme: str, path: str) -> None:
+        """Best-effort containment check for symlinked roots, parents and leaves.
+
+        Matches the host's realpath containment contract: an internal symlink is
+        followed, while a link that resolves outside the root is rejected —
+        including a dangling leaf and a new file below a symlinked parent. A
+        path check cannot survive a concurrent swap, so this is not race-proof
+        containment; the host's descriptor-relative traversal remains
+        authoritative for bridged work. Plain paths and arbitrary eval code are
+        not sandboxed.
+        """
+        real_root = os.path.realpath(root_path)
+        real_parent = os.path.realpath(os.path.dirname(resolved))
+        if not _within_root(real_parent, real_root):
+            raise ValueError(f"{scheme}:// path escapes its root: {path}")
+        # `realpath` resolves dangling links lexically, so a missing target is
+        # still checked against the root instead of silently skipping the guard.
+        real_target = os.path.realpath(resolved)
+        if not _within_root(real_target, real_root):
+            raise ValueError(f"{scheme}:// path escapes its root: {path}")
+
     def _resolve_omp_path(path: str | Path) -> Path:
         """Map a helper path to a real filesystem Path.
 
@@ -100,10 +123,11 @@ if "__omp_prelude_loaded__" not in globals():
         root = roots.get(scheme) if isinstance(roots, dict) else None
         if not root:
             raise ValueError(f"Protocol paths are not supported by this helper: {path}")
-        relative = unquote(match.group(2).replace("\\", "/"))
-        # Mirror the host `path.resolve`/`resolveLocalUrlToPath`: normalize and
-        # make absolute WITHOUT realpath'ing symlinks (Path.resolve would turn
-        # /tmp into /private/tmp and diverge from the read-side resolution).
+        # Host local:// components are literal (no percent decoding or
+        # backslash normalization), so validate exactly what the host opens.
+        relative = match.group(2)
+        # Normalize and make absolute WITHOUT realpath'ing: the containment
+        # check below resolves links against the canonical root.
         root_path = os.path.abspath(root)
         if relative == "":
             return Path(root_path)
@@ -113,11 +137,7 @@ if "__omp_prelude_loaded__" not in globals():
         resolved = os.path.abspath(os.path.join(root_path, relative))
         if resolved != root_path and not resolved.startswith(root_path + os.sep):
             raise ValueError(f"{scheme}:// path escapes its root: {path}")
-        if os.path.exists(resolved):
-            real_resolved = os.path.realpath(resolved)
-            real_root = os.path.realpath(root_path)
-            if real_resolved != real_root and not real_resolved.startswith(real_root + os.sep):
-                raise ValueError(f"{scheme}:// symlink target escapes its root: {path}")
+        _check_contained_realpath(root_path, resolved, scheme, path)
         return Path(resolved)
 
     def read(path: str | Path, offset: int = 1, limit: int | None = None) -> str:

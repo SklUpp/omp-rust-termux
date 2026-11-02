@@ -8,27 +8,56 @@ end
 # Internal-URL path resolution
 # -------------------------------------------------------------------------
 
-function __omp_url_decode(s::String)
-    res = IOBuffer()
-    i = 1
-    len = ncodeunits(s)
-    while i <= len
-        c = Char(codeunit(s, i))
-        if c == '%' && i + 2 <= len
-            h_str = s[i+1:i+2]
-            try
-                b = parse(UInt8, h_str, base=16)
-                write(res, b)
-                i += 3
-                continue
-            catch
-                # ignore format error
-            end
-        end
-        write(res, c)
-        i += 1
+# Resolve a path through its longest existing prefix, including dangling links,
+# without requiring the leaf to exist.
+function __omp_realpath(path, hops = 0)
+    if hops > 40
+        error("symlink depth exceeded: $path")
     end
-    return String(take!(res))
+    if ispath(path) || islink(path)
+        try
+            return realpath(path)
+        catch
+            # A dangling link reaches the manual walk below.
+        end
+    end
+    if islink(path)
+        target = readlink(path)
+        if !isabspath(target)
+            target = joinpath(dirname(path), target)
+        end
+        return __omp_realpath(target, hops + 1)
+    end
+    parent = dirname(path)
+    if parent == path
+        return abspath(path)
+    end
+    return joinpath(__omp_realpath(parent), basename(path))
+end
+
+function __omp_within_root(path, root)
+    sep = string(Base.Filesystem.path_separator)
+    return path == root || startswith(path, endswith(root, sep) ? root : root * sep)
+end
+
+# Best-effort containment check for symlinked roots, parents and leaves. Matches
+# the host's realpath containment contract: internal symlinks are followed,
+# while links resolving outside the root are rejected — including a dangling
+# leaf and a new file below a symlinked parent. A path check cannot survive a
+# concurrent swap, so this is not race-proof containment; the host's descriptor
+# traversal remains authoritative for bridged work. Plain paths and arbitrary
+# eval code are not sandboxed.
+function __omp_check_contained_realpath(root_path, resolved, scheme, original)
+    real_root = __omp_realpath(root_path)
+    real_parent = __omp_realpath(dirname(resolved))
+    if !__omp_within_root(real_parent, real_root)
+        error("$scheme:// path escapes its root: $original")
+    end
+    real_target = __omp_realpath(resolved)
+    if !__omp_within_root(real_target, real_root)
+        error("$scheme:// path escapes its root: $original")
+    end
+    return nothing
 end
 
 function __omp_resolve_path(p::AbstractString)
@@ -48,7 +77,9 @@ function __omp_resolve_path(p::AbstractString)
         error("Protocol paths are not supported by this helper: $p")
     end
     
-    relative = __omp_url_decode(replace(string(m.captures[2]), '\\' => '/'))
+    # Host local:// components are literal (no percent decoding or backslash
+    # normalization), so validate exactly what the host opens.
+    relative = string(m.captures[2])
     root_path = abspath(string(root))
     if isempty(relative)
         return root_path
@@ -62,6 +93,7 @@ function __omp_resolve_path(p::AbstractString)
     if resolved != root_path && !startswith(resolved, root_path * Base.Filesystem.path_separator)
         error("$scheme:// path escapes its root: $p")
     end
+    __omp_check_contained_realpath(root_path, resolved, scheme, p)
     return resolved
 end
 

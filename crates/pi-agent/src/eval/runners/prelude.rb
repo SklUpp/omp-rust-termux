@@ -20,8 +20,46 @@ unless defined?($__omp_prelude_loaded) && $__omp_prelude_loaded
   # Internal-URL path resolution
   # -------------------------------------------------------------------------
 
-  def __omp_url_decode(str)
-    str.gsub(/%([0-9A-Fa-f]{2})/) { [Regexp.last_match(1)].pack("H2") }.force_encoding(Encoding::UTF_8)
+  # Resolve a path through its longest existing prefix, including dangling
+  # links, without requiring the leaf to exist.
+  def __omp_realpath(path, hops = 0)
+    raise "symlink depth exceeded: #{path}" if hops > 40
+    begin
+      return File.realpath(path)
+    rescue Errno::ENOENT, Errno::ENOTDIR
+      # fall through to a manual walk
+    end
+    if File.symlink?(path)
+      target = File.readlink(path)
+      target = File.expand_path(target, File.dirname(path))
+      return __omp_realpath(target, hops + 1)
+    end
+    parent = File.dirname(path)
+    return File.absolute_path(path) if parent == path
+    File.join(__omp_realpath(parent), File.basename(path))
+  end
+
+  def __omp_within_root(path, root)
+    path == root || path.start_with?(root.end_with?(File::SEPARATOR) ? root : root + File::SEPARATOR)
+  end
+
+  # Best-effort containment check for symlinked roots, parents and leaves.
+  # Matches the host's realpath containment contract: internal symlinks are
+  # followed, while links resolving outside the root are rejected — including a
+  # dangling leaf and a new file below a symlinked parent. A path check cannot
+  # survive a concurrent swap, so this is not race-proof containment; the
+  # host's descriptor traversal remains authoritative for bridged work. Plain
+  # paths and arbitrary eval code are not sandboxed.
+  def __omp_check_contained_realpath(root_path, resolved, scheme, original)
+    real_root = __omp_realpath(root_path)
+    real_parent = __omp_realpath(File.dirname(resolved))
+    unless __omp_within_root(real_parent, real_root)
+      raise "#{scheme}:// path escapes its root: #{original}"
+    end
+    real_target = __omp_realpath(resolved)
+    unless __omp_within_root(real_target, real_root)
+      raise "#{scheme}:// path escapes its root: #{original}"
+    end
   end
 
   # Map a helper path to a real filesystem path. A `scheme://…` whose scheme has
@@ -41,7 +79,9 @@ unless defined?($__omp_prelude_loaded) && $__omp_prelude_loaded
       end
     root = roots.is_a?(Hash) ? roots[scheme] : nil
     raise "Protocol paths are not supported by this helper: #{path}" if root.nil? || root.to_s.empty?
-    relative = __omp_url_decode(m[2].tr("\\", "/"))
+    # Host local:// components are literal (no percent decoding or backslash
+    # normalization), so validate exactly what the host opens.
+    relative = m[2]
     root_path = File.absolute_path(root.to_s)
     return root_path if relative.empty?
     if relative.start_with?("/") || relative.split("/").include?("..")
@@ -51,6 +91,7 @@ unless defined?($__omp_prelude_loaded) && $__omp_prelude_loaded
     unless resolved == root_path || resolved.start_with?(root_path + File::SEPARATOR)
       raise "#{scheme}:// path escapes its root: #{path}"
     end
+    __omp_check_contained_realpath(root_path, resolved, scheme, path)
     resolved
   end
 

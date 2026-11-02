@@ -623,6 +623,312 @@ async fn scheme_map_local_roots_are_visible_to_subprocess_helpers() {
 	teardown(&runtime, cwd).await;
 }
 
+/// Seed a local root with every symlink shape the helper contract must classify:
+/// an existing outside link, a dangling outside leaf, a symlinked outside parent,
+/// and internal file/directory links that must keep working.
+#[cfg(unix)]
+fn seed_local_symlink_fixture(root: &std::path::Path, outside: &std::path::Path) {
+	std::fs::create_dir_all(root.join("insidedir")).expect("inside dir");
+	std::fs::create_dir_all(outside).expect("outside dir");
+	std::fs::write(root.join("inside.txt"), "inside").expect("inside file");
+	std::fs::write(root.join("my file.txt"), "space").expect("space file");
+	std::fs::write(root.join("100% safe#?.txt"), "special").expect("special file");
+	std::fs::write(root.join("literal%20name.txt"), "literal-percent").expect("literal percent file");
+	std::fs::write(root.join("draft%zz.md"), "bad-percent").expect("bad percent file");
+	std::fs::write(root.join("insidedir").join("existing.txt"), "nested").expect("nested file");
+	std::fs::write(outside.join("secret.txt"), "secret").expect("outside secret");
+	std::os::unix::fs::symlink(outside.join("secret.txt"), root.join("ext.txt")).expect("outside leaf link");
+	std::os::unix::fs::symlink(outside.join("new.txt"), root.join("dangling.txt"))
+		.expect("dangling leaf link");
+	std::os::unix::fs::symlink(outside, root.join("parentlink")).expect("outside parent link");
+	std::os::unix::fs::symlink("inside.txt", root.join("inside-link.txt")).expect("inside leaf link");
+	std::os::unix::fs::symlink("insidedir", root.join("insidedir-link")).expect("inside parent link");
+	std::os::unix::fs::symlink("my file.txt", root.join("space-link.txt")).expect("space target link");
+	std::os::unix::fs::symlink("100% safe#?.txt", root.join("special-link.txt"))
+		.expect("special target link");
+	std::os::unix::fs::symlink("literal%20name.txt", root.join("percent-link.txt"))
+		.expect("percent target link");
+}
+
+#[cfg(unix)]
+fn local_symlink_paths() -> (PathBuf, PathBuf) {
+	let root = std::env::temp_dir().join(format!("omp-eval-local-{}", pi_agent::eval::util::random_token()));
+	let outside = std::env::temp_dir().join(format!("omp-eval-outside-{}", pi_agent::eval::util::random_token()));
+	seed_local_symlink_fixture(&root, &outside);
+	(root, outside)
+}
+
+#[cfg(unix)]
+async fn assert_local_symlink_contract(language: EvalLanguage, code: &str) {
+	let available = match language {
+		EvalLanguage::Py => python_path().is_some(),
+		EvalLanguage::Js => js_path().is_some(),
+		EvalLanguage::Rb => ruby_path().is_some(),
+		EvalLanguage::Jl => julia_path().is_some(),
+	};
+	if !available {
+		eprintln!("skipping {} local symlink regression: interpreter absent", language.token());
+		return;
+	}
+	let (root, outside) = local_symlink_paths();
+	let Some((tool, runtime, ctx, cwd)) = harness_with(
+		one_language(language),
+		Interpreters::default(),
+		test_session().with_local_root("local", root.clone()),
+		Arc::new(TestHost::default()),
+		|settings| settings,
+	)
+	.await
+	else {
+		let _ = std::fs::remove_dir_all(&root);
+		let _ = std::fs::remove_dir_all(&outside);
+		return;
+	};
+	let result = tool
+		.execute(&json!({"language": language.token(), "code": code, "timeout": 120}), &ctx)
+		.await
+		.expect("local symlink cell");
+	assert!(!result.is_error, "{}", result.content);
+	for expected in [
+		"ext-read:blocked",
+		"ext-write:blocked",
+		"parent-read:blocked",
+		"dangling-write:blocked",
+		"parent-write:blocked",
+		"internal-read:inside",
+		"internal-done",
+		"space-link:space",
+		"special-link:special",
+		"percent-link:literal-percent",
+		"literal-percent:literal-percent",
+		"bad-percent:bad-percent",
+	] {
+		assert!(result.content.contains(expected), "missing {expected}: {}", result.content);
+	}
+	assert_eq!(
+		std::fs::read_to_string(root.join("inside.txt")).expect("internal link target"),
+		"updated"
+	);
+	assert_eq!(
+		std::fs::read_to_string(root.join("insidedir").join("note.txt")).expect("internal dir link"),
+		"nested"
+	);
+	assert_eq!(
+		std::fs::read_to_string(outside.join("secret.txt")).expect("outside secret"),
+		"secret"
+	);
+	assert!(!outside.join("new.txt").exists(), "dangling leaf escaped the root");
+	assert!(!outside.join("sub").exists(), "new file below a symlinked parent escaped the root");
+	teardown(&runtime, cwd).await;
+	let _ = std::fs::remove_dir_all(&root);
+	let _ = std::fs::remove_dir_all(&outside);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn python_local_symlinks_allow_internal_and_block_escapes() {
+	assert_local_symlink_contract(
+		EvalLanguage::Py,
+		r#"
+def attempt(label, fn):
+    try:
+        fn()
+        print(label + ':ok')
+    except Exception:
+        print(label + ':blocked')
+attempt('ext-read', lambda: read('local://ext.txt'))
+attempt('ext-write', lambda: write('local://ext.txt', 'pwn'))
+attempt('parent-read', lambda: read('local://parentlink/secret.txt'))
+attempt('dangling-write', lambda: write('local://dangling.txt', 'pwn'))
+attempt('parent-write', lambda: write('local://parentlink/sub/new.txt', 'pwn'))
+print('internal-read:' + read('local://inside-link.txt'))
+write('local://inside-link.txt', 'updated')
+write('local://insidedir-link/note.txt', 'nested')
+print('internal-done')
+print('space-link:' + read('local://space-link.txt'))
+print('special-link:' + read('local://special-link.txt'))
+print('percent-link:' + read('local://percent-link.txt'))
+print('literal-percent:' + read('local://literal%20name.txt'))
+print('bad-percent:' + read('local://draft%zz.md'))
+"#,
+	)
+	.await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn ruby_local_symlinks_allow_internal_and_block_escapes() {
+	assert_local_symlink_contract(
+		EvalLanguage::Rb,
+		r#"
+def attempt(label)
+  yield
+  puts "#{label}:ok"
+rescue Exception
+  puts "#{label}:blocked"
+end
+attempt('ext-read') { read('local://ext.txt') }
+attempt('ext-write') { write('local://ext.txt', 'pwn') }
+attempt('parent-read') { read('local://parentlink/secret.txt') }
+attempt('dangling-write') { write('local://dangling.txt', 'pwn') }
+attempt('parent-write') { write('local://parentlink/sub/new.txt', 'pwn') }
+puts 'internal-read:' + read('local://inside-link.txt')
+write('local://inside-link.txt', 'updated')
+write('local://insidedir-link/note.txt', 'nested')
+puts 'internal-done'
+puts 'space-link:' + read('local://space-link.txt')
+puts 'special-link:' + read('local://special-link.txt')
+puts 'percent-link:' + read('local://percent-link.txt')
+puts 'literal-percent:' + read('local://literal%20name.txt')
+puts 'bad-percent:' + read('local://draft%zz.md')
+"#,
+	)
+	.await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn julia_local_symlinks_allow_internal_and_block_escapes() {
+	assert_local_symlink_contract(
+		EvalLanguage::Jl,
+		r#"
+function attempt(label, f)
+    try
+        f()
+        println(label * ":ok")
+    catch
+        println(label * ":blocked")
+    end
+end
+attempt("ext-read", () -> read("local://ext.txt"))
+attempt("ext-write", () -> write("local://ext.txt", "pwn"))
+attempt("parent-read", () -> read("local://parentlink/secret.txt"))
+attempt("dangling-write", () -> write("local://dangling.txt", "pwn"))
+attempt("parent-write", () -> write("local://parentlink/sub/new.txt", "pwn"))
+println("internal-read:" * read("local://inside-link.txt"))
+write("local://inside-link.txt", "updated")
+write("local://insidedir-link/note.txt", "nested")
+println("internal-done")
+println("space-link:" * read("local://space-link.txt"))
+println("special-link:" * read("local://special-link.txt"))
+println("percent-link:" * read("local://percent-link.txt"))
+println("literal-percent:" * read("local://literal%20name.txt"))
+println("bad-percent:" * read("local://draft%zz.md"))
+"#,
+	)
+	.await;
+}
+
+/// JS delegates through the bridge, so assert the resolver validates before the
+/// host round-trip and flattens an internal link to its in-root real target.
+#[cfg(unix)]
+#[tokio::test]
+async fn javascript_local_symlinks_validate_before_bridging() {
+	if js_path().is_none() {
+		eprintln!("skipping JS local symlink regression: bun is not installed");
+		return;
+	}
+	let (root, outside) = local_symlink_paths();
+	let host = Arc::new(TestHost::default());
+	let Some((tool, runtime, ctx, cwd)) = harness_with(
+		one_language(EvalLanguage::Js),
+		Interpreters::default(),
+		test_session().with_local_root("local", root.clone()),
+		Arc::clone(&host),
+		|settings| settings,
+	)
+	.await
+	else {
+		let _ = std::fs::remove_dir_all(&root);
+		let _ = std::fs::remove_dir_all(&outside);
+		return;
+	};
+	let result = tool
+		.execute(
+			&json!({
+				"language": "js",
+				"code": r#"
+const outcomes = [];
+for (const [label, fn] of [
+  ["ext-read", () => read("local://ext.txt")],
+  ["ext-write", () => write("local://ext.txt", "pwn")],
+  ["parent-read", () => read("local://parentlink/secret.txt")],
+  ["dangling-write", () => write("local://dangling.txt", "pwn")],
+  ["parent-write", () => write("local://parentlink/sub/new.txt", "pwn")],
+]) {
+  try {
+    await fn();
+    outcomes.push(label + ":ok");
+  } catch {
+    outcomes.push(label + ":blocked");
+  }
+}
+await read("local://inside-link.txt");
+await write("local://inside-link.txt", "updated");
+await write("local://insidedir-link/note.txt", "nested");
+await read("local://space-link.txt");
+await read("local://special-link.txt");
+await read("local://percent-link.txt");
+await read("local://literal%20name.txt");
+await read("local://draft%zz.md");
+print(outcomes.join("\n"));
+print("internal-done");
+"#,
+				"timeout": 120
+			}),
+			&ctx,
+		)
+		.await
+		.expect("JS local symlink cell");
+	assert!(!result.is_error, "{}", result.content);
+	for expected in [
+		"ext-read:blocked",
+		"ext-write:blocked",
+		"parent-read:blocked",
+		"dangling-write:blocked",
+		"parent-write:blocked",
+		"internal-done",
+	] {
+		assert!(result.content.contains(expected), "missing {expected}: {}", result.content);
+	}
+	{
+		let calls = host.calls.lock().unwrap_or_else(|poison| poison.into_inner());
+		let paths: Vec<&str> = calls
+			.iter()
+			.filter(|(name, _)| name == "read" || name == "write")
+			.filter_map(|(_, args)| args.get("path").and_then(Value::as_str))
+			.collect();
+		assert!(
+			paths.contains(&"local://inside.txt"),
+			"internal leaf link must flatten: {paths:?}"
+		);
+		assert!(
+			paths.contains(&"local://insidedir/note.txt"),
+			"internal parent link must flatten: {paths:?}"
+		);
+		for expected in [
+			"local://my file.txt",
+			"local://100% safe#?.txt",
+			"local://literal%20name.txt",
+			"local://draft%zz.md",
+		] {
+			assert!(
+				paths.contains(&expected),
+				"raw host path {expected:?} must reach the bridge: {paths:?}"
+			);
+		}
+		assert!(
+			!paths.iter().any(|path| path.contains("ext.txt")
+				|| path.contains("dangling")
+				|| path.contains("parentlink")),
+			"escape attempts must fail before the bridge: {paths:?}"
+		);
+	}
+	teardown(&runtime, cwd).await;
+	let _ = std::fs::remove_dir_all(&root);
+	let _ = std::fs::remove_dir_all(&outside);
+}
+
 #[tokio::test]
 async fn bridged_helpers_route_through_the_host_and_reject_direct_only_tools() {
 	let Some((tool, runtime, ctx, cwd, host)) = py_harness(4096).await else { return };

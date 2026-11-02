@@ -11,7 +11,7 @@ use std::{
 	collections::{HashMap, HashSet, VecDeque},
 	sync::{
 		Arc, Mutex,
-		atomic::{AtomicBool, AtomicU64, Ordering},
+		atomic::{AtomicU64, Ordering},
 	},
 	time::{SystemTime, UNIX_EPOCH},
 };
@@ -82,23 +82,42 @@ struct Waiter {
 	id:   u64,
 	from: Option<String>,
 	tx:   oneshot::Sender<IrcMessage>,
-	/// Set when the hand-off succeeds, so the waiter's drop knows it must
-	/// release one reserved in-flight slot.
-	delivered: Arc<AtomicBool>,
+	/// Enqueue order of the handed-off message plus one, so the waiter's drop
+	/// can both release the reserved in-flight slot and reinsert the recovered
+	/// message at the position it would have occupied in the buffer. Zero means
+	/// no hand-off. Stored/read under the mailbox lock (atomic only because the
+	/// field is shared with [`MailboxWaiter`]).
+	delivery_order: Arc<AtomicU64>,
+}
+
+/// Buffered message plus its enqueue order. The order is assigned when a
+/// message enters the mailbox (buffer or successful waiter hand-off), so a
+/// message recovered from an unpolled waiter can be inserted where it belongs
+/// instead of behind mail that arrived later.
+struct QueuedMessage {
+	order:   u64,
+	message: IrcMessage,
 }
 
 #[derive(Default)]
 struct MailboxState {
-	mailboxes: HashMap<String, VecDeque<IrcMessage>>,
+	mailboxes: HashMap<String, VecDeque<QueuedMessage>>,
 	waiters:   HashMap<String, Vec<Waiter>>,
 	/// Messages handed to a waiter but not yet observed by its receiver. They
 	/// count against [`MAILBOX_CAP`] together with buffered mail, so recovery
 	/// can always fit without evicting older messages.
 	inflight:  HashMap<String, usize>,
 	next_waiter: u64,
+	next_order:  u64,
 	/// Agents with a running loop or hub wait. Root (`Main`) appears while a
 	/// root turn with a peer inbox is executing; children register themselves.
 	active:    HashSet<String>,
+}
+
+fn next_order(state: &mut MailboxState) -> u64 {
+	let order = state.next_order;
+	state.next_order = state.next_order.wrapping_add(1);
+	order
 }
 
 /// Shared mailbox store. Cheap to clone: all clones share one map.
@@ -141,6 +160,10 @@ impl Mailbox {
 			return false;
 		}
 		let mut delivered = false;
+		// Allocate the order under the same lock as the hand-off. A failed
+		// hand-off leaves a harmless gap; the caller buffers the message with a
+		// fresh order, which keeps send order intact.
+		let order = next_order(&mut state);
 		{
 			let Some(waiters) = state.waiters.get_mut(&message.to) else {
 				return false;
@@ -151,7 +174,7 @@ impl Mailbox {
 			{
 				let waiter = waiters.remove(index);
 				if waiter.tx.send(message.clone()).is_ok() {
-					waiter.delivered.store(true, Ordering::Release);
+					waiter.delivery_order.store(order.wrapping_add(1), Ordering::Release);
 					delivered = true;
 					break;
 				}
@@ -169,13 +192,13 @@ impl Mailbox {
 	/// [`Self::take_or_register`] in waits; this alone can race buffered mail.
 	pub fn register(&self, agent: &str, from: Option<&str>) -> MailboxWaiter {
 		let mut state = self.state.lock().unwrap_or_else(|poison| poison.into_inner());
-		let (id, rx, delivered) = push_waiter(&mut state, agent, from);
+		let (id, rx, delivery_order) = push_waiter(&mut state, agent, from);
 		MailboxWaiter {
 			mailbox: self.clone(),
 			agent: agent.to_string(),
 			id,
 			rx,
-			delivered,
+			delivery_order,
 		}
 	}
 
@@ -201,7 +224,7 @@ impl Mailbox {
 		if let Some(message) = take_from(&mut state, agent, from) {
 			return (Some(message), None);
 		}
-		let (id, rx, delivered) = push_waiter(&mut state, agent, from);
+		let (id, rx, delivery_order) = push_waiter(&mut state, agent, from);
 		(
 			None,
 			Some(MailboxWaiter {
@@ -209,7 +232,7 @@ impl Mailbox {
 				agent: agent.to_string(),
 				id,
 				rx,
-				delivered,
+				delivery_order,
 			}),
 		)
 	}
@@ -261,13 +284,13 @@ impl Mailbox {
 			return state
 				.mailboxes
 				.get(agent)
-				.map(|mailbox| mailbox.iter().cloned().collect())
+				.map(|mailbox| mailbox.iter().map(|queued| queued.message.clone()).collect())
 				.unwrap_or_default();
 		}
 		state
 			.mailboxes
 			.remove(agent)
-			.map(|mailbox| mailbox.into_iter().collect())
+			.map(|mailbox| mailbox.into_iter().map(|queued| queued.message).collect())
 			.unwrap_or_default()
 	}
 
@@ -323,11 +346,11 @@ impl Mailbox {
 /// RAII waiter slot; dropping it removes the slot so a timed-out wait cannot
 /// steal a later message.
 pub struct MailboxWaiter {
-	mailbox:   Mailbox,
-	agent:     String,
-	id:        u64,
-	rx:        oneshot::Receiver<IrcMessage>,
-	delivered: Arc<AtomicBool>,
+	mailbox:        Mailbox,
+	agent:          String,
+	id:             u64,
+	rx:             oneshot::Receiver<IrcMessage>,
+	delivery_order: Arc<AtomicU64>,
 }
 
 impl MailboxWaiter {
@@ -357,7 +380,12 @@ impl Drop for MailboxWaiter {
 		if empty == Some(true) {
 			state.waiters.remove(&self.agent);
 		}
-		if self.delivered.swap(false, Ordering::AcqRel) {
+		// Zero means no hand-off. Release the reservation and reinsert the
+		// recovered message at the order it was handed off, so mail buffered
+		// while this waiter was unpolled stays behind it and mail buffered
+		// earlier stays ahead of it.
+		let delivery_order = self.delivery_order.swap(0, Ordering::AcqRel);
+		if delivery_order != 0 {
 			let release = state.inflight.get_mut(&self.agent).map(|count| {
 				*count = count.saturating_sub(1);
 				*count
@@ -367,18 +395,34 @@ impl Drop for MailboxWaiter {
 			}
 		}
 		if let Some(message) = recovered {
-			buffer_locked(&mut state, message);
+			if delivery_order != 0 {
+				insert_ordered_locked(&mut state, delivery_order - 1, message);
+			} else {
+				buffer_locked(&mut state, message);
+			}
 		}
 	}
 }
 
-/// Bounded buffer insertion shared by [`Mailbox::buffer`] and waiter-drop
-/// recovery. Oldest mail is evicted at the cap, matching the existing policy.
+/// Bounded buffer insertion for a new message. The enqueue order is assigned
+/// here, so buffered mail sorts after every message already in the mailbox.
 fn buffer_locked(state: &mut MailboxState, message: IrcMessage) {
+	let order = next_order(state);
+	insert_ordered_locked(state, order, message);
+}
+
+/// Insert at the position matching `order` and evict oldest mail past the cap.
+/// Recovery reserves an in-flight slot until drop, which keeps the buffer below
+/// the cap before the recovered message is inserted; the loop is a safety net.
+fn insert_ordered_locked(state: &mut MailboxState, order: u64, message: IrcMessage) {
 	let inflight = state.inflight.get(&message.to).copied().unwrap_or(0);
 	let cap = MAILBOX_CAP.saturating_sub(inflight);
 	let mailbox = state.mailboxes.entry(message.to.clone()).or_default();
-	mailbox.push_back(message);
+	let index = mailbox
+		.iter()
+		.position(|queued| queued.order > order)
+		.unwrap_or(mailbox.len());
+	mailbox.insert(index, QueuedMessage { order, message });
 	while mailbox.len() > cap {
 		mailbox.pop_front();
 	}
@@ -389,11 +433,11 @@ fn push_waiter(
 	state: &mut MailboxState,
 	agent: &str,
 	from: Option<&str>,
-) -> (u64, oneshot::Receiver<IrcMessage>, Arc<AtomicBool>) {
+) -> (u64, oneshot::Receiver<IrcMessage>, Arc<AtomicU64>) {
 	let id = state.next_waiter;
 	state.next_waiter += 1;
 	let (tx, rx) = oneshot::channel();
-	let delivered = Arc::new(AtomicBool::new(false));
+	let delivery_order = Arc::new(AtomicU64::new(0));
 	state
 		.waiters
 		.entry(agent.to_string())
@@ -402,21 +446,21 @@ fn push_waiter(
 			id,
 			from: from.map(str::to_string),
 			tx,
-			delivered: Arc::clone(&delivered),
+			delivery_order: Arc::clone(&delivery_order),
 		});
-	(id, rx, delivered)
+	(id, rx, delivery_order)
 }
 
 fn take_from(state: &mut MailboxState, agent: &str, from: Option<&str>) -> Option<IrcMessage> {
 	let mailbox = state.mailboxes.get_mut(agent)?;
 	let index = mailbox
 		.iter()
-		.position(|message| from.is_none_or(|from| message.from == from))?;
-	let message = mailbox.remove(index);
+		.position(|queued| from.is_none_or(|from| queued.message.from == from))?;
+	let message = mailbox.remove(index).message;
 	if mailbox.is_empty() {
 		state.mailboxes.remove(agent);
 	}
-	message
+	Some(message)
 }
 
 #[cfg(test)]
@@ -477,6 +521,73 @@ mod tests {
 		// The delivered body must not vanish with the dropped wait.
 		assert_eq!(mailbox.take("b", None).expect("recovered hand-off").body, "handoff");
 		assert!(mailbox.take("b", None).is_none(), "recovery must be once-only");
+	}
+
+	#[test]
+	fn recovered_handoff_stays_behind_earlier_buffered_mail() {
+		let mailbox = Mailbox::new();
+		mailbox.buffer(IrcMessage::new("a", "b", "old-1"));
+		mailbox.buffer(IrcMessage::new("a", "b", "old-2"));
+		let waiter = mailbox.register("b", None);
+		assert!(mailbox.deliver_to_waiter(&IrcMessage::new("a", "b", "handoff")));
+		drop(waiter);
+		let bodies: Vec<_> = mailbox.inbox("b", true).into_iter().map(|m| m.body).collect();
+		assert_eq!(bodies, ["old-1", "old-2", "handoff"]);
+	}
+
+	#[test]
+	fn recovered_handoff_precedes_mail_buffered_after_it() {
+		let mailbox = Mailbox::new();
+		let waiter = mailbox.register("b", None);
+		assert!(mailbox.deliver_to_waiter(&IrcMessage::new("a", "b", "handoff")));
+		// The waiter was consumed by the hand-off, so this sender must buffer.
+		assert!(!mailbox.deliver_to_waiter(&IrcMessage::new("a", "b", "later")));
+		mailbox.buffer(IrcMessage::new("a", "b", "later"));
+		drop(waiter);
+		let bodies: Vec<_> = mailbox.inbox("b", true).into_iter().map(|m| m.body).collect();
+		assert_eq!(bodies, ["handoff", "later"]);
+	}
+
+	#[test]
+	fn out_of_order_waiter_drops_keep_send_order() {
+		for reverse in [false, true] {
+			let mailbox = Mailbox::new();
+			let first = mailbox.register("b", None);
+			let second = mailbox.register("b", None);
+			assert!(mailbox.deliver_to_waiter(&IrcMessage::new("a", "b", "first")));
+			assert!(mailbox.deliver_to_waiter(&IrcMessage::new("a", "b", "second")));
+			mailbox.buffer(IrcMessage::new("a", "b", "later"));
+			if reverse {
+				drop(second);
+				drop(first);
+			} else {
+				drop(first);
+				drop(second);
+			}
+			let bodies: Vec<_> = mailbox.inbox("b", true).into_iter().map(|m| m.body).collect();
+			assert_eq!(bodies, ["first", "second", "later"], "reverse={reverse}");
+		}
+	}
+
+	#[test]
+	fn recovered_handoffs_keep_capacity_and_order_with_other_inflight_mail() {
+		let mailbox = Mailbox::new();
+		for index in 0..MAILBOX_CAP - 2 {
+			mailbox.buffer(IrcMessage::new("a", "b", format!("buffered{index}")));
+		}
+		let first = mailbox.register("b", None);
+		let second = mailbox.register("b", None);
+		assert!(mailbox.deliver_to_waiter(&IrcMessage::new("a", "b", "first")));
+		assert!(mailbox.deliver_to_waiter(&IrcMessage::new("a", "b", "second")));
+		// Capacity is fully reserved: the sender must fail instead of evicting.
+		assert!(!mailbox.deliver_to_waiter(&IrcMessage::new("a", "b", "overflow")));
+		drop(second);
+		drop(first);
+		let all = mailbox.inbox("b", true);
+		assert_eq!(all.len(), MAILBOX_CAP);
+		assert_eq!(all[0].body, "buffered0", "oldest buffered mail must survive");
+		assert_eq!(all[all.len() - 2].body, "first");
+		assert_eq!(all.last().unwrap().body, "second");
 	}
 
 	#[test]

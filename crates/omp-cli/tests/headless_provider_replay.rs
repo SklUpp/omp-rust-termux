@@ -741,6 +741,97 @@ fn prewalk_switches_to_smol_after_todo_and_first_write_then_resumes_on_default()
 }
 
 #[test]
+fn plan_yolo_guards_then_switches_and_resumes_on_default() {
+	let a = MockWireServer::start(vec![
+		tool_sse(&[(
+			"call-blocked",
+			"write",
+			serde_json::json!({"path": "blocked.txt", "content": "must not land"}),
+		)]),
+		tool_sse(&[(
+			"call-plan",
+			"write",
+			serde_json::json!({
+				"path": "local://plan-plan.md",
+				"content": "# Plan\n\nImplement probe.\n"
+			}),
+		)]),
+		tool_sse(&[(
+			"call-propose",
+			"write",
+			serde_json::json!({"path": "xd://propose", "content": "Plan"}),
+		)]),
+		text_sse("resumed"),
+	]);
+	let b = MockWireServer::start(vec![
+		tool_sse(&[(
+			"call-probe",
+			"write",
+			serde_json::json!({"path": "probe.txt", "content": "done"}),
+		)]),
+		text_sse("implemented"),
+	]);
+	let base = temp_dir("plan-yolo-switch");
+	let (agent_dir, cwd, sessions) = setup_two_providers(&base, a.port, b.port, "");
+	let first = run(
+		omp(&agent_dir, &cwd, &sessions).args([
+			"--yolo",
+			"--plan-yolo",
+			"--plan-yolo-into",
+			"mockB/model-b",
+			"--session-id",
+			"plan-yolo-1",
+			"-p",
+			"PLAN-YOLO-TOKEN",
+		]),
+	);
+	assert!(
+		first.status.success(),
+		"plan-yolo run failed: {}",
+		String::from_utf8_lossy(&first.stderr)
+	);
+	assert_eq!(a.request_count(), 3, "guard, plan write, then proposal");
+	assert_eq!(b.request_count(), 2, "switch happens before implementation");
+	assert!(!cwd.join("blocked.txt").exists(), "guard must block working-tree writes");
+	let plan = b.request(0);
+	assert_eq!(plan["model"], "model-b");
+	assert_eq!(occurrences(&plan, "Plan approved: **Plan**"), 1);
+	assert_eq!(occurrences(&plan, "local://plan-plan.md"), 1);
+	assert_eq!(fs::read_to_string(cwd.join("probe.txt")).expect("probe"), "done");
+
+	let log = session_file(&sessions, "plan-yolo-1");
+	let stored = entries(&log);
+	let change = stored
+		.iter()
+		.position(|entry| entry["type"] == "model_change")
+		.expect("plan-yolo switch must be journaled");
+	assert_eq!(stored[change]["model"], "mockB/model-b");
+	assert_eq!(stored[change]["role"], "fallback");
+
+	let resumed = run(
+		omp(&agent_dir, &cwd, &sessions).args(["--resume", "plan-yolo-1", "-p", "RESUME-TOKEN"]),
+	);
+	assert!(
+		resumed.status.success(),
+		"resume failed: {}",
+		String::from_utf8_lossy(&resumed.stderr)
+	);
+	assert_eq!(a.request_count(), 4, "resume restores the default provider");
+	assert_eq!(b.request_count(), 2, "the ephemeral plan target must not survive");
+	assert_eq!(a.request(3)["model"], "model-a");
+	assert!(
+		!entries(&log)
+			.iter()
+			.any(|entry| entry["customType"] == "plan-yolo-handoff"),
+		"the live handoff steer is not persisted as a custom message"
+	);
+
+	a.stop();
+	b.stop();
+	fs::remove_dir_all(base).ok();
+}
+
+#[test]
 fn prewalk_noop_target_disarms_with_a_notice() {
 	let a = MockWireServer::start(vec![text_sse("working")]);
 	let b = MockWireServer::start(vec![text_sse("unused")]);

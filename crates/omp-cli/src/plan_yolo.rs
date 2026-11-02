@@ -29,6 +29,8 @@ use crate::{
 
 /// TS `DEFAULT_PLAN_YOLO_TARGET`.
 pub const DEFAULT_TARGET: &str = "@smol";
+/// TS `PLAN_YOLO_HANDOFF_MESSAGE_TYPE`.
+pub const PLAN_YOLO_HANDOFF_TYPE: &str = "plan-yolo-handoff";
 
 const PLAN_YOLO_HANDOFF_PROMPT: &str = include_str!(
 	"../../../packages/coding-agent/src/prompts/system/plan-yolo-handoff.md"
@@ -88,6 +90,12 @@ pub fn resolve_arm(
 	if cli.no_tools {
 		return Err(
 			"--plan-yolo requires tools; --no-tools cannot arm an unapprovable plan"
+				.to_string(),
+		);
+	}
+	if cli.no_session {
+		return Err(
+			"--plan-yolo requires a persisted session for plan artifacts"
 				.to_string(),
 		);
 	}
@@ -203,6 +211,11 @@ impl PlanYoloShared {
 	#[must_use]
 	pub fn is_armed(&self) -> bool {
 		self.armed.load(Ordering::Acquire) && !self.completed.load(Ordering::Acquire)
+	}
+
+	#[must_use]
+	pub fn is_completed(&self) -> bool {
+		self.completed.load(Ordering::Acquire)
 	}
 
 	fn approval_active(&self) -> bool {

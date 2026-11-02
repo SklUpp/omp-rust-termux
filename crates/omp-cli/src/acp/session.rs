@@ -24,7 +24,7 @@ use std::{
 	path::{Path, PathBuf},
 	sync::{
 		Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak,
-		atomic::{AtomicU64, Ordering},
+		atomic::{AtomicBool, AtomicU64, Ordering},
 		mpsc::{self, Receiver, RecvTimeoutError, Sender},
 	},
 	thread,
@@ -94,6 +94,8 @@ pub struct AcpRecipe {
 	/// Settings-derived target for newly created ACP sessions.
 	pub prewalk_fresh: Option<crate::prewalk::PrewalkArm>,
 	pub prewalk_explicit: bool,
+	/// Explicit plan-yolo target; armed on the first ACP prompt.
+	pub plan_yolo: Option<crate::plan_yolo::PlanYoloArm>,
 	pub max_time: Option<Duration>,
 	pub max_turns: usize,
 	pub tools_enabled: bool,
@@ -129,6 +131,7 @@ impl AcpRecipe {
 			prewalk: None,
 			prewalk_fresh: None,
 			prewalk_explicit: false,
+			plan_yolo: None,
 			max_time: None,
 			max_turns: 0,
 			tools_enabled: true,
@@ -268,6 +271,8 @@ impl AcpRuntime {
 			} else {
 				None
 			},
+			// Installed below on the shared ACP gate, not through a fresh gate.
+			plan_yolo: None,
 			max_time: self.recipe.max_time,
 			max_turns: self.recipe.max_turns,
 			tools_enabled: self.recipe.tools_enabled,
@@ -343,6 +348,13 @@ impl AcpRuntime {
 			.recipe
 			.runner
 			.reopen_session(scope_id.as_deref(), scope_file.as_deref());
+		let plan = Arc::new(Mutex::new(PlanGate::new(self.recipe.plan_enabled)));
+		let plan_yolo = self.recipe.plan_yolo.clone().map(|arm| {
+			Arc::new(crate::plan_yolo::PlanYoloShared::new(
+				Arc::clone(&plan),
+				arm,
+			))
+		});
 		let record = Arc::new(AcpSession {
 			id: id.clone(),
 			cwd,
@@ -355,7 +367,9 @@ impl AcpRuntime {
 			session: Mutex::new(session),
 			gate: PromptGate::default(),
 			token: token_slot,
-			plan: Arc::new(Mutex::new(PlanGate::new(self.recipe.plan_enabled))),
+			plan,
+			plan_yolo: plan_yolo.clone(),
+			plan_yolo_mode_sent: AtomicBool::new(false),
 			plan_artifacts,
 			closed: Mutex::new(None),
 			next_message_id: AtomicU64::new(1),
@@ -370,16 +384,22 @@ impl AcpRuntime {
 			let plan = Arc::clone(&record.plan);
 			let probe_plan = Arc::clone(&plan);
 			let mut session = record.lock();
-			session.set_plan_mode(crate::agent::PlanModeHooks {
-				guard:   Some(Arc::new(plan::PlanWriteGuard::new(
-					Arc::clone(&plan),
-					record.plan_artifacts.clone(),
-				))),
-				propose: Some(Arc::new(AcpPlanProposalHandler {
-					session: Arc::downgrade(&record),
-				})),
-				policy:  Some(Arc::new(plan::PlanReminderPolicy::new(Arc::clone(&plan)))),
-			});
+			if let Some(shared) = record.plan_yolo.as_ref() {
+				session.set_plan_yolo(Arc::clone(shared));
+			} else {
+				session.set_plan_mode(crate::agent::PlanModeHooks {
+					guard:   Some(Arc::new(plan::PlanWriteGuard::new(
+						Arc::clone(&plan),
+						record.plan_artifacts.clone(),
+					))),
+					propose: Some(Arc::new(AcpPlanProposalHandler {
+						session: Arc::downgrade(&record),
+					})),
+					policy:  Some(Arc::new(plan::PlanReminderPolicy::new(
+						Arc::clone(&plan),
+					))),
+				});
+			}
 			session.set_plan_mode_probe(Some(Arc::new(move || {
 				probe_plan
 					.lock()
@@ -436,6 +456,10 @@ pub struct AcpSession {
 	/// their reverse waits. Never held while waiting for a client answer.
 	token: Arc<Mutex<Option<CancellationToken>>>,
 	plan: Arc<Mutex<PlanGate>>,
+	/// Plan-yolo gate/pending shared with RpcSession; `None` when disabled.
+	plan_yolo: Option<Arc<crate::plan_yolo::PlanYoloShared>>,
+	/// One `current_mode_update` after a plan-yolo switch.
+	plan_yolo_mode_sent: AtomicBool,
 	/// Session `local://` root cached at open: the approval tool runs under the
 	/// turn's session lock and must not take it again.
 	plan_artifacts: Option<PathBuf>,
@@ -734,7 +758,7 @@ impl AcpSession {
 		}
 		let (text, images) = convert_prompt_blocks(prompt)?;
 		let mut text = text;
-		if self.runtime.recipe.tools_enabled {
+		if self.runtime.recipe.tools_enabled && self.plan_yolo.is_none() {
 			// Approved-plan pointer: injected once on the first prompt after
 			// approval, and only when the file is actually readable. A failed
 			// resolution keeps the pointer for a later turn.
@@ -773,6 +797,17 @@ impl AcpSession {
 				Ok(done) => {
 					if let Some(error) = done.error {
 						return Err(error);
+					}
+					if self
+						.plan_yolo
+						.as_ref()
+						.is_some_and(|shared| shared.is_completed())
+						&& !self.plan_yolo_mode_sent.swap(true, Ordering::AcqRel)
+					{
+						self.emit_update(json!({
+							"sessionUpdate": "current_mode_update",
+							"currentModeId": self.lock_plan().current_mode_id(),
+						}));
 					}
 					// Plan approval refreshed the mode: push the new config
 					// options now that the turn released the session lock.

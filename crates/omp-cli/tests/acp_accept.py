@@ -55,6 +55,8 @@ class Provider:
         self.hang_seconds = 2.0
         # Text returned when the request already contains a tool result.
         self.tool_result_text = "tool done"
+        self.plan_yolo_root = False
+        self.plan_yolo_target = False
         self.continuation_started = threading.Event()
         self.lock = threading.Lock()
         provider = self
@@ -115,6 +117,79 @@ class Provider:
             payload = dict(base)
             payload["choices"] = [{"index": 0, "delta": delta, "finish_reason": finish}]
             return "data: " + json.dumps(payload)
+
+        if self.plan_yolo_root and "PLAN_YOLO" in last_user:
+            tool_results = 0
+            for message in messages:
+                if message.get("role") == "user":
+                    tool_results = 0
+                elif message.get("role") == "tool":
+                    tool_results += 1
+
+            def tool_call(call_id, name, args):
+                yield chunk(
+                    {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": call_id,
+                                "type": "function",
+                                "function": {"name": name, "arguments": json.dumps(args)},
+                            }
+                        ],
+                    }
+                )
+                yield chunk({}, "tool_calls")
+                yield "data: [DONE]"
+
+            if tool_results == 0:
+                yield from tool_call(
+                    "call_plan_blocked",
+                    "write",
+                    {"path": "blocked.txt", "content": "must not land"},
+                )
+                return
+            if tool_results == 1:
+                yield from tool_call(
+                    "call_plan_write",
+                    "write",
+                    {
+                        "path": "local://plan-plan.md",
+                        "content": "# Plan\n\nImplement probe.\n",
+                    },
+                )
+                return
+            if tool_results == 2:
+                yield from tool_call(
+                    "call_plan_propose",
+                    "write",
+                    {"path": "xd://propose", "content": "Plan"},
+                )
+                return
+
+        if self.plan_yolo_target and self.requests == 1:
+            yield chunk(
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "index": 0,
+                            "id": "call_plan_probe",
+                            "type": "function",
+                            "function": {
+                                "name": "write",
+                                "arguments": json.dumps(
+                                    {"path": "probe.txt", "content": "done"}
+                                ),
+                            },
+                        }
+                    ],
+                }
+            )
+            yield chunk({}, "tool_calls")
+            yield "data: [DONE]"
+            return
 
         if tool_after_user:
             yield chunk({"role": "assistant", "content": self.tool_result_text})
@@ -205,6 +280,7 @@ class Client:
         root: Path,
         provider: Provider,
         prewalk_target: Provider | None = None,
+        plan_yolo_target: Provider | None = None,
     ) -> None:
         self.config = root / "config"
         self.data = root / "data"
@@ -231,27 +307,31 @@ class Client:
             "      - id: mock-model\n"
             "        contextWindow: 128000\n"
         )
-        if prewalk_target is not None:
+        target = prewalk_target or plan_yolo_target
+        if target is not None:
             # A provider-level baseUrl would override the per-model endpoints;
             # leave routing to models.yml so root and target stay separate.
             config_text = config_text.replace(
                 f"    baseUrl: \"{provider.base_url}\"\n", ""
             )
-            # Fresh ACP sessions carry the settings-derived prewalk arm; the
-            # restricted tool selection opens the gate before a todo call, and
-            # yolo avoids a permission round-trip for the write mutation.
-            config_text += (
-                "prewalk:\n"
-                "  enabled: true\n"
-                "modelRoles:\n"
-                "  smol: mock/model-b\n"
-                "tools: [write, read]\n"
-                "approvalMode: yolo\n"
-            )
+            if prewalk_target is not None:
+                # Fresh ACP sessions carry the settings-derived prewalk arm; the
+                # restricted tool selection opens the gate before a todo call.
+                config_text += (
+                    "prewalk:\n"
+                    "  enabled: true\n"
+                    "modelRoles:\n"
+                    "  smol: mock/model-b\n"
+                )
+            if plan_yolo_target is not None:
+                # The explicit plan-yolo flag is on the launch argv; yolo only
+                # avoids a permission round-trip for the implementation write.
+                config_text += "approvalMode: yolo\n"
+            config_text += "tools: [write, read]\n"
             models_text += (
                 "      - id: model-b\n"
                 "        contextWindow: 128000\n"
-                f"        baseUrl: \"{prewalk_target.base_url}\"\n"
+                f"        baseUrl: \"{target.base_url}\"\n"
             )
         (self.agent_dir / "config.yml").write_text(config_text, encoding="utf-8")
         (self.agent_dir / "models.json").write_text(
@@ -272,8 +352,12 @@ class Client:
         )
         self.cwd = root / "workspace"
         self.cwd.mkdir()
+        argv = [binary]
+        if plan_yolo_target is not None:
+            argv += ["--plan-yolo", "--plan-yolo-into", "mock/model-b"]
+        argv += ["acp"]
         self.proc = subprocess.Popen(
-            [binary, "acp"],
+            argv,
             cwd=str(self.cwd),
             env=env,
             stdin=subprocess.PIPE,
@@ -737,6 +821,67 @@ def run_prewalk(binary: str) -> None:
         print(f"acp_prewalk artifacts retained at: {root}")
 
 
+def run_plan_yolo(binary: str) -> None:
+    """ACP explicit plan-yolo: guard, auto-approved proposal, target switch,
+    live handoff, then the target keeps serving the session."""
+    root = Path(tempfile.mkdtemp(prefix="acp-plan-yolo."))
+    root_provider = Provider()
+    root_provider.plan_yolo_root = True
+    target_provider = Provider()
+    target_provider.model = "model-b"
+    target_provider.plan_yolo_target = True
+    target_provider.tool_result_text = "hello from target"
+    root_provider.start()
+    target_provider.start()
+    client = Client(binary, root, root_provider, plan_yolo_target=target_provider)
+    try:
+        client.request("initialize", {"protocolVersion": 1, "clientCapabilities": {}})
+        cwd = str(client.cwd)
+        created = client.request("session/new", {"cwd": cwd, "mcpServers": []})
+        session_id = created["sessionId"]
+        mark = client.mark()
+        response = client.request(
+            "session/prompt",
+            {"sessionId": session_id, "prompt": [{"type": "text", "text": "PLAN_YOLO start"}]},
+            PROMPT_TIMEOUT,
+        )
+        assert_eq(response["stopReason"], "end_turn", "plan-yolo stop reason")
+        assert_eq(root_provider.requests, 3, "guard, plan write, proposal")
+        assert_eq(target_provider.requests, 2, "target write plus final reply")
+        assert not (client.cwd / "blocked.txt").exists(), (
+            "the plan guard must deny a working-tree write"
+        )
+        assert (client.cwd / "probe.txt").read_text(encoding="utf-8") == "done"
+        assert any("Plan-yolo: plan approved, switched to mock/model-b" in line
+                   for line in client.stderr), (
+            f"missing plan-yolo notice; stderr={client.stderr[-10:]!r}"
+        )
+        updates = client.updates_since(mark, session_id)
+        assert any(update.get("sessionUpdate") == "current_mode_update" for update in updates), (
+            "plan-yolo mode change must be announced"
+        )
+        chunks = [u for u in updates if u.get("sessionUpdate") == "agent_message_chunk"]
+        assert "hello from target" in chunk_text(chunks), chunk_text(chunks)
+
+        follow = client.request(
+            "session/prompt",
+            {"sessionId": session_id, "prompt": [{"type": "text", "text": "follow up"}]},
+            PROMPT_TIMEOUT,
+        )
+        assert_eq(follow["stopReason"], "end_turn", "post-plan stop reason")
+        assert_eq(target_provider.requests, 3, "target keeps serving the session")
+        assert_eq(root_provider.requests, 3, "root provider stays at three requests")
+
+        client.close_stdin()
+        code = client.wait_exit(10.0)
+        assert code is not None, f"ACP did not exit; stderr={client.stderr[-20:]!r}"
+    finally:
+        client.kill()
+        root_provider.stop()
+        target_provider.stop()
+        print(f"acp_plan_yolo artifacts retained at: {root}")
+
+
 def chunk_text(chunks):
     parts = []
     for update in chunks:
@@ -755,6 +900,7 @@ def main(argv=None):
         raise SystemExit(f"binary not found: {binary}")
     run(binary)
     run_prewalk(binary)
+    run_plan_yolo(binary)
     print("acp_accept: OK")
 
 

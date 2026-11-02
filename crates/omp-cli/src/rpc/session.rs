@@ -126,6 +126,8 @@ pub struct RpcLaunch {
 	pub restore_model: bool,
 	/// Armed prewalk target for this session; `None` leaves it disabled.
 	pub prewalk: Option<crate::prewalk::PrewalkArm>,
+	/// Explicit plan-yolo target; armed before the first prompt.
+	pub plan_yolo: Option<crate::plan_yolo::PlanYoloArm>,
 	pub max_time: Option<Duration>,
 	pub max_turns: usize,
 	pub tools_enabled: bool,
@@ -336,6 +338,10 @@ pub struct RpcSession {
 	/// Live plan-mode probe handed to the hidden `goal` tool, which refuses
 	/// `create`/`resume` while plan mode holds the exclusive mode slot.
 	pub(crate) plan_mode_probe: Option<crate::goal_tool::PlanModeProbe>,
+	/// Plan-yolo gate/pending shared with the host; `None` when the flag is off.
+	pub(crate) plan_yolo: Option<Arc<crate::plan_yolo::PlanYoloShared>>,
+	/// Planning tool selection to restore after approval or a failed arm.
+	pub(crate) plan_yolo_tools: Option<crate::plan_yolo::PlanYoloToolSelection>,
 }
 
 impl RpcSession {
@@ -365,6 +371,7 @@ impl RpcSession {
 			thinking,
 			restore_model,
 			prewalk,
+			plan_yolo,
 			max_time,
 			max_turns,
 			tools_enabled,
@@ -486,7 +493,16 @@ impl RpcSession {
 			mcp_servers: Vec::new(),
 			plan_mode: crate::agent::PlanModeHooks::default(),
 			plan_mode_probe: None,
+			plan_yolo: None,
+			plan_yolo_tools: None,
 		};
+		if let Some(arm) = plan_yolo {
+			let gate =
+				Arc::new(std::sync::Mutex::new(crate::acp::plan::PlanGate::new(true)));
+			session.set_plan_yolo(Arc::new(crate::plan_yolo::PlanYoloShared::new(
+				gate, arm,
+			)));
+		}
 		session.refresh_root_endpoint();
 		if restore_model
 			&& let Some(restored) = session.restore_persisted_model(thinking.is_none())
@@ -1010,6 +1026,22 @@ impl RpcSession {
 	/// reminder policy) copied into every later `RunRequest`.
 	pub fn set_plan_mode(&mut self, hooks: crate::agent::PlanModeHooks) {
 		self.plan_mode = hooks;
+	}
+
+	/// Install the plan-yolo gate shared with the host and derive its hooks.
+	pub fn set_plan_yolo(
+		&mut self,
+		shared: Arc<crate::plan_yolo::PlanYoloShared>,
+	) {
+		self.plan_mode = crate::plan_yolo::plan_hooks(&shared, self.plan_artifacts());
+		self.plan_yolo = Some(shared);
+	}
+
+	fn plan_artifacts(&self) -> Option<PathBuf> {
+		self.store
+			.file()
+			.filter(|_| self.store.enabled())
+			.and_then(crate::session::artifacts_directory_for)
 	}
 
 	/// Install the live plan-mode probe the hidden `goal` tool consults.
@@ -1662,6 +1694,49 @@ impl RpcSession {
 		self.goal_frames()
 	}
 
+	/// Publish plan mode and the planning tool selection before the first
+	/// prompt. The guard is rolled back if the tool-set or artifact root is
+	/// unusable, so the session never advertises an unapprovable plan.
+	fn arm_plan_yolo(&mut self) -> Result<()> {
+		let Some(shared) = self.plan_yolo.as_ref().cloned() else {
+			return Ok(());
+		};
+		let Some(arming) = shared.arm() else {
+			return Ok(());
+		};
+		let Some(artifacts) = self.plan_artifacts() else {
+			shared.rollback_arm(arming);
+			return Err(Error::new(
+				"plan-yolo requires a persisted session for plan artifacts",
+			));
+		};
+		let tools = match crate::plan_yolo::plan_tools(
+			self.tools_enabled,
+			self.config.tools.as_deref(),
+		) {
+			Ok(tools) => tools,
+			Err(error) => {
+				shared.rollback_arm(arming);
+				return Err(Error::new(error));
+			},
+		};
+		self.config.tools = tools.selected().map(|selected| selected.to_vec());
+		self.plan_yolo_tools = Some(tools);
+		self.plan_mode = crate::plan_yolo::plan_hooks(&shared, Some(artifacts));
+		Ok(())
+	}
+
+	fn plan_context(&self) -> Option<String> {
+		let shared = self.plan_yolo.as_ref()?;
+		let gate = shared.gate();
+		let gate = gate.lock().unwrap_or_else(|poison| poison.into_inner());
+		gate.prompt_prefix(
+			self.tools_enabled && self.tool_selected("ask"),
+			self.tools_enabled && self.tool_selected("scout"),
+			self.tools_enabled && self.tool_selected("task"),
+		)
+	}
+
 	/// Build the provider request for a prompt, recording the user entry.
 	pub fn prepare_turn(
 		&mut self,
@@ -1678,6 +1753,7 @@ impl RpcSession {
 				"cannot append to legacy v1 session log: read-only; use import_legacy_v1",
 			));
 		}
+		self.arm_plan_yolo()?;
 
 		if input.continuation {
 			// Detached plan continuation: no user entry, no goal budget window and
@@ -1907,7 +1983,7 @@ impl RpcSession {
 			goal_context,
 			plan_mode: self.plan_mode.clone(),
 			continuation,
-			plan_context: None,
+			plan_context: self.plan_context(),
 			service_tier_by_family: self.service_tier_by_family(),
 })
 	}
@@ -2683,6 +2759,141 @@ impl RpcSession {
 				decision.guidance = guidance;
 			}
 		}
+		if !terminal
+			&& let Some(shared) = self.plan_yolo.as_ref().cloned()
+		{
+			let artifacts = self.plan_artifacts();
+			let catalog = Arc::clone(&self.catalog);
+			let config = self.config.clone();
+			let root_provider = self.provider.clone();
+			let root_base_url = self.root_base_url.clone();
+			let root_api_key = self.api_key.clone();
+			let root_cache_key = self.prompt_cache_key.clone();
+			let inherited = self.prompt_cache_key_inherited;
+			let resolver = Arc::clone(&self.resolver);
+			let service_tiers = self.store.service_tier_by_family();
+			let committed = shared.commit_pending(artifacts.as_deref(), |pending| {
+				let target = pending.target().clone();
+				let switch_thinking = pending.thinking().map(Some).or_else(|| {
+					match runtime::model_default_thinking(
+						&catalog,
+						&target.provider,
+						&target.model,
+					) {
+						runtime::DefaultThinking::Unspecified => None,
+						runtime::DefaultThinking::Resolved(level) => Some(level),
+					}
+				});
+				let mut switch_target = target.clone();
+				if switch_target.effort.is_none()
+					&& let Some(Some(runtime::CliThinking::Effort(effort))) =
+						switch_thinking
+				{
+					switch_target.effort = Some(effort.to_string());
+				}
+				let target_endpoint = runtime::effective_endpoint(
+					&catalog,
+					&config,
+					&target.provider,
+					&target.model,
+				)
+				.ok();
+				let reuses_root = root_provider.as_deref()
+					== Some(target.provider.as_str())
+					&& target_endpoint.is_some()
+					&& target_endpoint.as_deref() == root_base_url.as_deref();
+				let api_key = if reuses_root {
+					root_api_key.clone()
+				} else {
+					config.resolve_api_key(&target.provider).or_else(|| {
+						resolver
+							.peek_api_key(&target.provider)
+							.ok()
+							.flatten()
+							.filter(|key| !key.trim().is_empty())
+					})
+				};
+				let stored_auth = reuses_root
+					|| api_key.as_deref().is_some_and(|key| !key.trim().is_empty())
+					|| runtime::provider_has_configured_auth(
+						&catalog,
+						&config,
+						&target.provider,
+						None,
+					);
+				if !stored_auth {
+					return Err(format!(
+						"no independent credential for {}/{}",
+						target.provider, target.model
+					));
+				}
+				let cache_key = if inherited { None } else { root_cache_key.clone() };
+				let provider = runtime::build_switch_provider(
+					&catalog,
+					&config,
+					&switch_target,
+					api_key.clone(),
+					None,
+					cache_key,
+					&service_tiers,
+				)?;
+				Ok((provider, switch_target, switch_thinking, api_key))
+			});
+			match committed {
+				Ok((commit, (provider, target, switch_thinking, api_key))) => {
+					if self.store.enabled()
+						&& let Err(err) = self.store.append_model_change(
+							&format!("{}/{}", target.provider, target.model),
+							"fallback",
+						)
+					{
+						eprintln!("warning: cannot record plan-yolo model change: {err}");
+					}
+					decision.provider = Some(provider);
+					decision.context_limit = Some(
+						self.catalog
+							.context_window(&target.provider, &target.model)
+							.unwrap_or(runtime::DEFAULT_CONTEXT_LIMIT),
+					);
+					decision.guidance.push(pi_agent::Message::guidance(
+						crate::plan_yolo::PLAN_YOLO_HANDOFF_TYPE,
+						commit.handoff,
+					));
+					decision.continue_turn = true;
+					eprintln!("{}", commit.notice);
+					self.provider = Some(target.provider);
+					self.model = Some(target.model);
+					self.api_key = api_key;
+					if let Some(level) = switch_thinking {
+						self.thinking = level;
+						self.thinking_level = match level {
+							Some(runtime::CliThinking::Off) => Some("off".to_string()),
+							Some(runtime::CliThinking::Effort(effort)) => {
+								Some(effort.to_string())
+							},
+							Some(runtime::CliThinking::Auto) | None => None,
+						};
+					}
+					self.provider_session_id = None;
+					if self.prompt_cache_key_inherited {
+						self.prompt_cache_key = None;
+						self.prompt_cache_key_inherited = false;
+					}
+					self.refresh_root_endpoint();
+					self.config.tools = self
+						.plan_yolo_tools
+						.take()
+						.and_then(|tools| tools.restore());
+					self.plan_mode = crate::agent::PlanModeHooks::default();
+					let gate = shared.gate();
+					let mut gate = gate.lock().unwrap_or_else(|poison| poison.into_inner());
+					let persisted = gate.persisted_mode_change();
+					gate.queue_mode_persist(persisted.0, persisted.1);
+					gate.queue_config_refresh();
+				},
+				Err(err) => eprintln!("warning: plan-yolo switch failed — {err}"),
+			}
+		}
 		// A cut queued by an earlier turn must not mix with this turn's tail.
 		self.flush_pending_wire();
 		for entry in &valid {
@@ -3254,6 +3465,7 @@ mod tests {
 				thinking: None,
 				restore_model: false,
 				prewalk: None,
+				plan_yolo: None,
 				max_time: None,
 				max_turns: 8,
 				tools_enabled: true,

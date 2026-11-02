@@ -27,6 +27,7 @@ use omp_cli::{
 	local_cmd,
 	local_models,
 	output::{self, OutputMode, Reporter, session_id},
+	plan_yolo,
 	prewalk,
 	process_cli,
 	profile,
@@ -744,6 +745,15 @@ fn run() -> std::result::Result<(), CliError> {
 	for warning in &prewalk_policy.warnings {
 		eprintln!("{warning}");
 	}
+	// Plan-yolo is explicit and fails hard: an unresolved target, missing
+	// credential, or unapprovable tool mode must not silently run without it.
+	let plan_yolo_arm = plan_yolo::resolve_arm(
+		&cli,
+		&config,
+		&catalog,
+		requested_api_key.as_deref(),
+	)
+	.map_err(CliError::fail)?;
 
 	// Pre-resolve session target
 	let mut chosen_file: Option<PathBuf> = None;
@@ -925,6 +935,8 @@ fn run() -> std::result::Result<(), CliError> {
 		session_dir: session_dir.clone(),
 		goal: Arc::new(GoalRuntime::new()),
 		prewalk: prewalk::PrewalkState::new(prewalk_policy.arm.clone()),
+		plan_yolo: None,
+		plan_yolo_tools: None,
 	};
 	if let Some(model) = requested_model.or(default_model) {
 		session.select_model(model);
@@ -1018,6 +1030,7 @@ fn run() -> std::result::Result<(), CliError> {
 		recipe.prewalk = prewalk_policy.arm.clone();
 		recipe.prewalk_fresh = fresh_prewalk.arm;
 		recipe.prewalk_explicit = cli.prewalk || cli.prewalk_into.is_some();
+		recipe.plan_yolo = plan_yolo_arm.clone();
 		recipe.max_time = session.max_time;
 		recipe.max_turns = session.max_turns;
 		recipe.tools_enabled = session.tools_enabled;
@@ -1111,6 +1124,7 @@ fn run() -> std::result::Result<(), CliError> {
 			restore_model: cli.model.is_none()
 				&& (restoring_session || explicitly_existing),
 			prewalk: prewalk_policy.arm.clone(),
+			plan_yolo: plan_yolo_arm.clone(),
 			max_time: session.max_time,
 			max_turns: session.max_turns,
 			tools_enabled: session.tools_enabled,
@@ -1195,6 +1209,10 @@ fn run() -> std::result::Result<(), CliError> {
 	// Restore the persisted goal mode from the active branch before any turn:
 	// a malformed/disabled record is cleared, an active replay is paused.
 	session.reconcile_goal_mode();
+	if let Some(arm) = plan_yolo_arm {
+		let gate = Arc::new(std::sync::Mutex::new(acp::plan::PlanGate::new(true)));
+		session.plan_yolo = Some(Arc::new(plan_yolo::PlanYoloShared::new(gate, arm)));
+	}
 
 	let mode = cli.mode;
 	let reporter_id = if session.store.enabled() {
@@ -1507,6 +1525,10 @@ struct Session<'a> {
 	goal: Arc<GoalRuntime>,
 	/// One-way prewalk state machine; disarmed after a switch or no-op target.
 	prewalk: prewalk::PrewalkState,
+	/// Explicit plan-yolo gate/pending; armed before the first prompt.
+	plan_yolo: Option<Arc<plan_yolo::PlanYoloShared>>,
+	/// Planning tool selection to restore after approval or a failed arm.
+	plan_yolo_tools: Option<plan_yolo::PlanYoloToolSelection>,
 }
 
 impl Session<'_> {
@@ -1777,12 +1799,64 @@ impl Session<'_> {
 		Ok(())
 	}
 
+	fn plan_artifacts(&self) -> Option<PathBuf> {
+		self.store
+			.file()
+			.filter(|_| self.store.enabled())
+			.and_then(session::artifacts_directory_for)
+	}
+
+	fn arm_plan_yolo(&mut self) -> Result<()> {
+		let Some(shared) = self.plan_yolo.as_ref().cloned() else {
+			return Ok(());
+		};
+		let Some(arming) = shared.arm() else {
+			return Ok(());
+		};
+		let Some(_artifacts) = self.plan_artifacts() else {
+			shared.rollback_arm(arming);
+			return Err(Error::new(
+				"plan-yolo requires a persisted session for plan artifacts",
+			));
+		};
+		let tools = match plan_yolo::plan_tools(
+			self.tools_enabled,
+			self.config.tools.as_deref(),
+		) {
+			Ok(tools) => tools,
+			Err(error) => {
+				shared.rollback_arm(arming);
+				return Err(Error::new(error));
+			},
+		};
+		self.config.tools = tools.selected().map(|selected| selected.to_vec());
+		self.plan_yolo_tools = Some(tools);
+		Ok(())
+	}
+
+	fn plan_runtime(&self) -> (agent::PlanModeHooks, Option<String>) {
+		let Some(shared) = self.plan_yolo.as_ref().filter(|shared| shared.is_armed()) else {
+			return (agent::PlanModeHooks::default(), None);
+		};
+		let hooks = plan_yolo::plan_hooks(shared, self.plan_artifacts());
+		let gate = shared.gate();
+		let gate = gate.lock().unwrap_or_else(|poison| poison.into_inner());
+		let context = gate.prompt_prefix(
+			self.tools_enabled && self.tool_selected("ask"),
+			self.tools_enabled && self.tool_selected("scout"),
+			self.tools_enabled && self.tool_selected("task"),
+		);
+		(hooks, context)
+	}
+
 	fn request(
-		&self,
+		&mut self,
 		prompt: String,
 		parts: Vec<ContentPart>,
 		output_mode: OutputMode,
 	) -> Result<RunRequest> {
+		self.arm_plan_yolo()?;
+		let (plan_mode, plan_context) = self.plan_runtime();
 		let model = match (self.model.as_deref(), self.thinking) {
 			(Some(model), Some(level)) => Some(runtime::apply_thinking(model, level)),
 			(model, _) => model.map(str::to_string),
@@ -1874,9 +1948,9 @@ impl Session<'_> {
 			goal: Some(Arc::clone(&self.goal)),
 			goal_context,
 			credential_resolver: None,
-			plan_mode: Default::default(),
+			plan_mode,
 			continuation: false,
-			plan_context: None,
+			plan_context,
 			service_tier_by_family,
 })
 	}
@@ -2101,6 +2175,14 @@ impl Session<'_> {
 			self.prompt_cache_key_source == Some(PromptCacheKeySource::Inherited);
 		let prewalk_todo_available =
 			prewalk::todo_available(self.tools_enabled, self.config.tools.as_deref());
+		let plan_yolo_shared = self.plan_yolo.clone();
+		let plan_yolo_tools_restore = self.plan_yolo_tools.clone();
+		let plan_yolo_artifacts = self.plan_artifacts();
+		let mut plan_yolo_switch: Option<(
+			runtime::ModelSwitch,
+			Option<Option<runtime::CliThinking>>,
+			Option<String>,
+		)> = None;
 		let mut handle_event = |event: &agent::Event,
 		                        store: &mut SessionStore,
 		                        host: &CheckpointHost,
@@ -2594,6 +2676,128 @@ impl Session<'_> {
 						}
 					}
 
+					if !terminal
+						&& let Some(shared) = plan_yolo_shared.clone()
+					{
+						let committed = shared.commit_pending(
+							plan_yolo_artifacts.as_deref(),
+							|pending| {
+								let target = pending.target().clone();
+								let switch_thinking =
+									pending.thinking().map(Some).or_else(|| {
+										match runtime::model_default_thinking(
+											&prewalk_catalog,
+											&target.provider,
+											&target.model,
+										) {
+											runtime::DefaultThinking::Unspecified => None,
+											runtime::DefaultThinking::Resolved(level) => {
+												Some(level)
+											},
+										}
+									});
+								let mut switch_target = target.clone();
+								if switch_target.effort.is_none()
+									&& let Some(Some(runtime::CliThinking::Effort(
+										effort,
+									))) = switch_thinking
+								{
+									switch_target.effort = Some(effort.to_string());
+								}
+								let target_endpoint = runtime::effective_endpoint(
+									&prewalk_catalog,
+									session_config,
+									&target.provider,
+									&target.model,
+								)
+								.ok();
+								let reuses_root = prewalk_provider.as_deref()
+									== Some(target.provider.as_str())
+									&& target_endpoint.is_some()
+									&& target_endpoint.as_deref()
+										== prewalk_root_base_url.as_deref();
+								let api_key = if reuses_root {
+									prewalk_api_key.clone()
+								} else {
+									session_config.resolve_api_key(&target.provider)
+								};
+								let stored_auth = reuses_root
+									|| api_key
+										.as_deref()
+										.is_some_and(|key| !key.trim().is_empty())
+									|| runtime::provider_has_configured_auth(
+										&prewalk_catalog,
+										session_config,
+										&target.provider,
+										None,
+									);
+								if !stored_auth {
+									return Err(format!(
+										"no independent credential for {}/{}",
+										target.provider, target.model
+									));
+								}
+								let cache_key = if prewalk_cache_inherited {
+									None
+								} else {
+									prewalk_cache_key.clone()
+								};
+								let provider = runtime::build_switch_provider(
+									&prewalk_catalog,
+									session_config,
+									&switch_target,
+									api_key.clone(),
+									None,
+									cache_key,
+									&store.service_tier_by_family(),
+								)?;
+								Ok((provider, switch_target, switch_thinking, api_key))
+							},
+						);
+						match committed {
+							Ok((
+								commit,
+								(provider, target, switch_thinking, api_key),
+							)) => {
+								if store.enabled()
+									&& let Err(err) = store.append_model_change(
+										&format!(
+											"{}/{}",
+											target.provider, target.model
+										),
+										"fallback",
+									)
+								{
+									eprintln!(
+										"warning: cannot record plan-yolo model change: {err}"
+									);
+								}
+								decision.provider = Some(provider);
+								decision.context_limit = Some(
+									prewalk_catalog
+										.context_window(
+											&target.provider,
+											&target.model,
+										)
+										.unwrap_or(runtime::DEFAULT_CONTEXT_LIMIT),
+								);
+								decision.guidance.push(
+									pi_agent::Message::guidance(
+										plan_yolo::PLAN_YOLO_HANDOFF_TYPE,
+										commit.handoff,
+									),
+								);
+								decision.continue_turn = true;
+								eprintln!("{}", commit.notice);
+								*plan_yolo_switch =
+									Some((target, switch_thinking, api_key));
+							},
+							Err(err) => {
+								eprintln!("warning: plan-yolo switch failed — {err}");
+							},
+						}
+					}
+
 					if let Some((_, reply)) = pending {
 						let _ = reply.send(decision);
 					}
@@ -2688,6 +2892,30 @@ impl Session<'_> {
 				&mut self.prompt_cache_key,
 				&mut self.prompt_cache_key_source,
 			);
+		}
+		if let Some((target, thinking, api_key)) = plan_yolo_switch.take() {
+			self.provider = Some(target.provider);
+			self.model = Some(target.model);
+			self.api_key = api_key;
+			if let Some(level) = thinking {
+				self.thinking = level;
+			}
+			self.provider_session_id = None;
+			invalidate_inherited_cache_key(
+				&mut self.prompt_cache_key,
+				&mut self.prompt_cache_key_source,
+			);
+			self.root_base_url = self
+				.provider
+				.as_deref()
+				.zip(self.model.as_deref())
+				.and_then(|(provider, model)| {
+					runtime::effective_endpoint(&self.catalog, &self.config, provider, model)
+						.ok()
+				});
+			self.config.tools = plan_yolo_tools_restore
+				.and_then(|tools| tools.restore());
+			self.plan_yolo_tools = None;
 		}
 		// Drain the final goal writes (agent-end flush, interrupt pause) and, if
 		// the goal tool completed this goal, write `none` + the terminal metric.

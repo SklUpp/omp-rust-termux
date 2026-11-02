@@ -96,13 +96,12 @@ struct LaunchArgs {
 	prewalk_into: Option<String>,
 
 	/// Force read-only plan mode at start, auto-approve the model's plan, then
-	/// switch to the execution target and implement it. Hidden until the host
-	/// wiring lands so unwired runs never advertise the flow.
-	#[arg(long = "plan-yolo", hide = true)]
+	/// switch to the execution target and implement it.
+	#[arg(long = "plan-yolo")]
 	plan_yolo: bool,
 
 	/// Target model or role for plan-yolo execution (default `@smol`).
-	#[arg(long = "plan-yolo-into", value_name = "MODEL", hide = true)]
+	#[arg(long = "plan-yolo-into", value_name = "MODEL")]
 	plan_yolo_into: Option<String>,
 
 	/// Private think scratchpad; disables supported native provider reasoning.

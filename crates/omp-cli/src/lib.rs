@@ -27,6 +27,7 @@ pub mod goal_tool;
 pub mod local_cmd;
 pub mod local_models;
 pub mod output;
+pub mod plan_yolo;
 pub mod prewalk;
 pub mod process_cli;
 pub mod profile;

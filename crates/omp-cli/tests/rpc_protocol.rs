@@ -34,6 +34,7 @@ use omp_cli::{
 		session::{FrameSink, RpcLaunch},
 		types::RpcHostUriSchemeDefinition,
 	},
+	plan_yolo::PlanYoloArm,
 	prewalk::PrewalkArm,
 	runtime::{CliThinking, ModelSwitch, PiAgentRunner},
 	session::{
@@ -655,6 +656,7 @@ fn launch(port: u16, model: &str, provider: &str) -> RpcLaunch {
 		thinking: None,
 		restore_model: false,
 		prewalk: None,
+		plan_yolo: None,
 		max_time: Some(Duration::from_secs(10)),
 		max_turns: 2,
 		tools_enabled: false,
@@ -1919,6 +1921,110 @@ fn rpc_prewalk_switches_after_todo_and_first_write() {
 			&& entry["customType"] == "prewalk-checklist"),
 		"checklist continuation must replay from the journal"
 	);
+	drop(harness);
+	fs::remove_dir_all(&root).ok();
+}
+
+/// Plan-yolo through RPC: guard blocks the working tree, approval queues an
+/// atomic switch, the target implements, and the journal uses the ephemeral
+/// fallback role.
+#[test]
+fn rpc_plan_yolo_guards_proposes_switches_and_journals_fallback() {
+	let root = checkpoint_root("plan-yolo");
+	let worktree = root.join("worktree");
+	let sessions = root.join("sessions");
+	let (port, requests) = spawn_tool_model(vec![
+		ToolScript {
+			text: String::new(),
+			tool: Some((
+				"write",
+				json!({ "path": "blocked.txt", "content": "must not land" }),
+			)),
+		},
+		ToolScript {
+			text: String::new(),
+			tool: Some((
+				"write",
+				json!({
+					"path": "local://plan-plan.md",
+					"content": "# Plan\n\nImplement probe.\n"
+				}),
+			)),
+		},
+		ToolScript {
+			text: String::new(),
+			tool: Some((
+				"write",
+				json!({ "path": "xd://propose", "content": "Plan" }),
+			)),
+		},
+		ToolScript {
+			text: String::new(),
+			tool: Some(("write", json!({ "path": "probe.txt", "content": "done" }))),
+		},
+		ToolScript { text: "implemented".to_string(), tool: None },
+	]);
+	let mut launch = launch(port, "local/mock-model", "local");
+	launch.config.providers.insert(
+		"fast".to_string(),
+		ProviderConfig {
+			base_url: Some(format!("http://127.0.0.1:{port}/v1")),
+			api_key: Some("sk-fast".to_string()),
+			..Default::default()
+		},
+	);
+	launch.cwd = worktree.clone();
+	launch.tools_enabled = true;
+	launch.max_turns = 8;
+	launch.store_options = checkpoint_session_options(
+		&worktree,
+		&sessions,
+		Some("plan-yolo-rpc"),
+	);
+	launch.plan_yolo = Some(PlanYoloArm {
+		target: ModelSwitch {
+			provider: "fast".to_string(),
+			model: "small".to_string(),
+			effort: None,
+			thinking: None,
+		},
+		thinking: None,
+	});
+	let harness = Harness::start(launch);
+	harness.send(json!({ "type": "prompt", "id": "p1", "message": "start" }));
+	harness.wait_frame("agent_end", timeout());
+
+	let bodies = requests
+		.lock()
+		.unwrap_or_else(std::sync::PoisonError::into_inner)
+		.clone();
+	assert_eq!(bodies.len(), 5, "plan-yolo request sequence: {bodies:#?}");
+	assert!(
+		!worktree.join("blocked.txt").exists(),
+		"the guard must deny working-tree writes before approval"
+	);
+	for body in &bodies[..3] {
+		assert_ne!(body["model"], "small", "planning stays on the root model");
+	}
+	assert_eq!(bodies[3]["model"], "small", "implementation uses the plan target");
+	assert_eq!(
+		bodies[3].to_string().matches("Plan approved: **Plan**").count(),
+		1
+	);
+	assert_eq!(fs::read_to_string(worktree.join("probe.txt")).expect("probe"), "done");
+
+	let log = session_log(&sessions);
+	let entries: Vec<Value> = fs::read_to_string(&log)
+		.expect("session log")
+		.lines()
+		.filter_map(|line| serde_json::from_str(line).ok())
+		.collect();
+	let change = entries
+		.iter()
+		.find(|entry| entry["type"] == "model_change")
+		.expect("plan-yolo model_change entry");
+	assert_eq!(change["model"], "fast/small");
+	assert_eq!(change["role"], "fallback", "switch must be ephemeral on resume");
 	drop(harness);
 	fs::remove_dir_all(&root).ok();
 }

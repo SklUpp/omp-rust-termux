@@ -21,8 +21,9 @@ use pi_agent::{
 	},
 	supervisor::{ChildSpawn, DelegationLimits, Supervisor},
 	task_persisted_revive::{
-		DefaultPersistedReviverFactory, PersistedChildSession, load_transcript,
-		transcript_path, turn_journal_messages,
+		DefaultPersistedReviverFactory, PersistedChildReviverFactory,
+		PersistedChildSession, load_transcript, transcript_path,
+		turn_journal_messages,
 	},
 	tools::{
 		Tool,

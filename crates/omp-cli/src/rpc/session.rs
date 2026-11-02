@@ -262,6 +262,11 @@ pub struct RpcSession {
 	pub(crate) history_messages: Option<Vec<Message>>,
 	/// Live conversation in wire form (`AgentMessage` JSON), oldest first.
 	pub(crate) messages: Vec<Value>,
+	/// Wire mirror replacement queued by a turn-end rewind cut. Applied after
+	/// the settled turn's own `turn_end` frame, so that frame still describes
+	/// the turn that actually ran, and before `agent_end`, so the abandoned
+	/// tail never reaches the host.
+	pub(crate) pending_wire: Option<Vec<Value>>,
 	pub(crate) model:    Option<String>,
 	pub(crate) provider: Option<String>,
 	pub(crate) api_key:  Option<String>,
@@ -386,7 +391,7 @@ impl RpcSession {
 			.filter(|text| !text.is_empty());
 		let mut checkpoint_host = CheckpointHost::new();
 		checkpoint_host.rehydrate(&store);
-		let todo_phases = store.latest_todo_phases();
+		let todo_phases = store.branch_todo_phases();
 		let mut session = Self {
 			runner,
 			resolver,
@@ -401,6 +406,7 @@ impl RpcSession {
 			history,
 			history_messages: None,
 			messages,
+			pending_wire: None,
 			model,
 			provider,
 			api_key,
@@ -1007,6 +1013,7 @@ impl RpcSession {
 		self.history.clear();
 		self.history_messages = None;
 		self.messages.clear();
+		self.pending_wire = None;
 		self.in_memory_messages = None;
 		self.todo_phases.clear();
 		self.session_name = None;
@@ -1068,11 +1075,12 @@ impl RpcSession {
 			store.history().to_vec()
 		};
 		self.messages = branch_wire_messages(&store);
+		self.pending_wire = None;
 		self.session_name = store
 			.title_slot()
 			.map(|slot| slot.title.clone())
 			.or_else(|| store.header().and_then(|header| header.title.clone()));
-		self.todo_phases = store.latest_todo_phases();
+		self.todo_phases = store.branch_todo_phases();
 		self.history_messages = None;
 		self.in_memory_messages = None;
 		self.last_assistant_text = self
@@ -1201,7 +1209,7 @@ impl RpcSession {
 			self.store.history().to_vec()
 		};
 		self.history_messages = None;
-		self.todo_phases = self.store.latest_todo_phases();
+		self.todo_phases = self.store.branch_todo_phases();
 		self.last_assistant_text = self
 			.history
 			.last()
@@ -1213,6 +1221,7 @@ impl RpcSession {
 			.into_iter()
 			.filter_map(|entry| serde_json::to_value(&entry.message).ok())
 			.collect();
+		self.pending_wire = None;
 		Ok(json!({ "text": text, "cancelled": false }))
 	}
 
@@ -1459,6 +1468,9 @@ impl RpcSession {
 		if self.is_streaming {
 			return Err(Error::new("a turn is already streaming"));
 		}
+		// A cut queued by the previous run must land before this prompt joins
+		// the mirror, or the abandoned tail would sit before the new turn.
+		self.flush_pending_wire();
 		if self.store.is_v1() {
 			return Err(Error::new(
 				"cannot append to legacy v1 session log: read-only; use import_legacy_v1",
@@ -1630,7 +1642,7 @@ impl RpcSession {
 			.then(|| Arc::clone(self.checkpoint_host.controller()));
 		let session_persisted = self.store.enabled() && !self.store.is_v1();
 		let todo_phases = if session_persisted {
-			self.store.latest_todo_phases()
+			self.store.branch_todo_phases()
 		} else {
 			runtime::latest_todo_phases_from_turns(&self.history)
 		};
@@ -1766,6 +1778,14 @@ impl RpcSession {
 			.map(|dir| dir.join("subagents"))
 	}
 
+	/// Apply a rewind cut queued at turn end, once that turn's `turn_end` frame
+	/// has gone out.
+	fn flush_pending_wire(&mut self) {
+		if let Some(messages) = self.pending_wire.take() {
+			self.messages = messages;
+		}
+	}
+
 	/// Persist and account for one finished turn.
 	pub fn finish_turn(&mut self, prepared: &mut PreparedTurn, outcome: &TurnOutcome) {
 		self.is_streaming = false;
@@ -1776,6 +1796,11 @@ impl RpcSession {
 				record.stop_reason = "aborted".to_string();
 			}
 			self.checkpoint_host.abandon_in_memory_rewind();
+			if !self.store.enabled() {
+				// The pending report was rolled back with the turn; a queued cut
+				// mirror must not outlive it.
+				self.pending_wire = None;
+			}
 			if let Some(messages) = self.in_memory_messages.as_mut() {
 				messages.truncate(prepared.in_memory_before);
 			}
@@ -1787,12 +1812,24 @@ impl RpcSession {
 		// stream does not surface; the state field stays absent rather than zero.
 		self.tokens_per_second = None;
 		let _ = prepared.started.elapsed();
+		// A deferred rewind cut landed after its own `turn_end` frame; the
+		// mirror must follow the retained branch before `agent_end`.
+		self.flush_pending_wire();
+		let rewound = self.checkpoint_host.finish_in_memory_rewind();
 		if self.store.enabled() {
 			// The live path already journaled the prompt (prepare_turn) and every
 			// assistant/tool tail entry (persist_turn_end, record_user_steer), so
 			// appending the turn record here would write the whole turn twice.
 			// Rebuild the view from the log instead.
 			self.refresh_history_from_store();
+		} else if rewound {
+			// Same as headless: the rewind turn is abandoned, so its record must
+			// not become the session's last turn (todo fallback, last text).
+			self.last_assistant_text = self
+				.history
+				.last()
+				.map(|turn| turn.assistant.clone())
+				.filter(|text| !text.is_empty());
 		} else {
 			self.history.push(record);
 		}
@@ -1925,15 +1962,13 @@ impl RpcSession {
 					model.as_deref(),
 				);
 			},
-			AgentEvent::AgentEnd { messages, .. } => {
-				if !self.store.enabled() {
-					// In-memory mirror of the loop's final conversation.
-					let mut mirror = Vec::with_capacity(messages.len());
-					for message in messages {
-						mirror.push(message.clone());
-					}
-					self.in_memory_messages = Some(mirror);
-				}
+			AgentEvent::AgentEnd { .. } => {
+				// The no-session mirror is maintained per turn in
+				// `persist_turn_end` (headless parity). `AgentEnd.messages` is
+				// only this run's delta and still holds turns the loop rewound
+				// away, so replacing the mirror from it would resurrect the
+				// abandoned context for the next prompt.
+				self.flush_pending_wire();
 			},
 			_ => {},
 		}
@@ -2087,6 +2122,7 @@ impl RpcSession {
 		// travel in it, never be dropped in favour of a default ack.
 		let mut decision = pi_agent::TurnAckDecision::default();
 		let mut rewound = false;
+		let mut rewind_cut: Option<pi_agent::InMemoryRewind> = None;
 		if self.store.enabled() {
 			let captured = if valid.is_empty() {
 				false
@@ -2126,7 +2162,7 @@ impl RpcSession {
 					}
 					self.history = applied.history;
 					self.history_messages = None;
-					self.todo_phases = self.store.latest_todo_phases();
+					self.todo_phases = self.store.branch_todo_phases();
 					self.last_assistant_text = self
 						.history
 						.last()
@@ -2141,17 +2177,40 @@ impl RpcSession {
 			let captured = self
 				.checkpoint_host
 				.note_unpersisted_tool_results(tool_results, &prepared.tool_names, turn_start);
+			// Headless parity: the mirror receives this turn's assistant and
+			// tool results before the cut decision, so the cut anchors on the
+			// checkpoint result and the next run's request keeps it. Replacing
+			// the mirror from `AgentEnd` instead would re-introduce the
+			// abandoned turns the loop just cut.
+			if let Some(messages) = self.in_memory_messages.as_mut() {
+				messages.push(message.clone());
+				for result in tool_results {
+					let name = prepared
+						.tool_names
+						.get(&result.tool_call_id)
+						.map(String::as_str)
+						.unwrap_or("tool");
+					messages.push(Message::tool_with_status(
+						&result.tool_call_id,
+						name,
+						&result.content,
+						result.is_error,
+					));
+				}
+			}
 			if let Some(rewind) = self.checkpoint_host.apply_pending_rewind_in_memory() {
+				// Headless parity: the mirror is the uncompacted branch and now
+				// includes this turn's checkpoint result, so cut it and replay it
+				// wholesale. `Replace` ignores the live anchor, which mid-run
+				// compaction may already have pruned.
 				decision.rewrite = match self.in_memory_messages.as_mut() {
 					Some(messages) => {
-						// The mirror is the uncompacted branch; replay it wholesale
-						// so the run does not depend on the checkpoint result
-						// surviving compaction.
 						crate::session_checkpoint::apply_in_memory_rewind(messages, &rewind);
 						Some(pi_agent::TurnRewrite::Replace(messages.clone()))
 					},
-					None => Some(pi_agent::TurnRewrite::InMemory(rewind)),
+					None => Some(pi_agent::TurnRewrite::InMemory(rewind.clone())),
 				};
+				rewind_cut = Some(rewind);
 			} else if captured {
 				decision.warning = self.checkpoint_host.active_notice().map(str::to_string);
 			}
@@ -2170,6 +2229,8 @@ impl RpcSession {
 		{
 			messages.push(Message::system(warning));
 		}
+		// A cut queued by an earlier turn must not mix with this turn's tail.
+		self.flush_pending_wire();
 		for entry in &valid {
 			if let Ok(value) = serde_json::to_value(&entry.message) {
 				self.messages.push(value);
@@ -2177,10 +2238,19 @@ impl RpcSession {
 		}
 		if rewound {
 			// The cut moved the leaf past the rewound turn's own entries; the
-			// mirror and the next parent must follow the retained branch.
-			self.messages = branch_wire_messages(&self.store);
+			// mirror and the next parent must follow the retained branch. The
+			// swap waits until after `turn_end`, which must report the turn that
+			// actually settled rather than the retained checkpoint batch.
+			self.pending_wire = Some(branch_wire_messages(&self.store));
 			prepared.parent_id = self.store.leaf_id().map(str::to_string);
 		} else {
+			if let Some(rewind) = rewind_cut {
+				// Mirror the loop's cut once the frame is out; the loop remains
+				// authoritative for the conversation it carries.
+				let mut mirror = self.messages.clone();
+				apply_in_memory_rewind_wire(&mut mirror, &rewind);
+				self.pending_wire = Some(mirror);
+			}
 			prepared.parent_id = Some(previous);
 		}
 
@@ -2476,6 +2546,7 @@ impl RpcSession {
 			"content": [{ "type": "text", "text": summary }],
 			"timestamp": now_ms(),
 		})];
+		self.pending_wire = None;
 		self.last_assistant_text = None;
 		// The rewrite retains no prior entry: the rebuilt context starts at this
 		// compaction entry, so its id is the real `firstKeptEntryId` (same
@@ -2533,6 +2604,7 @@ impl RpcSession {
 			"content": [{ "type": "text", "text": summary }],
 			"timestamp": now_ms(),
 		})];
+		self.pending_wire = None;
 		self.last_assistant_text = None;
 		Ok(self.store.file().map(|path| path.display().to_string()))
 	}
@@ -2570,6 +2642,52 @@ fn now_ms() -> u64 {
 		.duration_since(SystemTime::UNIX_EPOCH)
 		.unwrap_or_default()
 		.as_millis() as u64
+}
+
+/// Wire counterpart of the no-session retained-branch cut: truncate the
+/// serialized mirror after the checkpoint batch's tool results, matching the
+/// persisted branch's view. The summary/report stay loop-only context, exactly
+/// like the persisted branch's custom entries, which [`branch_wire_messages`]
+/// also omits. A mirror without the anchor is left intact rather than wiped by
+/// the zero fallback.
+fn apply_in_memory_rewind_wire(messages: &mut Vec<Value>, rewind: &pi_agent::InMemoryRewind) {
+	let Some(id) = rewind.checkpoint_tool_call_id.as_deref() else {
+		return;
+	};
+	let Some(assistant) = messages.iter().position(|message| {
+		message.get("role").and_then(Value::as_str) == Some("assistant")
+			&& message.get("content").and_then(Value::as_array).is_some_and(|parts| {
+				parts.iter().any(|part| {
+					part.get("type").and_then(Value::as_str) == Some("toolCall")
+						&& part.get("id").and_then(Value::as_str) == Some(id)
+				})
+			})
+	}) else {
+		// The loop still cuts; a mirror without the anchor must not be wiped by
+		// the zero fallback.
+		return;
+	};
+	let call_ids: std::collections::HashSet<&str> = messages[assistant]
+		.get("content")
+		.and_then(Value::as_array)
+		.into_iter()
+		.flatten()
+		.filter(|part| part.get("type").and_then(Value::as_str) == Some("toolCall"))
+		.filter_map(|part| part.get("id").and_then(Value::as_str))
+		.collect();
+	let mut end = assistant + 1;
+	while let Some(message) = messages.get(end) {
+		let is_result = message.get("role").and_then(Value::as_str) == Some("toolResult");
+		let in_batch = message
+			.get("toolCallId")
+			.and_then(Value::as_str)
+			.is_some_and(|id| call_ids.contains(id));
+		if !is_result || !in_batch {
+			break;
+		}
+		end += 1;
+	}
+	messages.truncate(end);
 }
 
 /// Wire mirror of the messages on the store's active branch.

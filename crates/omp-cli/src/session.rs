@@ -276,6 +276,57 @@ pub(crate) fn background_usage_key(value: &serde_json::Value) -> Option<&str> {
 		.filter(|key| !key.is_empty())
 }
 
+/// Newest todo state among `entries` (newest first), else empty. Shared by the
+/// journal-wide and branch-scoped queries so the two can never diverge.
+fn todo_phases_from_entries<'a>(entries: impl Iterator<Item = &'a SessionEntry>) -> Vec<TodoPhase> {
+	for entry in entries {
+		match entry.kind.as_str() {
+			"custom" => {
+				if entry.extra.get("customType").and_then(serde_json::Value::as_str)
+					!= Some(USER_TODO_EDIT_CUSTOM_TYPE)
+				{
+					continue;
+				}
+				let Some(phases) = entry.extra.get("data").and_then(|data| data.get("phases")) else {
+					continue;
+				};
+				if !phases.is_array() {
+					continue;
+				}
+				if let Ok(phases) = serde_json::from_value::<Vec<TodoPhase>>(phases.clone()) {
+					return phases;
+				}
+			},
+			"message" => {
+				let Some(message) = entry.extra.get("message") else {
+					continue;
+				};
+				if message.get("role").and_then(serde_json::Value::as_str) != Some("toolResult")
+					|| message.get("toolName").and_then(serde_json::Value::as_str) != Some("todo")
+					|| message
+						.get("isError")
+						.and_then(serde_json::Value::as_bool)
+						.unwrap_or(false)
+				{
+					continue;
+				}
+				let Some(phases) = message.get("details").and_then(|details| details.get("phases"))
+				else {
+					continue;
+				};
+				if !phases.is_array() {
+					continue;
+				}
+				if let Ok(phases) = serde_json::from_value::<Vec<TodoPhase>>(phases.clone()) {
+					return phases;
+				}
+			},
+			_ => {},
+		}
+	}
+	Vec::new()
+}
+
 /// Collect every keyed background contribution already present in the retained
 /// in-memory log, using the same identity rules as [`SessionStore::session_usage`].
 ///
@@ -1458,54 +1509,15 @@ impl SessionStore {
 	/// results are skipped because their details echo the pre-call state.
 	#[must_use]
 	pub fn latest_todo_phases(&self) -> Vec<TodoPhase> {
-		for entry in self.entries.iter().rev() {
-			match entry.kind.as_str() {
-				"custom" => {
-					if entry.extra.get("customType").and_then(serde_json::Value::as_str)
-						!= Some(USER_TODO_EDIT_CUSTOM_TYPE)
-					{
-						continue;
-					}
-					let Some(phases) = entry.extra.get("data").and_then(|data| data.get("phases")) else {
-						continue;
-					};
-					if !phases.is_array() {
-						continue;
-					}
-					if let Ok(phases) = serde_json::from_value::<Vec<TodoPhase>>(phases.clone()) {
-						return phases;
-					}
-				},
-				"message" => {
-					let Some(message) = entry.extra.get("message") else {
-						continue;
-					};
-					if message.get("role").and_then(serde_json::Value::as_str) != Some("toolResult")
-						|| message.get("toolName").and_then(serde_json::Value::as_str) != Some("todo")
-						|| message
-							.get("isError")
-							.and_then(serde_json::Value::as_bool)
-							.unwrap_or(false)
-					{
-						continue;
-					}
-					let Some(phases) = message
-						.get("details")
-						.and_then(|details| details.get("phases"))
-					else {
-						continue;
-					};
-					if !phases.is_array() {
-						continue;
-					}
-					if let Ok(phases) = serde_json::from_value::<Vec<TodoPhase>>(phases.clone()) {
-						return phases;
-					}
-				},
-				_ => {},
-			}
-		}
-		Vec::new()
+		todo_phases_from_entries(self.entries.iter().rev())
+	}
+
+	/// [`Self::latest_todo_phases`] over the active branch only. Entries left
+	/// behind by a rewind or branch switch stay in the journal but must never
+	/// supply todo state for the next request or the session frame.
+	#[must_use]
+	pub fn branch_todo_phases(&self) -> Vec<TodoPhase> {
+		todo_phases_from_entries(self.branch_entries().into_iter().rev())
 	}
 
 	#[must_use]

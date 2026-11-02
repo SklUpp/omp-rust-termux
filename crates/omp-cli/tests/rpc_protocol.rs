@@ -674,6 +674,16 @@ fn launch_checkpoint(
 	launch
 }
 
+/// [`launch`] with the checkpoint pair mounted and no session log: the whole
+/// conversation lives in the agent mirror, so rewinds cut it in memory.
+fn launch_checkpoint_in_memory(port: u16) -> RpcLaunch {
+	let mut launch = launch(port, "local/mock-model", "local");
+	launch.config.checkpoint.enabled = Some(true);
+	launch.tools_enabled = true;
+	launch.max_turns = 8;
+	launch
+}
+
 /// Only session log in `dir`; fails loudly when a scenario wrote none or two.
 fn session_log(dir: &Path) -> PathBuf {
 	let mut logs: Vec<PathBuf> = fs::read_dir(dir)
@@ -1253,6 +1263,217 @@ fn rpc_checkpoint_rewind_replaces_context_and_keeps_abandoned_entries() {
 		worktree_after, worktree_before,
 		"rewind must not change the worktree"
 	);
+	fs::remove_dir_all(&root).ok();
+}
+
+/// No-session parity: a rewind must commit at successful turn end (so a later
+/// `checkpoint` is accepted) and cut from the loop's authoritative messages,
+/// not from the session's stale mirror.
+#[test]
+fn rpc_no_session_rewind_commits_and_handles_a_second_cycle() {
+	let (port, requests) = spawn_tool_model(vec![
+		ToolScript {
+			text: String::new(),
+			tool: Some(("checkpoint", json!({ "goal": "cycle one" }))),
+		},
+		ToolScript { text: "EXPLORATORY-ONE-SECRET".to_string(), tool: None },
+		ToolScript {
+			text: String::new(),
+			tool: Some(("rewind", json!({ "report": "FINDINGS-ONE" }))),
+		},
+		ToolScript { text: "FINAL-ONE".to_string(), tool: None },
+		ToolScript {
+			text: String::new(),
+			tool: Some(("checkpoint", json!({ "goal": "cycle two" }))),
+		},
+		ToolScript { text: "EXPLORATORY-TWO-SECRET".to_string(), tool: None },
+		ToolScript {
+			text: String::new(),
+			tool: Some(("rewind", json!({ "report": "FINDINGS-TWO" }))),
+		},
+		ToolScript { text: "FINAL-TWO".to_string(), tool: None },
+	]);
+	let harness = Harness::start(launch_checkpoint_in_memory(port));
+	harness.send(json!({ "type": "prompt", "id": "p1", "message": "first investigation" }));
+	harness.wait_frame("agent_end", timeout());
+	// Round-trip a read-only command so the worker's `end_if` has run before the
+	// second prompt; otherwise it could land as a steer on the finished run.
+	harness.send(json!({ "type": "get_state", "id": "idle1" }));
+	harness.wait_for(|frames| frames.iter().any(|frame| frame["id"] == "idle1"), timeout());
+	harness.send(json!({ "type": "prompt", "id": "p2", "message": "second investigation" }));
+	let frames = harness.wait_for(
+		|frames| frames.iter().filter(|frame| frame["type"] == "agent_end").count() >= 2,
+		timeout(),
+	);
+
+	let bodies = requests
+		.lock()
+		.unwrap_or_else(std::sync::PoisonError::into_inner)
+		.clone();
+	assert_eq!(bodies.len(), 8, "provider requests: {bodies:#?}");
+	let body = |index: usize| bodies[index].to_string();
+
+	// The cut keeps the checkpoint batch and drops the exploration; the summary
+	// and report replace it for the continuation.
+	assert!(body(3).contains("Checkpoint: cycle one"), "{}", body(3));
+	assert!(body(3).contains("Branch-return summary"), "{}", body(3));
+	assert!(body(3).contains("FINDINGS-ONE"), "{}", body(3));
+	assert!(!body(3).contains("EXPLORATORY-ONE-SECRET"), "{}", body(3));
+
+	// The committed controller accepts a second checkpoint in the next prompt,
+	// and that prompt's history is the mirror of the cut branch: the retained
+	// report, not the abandoned exploration.
+	assert!(body(4).contains("FINAL-ONE"), "{}", body(4));
+	assert!(body(4).contains("FINDINGS-ONE"), "{}", body(4));
+	assert!(body(4).contains("Branch-return summary"), "{}", body(4));
+	assert!(!body(4).contains("EXPLORATORY-ONE-SECRET"), "{}", body(4));
+	assert!(body(5).contains("Checkpoint: cycle two"), "{}", body(5));
+	assert!(body(7).contains("FINDINGS-TWO"), "{}", body(7));
+	assert!(!body(7).contains("EXPLORATORY-TWO-SECRET"), "{}", body(7));
+
+	// `turn_end` describes the turn that settled, never the retained checkpoint.
+	let rewind_turn = frames
+		.iter()
+		.filter(|frame| frame["type"] == "turn_end")
+		.find(|frame| {
+			frame["message"]["content"].as_array().is_some_and(|parts| {
+				parts.iter().any(|part| {
+					part.get("type").and_then(Value::as_str) == Some("toolCall")
+						&& part.get("name").and_then(Value::as_str) == Some("rewind")
+				})
+			})
+		})
+		.expect("rewind turn_end frame");
+	assert_eq!(rewind_turn["toolResults"][0]["toolName"], "rewind", "{rewind_turn:#?}");
+
+	let agent_ends: Vec<&Value> = frames
+		.iter()
+		.filter(|frame| frame["type"] == "agent_end")
+		.collect();
+	assert_eq!(agent_ends.len(), 2, "{frames:#?}");
+	assert!(
+		!agent_ends[0].to_string().contains("EXPLORATORY-ONE-SECRET"),
+		"{}",
+		agent_ends[0]
+	);
+	assert!(
+		!agent_ends[1].to_string().contains("EXPLORATORY-TWO-SECRET"),
+		"{}",
+		agent_ends[1]
+	);
+	drop(harness);
+}
+
+/// The persisted rewind's own `turn_end` must describe the settled turn, not
+/// the retained checkpoint batch that now ends the durable branch.
+#[test]
+fn rpc_rewind_turn_end_reports_the_settled_turn() {
+	let root = checkpoint_root("turn-end");
+	let (_, _, frames) = run_checkpoint_rewind(&root);
+	let rewind_turn = frames
+		.iter()
+		.filter(|frame| frame["type"] == "turn_end")
+		.find(|frame| {
+			frame["message"]["content"].as_array().is_some_and(|parts| {
+				parts.iter().any(|part| {
+					part.get("type").and_then(Value::as_str) == Some("toolCall")
+						&& part.get("name").and_then(Value::as_str) == Some("rewind")
+				})
+			})
+		})
+		.expect("rewind turn_end frame");
+	let message = &rewind_turn["message"];
+	assert_eq!(message["role"], "assistant", "{rewind_turn:#?}");
+	let call = message["content"]
+		.as_array()
+		.expect("message content")
+		.iter()
+		.find(|part| part["name"] == "rewind")
+		.expect("rewind tool call");
+	let results = rewind_turn["toolResults"].as_array().expect("tool results");
+	assert_eq!(results.len(), 1, "{rewind_turn:#?}");
+	assert_eq!(results[0]["role"], "toolResult");
+	assert_eq!(results[0]["toolName"], "rewind");
+	assert_eq!(results[0]["toolCallId"], call["id"]);
+	fs::remove_dir_all(&root).ok();
+}
+
+/// Todo state is branch-scoped: a rewind drops the abandoned tail's todo edits
+/// from the session frame and from the next persisted request.
+#[test]
+fn rpc_rewind_todo_state_follows_the_active_branch() {
+	let root = checkpoint_root("todo");
+	let worktree = root.join("worktree");
+	let sessions = root.join("sessions");
+	let (port, requests) = spawn_tool_model(vec![
+		ToolScript {
+			text: String::new(),
+			tool: Some((
+				"todo",
+				json!({ "op": "init", "list": [{ "phase": "kept", "items": ["RETAINED-TODO"] }] }),
+			)),
+		},
+		ToolScript {
+			text: String::new(),
+			tool: Some(("checkpoint", json!({ "goal": "map it" }))),
+		},
+		ToolScript {
+			text: String::new(),
+			tool: Some((
+				"todo",
+				json!({
+					"op": "init",
+					"list": [{ "phase": "abandoned", "items": ["ABANDONED-TODO"] }],
+				}),
+			)),
+		},
+		ToolScript { text: "EXPLORATORY-SECRET".to_string(), tool: None },
+		ToolScript {
+			text: String::new(),
+			tool: Some(("rewind", json!({ "report": "TODO-FINDINGS" }))),
+		},
+		ToolScript { text: "FINAL-TODO".to_string(), tool: None },
+		ToolScript {
+			text: String::new(),
+			tool: Some(("todo", json!({ "op": "view" }))),
+		},
+		ToolScript { text: "AFTER-VIEW".to_string(), tool: None },
+	]);
+	let harness =
+		Harness::start(launch_checkpoint(port, &worktree, &sessions, Some("todo-branch")));
+	harness.send(json!({ "type": "prompt", "id": "p1", "message": "todo investigation" }));
+	harness.wait_frame("agent_end", timeout());
+
+	harness.send(json!({ "type": "get_state", "id": "s1" }));
+	let frames =
+		harness.wait_for(|frames| frames.iter().any(|frame| frame["id"] == "s1"), timeout());
+	let state = frames
+		.iter()
+		.find(|frame| frame["id"] == "s1")
+		.expect("state response");
+	let phases = state["data"]["todoPhases"].to_string();
+	assert!(phases.contains("RETAINED-TODO"), "{state:#?}");
+	assert!(
+		!phases.contains("ABANDONED-TODO"),
+		"abandoned todo leaked into state: {state:#?}"
+	);
+
+	// The next prompt's request restores the branch's todo state, so a `view`
+	// call reports the retained task and never the abandoned one.
+	harness.send(json!({ "type": "prompt", "id": "p2", "message": "inspect todos" }));
+	harness.wait_for(
+		|frames| frames.iter().filter(|frame| frame["type"] == "agent_end").count() >= 2,
+		timeout(),
+	);
+	let bodies = requests
+		.lock()
+		.unwrap_or_else(std::sync::PoisonError::into_inner)
+		.clone();
+	assert_eq!(bodies.len(), 8, "provider requests: {bodies:#?}");
+	let after_view = bodies[7].to_string();
+	assert!(after_view.contains("RETAINED-TODO"), "{after_view}");
+	assert!(!after_view.contains("ABANDONED-TODO"), "abandoned todo re-sent: {after_view}");
+	drop(harness);
 	fs::remove_dir_all(&root).ok();
 }
 

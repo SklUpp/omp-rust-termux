@@ -990,7 +990,7 @@ fn run() -> std::result::Result<(), CliError> {
 			&session.config,
 			&session.catalog,
 			false,
-			requested_api_key.as_deref(),
+			session.api_key.as_deref(),
 		)
 		.map_err(CliError::fail)?;
 		let mut recipe = acp::AcpRecipe::new(

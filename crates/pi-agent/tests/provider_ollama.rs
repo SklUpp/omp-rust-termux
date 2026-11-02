@@ -835,3 +835,61 @@ async fn dropping_a_live_stream_closes_the_transport() {
 		.expect("server must observe the closed stream")
 		.expect("closed signal");
 }
+
+#[tokio::test]
+async fn completed_record_cap_rejects_a_newline_bearing_chunk() {
+	let mut record = vec![b'a'; 8 * 1024 * 1024 + 16];
+	record.push(b'\n');
+	let base = serve_chunked(vec![record]).await;
+	let provider = make_provider(&base, "m");
+	let chunks = drain(
+		provider
+			.stream(&[Message::user("hi")], &[], &ToolChoice::Auto)
+			.await
+			.expect("stream"),
+	)
+	.await
+	.expect("chunks");
+	let terminal = chunks.last().expect("terminal");
+	assert_eq!(terminal.stop_reason, Some(StopReason::Error));
+	assert!(
+		terminal
+			.error_message
+			.as_deref()
+			.unwrap_or_default()
+			.contains("exceeded"),
+		"{terminal:?}"
+	);
+}
+
+#[tokio::test]
+async fn custom_provider_id_is_stamped_and_default_is_unchanged() {
+	let records = "{\"message\":{\"content\":\"hi\"},\"done\":false}\n{\"done\":true}\n";
+	let base = serve_chunked(vec![records.as_bytes().to_vec()]).await;
+	let provider = make_provider(&base, "m").with_provider_id(Some("custom-gateway".to_string()));
+	let message = provider
+		.complete(&[Message::user("go")], &[], &ToolChoice::Auto)
+		.await
+		.expect("complete");
+	assert_eq!(message.provider.as_deref(), Some("custom-gateway"));
+	assert_eq!(message.api.as_deref(), Some("ollama-chat"));
+	assert_eq!(message.model.as_deref(), Some("m"));
+
+	let local = OllamaProvider::new("http://127.0.0.1:9", "", "m").expect("provider");
+	assert_eq!(local.provider(), Some("ollama"));
+	assert_eq!(
+		local.with_provider_id(Some("   ".to_string())).provider(),
+		Some("ollama"),
+		"an empty override keeps the dialect default"
+	);
+	let cloud = OllamaProvider::new("http://127.0.0.1:9", "", "m").expect("provider");
+	assert_eq!(cloud.with_cloud(true).provider(), Some("ollama-cloud"));
+	let custom = OllamaProvider::new("http://127.0.0.1:9", "", "m").expect("provider");
+	assert_eq!(
+		custom
+			.with_cloud(true)
+			.with_provider_id(Some("gateway-7".to_string()))
+			.provider(),
+		Some("gateway-7")
+	);
+}

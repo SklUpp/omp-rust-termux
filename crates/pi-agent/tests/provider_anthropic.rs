@@ -1599,3 +1599,76 @@ fn mixed_signed_and_unsigned_thinking_demotes_the_unsigned_half() {
 	assert_eq!(content[1]["type"], "text");
 	assert_eq!(content[1]["text"], "unsigned plan");
 }
+
+#[tokio::test]
+async fn uppercase_bearer_scheme_token_is_redacted() {
+	let token = "Upper-Secret-Token";
+	let body = format!("gateway echoed {token} and BEARER {token}");
+	let url = serve_responses(vec![response("500 Internal Server Error", "text/plain", &body)]).await;
+	let provider = AnthropicMessagesProvider::new(url, "sk-config-secret", "model")
+		.expect("provider")
+		.with_max_retries(0)
+		.with_custom_headers(vec![(
+			"Authorization".to_string(),
+			format!("BEARER {token}"),
+		)]);
+	let err = provider
+		.complete(&[Message::user("hi")], &[], &ToolChoice::Auto)
+		.await
+		.expect_err("HTTP failure");
+	match err {
+		ProviderError::HttpStatus(_, snippet) => {
+			assert!(snippet.contains("[redacted]"), "{snippet}");
+			assert!(!snippet.contains(token), "{snippet}");
+		},
+		other => panic!("expected HttpStatus, got {other:?}"),
+	}
+}
+
+#[tokio::test]
+async fn completed_line_cap_rejects_a_newline_bearing_chunk() {
+	let mut body = String::from("data: ");
+	body.push_str(&"a".repeat(1024 * 1024));
+	body.push_str("\n\n");
+	let url = serve_responses(vec![response("200 OK", "text/event-stream", &body)]).await;
+	let provider = AnthropicMessagesProvider::new(url, "sk-key", "model")
+		.expect("provider")
+		.with_max_retries(0);
+	let mut stream = provider
+		.stream(&[Message::user("hi")], &[], &ToolChoice::Auto)
+		.await
+		.expect("stream");
+	let err = stream.next().await.expect("item").expect_err("line cap");
+	match err {
+		ProviderError::Protocol(message) => {
+			assert!(message.contains("line exceeded"), "{message}");
+		},
+		other => panic!("expected line-cap protocol error, got {other:?}"),
+	}
+}
+
+#[tokio::test]
+async fn event_capacity_is_checked_before_appending_a_data_line() {
+	let mut body = String::new();
+	for _ in 0..9 {
+		body.push_str("data: ");
+		body.push_str(&"b".repeat(1_000_000));
+		body.push('\n');
+	}
+	body.push('\n');
+	let url = serve_responses(vec![response("200 OK", "text/event-stream", &body)]).await;
+	let provider = AnthropicMessagesProvider::new(url, "sk-key", "model")
+		.expect("provider")
+		.with_max_retries(0);
+	let mut stream = provider
+		.stream(&[Message::user("hi")], &[], &ToolChoice::Auto)
+		.await
+		.expect("stream");
+	let err = stream.next().await.expect("item").expect_err("event cap");
+	match err {
+		ProviderError::Protocol(message) => {
+			assert!(message.contains("event exceeded"), "{message}");
+		},
+		other => panic!("expected event-cap protocol error, got {other:?}"),
+	}
+}

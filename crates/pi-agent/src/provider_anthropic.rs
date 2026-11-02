@@ -2608,12 +2608,11 @@ fn credential_values(api_key: &str, custom_headers: &[(String, String)]) -> Vec<
 			continue;
 		}
 		push(value);
-		if let Some(stripped) = value
-			.trim()
-			.strip_prefix("Bearer ")
-			.or_else(|| value.trim().strip_prefix("bearer "))
-		{
-			push(stripped);
+		// Scheme spelling varies by gateway ("Bearer"/"BEARER"). The credential
+		// is the token after the scheme; collect it independently of its casing.
+		let trimmed = value.trim();
+		if let Some(index) = trimmed.find(char::is_whitespace) {
+			push(trimmed[index..].trim());
 		}
 	}
 	// Longest first so a bearer token is replaced before a shorter overlap.
@@ -2642,8 +2641,9 @@ fn bounded_redaction(text: &str, secrets: &[String], truncated: bool) -> String 
 	bounded
 }
 
-/// Drop the incomplete trailing token of a byte-capped read: a credential cut
-/// by the ceiling would otherwise survive as its prefix.
+/// Best effort for byte-capped reads: drop the incomplete trailing token so a
+/// credential cut mid-token is unlikely to survive. Diagnostics stay bounded
+/// and redacted regardless; this is a heuristic, not a prefix guarantee.
 fn trim_partial_token(text: &mut String) {
 	let boundary = text
 		.char_indices()
@@ -2920,6 +2920,9 @@ where
 	struct State<S> {
 		body: S,
 		buf: Vec<u8>,
+		/// Bytes after the last newline currently buffered; checked before any
+		/// segment is copied so a completed line cannot exceed the ceiling.
+		pending_line: usize,
 		event: Option<String>,
 		data: String,
 		pending: VecDeque<Result<StreamChunk, ProviderError>>,
@@ -2938,6 +2941,7 @@ where
 		State {
 			body,
 			buf: Vec::new(),
+			pending_line: 0,
 			event: None,
 			data: String::new(),
 			pending: VecDeque::new(),
@@ -3014,11 +3018,9 @@ where
 					if let Some(value) = line.strip_prefix("event:") {
 						st.event = Some(value.trim().to_string());
 					} else if let Some(value) = line.strip_prefix("data:") {
-						if !st.data.is_empty() {
-							st.data.push('\n');
-						}
-						st.data.push_str(value.trim_start());
-						if st.data.len() > MAX_SSE_EVENT_BYTES {
+						let value = value.trim_start();
+						let separator = usize::from(!st.data.is_empty());
+						if st.data.len() + separator + value.len() > MAX_SSE_EVENT_BYTES {
 							st.done = true;
 							return Some((
 								Err(ProviderError::Protocol(format!(
@@ -3027,6 +3029,10 @@ where
 								st,
 							));
 						}
+						if separator == 1 {
+							st.data.push('\n');
+						}
+						st.data.push_str(value);
 					}
 					continue;
 				}
@@ -3048,36 +3054,35 @@ where
 				};
 				match item {
 					Some(Ok(bytes)) => {
-						let incoming = bytes.as_ref();
-						// Reject growth of an unterminated line before allocating;
-						// chunks carrying newlines are drained on the next pass and
-						// checked by the tail bound below.
-						if !incoming.contains(&b'\n')
-							&& st.buf.len() + incoming.len() > MAX_SSE_LINE_BYTES
-						{
-							st.done = true;
-							return Some((
-								Err(ProviderError::Protocol(format!(
-									"Anthropic stream line exceeded {MAX_SSE_LINE_BYTES} bytes without a newline"
-								))),
-								st,
-							));
-						}
-						st.buf.extend_from_slice(incoming);
-						// Bound the unterminated tail, not the whole buffer: complete
-						// lines ahead of it are drained before the next read.
-						let tail = match st.buf.iter().rposition(|byte| *byte == b'\n') {
-							Some(position) => st.buf.len() - position - 1,
-							None => st.buf.len(),
-						};
-						if tail > MAX_SSE_LINE_BYTES {
-							st.done = true;
-							return Some((
-								Err(ProviderError::Protocol(format!(
-									"Anthropic stream line exceeded {MAX_SSE_LINE_BYTES} bytes without a newline"
-								))),
-								st,
-							));
+						// Validate every segment before copying it: a chunk carrying a
+						// newline must not smuggle a complete line past the ceiling.
+						let mut rest = bytes.as_ref();
+						loop {
+							let newline = rest.iter().position(|byte| *byte == b'\n');
+							let (segment, tail) = match newline {
+								Some(position) => (&rest[..position], &rest[position + 1..]),
+								None => (rest, &rest[rest.len()..]),
+							};
+							if st.pending_line + segment.len() > MAX_SSE_LINE_BYTES {
+								st.done = true;
+								return Some((
+									Err(ProviderError::Protocol(format!(
+										"Anthropic stream line exceeded {MAX_SSE_LINE_BYTES} bytes"
+									))),
+									st,
+								));
+							}
+							st.buf.extend_from_slice(segment);
+							st.pending_line += segment.len();
+							if newline.is_none() {
+								break;
+							}
+							st.buf.push(b'\n');
+							st.pending_line = 0;
+							rest = tail;
+							if rest.is_empty() {
+								break;
+							}
 						}
 					},
 					Some(Err(err)) => {

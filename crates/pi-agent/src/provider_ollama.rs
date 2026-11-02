@@ -101,8 +101,9 @@ fn bounded_redaction(text: &str, secrets: &[String], truncated: bool) -> String 
 	bounded
 }
 
-/// Drop the incomplete trailing token of a byte-capped read: a credential cut
-/// by the ceiling would otherwise survive as its prefix.
+/// Best effort for byte-capped reads: drop the incomplete trailing token so a
+/// credential cut mid-token is unlikely to survive. Diagnostics stay bounded
+/// and redacted regardless; this is a heuristic, not a prefix guarantee.
 fn trim_partial_token(text: &mut String) {
 	let boundary = text
 		.char_indices()
@@ -290,6 +291,9 @@ pub struct OllamaProvider {
 	temperature: Option<f64>,
 	/// TS `options.topP`.
 	top_p: Option<f64>,
+	/// Configured gateway identity; overrides the `ollama`/`ollama-cloud` default
+	/// so custom providers are stamped and cross-model replays classify right.
+	provider_id: Option<String>,
 }
 
 impl OllamaProvider {
@@ -337,6 +341,7 @@ impl OllamaProvider {
 			max_tokens: None,
 			temperature: None,
 			top_p: None,
+			provider_id: None,
 		}
 	}
 
@@ -349,6 +354,13 @@ impl OllamaProvider {
 	/// Select Ollama Cloud dialect behavior (`model.provider === "ollama-cloud"`).
 	pub fn with_cloud(mut self, enabled: bool) -> Self {
 		self.cloud = enabled;
+		self
+	}
+
+	/// Stamp a configured gateway/provider id instead of the `ollama` dialect
+	/// default. Empty values keep the default.
+	pub fn with_provider_id(mut self, provider_id: Option<String>) -> Self {
+		self.provider_id = provider_id.filter(|value| !value.trim().is_empty());
 		self
 	}
 
@@ -950,9 +962,13 @@ impl ModelProvider for OllamaProvider {
 		Some("ollama-chat")
 	}
 
-	/// TS `model.provider`: local `ollama` or `ollama-cloud`.
+	/// TS `model.provider`: configured gateway id, else local `ollama` /
+	/// `ollama-cloud`.
 	fn provider(&self) -> Option<&str> {
-		Some(if self.cloud { "ollama-cloud" } else { "ollama" })
+		self
+			.provider_id
+			.as_deref()
+			.or(Some(if self.cloud { "ollama-cloud" } else { "ollama" }))
 	}
 
 	fn model(&self) -> Option<&str> {
@@ -1104,6 +1120,9 @@ fn finalize_stop(state: &ParseState, stop: StopReason) -> (StopReason, Option<St
 struct NdjsonState<S> {
 	source: std::pin::Pin<Box<S>>,
 	buffer: Vec<u8>,
+	/// Bytes after the last newline; checked before any segment is copied so a
+	/// completed record cannot exceed the ceiling.
+	pending_record: usize,
 	queue: VecDeque<Result<StreamChunk, ProviderError>>,
 	parse: ParseState,
 	finished: bool,
@@ -1294,6 +1313,7 @@ where
 	let state = NdjsonState {
 		source: Box::pin(body),
 		buffer: Vec::new(),
+		pending_record: 0,
 		queue: VecDeque::new(),
 		parse: ParseState::default(),
 		finished: false,
@@ -1310,31 +1330,35 @@ where
 			}
 			match state.source.next().await {
 				Some(Ok(bytes)) => {
-					let incoming = bytes.as_ref();
-					// Reject growth of an unterminated record before allocating;
-					// chunks carrying newlines are drained below and covered by the
-					// tail bound.
-					if !incoming.contains(&b'\n')
-						&& state.buffer.len() + incoming.len() > MAX_RECORD_BYTES
-					{
-						state.queue.push_back(Ok(error_chunk(format!(
-							"Ollama stream record exceeded {MAX_RECORD_BYTES} bytes"
-						))));
-						state.finished = true;
-						continue;
+					// Validate every segment before copying it: a chunk carrying a
+					// newline must not smuggle a complete record past the ceiling.
+					let mut rest = bytes.as_ref();
+					loop {
+						let newline = rest.iter().position(|byte| *byte == b'\n');
+						let (segment, tail) = match newline {
+							Some(position) => (&rest[..position], &rest[position + 1..]),
+							None => (rest, &rest[rest.len()..]),
+						};
+						if state.pending_record + segment.len() > MAX_RECORD_BYTES {
+							state.queue.push_back(Ok(error_chunk(format!(
+								"Ollama stream record exceeded {MAX_RECORD_BYTES} bytes"
+							))));
+							state.finished = true;
+							break;
+						}
+						state.buffer.extend_from_slice(segment);
+						state.pending_record += segment.len();
+						if newline.is_none() {
+							break;
+						}
+						state.buffer.push(b'\n');
+						state.pending_record = 0;
+						rest = tail;
+						if rest.is_empty() {
+							break;
+						}
 					}
-					state.buffer.extend_from_slice(incoming);
-					// Complete records are drained below; only the unterminated tail
-					// counts against the per-record ceiling.
-					let tail = match state.buffer.iter().rposition(|byte| *byte == b'\n') {
-						Some(position) => state.buffer.len() - position - 1,
-						None => state.buffer.len(),
-					};
-					if tail > MAX_RECORD_BYTES {
-						state.queue.push_back(Ok(error_chunk(format!(
-							"Ollama stream record exceeded {MAX_RECORD_BYTES} bytes"
-						))));
-						state.finished = true;
+					if state.finished {
 						continue;
 					}
 					for line in take_lines(&mut state.buffer) {

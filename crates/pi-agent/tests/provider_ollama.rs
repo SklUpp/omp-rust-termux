@@ -15,8 +15,8 @@ use std::time::Duration;
 use futures::StreamExt;
 use pi_agent::provider_ollama::{
 	DeepSeekInbandScanner, InbandScanEvent, KimiInbandScanner, MAX_SECTION_BYTES,
-	MAX_STREAM_HOLD_BYTES, MarkupHealer, MarkupHealingEvent, OllamaPayloadHook,
-	OllamaPayloadModel, OllamaProvider,
+	MAX_STREAM_HOLD_BYTES, MarkupHealer, MarkupHealingEvent, OllamaPayloadCost,
+	OllamaPayloadHook, OllamaPayloadModel, OllamaPayloadThinking, OllamaProvider,
 	StreamMarkupHealingPattern, ThinkingInbandScanner, demote_thinking, extract_retry_hint,
 	get_stream_markup_healing_pattern, is_llama_cpp_parse_error, is_malformed_tool_call,
 	normalize_kimi_function_name, preferred_dialect, sanitize_malformed_tool_calls,
@@ -1285,11 +1285,15 @@ async fn test_on_payload_hook_modifies_request_payload() {
 
 	let expected_base = format!("http://{addr}");
 	let hook: OllamaPayloadHook = std::sync::Arc::new(
-		move |payload: &Value, model: &OllamaPayloadModel<'_>| {
-			assert_eq!(model.model, "test-model");
+		move |payload: &Value, model: &OllamaPayloadModel| {
+			assert_eq!(model.id, "test-model");
+			assert_eq!(model.name, "test-model");
 			assert_eq!(model.api, "ollama-chat");
 			assert_eq!(model.provider, "ollama");
 			assert_eq!(model.base_url, expected_base.as_str());
+			assert_eq!(model.input, vec!["text".to_string()]);
+			assert!(model.cost.is_none());
+			assert!(model.thinking.is_none());
 			let mut modified = payload.clone();
 			if let Some(map) = modified.as_object_mut() {
 				map.insert("custom_injected_option".to_string(), json!(true));
@@ -1306,6 +1310,93 @@ async fn test_on_payload_hook_modifies_request_payload() {
 
 	let received_json = req_rx.await.expect("received request json");
 	assert_eq!(received_json["custom_injected_option"], json!(true));
+}
+
+#[tokio::test]
+async fn payload_model_context_carries_full_catalog_fields_and_pre_auth_headers() {
+	let (base, request_rx) = serve_once(response(
+		"200 OK",
+		"application/x-ndjson",
+		"{\"message\":{\"content\":\"ok\"},\"done\":true,\"eval_count\":1}\n",
+	))
+	.await;
+	let context = OllamaPayloadModel {
+		provider: "custom-route".to_string(),
+		api: "ollama-chat".to_string(),
+		id: "catalog-row".to_string(),
+		request_model_id: Some("wire-model".to_string()),
+		name: "Display Name".to_string(),
+		base_url: base.clone(),
+		input: vec!["text".to_string(), "image".to_string()],
+		tokenizer: Some("qwen".to_string()),
+		cost: Some(OllamaPayloadCost {
+			input: 1.0,
+			output: 2.0,
+			cache_read: 0.1,
+			cache_write: 0.2,
+			long_context: Some(json!({"input": 3.0})),
+		}),
+		context_window: Some(131_072),
+		max_tokens: Some(8_192),
+		omit_max_output_tokens: true,
+		reasoning: true,
+		thinking: Some(OllamaPayloadThinking {
+			mode: "effort".to_string(),
+			efforts: vec!["low".to_string(), "high".to_string()],
+			default_level: Some("low".to_string()),
+			effort_map: vec![("low".to_string(), "low".to_string())],
+		}),
+		effort: Some("high".to_string()),
+		headers: vec![
+			("X-Model".to_string(), "model".to_string()),
+			("X-Model".to_string(), "config-wins".to_string()),
+			("X-Config".to_string(), "caller".to_string()),
+			("Authorization".to_string(), "evil".to_string()),
+			("Content-Type".to_string(), "text/plain".to_string()),
+		],
+	};
+	let hook: OllamaPayloadHook = std::sync::Arc::new(
+		move |_payload: &Value, model: &OllamaPayloadModel| {
+			assert_eq!(model.provider, "custom-route");
+			assert_eq!(model.id, "catalog-row");
+			assert_eq!(model.request_model_id.as_deref(), Some("wire-model"));
+			assert_eq!(model.name, "Display Name");
+			assert_eq!(model.input, vec!["text".to_string(), "image".to_string()]);
+			assert_eq!(model.tokenizer.as_deref(), Some("qwen"));
+			let cost = model.cost.as_ref().expect("cost");
+			assert_eq!((cost.input, cost.output), (1.0, 2.0));
+			assert_eq!(cost.long_context.as_ref().unwrap()["input"], 3.0);
+			assert_eq!(model.context_window, Some(131_072));
+			assert_eq!(model.max_tokens, Some(8_192));
+			assert!(model.omit_max_output_tokens);
+			assert!(model.reasoning);
+			let thinking = model.thinking.as_ref().expect("thinking");
+			assert_eq!(thinking.mode, "effort");
+			assert_eq!(thinking.efforts, vec!["low", "high"]);
+			assert_eq!(thinking.default_level.as_deref(), Some("low"));
+			assert_eq!(model.effort.as_deref(), Some("high"));
+			Box::pin(async move { Ok(None) })
+		},
+	);
+	let provider = make_provider(&base, "row")
+		.with_payload_model(context)
+		.with_on_payload(hook);
+	provider
+		.complete(&[Message::user("hi")], &[], &ToolChoice::Auto)
+		.await
+		.expect("complete");
+
+	let (raw, body) = request_rx.await.expect("request");
+	assert_eq!(body["model"], "wire-model");
+	assert_eq!(provider.provider(), Some("custom-route"));
+	let lower = raw.to_ascii_lowercase();
+	assert!(lower.contains("x-model: config-wins"), "{raw}");
+	assert!(!lower.contains("x-model: model\r\n"), "{raw}");
+	assert!(lower.contains("x-config: caller"), "{raw}");
+	assert!(lower.contains("authorization: bearer test-key"), "{raw}");
+	assert!(!lower.contains("evil"), "{raw}");
+	assert!(lower.contains("content-type: application/json"), "{raw}");
+	assert!(!lower.contains("content-type: text/plain"), "{raw}");
 }
 
 #[test]

@@ -20,27 +20,71 @@ use std::{
 /// Boxed future alias for async callbacks and hooks without extra lifetime dependencies.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-/// Adapter-owned projection of the TS `Model<"ollama-chat">` *identity* passed
-/// to `onPayload` (`ollama.ts:577`). This is NOT a full `Model`:
-/// catalog-only fields (`cost`, `input`, `contextWindow`, model-level
-/// `maxTokens`, `thinking`/`compat`, `headers`) are not carried by this adapter,
-/// so consumers needing them cannot be satisfied here without new catalog
-/// plumbing. Getters for the fields above live on this struct; the adapter
-/// supplies provider/api/model/baseUrl from its own configuration only.
-#[derive(Debug, Clone, Copy)]
-pub struct OllamaPayloadModel<'a> {
-	pub provider: &'a str,
-	pub api: &'a str,
-	pub model: &'a str,
-	pub base_url: &'a str,
+/// Per-model cost block as authored in the catalog; unknown fields stay absent.
+pub struct OllamaPayloadCost {
+	pub input: f64,
+	pub output: f64,
+	pub cache_read: f64,
+	pub cache_write: f64,
+	/// Authored long-context block, kept verbatim rather than re-modelled.
+	pub long_context: Option<Value>,
+}
+
+/// Materialized thinking ladder for the hook. No `Debug`/`Serialize`: this is
+/// configuration, not a wire payload.
+pub struct OllamaPayloadThinking {
+	/// Authored `mode`, else the TS default `"effort"`.
+	pub mode: String,
+	/// Non-empty effort ladder, materialized from the authored model.
+	pub efforts: Vec<String>,
+	/// Authored `defaultLevel`.
+	pub default_level: Option<String>,
+	/// Authored `effortMap`; omitted efforts map to themselves.
+	pub effort_map: Vec<(String, String)>,
+}
+
+/// Full resolved TS `Model<"ollama-chat">` context passed to `onPayload`
+/// (`ollama.ts:577`). Built once per provider by the runtime and handed over
+/// through [`OllamaProvider::with_payload_model`]. Deliberately carries no
+/// `Debug`/`Serialize`/`Deserialize`: it includes configuration headers.
+pub struct OllamaPayloadModel {
+	/// Configured route id (`be5dd`), defaulting to the adapter dialect label.
+	pub provider: String,
+	/// Always `ollama-chat`.
+	pub api: String,
+	/// Catalog row id; this is the wire `model`.
+	pub id: String,
+	/// TS `requestModelId`; set when the wire id must differ from `id`.
+	pub request_model_id: Option<String>,
+	/// Catalog display name, falling back to `id`.
+	pub name: String,
+	/// Resolved route URL before adapter normalization.
+	pub base_url: String,
+	/// `["text"]` or `["text", "image"]`.
+	pub input: Vec<String>,
+	/// TS `tokenizer`, when the catalog declares one.
+	pub tokenizer: Option<String>,
+	/// `None` means the catalog does not declare cost; never synthesize zeros.
+	pub cost: Option<OllamaPayloadCost>,
+	pub context_window: Option<u64>,
+	pub max_tokens: Option<u64>,
+	pub omit_max_output_tokens: bool,
+	pub reasoning: bool,
+	pub thinking: Option<OllamaPayloadThinking>,
+	/// Effort actually requested after resolution.
+	pub effort: Option<String>,
+	/// Pre-auth set: model-level headers first, then config.yml provider headers.
+	/// The adapter appends `Authorization` and `Content-Type` last.
+	pub headers: Vec<(String, String)>,
 }
 
 /// TS `onPayload?: (payload: unknown, model?: Model<Api>) => unknown | undefined | Promise<unknown | undefined>`.
-/// Receives the serialized request body and its model context, returning an optional replacement body or an error.
+/// Receives the serialized request body and its full resolved model context,
+/// returning an optional replacement body or an error.
 pub type OllamaPayloadHook = Arc<
 	dyn for<'a> Fn(
 			&'a Value,
-			&'a OllamaPayloadModel<'a>,
+			&'a OllamaPayloadModel,
 		) -> BoxFuture<'a, Result<Option<Value>, ProviderError>>
 		+ Send
 		+ Sync,
@@ -154,6 +198,14 @@ fn credential_values(api_key: Option<&str>) -> Vec<String> {
 		.filter(|value| !value.is_empty())
 		.map(|value| vec![value.to_string()])
 		.unwrap_or_default()
+}
+
+/// Header names whose values must never reach diagnostics or error bodies.
+fn is_credential_header(name: &str) -> bool {
+	matches!(
+		name.to_ascii_lowercase().as_str(),
+		"authorization" | "proxy-authorization" | "x-api-key" | "api-key"
+	)
 }
 
 fn redact_with(text: &str, secrets: &[String]) -> String {
@@ -373,6 +425,9 @@ pub struct OllamaProvider {
 	provider_id: Option<String>,
 	/// Optional request payload replacement hook (`ollama.ts:577-580`).
 	on_payload: Option<OllamaPayloadHook>,
+	/// Resolved full model context handed to `onPayload`; built once by the
+	/// runtime through [`Self::with_payload_model`].
+	payload_model: Option<OllamaPayloadModel>,
 	/// Pre-response and first-event stream budget (`idle-iterator.ts:24`).
 	first_event_timeout: StreamTimeout,
 	/// Idle gap budget between streamed stream chunks (`idle-iterator.ts:14`).
@@ -580,6 +635,7 @@ impl OllamaProvider {
 			top_p: None,
 			provider_id: None,
 			on_payload: None,
+			payload_model: None,
 			first_event_timeout: resolve_env_timeout_setting(
 				&[
 					"PI_OPENAI_STREAM_FIRST_EVENT_TIMEOUT_MS",
@@ -613,6 +669,11 @@ impl OllamaProvider {
 	/// default. Empty values keep the default.
 	pub fn with_provider_id(mut self, provider_id: Option<String>) -> Self {
 		self.provider_id = provider_id.filter(|value| !value.trim().is_empty());
+		if let Some(provider_id) = &self.provider_id
+			&& let Some(model) = &mut self.payload_model
+		{
+			model.provider.clone_from(provider_id);
+		}
 		self
 	}
 
@@ -670,6 +731,80 @@ impl OllamaProvider {
 	pub fn with_on_payload(mut self, hook: OllamaPayloadHook) -> Self {
 		self.on_payload = Some(hook);
 		self
+	}
+
+	/// Attach the resolved full model context for `onPayload`. The runtime builds
+	/// this once per provider (root turn or child).
+	pub fn with_payload_model(mut self, model: OllamaPayloadModel) -> Self {
+		self.provider_id = Some(model.provider.clone());
+		self.payload_model = Some(model);
+		self
+	}
+
+	/// Context handed to `onPayload` when the runtime did not supply one. Direct
+	/// construction (tests, embedders) exposes only honest known fields and
+	/// leaves catalog-only values absent instead of inventing defaults.
+	fn direct_payload_model(&self) -> OllamaPayloadModel {
+		let mut input = vec!["text".to_string()];
+		if self.supports_images {
+			input.push("image".to_string());
+		}
+		OllamaPayloadModel {
+			provider: self.provider().unwrap_or("ollama").to_string(),
+			api: "ollama-chat".to_string(),
+			id: self.model.clone(),
+			request_model_id: None,
+			name: self.model.clone(),
+			base_url: self.base_url.clone(),
+			input,
+			tokenizer: None,
+			cost: None,
+			context_window: None,
+			max_tokens: None,
+			omit_max_output_tokens: self.omit_max_output_tokens,
+			reasoning: self.model_reasoning,
+			thinking: None,
+			effort: self.reasoning.clone(),
+			headers: Vec::new(),
+		}
+	}
+
+	/// Every effective credential value, including sensitive configured headers,
+	/// so diagnostics redact all of them.
+	fn request_secrets(&self) -> Vec<String> {
+		let mut secrets = credential_values(self.api_key.as_deref());
+		if let Some(model) = &self.payload_model {
+			for (name, value) in &model.headers {
+				if is_credential_header(name) && !value.trim().is_empty() {
+					secrets.push(value.clone());
+				}
+			}
+		}
+		secrets
+	}
+
+	/// Model/config headers before auth: case-insensitive dedupe keeps the last
+	/// occurrence (config/caller overrides the model), and the adapter always
+	/// owns `Authorization` and `Content-Type` last.
+	fn config_headers(&self) -> Vec<(&str, &str)> {
+		let mut merged: Vec<(&str, &str)> = Vec::new();
+		if let Some(model) = &self.payload_model {
+			for (name, value) in &model.headers {
+				if name.eq_ignore_ascii_case("authorization")
+					|| name.eq_ignore_ascii_case("content-type")
+				{
+					continue;
+				}
+				match merged
+					.iter_mut()
+					.find(|(existing, _)| existing.eq_ignore_ascii_case(name))
+				{
+					Some(slot) => *slot = (name.as_str(), value.as_str()),
+					None => merged.push((name.as_str(), value.as_str())),
+				}
+			}
+		}
+		merged
 	}
 
 	/// Override first-event and idle stream watchdog timeouts (`idle-iterator.ts`).
@@ -1003,7 +1138,17 @@ impl OllamaProvider {
 		let has_options =
 			options.num_predict.is_some() || options.temperature.is_some() || options.top_p.is_some();
 		Ok(OllamaChatRequest {
-			model: self.model.clone(),
+			model: self
+				.payload_model
+				.as_ref()
+				.map(|model| {
+					model
+						.request_model_id
+						.as_deref()
+						.unwrap_or(model.id.as_str())
+				})
+				.unwrap_or(self.model.as_str())
+				.to_string(),
 			messages: self.convert_messages(messages),
 			tools: convert_tools(selected_tools),
 			think: self.think(),
@@ -1084,13 +1229,18 @@ impl OllamaProvider {
 	) -> Result<reqwest::Response, ProviderError> {
 		let pre_response_timeout = self.effective_first_event_timeout();
 		let max_attempts = MAX_FETCH_ATTEMPTS;
-		let secrets = credential_values(self.api_key.as_deref());
+		let secrets = self.request_secrets();
 
 		for attempt in 0..max_attempts {
-			let mut req = self.http.post(self.endpoint()).json(payload);
+			let mut req = self.http.post(self.endpoint());
+			for (name, value) in self.config_headers() {
+				req = req.header(name, value);
+			}
 			if let Some(api_key) = self.api_key.as_deref() {
 				req = req.bearer_auth(api_key);
 			}
+			// `json` sets `Content-Type` last, after every configured header.
+			let req = req.json(payload);
 
 			let response = match pre_response_timeout {
 				Some(limit) => match tokio::time::timeout(limit, req.send()).await {
@@ -1189,19 +1339,22 @@ impl OllamaProvider {
 	) -> Result<ChunkStream, ProviderError> {
 		let mut payload = self.request_value(messages, tools, tool_choice, true)?;
 		if let Some(hook) = &self.on_payload {
-			let context = OllamaPayloadModel {
-				provider: self.provider().unwrap_or(""),
-				api: self.api().unwrap_or("ollama-chat"),
-				model: &self.model,
-				base_url: &self.base_url,
-			};
-			if let Some(replaced) = hook(&payload, &context).await? {
+			let fallback = self
+				.payload_model
+				.is_none()
+				.then(|| self.direct_payload_model());
+			let context = self
+				.payload_model
+				.as_ref()
+				.or(fallback.as_ref())
+				.expect("payload context");
+			if let Some(replaced) = hook(&payload, context).await? {
 				payload = replaced;
 			}
 		}
 
 		let response = self.send_request_with_retry(&payload).await?;
-		let secrets = credential_values(self.api_key.as_deref());
+		let secrets = self.request_secrets();
 		let body = response
 			.bytes_stream()
 			.map(|item| item.map_err(|err| err.to_string()));
@@ -3288,8 +3441,10 @@ impl ModelProvider for OllamaProvider {
 	/// `ollama-cloud`.
 	fn provider(&self) -> Option<&str> {
 		self
-			.provider_id
-			.as_deref()
+			.payload_model
+			.as_ref()
+			.map(|model| model.provider.as_str())
+			.or(self.provider_id.as_deref())
 			.or(Some(if self.cloud { "ollama-cloud" } else { "ollama" }))
 	}
 

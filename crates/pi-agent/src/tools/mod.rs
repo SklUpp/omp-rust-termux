@@ -1341,9 +1341,21 @@ pub(crate) fn validate_artifact_relative(relative: &str) -> Result<(), String> {
 
 /// Contained UTF-8 read of one artifact, for hosts that resolve a `local:`
 /// URL outside the read tool.
+///
+/// The caller always receives the full text: `read_contained` caps at
+/// [`hashline::snapshot::SNAPSHOT_MAX_BYTES`] plus one sentinel byte, so a
+/// truncated or ambiguous read is rejected before UTF-8 decoding. Approval
+/// consumers must never compare a capped prefix as if it were the artifact.
 pub fn read_local_artifact(root: &Path, relative: &str) -> Result<String, String> {
 	validate_artifact_relative(relative)?;
-	let (bytes, _) = internal_urls::read_contained(root, relative)?;
+	let (bytes, size) = internal_urls::read_contained(root, relative)?;
+	let limit = hashline::snapshot::SNAPSHOT_MAX_BYTES as u64;
+	let read = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+	if size > read || size > limit || read > limit {
+		return Err(format!(
+			"local://{relative} is {size} bytes and exceeds the {limit} byte full-text artifact limit; refusing to return a truncated read"
+		));
+	}
 	String::from_utf8(bytes).map_err(|_| format!("local://{relative} is not UTF-8 text"))
 }
 
@@ -3891,6 +3903,40 @@ mod plan_mode_tool_tests {
 			.is_err());
 		assert!(read_local_artifact(&artifacts, "leaf.md").is_err(), "leaf symlink read rejected");
 		assert!(!outside.join("new.md").exists());
+	}
+
+	#[test]
+	fn local_artifact_reader_rejects_capped_and_truncated_files() {
+		let cwd = temp_cwd("artifact-truncate");
+		let artifacts = cwd.join("artifacts");
+		std::fs::create_dir_all(&artifacts).expect("artifact root");
+		std::fs::write(artifacts.join("ok.md"), "ok").expect("small artifact");
+		assert_eq!(
+			read_local_artifact(&artifacts, "ok.md").expect("full read"),
+			"ok"
+		);
+
+		let limit = hashline::snapshot::SNAPSHOT_MAX_BYTES as u64;
+		// Exactly the cap+sentinel: the length is ambiguous between a full file
+		// and a capped read, so approval must reject it.
+		let capped = artifacts.join("capped.md");
+		std::fs::File::create(&capped)
+			.expect("capped")
+			.set_len(limit + 1)
+			.expect("capped size");
+		let error = read_local_artifact(&artifacts, "capped.md").expect_err("cap sentinel");
+		assert!(error.contains("refusing to return a truncated read"), "{error}");
+
+		// Original metadata size beyond the bytes returned (and beyond the cap):
+		// this is the actual truncated-prefix case.
+		let truncated = artifacts.join("truncated.md");
+		std::fs::File::create(&truncated)
+			.expect("truncated")
+			.set_len(limit + 2)
+			.expect("truncated size");
+		let error = read_local_artifact(&artifacts, "truncated.md").expect_err("truncated");
+		assert!(error.contains("refusing to return a truncated read"), "{error}");
+		let _ = std::fs::remove_dir_all(cwd);
 	}
 
 	#[tokio::test]

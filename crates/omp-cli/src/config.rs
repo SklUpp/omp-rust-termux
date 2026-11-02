@@ -602,6 +602,12 @@ pub struct Config {
 	pub external_thinking:    bool,
 	/// Ephemeral `--service-tier` (OpenAI wire; `none`/empty omit).
 	pub service_tier:         Option<String>,
+	/// `tier.openai` / `tier.anthropic` / `tier.google` settings (TS
+	/// `buildServiceTierByFamily`). `"none"` and values the family cannot
+	/// realize are dropped at parse time.
+	pub tier_openai:          Option<String>,
+	pub tier_anthropic:       Option<String>,
+	pub tier_google:          Option<String>,
 	/// Ephemeral `--add-dir` workspace roots, before `cwd` normalization.
 	pub add_dirs:             Vec<PathBuf>,
 	/// Ephemeral `--no-rules`.
@@ -932,6 +938,25 @@ impl Config {
 		self.read_line_numbers.unwrap_or(false)
 	}
 
+	/// TS `buildServiceTierByFamily`: the configured per-family selection,
+	/// already clamped to what each family realizes.
+	#[must_use]
+	pub fn configured_service_tiers(&self) -> std::collections::BTreeMap<String, String> {
+		let mut out = std::collections::BTreeMap::new();
+		for (family, value) in [
+			("openai", self.tier_openai.as_deref()),
+			("anthropic", self.tier_anthropic.as_deref()),
+			("google", self.tier_google.as_deref()),
+		] {
+			if let Some(tier) = value
+				.and_then(|value| crate::service_tier::family_value(family, value))
+			{
+				out.insert(family.to_string(), tier.to_string());
+			}
+		}
+		out
+	}
+
 	/// Resolve a provider API key through its `config.yml` connection block.
 	#[must_use]
 	pub fn resolve_api_key(&self, provider: &str) -> Option<String> {
@@ -1057,6 +1082,22 @@ impl Config {
 }
 
 fn apply_nested_settings(config: &mut Config, value: &Value, path: &Path) -> Result<()> {
+	if let Some(tier) = value.get("tier").and_then(Value::as_map) {
+		for (family, item) in tier {
+			let Some(value) = expect_text(item, &format!("tier.{family}"), path)? else {
+				continue;
+			};
+			let Some(tier) = crate::service_tier::family_value(family, &value) else {
+				continue;
+			};
+			match family.as_str() {
+				"openai" => config.tier_openai = Some(tier.to_string()),
+				"anthropic" => config.tier_anthropic = Some(tier.to_string()),
+				"google" => config.tier_google = Some(tier.to_string()),
+				_ => {},
+			}
+		}
+	}
 	if let Some(disabled) = value.get("disabledProviders") {
 		config.disabled_providers = Some(parse_disabled_providers(disabled, path)?);
 	}

@@ -1122,6 +1122,7 @@ fn run() -> std::result::Result<(), CliError> {
 				.is_none()
 				&& rpc_cache_key.is_some(),
 			prompt_cache_key: rpc_cache_key,
+			service_tier_explicit: cli.service_tier.is_some(),
 			provider_session_id: cli
 				.provider_session_id
 				.clone()
@@ -1825,7 +1826,12 @@ impl Session<'_> {
 		} else if self.service_tier_recorded {
 			self.service_tier_by_family.clone()
 		} else {
-			crate::service_tier::for_single(self.config.service_tier.as_deref())
+			let configured = self.config.configured_service_tiers();
+			if configured.is_empty() {
+				crate::service_tier::for_single(self.config.service_tier.as_deref())
+			} else {
+				configured
+			}
 		};
 		Ok(RunRequest {
 			prompt,

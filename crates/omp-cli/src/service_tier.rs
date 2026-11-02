@@ -140,3 +140,15 @@ pub(crate) fn for_single(tier: Option<&str>) -> BTreeMap<String, String> {
 	}
 	out
 }
+
+/// TS `isServiceTierForFamily`: the value a family can actually realize.
+/// `none`/empty/unknown values yield `None`.
+pub(crate) fn family_value(family: &str, value: &str) -> Option<&'static str> {
+	let values: &[&'static str] = match family {
+		"openai" => &["auto", "default", "flex", "scale", "priority"],
+		"anthropic" => &["priority"],
+		"google" => &["flex", "priority"],
+		_ => return None,
+	};
+	values.iter().copied().find(|tier| *tier == value)
+}

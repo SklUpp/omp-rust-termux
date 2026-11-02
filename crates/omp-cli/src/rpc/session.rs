@@ -131,6 +131,9 @@ pub struct RpcLaunch {
 	pub tools_enabled: bool,
 	pub prompt_cache_key: Option<String>,
 	pub prompt_cache_key_inherited: bool,
+	/// `--service-tier` was supplied at launch: it rearms the selection ahead
+	/// of any recorded entry (TS precedence).
+	pub service_tier_explicit: bool,
 	pub provider_session_id: Option<String>,
 	pub store_options: SessionOptions,
 	/// Present when the host installed a live steering channel.
@@ -370,12 +373,31 @@ impl RpcSession {
 			provider_session_id,
 			store_options,
 			steer,
+			service_tier_explicit,
 		} = launch;
 
 		let mut store = SessionStore::open(&store_options);
 		for warning in store.take_warnings() {
 			eprintln!("warning: {warning}");
 		}
+		let live_service_tiers = if service_tier_explicit {
+			crate::service_tier::for_single(config.service_tier.as_deref())
+		} else if store.has_service_tier_entry() {
+			store.service_tier_by_family()
+		} else {
+			config.configured_service_tiers()
+		};
+		if service_tier_explicit
+			&& store.enabled()
+			&& let Err(err) = store.append_service_tier_change(&live_service_tiers)
+		{
+			eprintln!("warning: cannot record service tier change: {err}");
+		}
+		let priority_families: std::collections::BTreeMap<String, bool> = live_service_tiers
+			.iter()
+			.filter(|(_, tier)| tier.as_str() == "priority")
+			.map(|(family, _)| (family.clone(), true))
+			.collect();
 		if store.is_v1() {
 			return Err(Error::new(
 				"cannot run RPC on a legacy v1 session log: read-only; use import_legacy_v1",
@@ -430,6 +452,7 @@ impl RpcSession {
 			thinking_level,
 			prompt_cache_key,
 			prompt_cache_key_inherited,
+			service_tier_explicit,
 			prewalk: crate::prewalk::PrewalkState::new(prewalk),
 			provider_session_id,
 			max_time,
@@ -448,7 +471,7 @@ impl RpcSession {
 			queued: VecDeque::new(),
 			todo_phases,
 			session_name,
-			priority_families: std::collections::BTreeMap::new(),
+			priority_families,
 			last_assistant_text,
 			tokens_per_second: None,
 			steer,
@@ -3208,6 +3231,7 @@ mod tests {
 				tools_enabled: true,
 				prompt_cache_key: None,
 				prompt_cache_key_inherited: false,
+				service_tier_explicit: false,
 				provider_session_id: None,
 				store_options: SessionOptions {
 					enabled: false,

@@ -405,7 +405,7 @@ const CHILD_TOOL_TURN: &str = concat!(
 /// makes exactly one provider request: `yield` is its terminal tool, so no
 /// follow-up assistant turn follows the tool result.
 #[test]
-fn child_task_dispatch_reaches_its_own_endpoint_with_its_own_key() {
+fn child_spawn_inherits_the_priority_fast_mode() {
 	let root_listener = TcpListener::bind("127.0.0.1:0").expect("bind root");
 	let root_addr = root_listener.local_addr().expect("root addr");
 	let child_listener = TcpListener::bind("127.0.0.1:0").expect("bind child");
@@ -436,10 +436,10 @@ fn child_task_dispatch_reaches_its_own_endpoint_with_its_own_key() {
 			..ModelInfo::default()
 		},
 	)]));
-	providers.insert("childprov".to_string(), BTreeMap::from([(
+	providers.insert("anthropic".to_string(), BTreeMap::from([(
 		"claude-child".to_string(),
 		ModelInfo {
-			provider: "childprov".to_string(),
+			provider: "anthropic".to_string(),
 			api: Some("anthropic-messages".to_string()),
 			base_url: Some(format!("http://{child_addr}/v1")),
 			max_tokens: Some(2048),
@@ -459,16 +459,20 @@ fn child_task_dispatch_reaches_its_own_endpoint_with_its_own_key() {
 	std::fs::create_dir_all(&agents_dir).expect("project agents dir");
 	std::fs::write(
 		agents_dir.join("cli-child.md"),
-		"---\nname: cli-child\ndescription: dialect child fixture\ntools:\n  - yield\nmodel: childprov/claude-child\n---\nYield the requested data.\n",
+		"---\nname: cli-child\ndescription: dialect child fixture\ntools:\n  - yield\nmodel: anthropic/claude-child\n---\nYield the requested data.\n",
 	)
 	.expect("write cli-child agent");
 
 	let mut request = wire_request(catalog, "ollama-proxy", "qwen3", Some("root-only-key"));
 	request.prompt = "CHILD_WIRE".to_string();
 	request.cwd = project;
+	// The root selected priority for the Anthropic family: the child inherits it.
+	request
+		.service_tier_by_family
+		.insert("anthropic".to_string(), "priority".to_string());
 	// Synchronous inline delegation: the task result is returned to this turn.
 	request.config.async_config.enabled = Some(false);
-	request.config.providers.insert("childprov".to_string(), ProviderConfig {
+	request.config.providers.insert("anthropic".to_string(), ProviderConfig {
 		api_key: Some("sk-ant-child".to_string()),
 		..ProviderConfig::default()
 	});
@@ -528,6 +532,14 @@ fn child_task_dispatch_reaches_its_own_endpoint_with_its_own_key() {
 		assert!(!lower.contains("x-api-key"), "non-official child endpoint: {head}");
 		assert!(!lower.contains("root-only-key"), "child endpoint saw the root key: {head}");
 		assert!(!body.contains("root-only-key"), "child body carried the root key: {body}");
+		assert!(
+			lower.contains("anthropic-beta:") && head.contains("fast-mode-2026-02-01"),
+			"the child inherits the priority beta: {head}"
+		);
+		assert!(
+			body.contains("\"speed\":\"fast\""),
+			"the child request realizes fast mode: {body}"
+		);
 	}
 	let child_body: serde_json::Value = serde_json::from_str(&child_requests[0].1).expect("child body");
 	assert_eq!(child_body["model"], "claude-child");

@@ -250,6 +250,8 @@ impl AcpRuntime {
 			skills: self.recipe.skills.clone(),
 			catalog: Arc::clone(&self.recipe.catalog),
 			agent_db: PathBuf::new(),
+			// ACP hosts toggle tiers over the RPC protocol; there is no launch flag.
+			service_tier_explicit: false,
 			approval_mode: self.recipe.approval_mode,
 			allow: self.recipe.allow.clone(),
 			model: self.recipe.model.clone(),

@@ -15,7 +15,8 @@ model prose.
 Covered: initialize + advertised capabilities, new/list/load/resume/fork/close,
 set_mode plan/default, set_config_option thinking, prompt block fallbacks,
 permission reverse request + `allow_always` persistence, cancel notification,
-malformed-line recovery, unknown method, EOF cleanup.
+detached plan continuation cancel (cooperative release only, not the 5s forced
+close), malformed-line recovery, unknown method, EOF cleanup.
 """
 
 from __future__ import annotations
@@ -43,9 +44,11 @@ class Provider:
     def __init__(self, model: str = "mock-model") -> None:
         self.model = model
         self.requests = 0
-        # Detached plan continuations: when armed, the reminder turn streams one
-        # chunk, stalls past the ACP cancel cleanup timeout, then emits a late
-        # chunk that a cancelled session must never publish.
+        # Detached plan continuations: when armed, the reminder turn (sent as a
+        # `developer` message, not `user`) streams one chunk, stalls, then emits
+        # a late chunk that a cancelled session must never publish. The stall is
+        # 2s, well under the 5s `CANCEL_CLEANUP_TIMEOUT`: this exercises the
+        # cooperative release path only, never the forced-close watchdog.
         self.hang_continuation = False
         self.hang_seconds = 2.0
         self.continuation_started = threading.Event()
@@ -115,7 +118,12 @@ class Provider:
             yield "data: [DONE]"
             return
 
-        if self.hang_continuation and "Plan mode turn ended without a required tool call." in last_user:
+        reminder_marker = "Plan mode turn ended without a required tool call."
+        if self.hang_continuation and any(
+            message.get("role") == "developer"
+            and reminder_marker in text_of(message.get("content"))
+            for message in messages
+        ):
             self.continuation_started.set()
             yield chunk({"role": "assistant", "content": "continuation delta"})
             time.sleep(self.hang_seconds)
@@ -538,9 +546,12 @@ def run(binary: str) -> None:
         assert_eq(resumed_prompt["stopReason"], "end_turn", "resume prompt")
 
         # 9. cancel a detached plan continuation: the prompt response leaves
-        # first, the reminder turn stalls, and `session/cancel` must end
-        # ownership within the bounded cleanup window instead of leaving the
-        # session busy forever or publishing the orphaned continuation.
+        # first, the reminder turn stalls, and `session/cancel` must release
+        # ownership cooperatively (the 2s stall unwinds well inside the 5s
+        # forced-close watchdog, which this case deliberately does not reach)
+        # while the orphaned continuation is never published. Only the
+        # cooperative path is asserted here; the forced-close boundary is the
+        # gate unit tests' claim, not this fixture.
         plan_session = client.request("session/new", {"cwd": cwd, "mcpServers": []})["sessionId"]
         client.request("session/set_mode", {"sessionId": plan_session, "modeId": "plan"})
         provider.hang_continuation = True
@@ -572,7 +583,10 @@ def run(binary: str) -> None:
                 continue
             resolved = f"closed: {error.get('message')}"
             break
-        assert resolved, "cancel left the detached continuation busy indefinitely"
+        assert resolved == "accepted", (
+            "cooperative cancel must release the continuation, not force-close the session: "
+            f"{resolved}"
+        )
         # A cancelled continuation may not publish its late chunk.
         time.sleep(provider.hang_seconds + 1.0)
         late = [update for update in client.updates_since(mark, plan_session) if "orphan delta" in chunk_text([update])]

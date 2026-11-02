@@ -920,7 +920,9 @@ impl AcpSession {
 				loop {
 					match rx.recv_timeout(CANCEL_POLL) {
 						Ok(_) => return,
-						// The worker died without completing: free the gate.
+						// The worker died without sending: close its generation if it
+						// still owns the gate. A worker that already released is a
+						// no-op, so a healthy session is never tombstoned here.
 						Err(RecvTimeoutError::Disconnected) => break,
 						Err(RecvTimeoutError::Timeout) => {},
 					}
@@ -1159,23 +1161,30 @@ impl AcpSession {
 	/// Close after a timeout without waiting for the wedged turn, matching TS
 	/// `cancel()` closing the session once its cleanup barrier rejects.
 	pub fn force_close(&self, reason: &str) {
+		// Publish the closed marker before the gate opens, so a prompt admitted
+		// in between fails in `ensure_open` instead of starting a cancelled turn.
+		*self.lock_closed() = Some(reason.to_string());
 		self.gate.abort();
 		self.finish_forced_close(reason);
 	}
 
 	/// Bounded cleanup hook: close only the owner generation that timed out, so
 	/// a stale watchdog can never close a newer prompt or session generation.
-	/// Returns false without touching any state when a newer owner took over.
+	/// Returns false without touching any state when a newer owner took over or
+	/// the owner already released.
 	pub(crate) fn force_close_if_generation(&self, generation: u64, reason: &str) -> bool {
-		if !self.gate.claim_close(generation) {
+		if !self.gate.claim_close(generation, || {
+			*self.lock_closed() = Some(reason.to_string());
+		}) {
 			return false;
 		}
 		self.finish_forced_close(reason);
 		true
 	}
 
+	/// Signal and run the close hook. Callers publish the closed marker before
+	/// the gate opens (`claim_close` does it inside its critical section).
 	fn finish_forced_close(&self, reason: &str) {
-		*self.lock_closed() = Some(reason.to_string());
 		self.signal_cancel();
 		if let Some(hook) = self
 			.on_close
@@ -1477,13 +1486,20 @@ impl PromptGate {
 	}
 
 	/// Claim the forced close for the exact owner that timed out. Atomic with
-	/// the generation check, so a newer prompt can never observe a half-closed
-	/// gate. Returns false when a newer owner already took over.
-	fn claim_close(&self, generation: u64) -> bool {
+	/// the generation and `active` checks, so a watchdog that broke its loop
+	/// after the owner already unwound — or after a newer prompt took over — is
+	/// a no-op. Returns false when the owner is gone.
+	///
+	/// `mark_closed` runs inside the same critical section, before the gate
+	/// opens: a prompt admitted afterwards sees the closed marker in
+	/// `ensure_open`. Lock order is gate then `closed`; no path holds `closed`
+	/// while taking the gate.
+	fn claim_close(&self, generation: u64, mark_closed: impl FnOnce()) -> bool {
 		let mut state = self.lock();
-		if state.generation != generation {
+		if !state.active || state.generation != generation {
 			return false;
 		}
+		mark_closed();
 		state.active = false;
 		state.cancel_requested = true;
 		state.autonomous = false;
@@ -3575,12 +3591,50 @@ mod tests {
 		let old = gate.begin();
 		assert!(gate.release(old));
 		let newer = gate.begin();
-		assert!(!gate.claim_close(old), "stale watchdog closed a newer prompt");
+		assert!(!gate.claim_close(old, || {}), "stale watchdog closed a newer prompt");
 		assert!(gate.is_active());
 		assert!(!gate.cancel_requested());
-		assert!(gate.claim_close(newer));
+		assert!(gate.claim_close(newer, || {}));
 		assert!(!gate.is_active());
 		assert!(gate.cancel_requested());
+	}
+
+	#[test]
+	fn plan_gate_released_owner_never_closes() {
+		// The watchdog can break its loop on the deadline just as the owner
+		// unwinds and releases; the same generation must not be closed once
+		// `active` is gone, and the rejected claim must not publish a close.
+		let gate = PromptGate::default();
+		let owner = gate.begin();
+		assert!(gate.release(owner));
+		let mut marked = false;
+		assert!(
+			!gate.claim_close(owner, || marked = true),
+			"watchdog closed an owner that already released"
+		);
+		assert!(!marked, "rejected claim published the closed marker");
+		assert!(!gate.cancel_requested());
+		assert!(!gate.is_active(), "rejected claim must leave the gate untouched");
+		let next = gate.begin();
+		assert_ne!(next, owner, "released owner still holds the gate");
+		assert!(gate.release(next));
+	}
+
+	#[test]
+	fn plan_gate_close_publishes_before_the_gate_opens() {
+		// `mark_closed` runs inside the claim's critical section, so the prompt
+		// admitted after the claim sees the closed marker and a fresh generation
+		// instead of starting a turn on a force-closed session.
+		use std::cell::Cell;
+		let gate = PromptGate::default();
+		let owner = gate.begin();
+		let published = Cell::new(false);
+		assert!(gate.claim_close(owner, || published.set(true)));
+		assert!(published.get(), "mark_closed did not run");
+		let next = gate.begin();
+		assert!(published.get(), "begin admitted a closed session");
+		assert_ne!(next, owner, "closed owner still holds the gate");
+		assert!(gate.release(next));
 	}
 
 	#[test]
@@ -3592,7 +3646,7 @@ mod tests {
 		let owner = gate.begin();
 		gate.switch_to_autonomous();
 		assert_eq!(gate.claim_continuation(), Some(owner));
-		assert!(gate.claim_close(owner), "watchdog closes its owner");
+		assert!(gate.claim_close(owner, || {}), "watchdog closes its owner");
 		assert!(!gate.is_active());
 		assert!(!gate.release(owner), "finalizer after the close is a no-op");
 	}

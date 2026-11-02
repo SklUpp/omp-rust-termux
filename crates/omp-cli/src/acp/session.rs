@@ -3726,7 +3726,7 @@ mod tests {
 		// sink ACP installs, never a bare frame.
 		let sink: Arc<dyn crate::rpc::session::FrameSink> = Arc::new(super::AcpNoticeSink {
 			transport: transport.clone(),
-			session_id: Arc::new(Mutex::new("sess-1".to_string())),
+			session_id: Arc::new(std::sync::Mutex::new("sess-1".to_string())),
 		});
 		HostToolBridge::new(Arc::clone(&sink))
 			.send_notice("warning", "Priority/fast mode rejected");

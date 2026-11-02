@@ -86,8 +86,10 @@ pub struct OllamaPayloadModel {
 	pub thinking: Option<OllamaPayloadThinking>,
 	/// Effort actually requested after resolution.
 	pub effort: Option<String>,
-	/// Pre-auth set: model-level headers first, then config.yml provider headers.
-	/// The adapter appends `Authorization` and `Content-Type` last.
+	/// Model-level headers only (`ModelInfo.headers`); caller/connection headers
+	/// travel separately via `OllamaProvider::with_request_headers` and are never
+	/// hook-visible. The adapter emits model then request headers, then appends
+	/// `Authorization` and `Content-Type` last.
 	pub headers: Vec<(String, String)>,
 }
 

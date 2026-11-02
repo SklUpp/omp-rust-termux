@@ -1438,14 +1438,21 @@ async fn default_client_rejects_redirects_without_contacting_second_origin() {
 		);
 		let _ = socket.write_all(redirect.as_bytes()).await;
 	});
-	let provider = make_provider(&format!("http://{first_addr}"), "m");
+	let provider = make_provider(&format!("http://{first_addr}"), "m")
+		.with_request_headers(vec![(
+			"X-Api-Key".to_string(),
+			"gateway-secret".to_string(),
+		)]);
 	let err = provider
 		.stream(&[Message::user("hi")], &[], &ToolChoice::Auto)
 		.await
 		.err()
 		.expect("redirect status");
 	let head = head_rx.await.expect("first origin request");
-	assert!(head.to_ascii_lowercase().contains("authorization: bearer"));
+	let lower_head = head.to_ascii_lowercase();
+	assert!(lower_head.contains("authorization: bearer"));
+	// The request that would have been forwarded carries a custom credential.
+	assert!(lower_head.contains("x-api-key: gateway-secret"));
 	match err {
 		ProviderError::HttpStatus(status, _) => assert_eq!(status, 302),
 		other => panic!("Expected HttpStatus(302), got {other:?}"),

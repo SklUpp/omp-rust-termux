@@ -29,7 +29,7 @@ use pi_agent::{
 use serde_json::{Value, json};
 
 use crate::{
-	service_tier::{family as service_tier_family, realizes_priority, should_send_service_tier},
+	service_tier::{family as service_tier_family, realizes_priority},
 	Error, Result,
 	agent::{AgentRunner, Event as AgentEvent, RunRequest},
 	approve::{ApprovalMode, Approvals},

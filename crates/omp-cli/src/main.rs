@@ -2286,8 +2286,17 @@ impl Session<'_> {
 								self.store.append_service_tier_change(&self.service_tier_by_family)
 						{
 							eprintln!("warning: cannot record service tier change: {err}");
-						}					}
-					*parent = Some(prev_id);
+						}
+					}
+					// The journal leaf (a downgrade metadata entry included) is the
+					// ancestry for the next assistant turn, so a tool continuation
+					// cannot orphan the recorded reset; the non-persistent path keeps
+					// the in-memory id chain.
+					*parent = if store.enabled() {
+						store.leaf_id().map(str::to_string).or(Some(prev_id))
+					} else {
+						Some(prev_id)
+					};
 
 					if !store.enabled()
 						&& let Some(messages) = in_memory.as_mut()

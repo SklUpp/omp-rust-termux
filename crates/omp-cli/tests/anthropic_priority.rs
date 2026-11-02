@@ -28,6 +28,23 @@ use omp_cli::{
 
 const FAST_REJECTION: &str = r#"{"type":"error","error":{"type":"invalid_request_error","message":"speed is not supported for this model"}}"#;
 
+/// Downgraded retry that asks for a real tool: the continuation assistant turn
+/// must descend from the recorded reset entry, not from the sibling assistant.
+const TOOL_TURN: &str = concat!(
+	"event: message_start\n",
+	"data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"usage\":{\"input_tokens\":3,\"output_tokens\":0}}}\n\n",
+	"event: content_block_start\n",
+	"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"bash\",\"input\":{}}}\n\n",
+	"event: content_block_delta\n",
+	"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\":\\\"echo hi\\\"}\"}}\n\n",
+	"event: content_block_stop\n",
+	"data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+	"event: message_delta\n",
+	"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":2}}\n\n",
+	"event: message_stop\n",
+	"data: {\"type\":\"message_stop\"}\n\n"
+);
+
 /// A 200 stream whose first event is an error (TS `streamFailure` before
 /// `firstTokenTime`), which must take the same one-shot downgrade path as an
 /// HTTP rejection.
@@ -541,4 +558,103 @@ fn many_metadata_records_coalesce_without_losing_usage() {
 	assert_eq!(usage.cache_write, 3, "initial cache write is preserved");
 	assert_eq!(usage.output, 7, "the final output count wins");
 	server.join().expect("server");
+}
+
+/// A downgraded turn that continues with a tool call must keep the recorded
+/// reset on the ancestry path: the follow-up assistant turn and the resumed
+/// process both stay downgraded.
+#[test]
+fn downgrade_survives_a_tool_continuation_and_resume() {
+	let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+	let addr = listener.local_addr().expect("addr");
+	let (captured_tx, captured_rx) = mpsc::channel::<(String, String)>();
+	let server = std::thread::spawn(move || {
+		for index in 0..4 {
+			let (mut socket, _) = listener.accept().expect("accept");
+			let captured = read_request(&mut socket);
+			captured_tx.send(captured).expect("capture");
+			match index {
+				0 => respond(&mut socket, "400 Bad Request", "application/json", FAST_REJECTION),
+				1 => respond(&mut socket, "200 OK", "text/event-stream", TOOL_TURN),
+				_ => respond(&mut socket, "200 OK", "text/event-stream", TURN),
+			}
+		}
+	});
+
+	let root = std::env::temp_dir().join(format!(
+		"omp-anthropic-priority-tool-{}-{}",
+		std::process::id(),
+		std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.expect("clock")
+			.as_nanos()
+	));
+	let agent = root.join("agent");
+	let cwd = root.join("work");
+	let sessions = root.join("sessions");
+	std::fs::create_dir_all(&agent).expect("agent dir");
+	std::fs::create_dir_all(&cwd).expect("cwd");
+	std::fs::write(
+		agent.join("config.yml"),
+		format!(
+			"defaultModel: anthropic/claude-priority\nproviders:\n  anthropic:\n    \
+			 baseUrl: \"http://{addr}/v1\"\n    api: anthropic-messages\n    apiKey: test-key\n"
+		),
+	)
+	.expect("config.yml");
+	std::fs::write(
+		agent.join("models.yml"),
+		format!(
+			"providers:\n  anthropic:\n    baseUrl: \"http://{addr}/v1\"\n    \
+			 api: anthropic-messages\n    apiKey: test-key\n    models:\n      - id: claude-priority\n\
+			 \x20       contextWindow: 200000\n"
+		),
+	)
+	.expect("models.yml");
+
+	let run = |extra: &[&str]| {
+		let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_omp"));
+		command
+			.env("HOME", root.join("home"))
+			.env("PI_CODING_AGENT_DIR", &agent)
+			.args(["--cwd", cwd.to_str().expect("cwd")])
+			.args(["--session-dir", sessions.to_str().expect("sessions")])
+			.args(["--no-title", "--approval-mode", "yolo"])
+			.args(extra)
+			.args(["-p", "run echo hi"])
+			.stdin(std::process::Stdio::null());
+		command.output().expect("run omp")
+	};
+
+	let first = run(&["--service-tier", "priority"]);
+	assert!(
+		first.status.success(),
+		"first run failed: {}",
+		String::from_utf8_lossy(&first.stderr)
+	);
+	let (_reject, _tool) = captured_rx.recv().expect("reject request");
+	// Both the retried tool turn and the continuation omit fast mode.
+	for label in ["retried tool turn", "continuation turn"] {
+		let (head, body) = captured_rx.recv().expect("provider request");
+		assert!(
+			!head.to_ascii_lowercase().contains("fast-mode-2026-02-01"),
+			"{label} must stay downgraded: {head}"
+		);
+		assert_eq!(body_field(&body, "speed"), None, "{label} must omit speed");
+	}
+
+	let second = run(&[]);
+	assert!(
+		second.status.success(),
+		"second run failed: {}",
+		String::from_utf8_lossy(&second.stderr)
+	);
+	let (_head, resumed) = captured_rx.recv().expect("resumed request");
+	assert_eq!(
+		body_field(&resumed, "speed"),
+		None,
+		"resume walks the reset entry and stays downgraded"
+	);
+	server.join().expect("server");
+	let _ = std::fs::remove_dir_all(&root);
 }

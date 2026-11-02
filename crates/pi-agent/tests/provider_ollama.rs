@@ -1199,12 +1199,13 @@ async fn test_on_payload_hook_modifies_request_payload() {
 		let _ = socket.flush().await;
 	});
 
+	let expected_base = format!("http://{addr}");
 	let hook: OllamaPayloadHook = std::sync::Arc::new(
-		|payload: &Value, model: &OllamaPayloadModel<'_>| {
+		move |payload: &Value, model: &OllamaPayloadModel<'_>| {
 			assert_eq!(model.model, "test-model");
 			assert_eq!(model.api, "ollama-chat");
 			assert_eq!(model.provider, "ollama");
-			assert_eq!(model.base_url, format!("http://{addr}"));
+			assert_eq!(model.base_url, expected_base.as_str());
 			let mut modified = payload.clone();
 			if let Some(map) = modified.as_object_mut() {
 				map.insert("custom_injected_option".to_string(), json!(true));

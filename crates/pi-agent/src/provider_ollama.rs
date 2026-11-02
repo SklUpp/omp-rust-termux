@@ -1825,11 +1825,6 @@ impl FencedThinkingScanner {
 		text: &str,
 		is_final: bool,
 	) -> Result<FencedThinkingResult, ProviderError> {
-		if self.buffer.len() + text.len() > MAX_STREAM_HOLD_BYTES {
-			return Err(ProviderError::Protocol(format!(
-				"fenced thinking block exceeded {MAX_STREAM_HOLD_BYTES} bytes without closing"
-			)));
-		}
 		self.buffer.push_str(text);
 		let mut thinking = String::new();
 
@@ -1876,6 +1871,11 @@ impl FencedThinkingScanner {
 			});
 		}
 		if !is_final && self.must_hold(&self.buffer) {
+			if self.buffer.len() > MAX_STREAM_HOLD_BYTES {
+				return Err(ProviderError::Protocol(format!(
+					"fenced thinking block held {MAX_STREAM_HOLD_BYTES} bytes without closing"
+				)));
+			}
 			return Ok(FencedThinkingResult {
 				thinking,
 				closed: false,
@@ -2131,13 +2131,16 @@ impl ThinkingInbandScanner {
 		if text.is_empty() {
 			return Ok(Vec::new());
 		}
-		if self.buffer.len() + text.len() > MAX_STREAM_HOLD_BYTES {
+		// The cap applies to what is *retained* (an unresolved tag/fence tail),
+		// never to a single large but valid record that drains immediately.
+		self.buffer.push_str(text);
+		let events = self.consume(false)?;
+		if self.buffer.len() > MAX_STREAM_HOLD_BYTES {
 			return Err(ProviderError::Protocol(format!(
 				"thinking markup held {MAX_STREAM_HOLD_BYTES} bytes without closing"
 			)));
 		}
-		self.buffer.push_str(text);
-		self.consume(false)
+		Ok(events)
 	}
 
 	pub fn flush(&mut self) -> Result<Vec<InbandScanEvent>, ProviderError> {

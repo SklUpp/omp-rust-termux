@@ -207,6 +207,11 @@ impl PlanYoloShared {
 		self.armed.load(Ordering::Acquire) && !self.completed.load(Ordering::Acquire)
 	}
 
+	#[must_use]
+	pub fn is_completed(&self) -> bool {
+		self.completed.load(Ordering::Acquire)
+	}
+
 	fn approval_active(&self) -> bool {
 		self.is_armed()
 	}

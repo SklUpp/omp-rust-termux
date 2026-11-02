@@ -20,6 +20,8 @@ use pi_agent::{
 	ChildToolSettings, EditTool, GlobTool, GrepTool, ModelProvider,
 	OpenAiCompatibleProvider, PendingStore, ReadTool,
 	SteeringEvent, Supervisor, TodoTool, Tool, ToolApprover, ToolRegistry, WriteTool,
+	provider_anthropic::{AnthropicConfig, AnthropicMessagesProvider, AnthropicThinkingConfig},
+	provider_ollama::OllamaProvider,
 	dap::{DapSessionManager, DapTool},
 	process_broker::BrokerProcessBackend,
 	tools::process::{ProcessBackend, ProcessManager},
@@ -1446,29 +1448,30 @@ impl AgentRunner for PiAgentRunner {
 		let plan_api = plan.api.clone();
 		let plan_provider = plan.provider.clone();
 		let plan_model = plan.model.clone();
-		let provider = OpenAiCompatibleProvider::new(plan.base_url, plan.api_key, plan.model)
-			.map_err(|err| Error::with_source("pi-agent provider setup failed", err))?
-			.with_effort(plan.effort)
-			.with_images(plan.supports_images)
-			.with_prompt_cache_enabled(plan.provider == "kimi-code")
-			// Per-model `compat.supportsUsageInStreaming` override, else the TS
-			// provider default (`!isCerebras`, `compat/openai.ts`): the Cerebras
-			// dialect rejects the `stream_options` field.
-			.with_usage_in_streaming(plan.supports_usage_in_streaming)
-			.with_session_id(request.provider_session_id.clone())
-			.with_prompt_cache_key(request.prompt_cache_key.clone())
-			.with_force_reasoning_off(request.config.external_thinking)
-			.with_service_tier(request.config.service_tier.clone())
-			// Assembly stamps the real route on produced messages so signed
-			// reasoning is only replayed to the provider that issued it.
-			.with_provider_id(plan_provider.clone());
+		let target = WireTarget {
+			dialect: plan.dialect,
+			provider: &plan_provider,
+			model: &plan_model,
+			base_url: &plan.base_url,
+			api_key: &plan.api_key,
+			effort: plan.effort.as_deref(),
+			supports_images: plan.supports_images,
+			usage_in_streaming: Some(plan.supports_usage_in_streaming),
+		};
+		let provider = wire_provider(
+			&request.catalog,
+			&request.config,
+			&target,
+			request.provider_session_id.clone(),
+			request.prompt_cache_key.clone(),
+		)
+		.map_err(Error::new)?;
 		let config = AgentConfig {
 			max_turns: plan.max_turns,
 			context_limit: plan.context_limit,
 			system_prompt: None,
 			cwd,
 		};
-		let provider: Arc<dyn ModelProvider> = Arc::new(provider);
 		// Children never prompt: keep the interactive `ask` surface on the root
 		// approver only.
 		let child_approvals: Arc<dyn ToolApprover> = Arc::new(approvals.without_ask());
@@ -2147,21 +2150,366 @@ impl Iterator for BoundedEventStream {
 		}
 	}
 }
-/// One root candidate: provider/model/effort plus the provider connection and
-/// its required base URL. Pure selector logic shared by every candidate.
+/// Wire dialect this build can speak.
+///
+/// Only the adapters compiled into `pi-agent` are listed: a model that declares
+/// another `api` is a hard setup error, never a silent OpenAI-compatible send.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum WireDialect {
+	OpenAiCompletions,
+	OllamaChat,
+	AnthropicMessages,
+}
+
+impl WireDialect {
+	const fn api(self) -> &'static str {
+		match self {
+			Self::OpenAiCompletions => "openai-completions",
+			Self::OllamaChat => "ollama-chat",
+			Self::AnthropicMessages => "anthropic-messages",
+		}
+	}
+}
+
+/// Resolve the wire dialect. Precedence is TS `modelDef.api ?? providerApi`:
+/// the per-model `api` is authoritative and a connection block only fills in
+/// for a model that declares none.
+fn wire_dialect(
+	catalog: &crate::catalog::Catalog,
+	provider: &str,
+	model: &str,
+	connection: Option<&crate::config::ProviderConfig>,
+) -> std::result::Result<WireDialect, String> {
+	let api = catalog
+		.model_api(provider, model)
+		.or_else(|| connection.and_then(|connection| connection.api.as_deref()));
+	match api {
+		None | Some("openai-completions") => Ok(WireDialect::OpenAiCompletions),
+		Some("ollama-chat") => Ok(WireDialect::OllamaChat),
+		Some("anthropic-messages") => Ok(WireDialect::AnthropicMessages),
+		Some(other) => Err(format!(
+			"unsupported provider api `{other}` for `{provider}/{model}`: this build speaks \
+			 `openai-completions`, `ollama-chat` and `anthropic-messages`"
+		)),
+	}
+}
+
+/// Effective endpoint.
+///
+/// `config.yml` is the CLI's own override and outranks every catalog route (a
+/// gateway base URL there must not be shadowed by a bundled row's vendor URL).
+/// Inside the catalog the per-model `baseUrl` wins over the provider block,
+/// which is what makes a `models.yml` model entry override its provider.
+fn wire_base_url(
+	catalog: &crate::catalog::Catalog,
+	provider: &str,
+	model: &str,
+	cli_base_url: Option<&str>,
+	dialect: WireDialect,
+) -> std::result::Result<String, String> {
+	let configured = cli_base_url
+		.map(str::to_string)
+		.or_else(|| catalog.model_base_url(provider, model).map(str::to_string))
+		.or_else(|| {
+			catalog
+				.connections
+				.get(provider)
+				.and_then(|connection| connection.base_url.clone())
+		});
+	match dialect {
+		WireDialect::OpenAiCompletions => configured.ok_or_else(|| {
+			format!("provider `{provider}` has no baseUrl in config.yml or models.yml")
+		}),
+		// The Ollama adapter normalizes a bare host and defaults to the cloud
+		// endpoint, so an absent base URL is legal for this dialect.
+		WireDialect::OllamaChat => Ok(configured.unwrap_or_else(|| "https://ollama.com".to_string())),
+		WireDialect::AnthropicMessages => anthropic_base_url(provider, configured)
+			.ok_or_else(|| format!("provider `{provider}` has no baseUrl for `anthropic-messages`")),
+	}
+}
+
+/// TS `resolveAnthropicBaseUrl`: an explicitly configured non-official URL wins,
+/// otherwise `ANTHROPIC_BASE_URL` routes the stock `anthropic` provider, then
+/// the configured URL, then the official default. The adapter appends
+/// `/v1/messages`, so a trailing `/v1` is dropped
+/// (TS `normalizeAnthropicBaseUrl`).
+fn anthropic_base_url(provider: &str, configured: Option<String>) -> Option<String> {
+	const OFFICIAL: &str = "https://api.anthropic.com";
+	fn normalize(value: String) -> String {
+		let trimmed = value.trim().trim_end_matches('/');
+		trimmed.strip_suffix("/v1").unwrap_or(trimmed).to_string()
+	}
+	let configured = configured.map(normalize);
+	if provider != "anthropic" {
+		return configured;
+	}
+	let official = |url: &str| {
+		let url = url.to_ascii_lowercase();
+		url == OFFICIAL || url.starts_with("https://api.anthropic.com/")
+	};
+	match configured {
+		Some(url) if !official(&url) => Some(url),
+		other => std::env::var("ANTHROPIC_BASE_URL")
+			.ok()
+			.map(normalize)
+			.filter(|value| !value.is_empty())
+			.or(other)
+			.or_else(|| Some(OFFICIAL.to_string())),
+	}
+}
+
+/// `compat`/`thinking` JSON flag, `None` when the block or key is absent.
+fn json_flag(block: Option<&serde_json::Value>, key: &str) -> Option<bool> {
+	block?.get(key)?.as_bool()
+}
+
+/// `compat`/`thinking` JSON counter, `None` when the block or key is absent.
+fn json_u64(block: Option<&serde_json::Value>, key: &str) -> Option<u64> {
+	block?.get(key)?.as_u64()
+}
+
+/// String pairs of one authored `thinking.effortMap`-style object.
+fn json_string_map(
+	block: Option<&serde_json::Value>,
+	key: &str,
+) -> Vec<(String, String)> {
+	let Some(map) = block
+		.and_then(|block| block.get(key))
+		.and_then(serde_json::Value::as_object)
+	else {
+		return Vec::new();
+	};
+	map.iter()
+		.filter_map(|(key, value)| value.as_str().map(|value| (key.clone(), value.to_string())))
+		.collect()
+}
+
+/// Apply the authored compat flags that are present, leaving the adapter
+/// default in place for every key the model does not declare.
+fn apply_compat_flags(
+	compat: Option<&serde_json::Value>,
+	flags: &[(&str, &mut bool)],
+) {
+	let Some(compat) = compat else {
+		return;
+	};
+	for (key, slot) in flags {
+		if let Some(value) = compat.get(*key).and_then(serde_json::Value::as_bool) {
+			**slot = value;
+		}
+	}
+}
+
+/// Anthropic thinking request state derived from the authored model metadata
+/// and the turn's requested effort (TS `buildParams` thinking selection).
+struct AnthropicThinking {
+	thinking:      Option<AnthropicThinkingConfig>,
+	output_effort: Option<String>,
+	adaptive_only: bool,
+}
+
+/// TS `isAdaptiveOnlyThinking` minus the `usesAdaptiveThinkingTagOnly` case:
+/// an `anthropic-adaptive` model that only drives thinking through the tag
+/// itself is not an adaptive-effort model.
+fn anthropic_adaptive_only(
+	mode: Option<&str>,
+	compat: Option<&serde_json::Value>,
+	thinking: Option<&serde_json::Value>,
+) -> bool {
+	if mode != Some("anthropic-adaptive") || json_flag(compat, "disableAdaptiveThinking") == Some(true) {
+		return false;
+	}
+	let tag_only = match (
+		thinking.and_then(|thinking| thinking.get("efforts")).and_then(serde_json::Value::as_array),
+		thinking.and_then(|thinking| thinking.get("effortMap")).and_then(serde_json::Value::as_object),
+	) {
+		(Some(efforts), Some(effort_map)) if !efforts.is_empty() => efforts
+			.iter()
+			.filter_map(serde_json::Value::as_str)
+			.all(|effort| effort_map.get(effort).and_then(serde_json::Value::as_str) == Some("adaptive")),
+		_ => false,
+	};
+	!tag_only
+}
+
+/// Thinking budget per effort (TS `ANTHROPIC_THINKING`).
+fn anthropic_thinking_budget(effort: &str) -> u32 {
+	match effort {
+		"minimal" => 1024,
+		"low" => 4096,
+		"medium" => 8192,
+		"high" => 16384,
+		"xhigh" | "max" => 32768,
+		_ => 1024,
+	}
+}
+
+/// TS streaming `stream.ts` anthropic option fold: thinking is only requested
+/// when the model declares `reasoning`, the turn asks for an effort, and no
+/// external scratchpad replaces it. `display` mirrors the TS defaults because
+/// the adapter omits the field when it is unset.
+fn anthropic_thinking(
+	reasoning: bool,
+	compat: Option<&serde_json::Value>,
+	thinking: Option<&serde_json::Value>,
+	effort: Option<&str>,
+	force_off: bool,
+) -> AnthropicThinking {
+	let mode = thinking
+		.and_then(|thinking| thinking.get("mode"))
+		.and_then(serde_json::Value::as_str);
+	let adaptive_only = anthropic_adaptive_only(mode, compat, thinking);
+	if !reasoning {
+		return AnthropicThinking { thinking: None, output_effort: None, adaptive_only };
+	}
+	let Some(effort) = effort.filter(|_| !force_off) else {
+		let thinking = Some(AnthropicThinkingConfig::Disabled);
+		return AnthropicThinking { thinking, output_effort: None, adaptive_only };
+	};
+	let mapped = thinking
+		.and_then(|thinking| thinking.get("effortMap"))
+		.and_then(|map| map.get(effort))
+		.and_then(serde_json::Value::as_str)
+		.unwrap_or(effort)
+		.to_string();
+	if mode == Some("anthropic-adaptive") {
+		let display = json_flag(thinking, "supportsDisplay")
+			.and_then(|supported| supported.then(|| "summarized".to_string()));
+		AnthropicThinking {
+			thinking:      Some(AnthropicThinkingConfig::Adaptive { display }),
+			output_effort: (mapped != "adaptive").then_some(mapped),
+			adaptive_only,
+		}
+	} else {
+		AnthropicThinking {
+			thinking: Some(AnthropicThinkingConfig::Enabled {
+				budget_tokens: anthropic_thinking_budget(effort),
+				display:       Some("summarized".to_string()),
+			}),
+			output_effort: (mode == Some("anthropic-budget-effort")).then_some(mapped),
+			adaptive_only,
+		}
+	}
+}
+
+/// One resolved wire target: dialect, route, credential and request shaping.
+struct WireTarget<'a> {
+	dialect:         WireDialect,
+	provider:        &'a str,
+	model:           &'a str,
+	base_url:        &'a str,
+	api_key:         &'a str,
+	effort:          Option<&'a str>,
+	supports_images: bool,
+	/// Resolved `compat.supportsUsageInStreaming`; `None` applies the dialect
+	/// default (`!isCerebras`).
+	usage_in_streaming: Option<bool>,
+}
+
+/// Build the provider the resolved dialect names. This is the only place the
+/// CLI chooses an adapter, so the root turn and every child share one mapping.
+fn wire_provider(
+	catalog: &crate::catalog::Catalog,
+	config: &crate::config::Config,
+	target: &WireTarget<'_>,
+	session_id: Option<String>,
+	prompt_cache_key: Option<String>,
+) -> std::result::Result<Arc<dyn ModelProvider>, String> {
+	let info = catalog
+		.providers
+		.get(target.provider)
+		.and_then(|models| models.get(target.model));
+	let compat = catalog.model_compat(target.provider, target.model);
+	let thinking = catalog.model_thinking(target.provider, target.model);
+	let setup = |err: pi_agent::ProviderError| format!("pi-agent provider setup failed: {err}");
+	let effort = target.effort.map(str::to_string);
+	match target.dialect {
+		WireDialect::OpenAiCompletions => {
+			// Per-model `compat.supportsUsageInStreaming` override, else the TS
+			// provider default (`!isCerebras`): the Cerebras dialect rejects the
+			// `stream_options` field.
+			let usage_in_streaming = target
+				.usage_in_streaming
+				.unwrap_or(target.provider != "cerebras");
+			let provider = OpenAiCompatibleProvider::new(target.base_url, target.api_key, target.model)
+				.map_err(setup)?
+				.with_effort(effort)
+				.with_images(target.supports_images)
+				.with_prompt_cache_enabled(target.provider == "kimi-code")
+				.with_usage_in_streaming(usage_in_streaming)
+				.with_session_id(session_id)
+				.with_prompt_cache_key(prompt_cache_key)
+				.with_force_reasoning_off(config.external_thinking)
+				.with_service_tier(config.service_tier.clone())
+				// Assembly stamps the real route on produced messages so signed
+				// reasoning is only replayed to the provider that issued it.
+				.with_provider_id(target.provider.to_string());
+			Ok(Arc::new(provider))
+		},
+		WireDialect::OllamaChat => {
+			let provider = OllamaProvider::new(target.base_url, target.api_key, target.model)
+				.map_err(setup)?
+				.with_images(target.supports_images)
+				.with_cloud(target.provider == "ollama-cloud")
+				.with_model_reasoning(info.is_some_and(|info| info.reasoning))
+				.with_reasoning(effort)
+				.with_disable_reasoning(config.external_thinking)
+				.with_effort_map(json_string_map(thinking, "effortMap"))
+				.with_max_tokens(info.and_then(|info| info.max_tokens));
+			Ok(Arc::new(provider))
+		},
+		WireDialect::AnthropicMessages => {
+			let mut anthropic = AnthropicConfig::new(target.base_url, target.api_key, target.model);
+			anthropic.max_tokens = info
+				.and_then(|info| info.max_tokens)
+				.map(|tokens| u32::try_from(tokens).unwrap_or(u32::MAX));
+			anthropic.supports_images = target.supports_images;
+			anthropic.provider_id = Some(target.provider.to_string());
+			anthropic.claude_code_session_id = session_id;
+			anthropic.idle_timeout = json_u64(compat, "streamIdleTimeoutMs")
+				.map(std::time::Duration::from_millis);
+			apply_compat_flags(compat, &[
+				("supportsSamplingParams", &mut anthropic.supports_sampling_params),
+				("supportsForcedToolChoice", &mut anthropic.supports_forced_tool_choice),
+				("replayUnsignedThinking", &mut anthropic.replay_unsigned_thinking),
+				("supportsLongCacheRetention", &mut anthropic.supports_long_cache_retention),
+				("supportsMidConversationSystem", &mut anthropic.supports_mid_conversation_system),
+				("requiresToolResultId", &mut anthropic.requires_tool_result_id),
+				("escapeBuiltinToolNames", &mut anthropic.escape_builtin_tool_names),
+				("allowAnthropicHeaderOverrides", &mut anthropic.allow_anthropic_header_overrides),
+				("disableStrictTools", &mut anthropic.disable_strict_tools),
+			]);
+			let thinking = anthropic_thinking(
+				info.is_some_and(|info| info.reasoning),
+				compat,
+				thinking,
+				target.effort,
+				config.external_thinking,
+			);
+			anthropic.thinking = thinking.thinking;
+			anthropic.output_effort = thinking.output_effort;
+			anthropic.adaptive_only_thinking = thinking.adaptive_only;
+			let provider = AnthropicMessagesProvider::from_config(anthropic).map_err(setup)?;
+			Ok(Arc::new(provider))
+		},
+	}
+}
+
+/// One root candidate: provider/model/effort plus the resolved connection,
+/// dialect and endpoint. Pure selector logic shared by every candidate.
+struct RootCandidate {
+	provider:   String,
+	model:      String,
+	effort:     Option<String>,
+	connection: Option<crate::config::ProviderConfig>,
+	dialect:    WireDialect,
+	base_url:   String,
+}
+
 fn root_candidate(
 	request: &RunRequest,
 	pattern: &str,
-) -> std::result::Result<
-	(
-		String,
-		String,
-		Option<String>,
-		Option<crate::config::ProviderConfig>,
-		String,
-	),
-	String,
-> {
+) -> std::result::Result<RootCandidate, String> {
 	let (provider, model, effort) = match request.provider.as_deref() {
 		Some(provider) => {
 			let prefix = format!("{provider}/");
@@ -2194,13 +2542,14 @@ fn root_candidate(
 		.get(&provider)
 		.cloned()
 		.or_else(|| request.catalog.connections.get(&provider).cloned());
-	let base_url = connection
-		.as_ref()
-		.and_then(|connection| connection.base_url.clone())
-		.ok_or_else(|| {
-			format!("provider `{provider}` has no baseUrl in config.yml or models.yml")
-		})?;
-	Ok((provider, model, effort, connection, base_url))
+	let dialect = wire_dialect(&request.catalog, &provider, &model, connection.as_ref())?;
+	let cli_base_url = request
+		.config
+		.providers
+		.get(&provider)
+		.and_then(|provider| provider.base_url.as_deref());
+	let base_url = wire_base_url(&request.catalog, &provider, &model, cli_base_url, dialect)?;
+	Ok(RootCandidate { provider, model, effort, connection, dialect, base_url })
 }
 
 
@@ -2208,7 +2557,10 @@ fn root_candidate(
 struct RunPlan {
 	base_url:      String,
 	api_key:       String,
+	/// Wire dialect stamped on produced messages (TS `model.api`).
 	api:           String,
+	/// Adapter to build for this plan, resolved with `api`.
+	dialect:       WireDialect,
 	provider:      String,
 	model:         String,
 	effort:        Option<String>,
@@ -2253,9 +2605,10 @@ impl RunPlan {
 				Err(error) => last_error = Some(error),
 			}
 		}
-		let (provider, model, effort, connection, base_url) = selected.ok_or_else(|| {
-			Error::new(last_error.unwrap_or_else(|| format!("no model candidate for `{requested}`")))
-		})?;
+		let RootCandidate { provider, model, effort, connection, dialect, base_url } =
+			selected.ok_or_else(|| {
+				Error::new(last_error.unwrap_or_else(|| format!("no model candidate for `{requested}`")))
+			})?;
 		// A keyless provider (local gateway, `auth: none`) is legal: the OpenAI
 		// client sends an empty bearer token.
 		//
@@ -2296,10 +2649,7 @@ impl RunPlan {
 			.catalog
 			.context_window(&provider, &model)
 			.unwrap_or(DEFAULT_CONTEXT_LIMIT);
-		let api = connection
-			.as_ref()
-			.and_then(|c| c.api.clone())
-			.unwrap_or_else(|| "openai-completions".to_string());
+		let api = dialect.api().to_string();
 		// Model image capabilities resolution:
 		// - If catalog explicitly declares inputs without "image" -> fail closed (`supports_images = false`).
 		// - If catalog explicitly declares "image" -> `supports_images = true`.
@@ -2321,6 +2671,7 @@ impl RunPlan {
 			base_url,
 			api_key,
 			api,
+			dialect,
 			provider,
 			model,
 			effort,
@@ -2369,13 +2720,7 @@ impl CliChildModelFactory {
 		model_patterns(&self.config, raw, self.default_model.as_deref())
 	}
 
-	fn locate(
-		&self,
-		pattern: &str,
-	) -> std::result::Result<
-		(String, String, String, bool, Option<String>, crate::config::ProviderConfig),
-		String,
-	> {
+	fn locate(&self, pattern: &str) -> std::result::Result<ChildTarget, String> {
 		let (base, selector) = split_thinking(pattern, -1);
 		let effort = selector.and_then(|selector| match selector {
 			"inherit" | "auto" | "off" => None,
@@ -2404,13 +2749,28 @@ impl CliChildModelFactory {
 			.get(&provider)
 			.cloned()
 			.or_else(|| self.catalog.connections.get(&provider).cloned())
-			.ok_or_else(|| format!("provider `{provider}` has no connection block"))?;
-		let base_url = connection
-			.base_url
-			.clone()
-			.ok_or_else(|| format!("provider `{provider}` has no baseUrl"))?;
+			.unwrap_or_default();
+		let dialect = wire_dialect(&self.catalog, &provider, &model, Some(&connection))?;
+		let cli_base_url = self
+			.config
+			.providers
+			.get(&provider)
+			.and_then(|provider| provider.base_url.as_deref());
+		let base_url = wire_base_url(&self.catalog, &provider, &model, cli_base_url, dialect)?;
 		let supports_images = self.catalog.supports_images(&provider, &model).unwrap_or(true);
-		Ok((provider, model, base_url, supports_images, effort, connection))
+		Ok(ChildTarget {
+			provider,
+			model,
+			base_url,
+			api_key: None,
+			supports_images,
+			effort,
+			dialect,
+			usage_in_streaming: self
+				.catalog
+				.supports_usage_in_streaming(&provider, &model),
+			connection,
+		})
 	}
 
 	/// Key for a resolved child target. The root turn's key is reused only for
@@ -2451,13 +2811,11 @@ impl CliChildModelFactory {
 			.unwrap_or_default())
 	}
 
-	fn target(
-		&self,
-		pattern: &str,
-	) -> std::result::Result<(String, String, String, String, bool, Option<String>), String> {
-		let (provider, model, base_url, supports_images, effort, connection) = self.locate(pattern)?;
-		let api_key = self.api_key_for(&provider, &base_url, &connection)?;
-		Ok((provider, model, base_url, api_key, supports_images, effort))
+	fn target(&self, pattern: &str) -> std::result::Result<ChildTarget, String> {
+		let mut target = self.locate(pattern)?;
+		let api_key = self.api_key_for(&target.provider, &target.base_url, &target.connection)?;
+		target.api_key = Some(api_key);
+		Ok(target)
 	}
 }
 
@@ -2478,47 +2836,58 @@ impl ChildModelFactory for CliChildModelFactory {
 		let patterns = self.patterns_for(model)?;
 		let mut last_error = None;
 		for pattern in patterns {
-			let (provider_id, id, base_url, api_key, supports_images, pattern_effort) =
-				match self.target(&pattern) {
-					Ok(target) => target,
+			let target = match self.target(&pattern) {
+				Ok(target) => target,
+				Err(error) => {
+					last_error = Some(error);
+					continue;
+				},
+			};
+			let chosen_effort = effort
+				.map(str::to_string)
+				.or_else(|| target.effort.clone())
+				.or_else(|| fallback_effort.map(str::to_string));
+			let selection = WireTarget {
+				dialect: target.dialect,
+				provider: &target.provider,
+				model: &target.model,
+				base_url: &target.base_url,
+				api_key: target.api_key.as_deref().unwrap_or_default(),
+				effort: chosen_effort.as_deref(),
+				supports_images: target.supports_images,
+				usage_in_streaming: target.usage_in_streaming,
+			};
+			let provider =
+				match wire_provider(&self.catalog, &self.config, &selection, None, None) {
+					Ok(provider) => provider,
 					Err(error) => {
 						last_error = Some(error);
 						continue;
 					},
 				};
-			let chosen_effort = effort
-				.map(str::to_string)
-				.or(pattern_effort)
-				.or_else(|| fallback_effort.map(str::to_string));
-			let provider = match OpenAiCompatibleProvider::new(base_url, api_key, id.clone()) {
-				Ok(provider) => provider
-					.with_effort(chosen_effort)
-					.with_images(supports_images)
-					.with_prompt_cache_enabled(provider_id == "kimi-code")
-					// Per-model `compat.supportsUsageInStreaming`, else TS
-					// provider default `!isCerebras`.
-					.with_usage_in_streaming(
-						self
-							.catalog
-							.supports_usage_in_streaming(&provider_id, &id)
-							.unwrap_or(provider_id != "cerebras"),
-					)
-					.with_force_reasoning_off(self.config.external_thinking)
-					.with_service_tier(self.config.service_tier.clone())
-					.with_provider_id(provider_id.clone()),
-				Err(error) => {
-					last_error = Some(error.to_string());
-					continue;
-				},
-			};
 			return Ok(ChildModel {
-				provider: Arc::new(provider),
-				model: format!("{provider_id}/{id}"),
+				provider,
+				model: format!("{}/{}", target.provider, target.model),
 				role: None,
 			});
 		}
 		Err(last_error.unwrap_or_else(|| format!("no model candidate for '{model}'")))
 	}
+}
+
+/// One resolved child target: route, credential, dialect and request shaping.
+/// `api_key` stays `None` for the structural probe (`can_resolve`), which must
+/// never touch the credential store.
+struct ChildTarget {
+	provider:   String,
+	model:      String,
+	base_url:   String,
+	api_key:    Option<String>,
+	supports_images: bool,
+	effort:     Option<String>,
+	dialect:    WireDialect,
+	usage_in_streaming: Option<bool>,
+	connection: crate::config::ProviderConfig,
 }
 
 /// Resolve a CLI/agent model pattern to an ordered candidate list using the
@@ -4337,6 +4706,86 @@ fn apply_session_metadata(message: &mut pi_agent::Message, source: &crate::sessi
 	message.attribution = session_attribution(source.attribution.as_deref());
 }
 
+/// Rebuild the provider usage an assistant message was recorded with.
+///
+/// The persisted view keeps every counter the provider reported, including the
+/// Anthropic `cttl`/`server` breakdowns (typed or forward-compatible), so the
+/// reconstruction round-trips the session JSON through [`pi_agent::TokenUsage`]
+/// instead of hand-copying each counter. A malformed extra field degrades to
+/// the core counters rather than dropping the recorded usage entirely.
+fn session_message_usage(usage: &crate::session::Usage) -> pi_agent::TokenUsage {
+	let value = serde_json::to_value(usage).unwrap_or(serde_json::Value::Null);
+	serde_json::from_value(value).unwrap_or_else(|_| pi_agent::TokenUsage {
+		input: usage.input,
+		output: usage.output,
+		cache_read: usage.cache_read,
+		cache_write: usage.cache_write,
+		total_tokens: usage.total_tokens,
+		reasoning_tokens: usage.reasoning_tokens,
+		..pi_agent::TokenUsage::default()
+	})
+}
+
+/// Drop error/abort assistant turns before they reach a provider request.
+///
+/// TS `session-context.ts:565-584` treats them as transcript events: a resumed
+/// session that replays a dead partial turn re-processes context it can never
+/// finish. A failed turn still persists synthetic tool-result placeholders, so
+/// the paired results go with it — a `tool_result` with no preceding `tool_use`
+/// is a shape providers reject. Only results whose id the dropped assistant
+/// emitted are removed; unrelated user turns and tool batches stay. TS keeps
+/// the assistant when a custom "interrupted thinking" continuity entry follows
+/// it; this session model has no custom entries, so the turn is always dropped.
+fn replayable_entries(
+	entries: &[crate::session::MessageEntry],
+) -> Vec<&crate::session::MessageEntry> {
+	use pi_agent::StopReason;
+
+	let mut kept: Vec<&crate::session::MessageEntry> = entries.iter().collect();
+	let mut index = kept.len();
+	while index > 0 {
+		index -= 1;
+		let message = &kept[index].message;
+		if message.role != "assistant" {
+			continue;
+		}
+		let terminal = message.stop_reason.as_deref().and_then(StopReason::parse);
+		if !matches!(terminal, Some(StopReason::Aborted | StopReason::Error)) {
+			continue;
+		}
+		let dropped: HashSet<String> = message
+			.content
+			.parts()
+			.iter()
+			.filter(|part| part.kind == "toolCall")
+			.filter_map(|part| {
+				part.extra
+					.get("id")
+					.and_then(serde_json::Value::as_str)
+					.map(str::to_string)
+			})
+			.collect();
+		kept.remove(index);
+		if dropped.is_empty() {
+			continue;
+		}
+		for scan in (index..kept.len()).rev() {
+			let paired = {
+				let candidate = &kept[scan].message;
+				candidate.role == "toolResult"
+					&& candidate
+						.tool_call_id
+						.as_deref()
+						.is_some_and(|id| dropped.contains(id))
+			};
+			if paired {
+				kept.remove(scan);
+			}
+		}
+	}
+	kept
+}
+
 /// Replay persisted branch entries as provider-ready history.
 ///
 /// Unlike the lossy [`history_messages`] `TurnRecord` view, this keeps every
@@ -4346,7 +4795,7 @@ pub fn history_messages_from_entries(
 	entries: &[crate::session::MessageEntry],
 ) -> Result<Vec<pi_agent::Message>, Error> {
 	let mut messages = Vec::with_capacity(entries.len());
-	for entry in entries {
+	for entry in replayable_entries(entries) {
 		let source = &entry.message;
 		match source.role.as_str() {
 			"user" => {
@@ -4394,6 +4843,7 @@ pub fn history_messages_from_entries(
 					.as_deref()
 					.and_then(pi_agent::StopReason::parse);
 				message.error_message = source.error_message.clone();
+				message.usage = source.usage.as_ref().map(session_message_usage);
 				apply_session_metadata(&mut message, source);
 				messages.push(message);
 			},
@@ -5154,12 +5604,12 @@ mod tests {
 			cancel: None,
 		};
 
-		let (_, _, _, key, _, _) = factory.target("otherprov/model").expect("other provider");
-		assert_eq!(key, "other-key", "root key must not leak to a foreign provider");
-		let (_, _, _, key, _, _) = factory.target("nokey/model").expect("keyless provider");
-		assert_eq!(key, "", "root key must not be sent to a keyless foreign provider");
-		let (_, _, _, key, _, _) = factory.target("rootprov/model").expect("root provider");
-		assert_eq!(key, "root-session-key");
+		let key = factory.target("otherprov/model").expect("other provider").api_key;
+		assert_eq!(key.as_deref(), Some("other-key"), "root key must not leak to a foreign provider");
+		let key = factory.target("nokey/model").expect("keyless provider").api_key;
+		assert_eq!(key.as_deref(), Some(""), "root key must not be sent to a keyless foreign provider");
+		let key = factory.target("rootprov/model").expect("root provider").api_key;
+		assert_eq!(key.as_deref(), Some("root-session-key"));
 	}
 
 	#[test]
@@ -5234,14 +5684,14 @@ mod tests {
 		};
 
 		// Same provider+base URL: reuse the root key, never touch the store.
-		let (_, _, _, key, _, _) = factory.target("rootprov/model").expect("root target");
-		assert_eq!(key, "root-store-key");
+		let key = factory.target("rootprov/model").expect("root target").api_key;
+		assert_eq!(key.as_deref(), Some("root-store-key"));
 		assert!(resolver.queries.lock().expect("lock").is_empty());
 
 		// Override to another provider: that provider's own store credential,
 		// and the root secret is not forwarded.
-		let (_, _, _, key, _, _) = factory.target("childprov/model").expect("child target");
-		assert_eq!(key, "child-store-key");
+		let key = factory.target("childprov/model").expect("child target").api_key;
+		assert_eq!(key.as_deref(), Some("child-store-key"));
 		assert_eq!(*resolver.queries.lock().expect("lock"), vec!["childprov".to_string()]);
 
 		// A cancelled turn fails closed before returning any key.
@@ -7109,6 +7559,249 @@ mod tests {
 
 		server.join().expect("fixture joined");
 	}
+	/// Resume replays the usage the assistant message was recorded with,
+	/// including the Anthropic cache-TTL and server-tool counters.
+	#[test]
+	fn entry_history_restores_recorded_assistant_usage() {
+		let mut usage = crate::session::Usage {
+			input: 11,
+			output: 7,
+			cache_read: 3,
+			cache_write: 5,
+			total_tokens: 26,
+			reasoning_tokens: Some(2),
+			..crate::session::Usage::default()
+		};
+		usage
+			.extra
+			.insert("cttl".to_string(), serde_json::json!({"ephemeral5m": 5}));
+		usage
+			.extra
+			.insert("server".to_string(), serde_json::json!({"webSearch": 2, "webFetch": 1}));
+		let entry = crate::session::MessageEntry::new(
+			"m1",
+			None,
+			"2026-01-01T00:00:00Z",
+			crate::session::SessionMessage {
+				role: "assistant".to_string(),
+				content: crate::session::MessageContent::Text("answer".to_string()),
+				tool_call_id: None,
+				tool_name: None,
+				api: Some("anthropic-messages".to_string()),
+				provider: Some("anthropic".to_string()),
+				model: Some("claude".to_string()),
+				attribution: Some("agent".to_string()),
+				usage: Some(usage),
+				stop_reason: Some("stop".to_string()),
+				error_message: None,
+				timestamp_ms: None,
+				is_error: None,
+				extra: serde_json::Map::new(),
+			},
+		);
+		let history = history_messages_from_entries(&[entry]).expect("history");
+		let usage = history.first().expect("assistant message").usage.expect("recorded usage");
+		assert_eq!(usage.input, 11);
+		assert_eq!(usage.output, 7);
+		assert_eq!(usage.cache_read, 3);
+		assert_eq!(usage.cache_write, 5);
+		assert_eq!(usage.total_tokens, 26);
+		assert_eq!(usage.reasoning_tokens, Some(2));
+		assert_eq!(
+			usage.cttl,
+			Some(pi_agent::CacheTtlUsage { ephemeral_5m: Some(5), ephemeral_1h: None })
+		);
+		assert_eq!(
+			usage.server,
+			Some(pi_agent::ServerToolUsage { web_search: Some(2), web_fetch: Some(1) })
+		);
+	}
+
+	/// A failed or aborted turn is a transcript event: it must not replay, and
+	/// neither may its synthetic tool results. Successful turns — including a
+	/// signed `length` turn — and unrelated user turns survive.
+	#[test]
+	fn entry_history_drops_aborted_and_error_turns_with_paired_results() {
+		use crate::session::{
+			ContentPart as SessionPart, MessageContent, MessageEntry, SessionMessage,
+		};
+
+		let entry = |id: &str, message: SessionMessage| {
+			MessageEntry::new(id, None, "2026-01-01T00:00:00Z", message)
+		};
+		let entries = vec![
+			entry("m1", SessionMessage::user(MessageContent::Text("first".to_string()), 1)),
+			entry("m2", SessionMessage::assistant(
+				MessageContent::Parts(vec![
+					SessionPart::thinking_with_signature("dead plan", "sig-dead"),
+					SessionPart::tool_call("call-dead", "read", serde_json::json!({"path": "a"})),
+				]),
+				"anthropic-messages",
+				"anthropic",
+				"claude",
+				None,
+				"aborted",
+				2,
+			)),
+			entry("m3", SessionMessage::tool_result(
+				"call-dead",
+				"read",
+				MessageContent::Text("interrupted".to_string()),
+				true,
+				3,
+			)),
+			entry("m4", SessionMessage::user(MessageContent::Text("second".to_string()), 4)),
+			entry("m5", SessionMessage::assistant(
+				MessageContent::Parts(vec![
+					SessionPart::thinking_with_signature("live plan", "sig-live"),
+					SessionPart::text("answer"),
+				]),
+				"anthropic-messages",
+				"anthropic",
+				"claude",
+				None,
+				"length",
+				5,
+			)),
+			entry("m6", SessionMessage::assistant(
+				MessageContent::Text("partial".to_string()),
+				"anthropic-messages",
+				"anthropic",
+				"claude",
+				None,
+				"error",
+				6,
+			)),
+			entry("m7", SessionMessage::user(MessageContent::Text("third".to_string()), 7)),
+		];
+		let history = history_messages_from_entries(&entries).expect("history");
+		let roles: Vec<&str> = history.iter().map(|message| message.role.as_str()).collect();
+		assert_eq!(roles, vec!["user", "user", "assistant", "user"], "{roles:?}");
+		assert_eq!(history[0].content, "first");
+		assert_eq!(history[1].content, "second");
+		assert_eq!(history[2].parts[0].thinking_signature(), Some("sig-live"));
+		assert_eq!(history[3].content, "third");
+		assert!(
+			history
+				.iter()
+				.all(|message| message.content != "partial" && message.content != "interrupted"),
+			"dead assistant turns and their paired results must not replay"
+		);
+		assert!(
+			history.iter().all(|message| message.tool_calls.is_empty()),
+			"no orphan tool call or result survives"
+		);
+	}
+
+	/// One catalog provider/model pair with an optional connection block.
+	fn catalog_with_model(
+		provider: &str,
+		model: &str,
+		info: ModelInfo,
+		connection: Option<ProviderConfig>,
+	) -> Catalog {
+		let mut models = BTreeMap::new();
+		models.insert(model.to_string(), info);
+		let mut providers = BTreeMap::new();
+		providers.insert(provider.to_string(), models);
+		let mut connections = BTreeMap::new();
+		if let Some(connection) = connection {
+			connections.insert(provider.to_string(), connection);
+		}
+		Catalog { providers, connections, source: PathBuf::from("test-models.json") }
+	}
+
+	/// Child dispatch resolves the same way as the root: the per-model dialect and
+	/// route win over the catalog provider fallback, the adapter stamps the child
+	/// provider id, and the child never receives the root turn's credential.
+	#[test]
+	fn child_dispatch_uses_model_route_and_own_key() {
+		let catalog = catalog_with_model("childprov", "claude-child", ModelInfo {
+			provider: "childprov".to_string(),
+			api: Some("anthropic-messages".to_string()),
+			base_url: Some("http://127.0.0.1:9/v1".to_string()),
+			..ModelInfo::default()
+		}, Some(ProviderConfig {
+			base_url: Some("http://127.0.0.1:2".to_string()),
+			..ProviderConfig::default()
+		}));
+		let mut config = Config::default();
+		config.providers.insert("rootprov".to_string(), ProviderConfig {
+			base_url: Some("http://127.0.0.1:1".to_string()),
+			api_key: Some("root-conn-key".to_string()),
+			..ProviderConfig::default()
+		});
+		// The CLI override supplies the credential only, so the catalog route is
+		// the one dispatch resolves.
+		config.providers.insert("childprov".to_string(), ProviderConfig {
+			api_key: Some("child-conn-key".to_string()),
+			..ProviderConfig::default()
+		});
+		let factory = CliChildModelFactory {
+			config,
+			catalog: Arc::new(catalog),
+			explicit_provider: None,
+			api_key: Some("root-session-key".to_string()),
+			default_model: None,
+			root_provider: Some("rootprov".to_string()),
+			root_base_url: Some("http://127.0.0.1:1".to_string()),
+			credential_resolver: None,
+			session_id: None,
+			cancel: None,
+		};
+		let target = factory.target("childprov/claude-child").expect("child target");
+		assert_eq!(
+			target.api_key.as_deref(),
+			Some("child-conn-key"),
+			"the root secret must never cross providers"
+		);
+		assert_eq!(
+			target.base_url, "http://127.0.0.1:9",
+			"the per-model baseUrl wins over the connection block and is normalized"
+		);
+		assert_eq!(target.dialect, WireDialect::AnthropicMessages);
+
+		let child = factory.resolve("childprov/claude-child", None, None).expect("child provider");
+		assert_eq!(child.model, "childprov/claude-child");
+		assert_eq!(child.provider.api(), Some("anthropic-messages"));
+		assert_eq!(child.provider.provider(), Some("childprov"), "messages carry the child route");
+		assert_eq!(child.provider.model(), Some("claude-child"));
+	}
+
+	/// `config.yml` is the CLI's own override: a gateway base URL there must not
+	/// be shadowed by the catalog's (usually bundled, vendor-default) route.
+	#[test]
+	fn cli_base_url_outranks_the_catalog_route() {
+		let catalog = catalog_with_model("childprov", "claude-child", ModelInfo {
+			provider: "childprov".to_string(),
+			api: Some("anthropic-messages".to_string()),
+			base_url: Some("https://api.anthropic.com/v1".to_string()),
+			..ModelInfo::default()
+		}, None);
+		let mut config = Config::default();
+		config.providers.insert("childprov".to_string(), ProviderConfig {
+			base_url: Some("http://127.0.0.1:7/v1".to_string()),
+			..ProviderConfig::default()
+		});
+		let factory = CliChildModelFactory {
+			config,
+			catalog: Arc::new(catalog),
+			explicit_provider: None,
+			api_key: None,
+			default_model: None,
+			root_provider: None,
+			root_base_url: None,
+			credential_resolver: None,
+			session_id: None,
+			cancel: None,
+		};
+		let target = factory.target("childprov/claude-child").expect("child target");
+		assert_eq!(
+			target.base_url, "http://127.0.0.1:7",
+			"the configured CLI route wins over the catalog default"
+		);
+	}
+
 }
 
 #[cfg(test)]

@@ -1769,6 +1769,12 @@ impl RpcSession {
 
 	fn plan_context(&self) -> Option<String> {
 		let shared = self.plan_yolo.as_ref()?;
+		// Only the armed plan-yolo turn owns the typed request context. After
+		// the cutover the ACP driver injects the ordinary plan prefix itself;
+		// returning it here too would duplicate the plan block.
+		if !shared.is_armed() {
+			return None;
+		}
 		let gate = shared.gate();
 		let gate = gate.lock().unwrap_or_else(|poison| poison.into_inner());
 		gate.prompt_prefix(

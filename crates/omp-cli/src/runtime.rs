@@ -2288,7 +2288,7 @@ fn json_string_map(
 /// default in place for every key the model does not declare.
 fn apply_compat_flags(
 	compat: Option<&serde_json::Value>,
-	flags: &[(&str, &mut bool)],
+	flags: &mut [(&str, &mut bool)],
 ) {
 	let Some(compat) = compat else {
 		return;
@@ -2361,10 +2361,77 @@ fn require_supported_effort(
 	if levels.iter().any(|level| level == effort) {
 		return Ok(());
 	}
-	Err(format!(
+	Err(unsupported_effort_error(provider, model, levels, effort))
+}
+
+/// TS error text for an effort the model does not declare.
+fn unsupported_effort_error(
+	provider: &str,
+	model: &str,
+	levels: &[String],
+	effort: &str,
+) -> String {
+	format!(
 		"Thinking effort {effort} is not supported by {provider}/{model}. Supported efforts: {}",
 		levels.join(", ")
-	))
+	)
+}
+
+/// TS `resolveOpenAiReasoningEffort` (`stream.ts:1818-1858`): the effort a
+/// plain-dialect adapter requests. A model without a `thinking` block exposes
+/// no dial, so the request is dropped instead of failing the turn; a declared
+/// effort wins, then the compat `reasoningEffortMap` remap (only when the
+/// mapped value is itself declared), then either map may merely alias the
+/// requested effort for the adapter to remap later. Anything else is the TS
+/// unsupported-effort error, never a silent substitution.
+fn resolve_openai_reasoning_effort(
+	provider: &str,
+	model: &str,
+	info: Option<&crate::catalog::ModelInfo>,
+	compat: Option<&serde_json::Value>,
+	thinking: Option<&serde_json::Value>,
+	effort: Option<&str>,
+) -> std::result::Result<Option<String>, String> {
+	let Some(reasoning) = effort.filter(|_| info.is_some_and(|info| info.reasoning)) else {
+		return Ok(None);
+	};
+	let Some(thinking) = thinking else {
+		return Ok(None);
+	};
+	let efforts: Vec<String> = thinking
+		.get("efforts")
+		.and_then(serde_json::Value::as_array)
+		.map(|efforts| {
+			efforts
+				.iter()
+				.filter_map(|effort| effort.as_str().map(str::to_string))
+				.collect()
+		})
+		.unwrap_or_default();
+	if efforts.iter().any(|level| level == reasoning) {
+		return Ok(Some(reasoning.to_string()));
+	}
+	let compat_map = compat
+		.and_then(|compat| compat.get("reasoningEffortMap"))
+		.and_then(serde_json::Value::as_object);
+	if let Some(mapped) = compat_map
+		.and_then(|map| map.get(reasoning))
+		.and_then(serde_json::Value::as_str)
+		.filter(|mapped| !mapped.is_empty())
+	{
+		if efforts.iter().any(|level| level == mapped) {
+			return Ok(Some(mapped.to_string()));
+		}
+	}
+	let aliased = compat_map.is_some_and(|map| map.contains_key(reasoning))
+		|| thinking
+			.get("effortMap")
+			.and_then(serde_json::Value::as_object)
+			.is_some_and(|map| map.contains_key(reasoning));
+	if aliased {
+		return Ok(Some(reasoning.to_string()));
+	}
+	Err(unsupported_effort_error(provider, model, &efforts, reasoning))
 }
 
 /// TS streaming `stream.ts` anthropic option fold: thinking is only requested
@@ -2488,7 +2555,14 @@ fn wire_provider(
 				.with_images(target.supports_images)
 				.with_cloud(target.provider == "ollama-cloud")
 				.with_model_reasoning(info.is_some_and(|info| info.reasoning))
-				.with_reasoning(target.effort.map(str::to_string))
+				.with_reasoning(resolve_openai_reasoning_effort(
+					target.provider,
+					target.model,
+					info,
+					compat,
+					thinking,
+					target.effort,
+				)?)
 				.with_disable_reasoning(config.external_thinking)
 				// Explicit `false` overrides the provider default; a model that
 				// declares nothing keeps emitting `num_predict`.
@@ -2525,7 +2599,7 @@ fn wire_provider(
 				.unwrap_or_default();
 			anthropic.idle_timeout = json_u64(compat, "streamIdleTimeoutMs")
 				.map(std::time::Duration::from_millis);
-			apply_compat_flags(compat, &[
+			apply_compat_flags(compat, &mut [
 				("supportsSamplingParams", &mut anthropic.supports_sampling_params),
 				("supportsForcedToolChoice", &mut anthropic.supports_forced_tool_choice),
 				("replayUnsignedThinking", &mut anthropic.replay_unsigned_thinking),
@@ -7744,6 +7818,91 @@ mod tests {
 		assert!(
 			history.iter().all(|message| message.tool_calls.is_empty()),
 			"no orphan tool call or result survives"
+		);
+	}
+
+	/// TS `resolveOpenAiReasoningEffort`: a declared effort passes through, the
+	/// compat remap wins only when its target is declared, an alias-only map
+	/// keeps the requested effort, and anything else is the unsupported error.
+	#[test]
+	fn ollama_effort_resolution_follows_ts_precedence() {
+		let reasoning = |efforts: &[&str], reasoning: bool| ModelInfo {
+			reasoning,
+			efforts: Some(efforts.iter().map(|effort| (*effort).to_string()).collect()),
+			..ModelInfo::default()
+		};
+		let thinking = |efforts: &[&str], effort_map: Option<serde_json::Value>| {
+			serde_json::json!({"mode": "effort", "efforts": efforts, "effortMap": effort_map})
+		};
+		let resolve = |info: &ModelInfo,
+		               compat: Option<serde_json::Value>,
+		               thinking: Option<serde_json::Value>,
+		               effort: &str| {
+			resolve_openai_reasoning_effort(
+				"ollama",
+				"qwen3",
+				Some(info),
+				compat.as_ref(),
+				thinking.as_ref(),
+				Some(effort),
+			)
+		};
+
+		// Declared effort: requested as-is.
+		let declared = reasoning(&["low", "high"], true);
+		assert_eq!(
+			resolve(&declared, None, Some(thinking(&["low", "high"], None)), "high"),
+			Ok(Some("high".to_string()))
+		);
+
+		// `compat.reasoningEffortMap` remap, target declared by the model.
+		assert_eq!(
+			resolve(
+				&reasoning(&["low", "medium"], true),
+				Some(serde_json::json!({"reasoningEffortMap": {"high": "medium"}})),
+				Some(thinking(&["low", "medium"], None)),
+				"high"
+			),
+			Ok(Some("medium".to_string()))
+		);
+
+		// The compat map merely aliases the effort when its target is undeclared:
+		// the adapter owns the remap, so the requested effort passes through.
+		assert_eq!(
+			resolve(
+				&reasoning(&["low"], true),
+				Some(serde_json::json!({"reasoningEffortMap": {"high": "xhigh"}})),
+				Some(thinking(&["low"], None)),
+				"high"
+			),
+			Ok(Some("high".to_string()))
+		);
+
+		// Same for `thinking.effortMap` without a compat map.
+		assert_eq!(
+			resolve(
+				&reasoning(&["low"], true),
+				None,
+				Some(thinking(&["low"], Some(serde_json::json!({"high": "medium"})))),
+				"high"
+			),
+			Ok(Some("high".to_string()))
+		);
+
+		// Undeclared and unmapped: exact TS error, no silent substitution.
+		let error = resolve(&reasoning(&["low"], true), None, Some(thinking(&["low"], None)), "high")
+			.expect_err("unsupported effort");
+		assert_eq!(
+			error,
+			"Thinking effort high is not supported by ollama/qwen3. Supported efforts: low"
+		);
+
+		// No `thinking` block means no effort dial: the request is dropped.
+		assert_eq!(resolve(&declared, None, None, "high"), Ok(None));
+		// A non-reasoning model never asks for one either.
+		assert_eq!(
+			resolve(&reasoning(&["low"], false), None, Some(thinking(&["low"], None)), "low"),
+			Ok(None)
 		);
 	}
 

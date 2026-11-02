@@ -2091,15 +2091,29 @@ impl Session<'_> {
 								// longer active, so its notice must not contradict the
 								// retained report.
 								decision.warning = None;
-								match CheckpointHost::context_messages(store) {
+								let rebuilt = {
+									// Debug-only fault injection: a production rebuild
+									// cannot fail this way, because the typed request gate
+									// rejects an unreplayable journal before the turn.
+									#[cfg(debug_assertions)]
+									if std::env::var_os("OMP_TEST_FAIL_REWIND_REBUILD").is_some() {
+										Err("injected rewind rebuild failure".to_string())
+									} else {
+										CheckpointHost::context_messages(store)
+									}
+									#[cfg(not(debug_assertions))]
+									CheckpointHost::context_messages(store)
+								};
+								match rebuilt {
 									Ok(messages) => {
 										decision.rewrite = Some(pi_agent::TurnRewrite::Replace(messages));
 									},
-									// The journal already moved to the rewound branch:
-									// continuing would send the next provider request
-									// with the stale pre-rewind conversation. End the
-									// loop and fail the turn instead of downgrading.
+									// The journal already moved to the rewound branch.
+									// Cancel the provider loop *before* releasing the parked
+									// ack, or it can observe the default decision and start
+									// the next request; then fail the turn.
 									Err(err) => {
+										cancel_token.cancel();
 										if let Some((_, reply)) = pending {
 											let _ = reply.send(pi_agent::TurnAckDecision::default());
 										}

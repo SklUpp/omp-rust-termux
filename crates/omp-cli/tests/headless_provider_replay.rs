@@ -457,3 +457,65 @@ fn corrupt_stored_context_fails_before_any_provider_request() {
 	server.stop();
 	fs::remove_dir_all(base).ok();
 }
+
+#[tokio::test]
+async fn rewind_rebuild_failure_aborts_before_another_provider_request() {
+	// One real checkpoint+rewind tool pair in the first turn: the turn-end
+	// handler applies the pending rewind, then cannot rebuild the branch.
+	let tool_sse = r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-cp","type":"function","function":{"name":"checkpoint","arguments":"{\"goal\":\"probe\"}"}}]},"finish_reason":null}]}
+
+data: {"choices":[{"delta":{"tool_calls":[{"index":1,"id":"call-rw","type":"function","function":{"name":"rewind","arguments":"{\"report\":\"probe report\"}"}}]},"finish_reason":null}]}
+
+data: [DONE]
+
+"#;
+	let server = MockWireServer::start(vec![tool_sse.to_string(), DEFAULT_SSE.to_string()]);
+	let base = temp_dir("rewind-failure");
+	let (agent_dir, cwd, sessions) = setup(server.port, &base);
+	let mut config = fs::read_to_string(agent_dir.join("config.yml")).expect("read config");
+	config.push_str("checkpoint:\n  enabled: true\n");
+	fs::write(agent_dir.join("config.yml"), config).expect("enable checkpoint");
+
+	let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_omp"));
+	command
+		.env("PI_CODING_AGENT_DIR", &agent_dir)
+		.env("OMP_TEST_FAIL_REWIND_REBUILD", "1")
+		.args([
+			"--cwd",
+			cwd.to_str().expect("utf8 cwd"),
+			"--session-dir",
+			sessions.to_str().expect("utf8 sessions"),
+			"--no-title",
+			"--yolo",
+			"--session-id",
+			"rewind-1",
+			"-p",
+			"checkpoint then rewind",
+		])
+		.stdin(std::process::Stdio::null());
+	let output = tokio::time::timeout(Duration::from_secs(30), command.output())
+		.await
+		.expect("a failed rewind rebuild must not park the turn-end ack")
+		.expect("run omp");
+	let stderr = String::from_utf8_lossy(&output.stderr);
+	assert!(
+		!output.status.success(),
+		"a failed rewind rebuild must fail the turn: {stderr}"
+	);
+	assert!(
+		stderr.contains("cannot rebuild branch context after rewind"),
+		"the failure must be reported: {stderr}"
+	);
+	assert!(
+		stderr.contains("injected rewind rebuild failure"),
+		"the debug injection must be the cause: {stderr}"
+	);
+	assert_eq!(
+		server.request_count(),
+		1,
+		"no provider request may start after the failed rewind rebuild"
+	);
+
+	server.stop();
+	fs::remove_dir_all(base).ok();
+}

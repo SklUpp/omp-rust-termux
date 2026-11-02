@@ -129,6 +129,15 @@ impl MockWireServer {
 		self.requests.lock().expect("lock").len()
 	}
 
+	fn request(&self, index: usize) -> serde_json::Value {
+		self.requests
+			.lock()
+			.expect("lock")
+			.get(index)
+			.cloned()
+			.unwrap_or_else(|| panic!("mock request {index} not recorded"))
+	}
+
 	fn last_request(&self) -> serde_json::Value {
 		self.requests
 			.lock()
@@ -215,6 +224,14 @@ fn run(cmd: &mut ProcCommand) -> Output {
 	cmd.output().expect("run omp")
 }
 
+/// Count literal prompt-token occurrences in a recorded provider request.
+fn occurrences(body: &serde_json::Value, needle: &str) -> usize {
+	serde_json::to_string(body)
+		.expect("serialize request")
+		.matches(needle)
+		.count()
+}
+
 #[test]
 fn headless_turn_persists_ordered_blocks_and_resume_replays_call_once() {
 	let tool_sse = r#"data: {"choices":[{"delta":{"reasoning_content":"REASON-TOKEN-9f"},"finish_reason":null}]}
@@ -237,12 +254,25 @@ data: [DONE]
 
 	let first = run(
 		omp(&agent_dir, &cwd, &sessions)
-			.args(["--session-id", "replay-1", "-p", "read note.txt"]),
+			.args(["--session-id", "replay-1", "-p", "PROMPT-TOKEN-3c read note.txt"]),
 	);
 	assert!(
 		first.status.success(),
 		"first headless turn failed: {}",
 		String::from_utf8_lossy(&first.stderr)
+	);
+	assert_eq!(server.request_count(), 2, "one turn plus its tool follow-up");
+	// The typed rebuild must describe the journal *before* this turn's user
+	// entry is appended, otherwise the loop prompt lands a second time.
+	assert_eq!(
+		occurrences(&server.request(0), "PROMPT-TOKEN-3c"),
+		1,
+		"first request duplicated the current prompt"
+	);
+	assert_eq!(
+		occurrences(&server.request(1), "PROMPT-TOKEN-3c"),
+		1,
+		"tool follow-up duplicated the current prompt"
 	);
 
 	let log = session_file(&sessions, "replay-1");
@@ -293,7 +323,9 @@ data: [DONE]
 		"tool result must follow its call: {stored:?}"
 	);
 
-	let second = run(omp(&agent_dir, &cwd, &sessions).args(["--resume", "replay-1", "-p", "continue"]));
+	let second = run(
+		omp(&agent_dir, &cwd, &sessions).args(["--resume", "replay-1", "-p", "RESUME-PROMPT-8a continue"]),
+	);
 	assert!(
 		second.status.success(),
 		"resumed headless turn failed: {}",
@@ -301,6 +333,16 @@ data: [DONE]
 	);
 
 	let body = server.last_request();
+	assert_eq!(
+		occurrences(&body, "RESUME-PROMPT-8a"),
+		1,
+		"resume duplicated the new prompt: {body}"
+	);
+	assert_eq!(
+		occurrences(&body, "PROMPT-TOKEN-3c"),
+		1,
+		"resume duplicated the replayed prompt: {body}"
+	);
 	let wire = serde_json::to_string(&body).expect("serialize request");
 	assert_eq!(
 		wire.matches("call-1").count(),
@@ -384,7 +426,9 @@ fn corrupt_stored_context_fails_before_any_provider_request() {
 	];
 	fs::write(&log, format!("{}\n", lines.join("\n"))).expect("write corrupt log");
 
-	let output = run(omp(&agent_dir, &cwd, &sessions).args(["--resume", "broken-context", "-p", "hi"]));
+	let output = run(
+		omp(&agent_dir, &cwd, &sessions).args(["--resume", "broken-context", "-p", "CORRUPT-PROMPT-5e"]),
+	);
 	let stderr = String::from_utf8_lossy(&output.stderr);
 	assert!(
 		!output.status.success(),
@@ -402,6 +446,12 @@ fn corrupt_stored_context_fails_before_any_provider_request() {
 		server.request_count(),
 		0,
 		"the provider must never be called with degraded context"
+	);
+	assert!(
+		!entries(&log)
+			.iter()
+			.any(|entry| entry.to_string().contains("CORRUPT-PROMPT-5e")),
+		"the request must be built before the journal gains this turn's prompt"
 	);
 
 	server.stop();

@@ -1828,6 +1828,11 @@ impl Session<'_> {
 			&now_iso,
 			SessionMessage::user(user_content, now_ms),
 		);
+		// Build the provider request before the journal gains this turn's user
+		// entry: the typed rebuild must describe the conversation *before* the
+		// prompt the loop is about to append, or every journaled turn replays it
+		// twice. The entry still lands before the provider call for resume.
+		let mut request = self.request(full_prompt.clone(), turn_parts.clone(), mode)?;
 		if self.store.enabled() {
 			if let Some(custom_type) = hidden_custom_type {
 				// Hidden continuation: never replayed as a user prompt, but it is
@@ -1857,7 +1862,6 @@ impl Session<'_> {
 			std::collections::HashMap::new();
 
 		let cancel_token = pi_agent::CancellationToken::new();
-		let mut request = self.request(full_prompt.clone(), turn_parts.clone(), mode)?;
 		if !self.store.enabled() {
 			let user_message = runtime::user_message_from_parts(&full_prompt, &turn_parts)?;
 			self
@@ -1896,7 +1900,7 @@ impl Session<'_> {
 		                        parent: &mut Option<String>,
 		                        tools: &mut std::collections::HashMap<String, String>,
 		                        model_fallback: Option<&str>,
-		                        provider_fallback: Option<&str>| {
+		                        provider_fallback: Option<&str>| -> Result<()> {
 			match event {
 				agent::Event::ToolStart { id, tool, .. } => {
 					tools.insert(id.clone(), tool.clone());
@@ -2091,13 +2095,18 @@ impl Session<'_> {
 									Ok(messages) => {
 										decision.rewrite = Some(pi_agent::TurnRewrite::Replace(messages));
 									},
-									// A journal rebuild failure must not be papered over
-									// with the lossy TurnRecord projection: leave the
-									// loop unreplayed and let the next request fail
-									// closed instead of sending degraded context.
-									Err(err) => eprintln!(
-										"warning: cannot rebuild branch context after rewind: {err}"
-									),
+									// The journal already moved to the rewound branch:
+									// continuing would send the next provider request
+									// with the stale pre-rewind conversation. End the
+									// loop and fail the turn instead of downgrading.
+									Err(err) => {
+										if let Some((_, reply)) = pending {
+											let _ = reply.send(pi_agent::TurnAckDecision::default());
+										}
+										return Err(Error::new(format!(
+											"cannot rebuild branch context after rewind: {err}"
+										)));
+									},
 								}
 								*rewind_history = Some(applied.history);
 								*parent = store.leaf_id().map(str::to_string);
@@ -2143,6 +2152,7 @@ impl Session<'_> {
 				},
 				_ => {},
 			}
+			Ok(())
 		};
 
 		let model_opt = self.model.clone();
@@ -2166,7 +2176,7 @@ impl Session<'_> {
 					&mut tool_name_by_id,
 					model_opt.as_deref(),
 					provider_opt.as_deref(),
-				);
+				)?;
 				// A goal tool transition queued during this event lands before the
 				// turn-end entries, like TS `appendModeChange` during execution.
 				apply_goal_intents(&mut self.store, &self.goal);
@@ -2183,7 +2193,7 @@ impl Session<'_> {
 			for event in stream {
 				if let Ok(event) = event {
 					builder.observe(&event);
-					handle_event(
+					let _ = handle_event(
 						&event,
 						&mut self.store,
 						&self.checkpoint_host,

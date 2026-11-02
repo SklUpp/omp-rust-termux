@@ -362,3 +362,92 @@ fn fork_restores_the_recorded_service_tier() {
 	);
 	let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// End-to-end CLI: the launch flag rearms priority, the rejection downgrade is
+/// reported once on the live stderr sink, and the resumed session restores the
+/// recorded reset so the next process sends no fast mode.
+#[test]
+fn cli_priority_downgrade_reports_once_and_persists_the_reset() {
+	let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+	let addr = listener.local_addr().expect("addr");
+	let (captured_tx, captured_rx) = mpsc::channel::<(String, String)>();
+	let server = std::thread::spawn(move || {
+		for index in 0..3 {
+			let (mut socket, _) = listener.accept().expect("accept");
+			let captured = read_request(&mut socket);
+			captured_tx.send(captured).expect("capture");
+			if index == 0 {
+				respond(&mut socket, "400 Bad Request", "application/json", FAST_REJECTION);
+			} else {
+				respond(&mut socket, "200 OK", "text/event-stream", TURN);
+			}
+		}
+	});
+
+	let root = std::env::temp_dir().join(format!(
+		"omp-anthropic-priority-cli-{}-{}",
+		std::process::id(),
+		std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.expect("clock")
+			.as_nanos()
+	));
+	let agent = root.join("agent");
+	let cwd = root.join("work");
+	let sessions = root.join("sessions");
+	std::fs::create_dir_all(&agent).expect("agent dir");
+	std::fs::create_dir_all(&cwd).expect("cwd");
+	std::fs::write(
+		agent.join("config.yml"),
+		format!(
+			"defaultModel: anthropic/claude-priority\nproviders:\n  anthropic:\n    \
+			 baseUrl: \"http://{addr}/v1\"\n    api: anthropic-messages\n    apiKey: test-key\n"
+		),
+	)
+	.expect("config.yml");
+	std::fs::write(
+		agent.join("models.yml"),
+		format!(
+			"providers:\n  anthropic:\n    baseUrl: \"http://{addr}/v1\"\n    \
+			 api: anthropic-messages\n    apiKey: test-key\n    models:\n      - id: claude-priority\n\
+			 \x20       contextWindow: 200000\n"
+		),
+	)
+	.expect("models.yml");
+
+	let run = |extra: &[&str]| {
+		let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_omp"));
+		command
+			.env("HOME", root.join("home"))
+			.env("PI_CODING_AGENT_DIR", &agent)
+			.args(["--cwd", cwd.to_str().expect("cwd")])
+			.args(["--session-dir", sessions.to_str().expect("sessions")])
+			.args(["--no-title", "--approval-mode", "yolo"])
+			.args(extra)
+			.args(["-p", "answer quickly"])
+			.stdin(std::process::Stdio::null());
+		command.output().expect("run omp")
+	};
+
+	let first = run(&["--service-tier", "priority"]);
+	assert!(first.status.success(), "first run failed: {}", String::from_utf8_lossy(&first.stderr));
+	let stderr = String::from_utf8_lossy(&first.stderr);
+	const NOTICE: &str =
+		"Priority/fast mode rejected for this model; retried without it. Fast mode is now off.";
+	assert_eq!(stderr.matches(NOTICE).count(), 1, "reported exactly once: {stderr}");
+
+	let (first_head, first_body) = captured_rx.recv().expect("first request");
+	assert!(first_head.to_ascii_lowercase().contains("anthropic-beta:"));
+	assert_eq!(body_field(&first_body, "speed"), Some(&serde_json::json!("fast")));
+	let (retry_head, retry_body) = captured_rx.recv().expect("retry request");
+	assert!(!retry_head.to_ascii_lowercase().contains("fast-mode-2026-02-01"));
+	assert_eq!(body_field(&retry_body, "speed"), None);
+
+	// Resume without the flag: the recorded reset wins over configuration.
+	let second = run(&[]);
+	assert!(second.status.success(), "second run failed: {}", String::from_utf8_lossy(&second.stderr));
+	let (_head, body) = captured_rx.recv().expect("resumed request");
+	assert_eq!(body_field(&body, "speed"), None, "the reset survived resume");
+	server.join().expect("server");
+	let _ = std::fs::remove_dir_all(&root);
+}

@@ -388,9 +388,11 @@ fn fork_restores_the_recorded_service_tier() {
 	let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// End-to-end CLI: the launch flag rearms priority, the rejection downgrade is
+/// End-to-end CLI: the configured `tier.anthropic` selection (project
+/// settings) starts the request in fast mode, the rejection downgrade is
 /// reported once on the live stderr sink, and the resumed session restores the
-/// recorded reset so the next process sends no fast mode.
+/// recorded reset so the next process sends no fast mode. The explicit toggle
+/// rearm lives in the RPC fixture (`set_fast_mode`).
 #[test]
 fn cli_priority_downgrade_reports_once_and_persists_the_reset() {
 	let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -476,7 +478,7 @@ fn cli_priority_downgrade_reports_once_and_persists_the_reset() {
 	assert!(!retry_head.to_ascii_lowercase().contains("fast-mode-2026-02-01"));
 	assert_eq!(body_field(&retry_body, "speed"), None);
 
-	// Resume without the flag: the recorded reset wins over configuration.
+	// Resume with the same settings: the recorded reset still wins over configuration.
 	let second = run(&[]);
 	assert!(second.status.success(), "second run failed: {}", String::from_utf8_lossy(&second.stderr));
 	let (_head, body) = captured_rx.recv().expect("resumed request");

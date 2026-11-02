@@ -2472,15 +2472,7 @@ impl RpcSession {
 			messages.push(Message::system(warning));
 		}
 
-		if let Some(notice) = priority_notice.take() {
-			// Live protocol channel: the RPC/ACP consumer already receives the
-			// turn-ack warning, so the downgrade notice rides the same frame
-			// instead of a host-only log line.
-			decision.warning = Some(match decision.warning.take() {
-				Some(existing) => format!("{notice}\n{existing}"),
-				None => notice,
-			});
-		}
+		merge_turn_warning(&mut decision, priority_notice.take());
 		// Prewalk: advance the one-way switch at this settled boundary. A
 		// terminal provider turn never starts another request, so it neither
 		// swaps the provider nor injects guidance.
@@ -2720,6 +2712,19 @@ impl RpcSession {
 			let _ = reply.send(decision);
 		}
 	}
+}
+
+/// The RPC/ACP consumer receives the turn-ack warning, so the downgrade notice
+/// rides that existing protocol field instead of a host-only log line. A
+/// checkpoint warning decided at the same boundary is preserved after it.
+fn merge_turn_warning(decision: &mut pi_agent::TurnAckDecision, notice: Option<String>) {
+	let Some(notice) = notice else {
+		return;
+	};
+	decision.warning = Some(match decision.warning.take() {
+		Some(existing) => format!("{notice}\n{existing}"),
+		None => notice,
+	});
 }
 
 fn clean_title(name: &str) -> String {
@@ -3205,6 +3210,29 @@ mod tests {
 
 	/// `--no-session` session: every turn lives in the in-memory mirror only.
 	fn no_session() -> RpcSession {
+	#[test]
+	fn priority_notice_rides_the_turn_ack_warning_and_keeps_the_checkpoint_one() {
+		const NOTICE: &str =
+			"Priority/fast mode rejected for this model; retried without it. Fast mode is now off.";
+		let mut decision = pi_agent::TurnAckDecision::default();
+		merge_turn_warning(&mut decision, Some(NOTICE.to_string()));
+		assert_eq!(decision.warning.as_deref(), Some(NOTICE));
+		decision.warning = Some("checkpoint".to_string());
+		merge_turn_warning(&mut decision, Some(NOTICE.to_string()));
+		assert_eq!(
+			decision.warning.as_deref(),
+			Some("Priority/fast mode rejected for this model; retried without it. Fast mode is now off.\ncheckpoint")
+		);
+		merge_turn_warning(&mut decision, None);
+		assert!(
+			decision
+				.warning
+				.as_deref()
+				.is_some_and(|warning| warning.contains("checkpoint")),
+			"no notice leaves the existing warning untouched"
+		);
+	}
+
 		let sink: Arc<dyn FrameSink> = Arc::new(NullSink);
 		let mut config = Config::default();
 		config.checkpoint.enabled = Some(true);

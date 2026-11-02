@@ -646,8 +646,18 @@ impl StreamAssembler {
 	pub fn push(&mut self, chunk: &StreamChunk) -> Result<(), ProviderError> {
 		// TS `openai-completions.ts:1160-1192`: reasoning in one chunk precedes
 		// its content, which is what decides first-occurrence block order.
-		if let Some(delta) = chunk.reasoning.as_deref().filter(|delta| !delta.is_empty()) {
-			self.append(chunk.content_index, StreamBlockKind::Thinking, delta)?;
+		if let Some(delta) = chunk.reasoning.as_deref() {
+			if delta.is_empty() {
+				// Anthropic `thinking.display: "omitted"` still opens the block
+				// but streams no text. Keep the explicit index so the signature
+				// arriving at `content_block_stop` has a thinking block to
+				// attach to; unindexed legacy deltas stay ignored when empty.
+				if let Some(index) = chunk.content_index {
+					self.ensure_thinking(index)?;
+				}
+			} else {
+				self.append(chunk.content_index, StreamBlockKind::Thinking, delta)?;
+			}
 		}
 		if let Some(delta) = chunk.content.as_deref().filter(|delta| !delta.is_empty()) {
 			self.append(chunk.content_index, StreamBlockKind::Text, delta)?;
@@ -661,22 +671,7 @@ impl StreamAssembler {
 					"thinking signature arrived without a content index".to_string(),
 				)
 			})?;
-			match self.blocks.get_mut(&index) {
-				Some(AssembledBlock::Thinking { signature: slot, .. }) => match slot {
-					Some(existing) if existing != signature => {
-						return Err(ProviderError::Protocol(format!(
-							"thinking block {index} received a second, different signature"
-						)));
-					},
-					Some(_) => {},
-					None => *slot = Some(signature.clone()),
-				},
-				_ => {
-					return Err(ProviderError::Protocol(format!(
-						"thinking signature refers to non-thinking block {index}"
-					)));
-				},
-			}
+			self.set_signature(index, signature)?;
 		}
 		if let Some(usage) = chunk.usage {
 			self.usage = Some(usage);
@@ -691,6 +686,56 @@ impl StreamAssembler {
 			self.push_tool_delta(delta)?;
 		}
 		Ok(())
+	}
+
+	/// Open an empty thinking block at an explicit index, or verify that the
+	/// index already belongs to one. An omitted-display thinking block streams
+	/// no text, so the opener is the only signal that the index is thinking.
+	fn ensure_thinking(&mut self, index: usize) -> Result<(), ProviderError> {
+		match self.blocks.get(&index) {
+			Some(AssembledBlock::Thinking { .. }) => Ok(()),
+			Some(_) => Err(ProviderError::Protocol(format!(
+				"content index {index} carries conflicting block kinds"
+			))),
+			None => {
+				self.blocks.insert(
+					index,
+					AssembledBlock::Thinking { text: String::new(), signature: None },
+				);
+				Ok(())
+			},
+		}
+	}
+
+	/// Attach a signature to the thinking block at `index`. A block that
+	/// streamed no text (omitted display, or an opener the adapter skipped) is
+	/// opened here; a signature may never take over a text/tool/redacted block.
+	fn set_signature(&mut self, index: usize, signature: &str) -> Result<(), ProviderError> {
+		match self.blocks.get_mut(&index) {
+			Some(AssembledBlock::Thinking { signature: slot, .. }) => match slot {
+				Some(existing) if existing != signature => Err(ProviderError::Protocol(format!(
+					"thinking block {index} received a second, different signature"
+				))),
+				Some(_) => Ok(()),
+				None => {
+					*slot = Some(signature.to_string());
+					Ok(())
+				},
+			},
+			Some(_) => Err(ProviderError::Protocol(format!(
+				"thinking signature refers to non-thinking block {index}"
+			))),
+			None => {
+				self.blocks.insert(
+					index,
+					AssembledBlock::Thinking {
+						text:      String::new(),
+						signature: Some(signature.to_string()),
+					},
+				);
+				Ok(())
+			},
+		}
 	}
 
 	/// Append a text/thinking/redacted delta, opening a block when needed.

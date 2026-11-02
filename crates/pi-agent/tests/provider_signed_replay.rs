@@ -162,12 +162,85 @@ fn redacted_reasoning_and_error_terminal_survive_roundtrip() {
 }
 
 #[test]
-fn signature_for_an_unknown_block_is_a_protocol_error() {
+fn omitted_display_empty_thinking_opener_keeps_signature_across_resume() {
 	let mut assembler = StreamAssembler::new();
+	assembler
+		.push(&chunk(Some(0), Some(""), None, None, None, Vec::new()))
+		.expect("empty thinking opener keeps its explicit index");
+	assembler
+		.push(&chunk(Some(0), None, None, Some("sig-omitted"), None, Vec::new()))
+		.expect("signature attaches to the empty block");
+	assembler
+		.push(&chunk(Some(1), None, Some("answer"), None, None, Vec::new()))
+		.expect("text delta");
+
+	let message = assembler.finish().expect("assembled turn");
+	assert_eq!(message.parts.len(), 2);
+	assert_eq!(message.parts[0].as_thinking(), Some(""));
+	assert_eq!(message.parts[0].thinking_signature(), Some("sig-omitted"));
+	assert_eq!(message.content, "answer");
+
+	let json = serde_json::to_string(&message).expect("serialize message");
+	assert!(json.contains("\"thinkingSignature\":\"sig-omitted\""), "{json}");
+	let resumed: Message = serde_json::from_str(&json).expect("deserialize message");
+	assert_eq!(resumed, message, "empty signed thinking replays unchanged");
+}
+
+#[test]
+fn signature_opens_empty_thinking_block_when_opener_is_absent() {
+	let mut assembler = StreamAssembler::new();
+	assembler
+		.push(&chunk(Some(2), None, None, Some("sig-only"), None, Vec::new()))
+		.expect("signature opens an empty thinking block at its exact index");
+
+	let message = assembler.finish().expect("assembled turn");
+	assert_eq!(message.parts.len(), 1);
+	assert_eq!(message.parts[0].as_thinking(), Some(""));
+	assert_eq!(message.parts[0].thinking_signature(), Some("sig-only"));
+
+	let json = serde_json::to_string(&message).expect("serialize message");
+	let resumed: Message = serde_json::from_str(&json).expect("deserialize message");
+	assert_eq!(resumed, message);
+}
+
+#[test]
+fn signature_on_a_non_thinking_index_is_still_rejected() {
+	let mut assembler = StreamAssembler::new();
+	assembler
+		.push(&chunk(Some(0), None, Some("text"), None, None, Vec::new()))
+		.expect("text block");
 	let err = assembler
-		.push(&chunk(Some(3), None, None, Some("orphan"), None, Vec::new()))
-		.expect_err("signature without its thinking block must fail");
-	assert!(matches!(err, ProviderError::Protocol(_)));
+		.push(&chunk(Some(0), None, None, Some("sig"), None, Vec::new()))
+		.expect_err("a signature may not take over a text block");
+	assert!(matches!(
+		err,
+		ProviderError::Protocol(message) if message.contains("non-thinking block")
+	));
+
+	let mut assembler = StreamAssembler::new();
+	assembler
+		.push(&chunk(
+			Some(1),
+			None,
+			None,
+			None,
+			None,
+			vec![ToolCallDelta {
+				index: 0,
+				id: Some("call_1".to_string()),
+				name: Some("read".to_string()),
+				arguments_delta: Some("{}".to_string()),
+				content_index: Some(1),
+			}],
+		))
+		.expect("tool block");
+	let err = assembler
+		.push(&chunk(Some(1), None, None, Some("sig"), None, Vec::new()))
+		.expect_err("a signature may not take over a tool block");
+	assert!(matches!(
+		err,
+		ProviderError::Protocol(message) if message.contains("non-thinking block")
+	));
 }
 
 #[test]

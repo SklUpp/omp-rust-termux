@@ -3451,6 +3451,60 @@ pub enum CliThinking {
 	Effort(&'static str),
 }
 
+/// Thinking selector spelled by a model string's `:suffix` (TS
+/// `parseModelString(...).thinkingLevel`), including the `auto` alias.
+#[must_use]
+pub fn thinking_suffix(model: &str) -> Option<CliThinking> {
+	split_thinking(model, -1).1.and_then(parse_cli_thinking)
+}
+
+/// TS `resolveThinkingLevelForModel` (`thinking.ts:119-130`) over catalog
+/// metadata: `None`/`auto` resolve to no concrete level, `off` stays `off`,
+/// and an effort is clamped against the **target** model's declared efforts
+/// (`clampThinkingLevelForModel`, `model-thinking.ts:836-866`). A model the
+/// catalog does not know is left unclamped, exactly like `model === undefined`.
+#[must_use]
+pub fn resolve_thinking_effort(
+	catalog: &crate::catalog::Catalog,
+	provider: &str,
+	model: &str,
+	thinking: Option<CliThinking>,
+) -> Option<String> {
+	match thinking {
+		None | Some(CliThinking::Auto) => None,
+		Some(CliThinking::Off) => Some("off".to_string()),
+		Some(CliThinking::Effort(effort)) => {
+			let Some(info) = catalog.providers.get(provider).and_then(|models| models.get(model))
+			else {
+				return Some(effort.to_string());
+			};
+			if !info.reasoning {
+				return None;
+			}
+			let levels = info.efforts.as_deref().unwrap_or(&[]);
+			if levels.iter().any(|level| level == effort) {
+				return Some(effort.to_string());
+			}
+			let Some(requested) = THINKING_SELECTORS.iter().position(|level| *level == effort)
+			else {
+				return None;
+			};
+			let mut clamped: Option<&str> = None;
+			for level in levels {
+				let Some(index) = THINKING_SELECTORS.iter().position(|candidate| *candidate == level)
+				else {
+					continue;
+				};
+				if index > requested {
+					break;
+				}
+				clamped = Some(level);
+			}
+			clamped.or_else(|| levels.first().map(String::as_str)).map(str::to_string)
+		},
+	}
+}
+
 /// Parses a `--thinking` value exactly like TS `parseCliThinkingLevel`:
 /// case-sensitive unique prefixes of `off`..`max`, plus the exact `auto`
 /// sentinel. `inherit` is not a CLI selector.

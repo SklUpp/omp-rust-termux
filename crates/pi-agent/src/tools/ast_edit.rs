@@ -897,6 +897,10 @@ impl PendingAction for AstEditPending {
 		"ast_edit"
 	}
 
+	fn tier(&self) -> Option<crate::tools::pending::ActionTier> {
+		Some(crate::tools::pending::ActionTier::Write)
+	}
+
 	async fn apply(&self, ctx: &AgentContext, _reason: &str) -> Result<ToolResult, ToolError> {
 		if ctx.cancellation_token.is_cancelled() {
 			return Err(ToolError::Aborted("AST edit cancelled".to_string()));

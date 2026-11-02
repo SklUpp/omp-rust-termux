@@ -729,33 +729,20 @@ fn run() -> std::result::Result<(), CliError> {
 		.as_ref()
 		.map(|dir| dirs::absolute(&cwd, dir));
 
-	// Prewalk is wired to the local CLI session owner only. The RPC/ACP
-	// transports have no host-side turn ack here, so an explicit flag would be
-	// inert and fails loudly; a settings-only enablement is ignored there.
-	let prewalk_requested = cli.prewalk || cli.prewalk_into.is_some();
-	let prewalk_transport_unsupported = matches!(cli.mode, OutputMode::Rpc)
-		|| matches!(cli.command.as_ref(), Some(Command::Acp { .. }));
-	if prewalk_transport_unsupported && prewalk_requested {
-		return Err(CliError::usage(
-			"--prewalk is only available for local CLI sessions, not --mode rpc or `omp acp`",
-		));
-	}
 	// TS `main.ts:1234-1264`: prewalk conflicts fail startup; an optional target
 	// that cannot be resolved or has no configured auth only warns and leaves
 	// prewalk unarmed. Config enablement never applies to a restored session.
-	let mut prewalk_policy = prewalk::PrewalkPolicy::default();
-	if !prewalk_transport_unsupported {
-		prewalk_policy = prewalk::resolve_policy(
-			&cli,
-			&config,
-			&catalog,
-			restoring_session,
-			requested_api_key.as_deref(),
-		)
-		.map_err(CliError::fail)?;
-		for warning in &prewalk_policy.warnings {
-			eprintln!("{warning}");
-		}
+	// The policy travels into every session owner (CLI, RPC, ACP).
+	let prewalk_policy = prewalk::resolve_policy(
+		&cli,
+		&config,
+		&catalog,
+		restoring_session,
+		requested_api_key.as_deref(),
+	)
+	.map_err(CliError::fail)?;
+	for warning in &prewalk_policy.warnings {
+		eprintln!("{warning}");
 	}
 
 	// Pre-resolve session target
@@ -933,7 +920,7 @@ fn run() -> std::result::Result<(), CliError> {
 		in_memory_messages: None,
 		session_dir: session_dir.clone(),
 		goal: Arc::new(GoalRuntime::new()),
-		prewalk: prewalk::PrewalkState::new(prewalk_policy.arm),
+		prewalk: prewalk::PrewalkState::new(prewalk_policy.arm.clone()),
 	};
 	if let Some(model) = requested_model.or(default_model) {
 		session.select_model(model);
@@ -996,6 +983,16 @@ fn run() -> std::result::Result<(), CliError> {
 		let auth = acp::AcpAuth::open(dirs::agent_dir().join("agent.db"))
 			.map_err(|err| CliError::fail(format!("cannot open agent.db for ACP: {err}")))?;
 		let runner: Arc<dyn AgentRunner> = native_runner.clone();
+		// ACP opens sessions later, so resolve the fresh-session settings arm
+		// independently of this process's restored-session state.
+		let fresh_prewalk = prewalk::resolve_policy(
+			&cli,
+			&session.config,
+			&session.catalog,
+			false,
+			requested_api_key.as_deref(),
+		)
+		.map_err(CliError::fail)?;
 		let mut recipe = acp::AcpRecipe::new(
 			runner,
 			session.config.clone(),
@@ -1012,6 +1009,10 @@ fn run() -> std::result::Result<(), CliError> {
 		recipe.provider = session.provider.clone();
 		recipe.api_key = session.api_key.clone();
 		recipe.thinking = session.thinking;
+		recipe.model_explicit = cli.model.is_some();
+		recipe.prewalk = prewalk_policy.arm.clone();
+		recipe.prewalk_fresh = fresh_prewalk.arm;
+		recipe.prewalk_explicit = cli.prewalk || cli.prewalk_into.is_some();
 		recipe.max_time = session.max_time;
 		recipe.max_turns = session.max_turns;
 		recipe.tools_enabled = session.tools_enabled;
@@ -1102,10 +1103,19 @@ fn run() -> std::result::Result<(), CliError> {
 			provider: session.provider.clone(),
 			api_key: session.api_key.clone(),
 			thinking: session.thinking,
+			restore_model: cli.model.is_none()
+				&& (restoring_session || explicitly_existing),
+			prewalk: prewalk_policy.arm.clone(),
 			max_time: session.max_time,
 			max_turns: session.max_turns,
 			tools_enabled: session.tools_enabled,
 			// Same rule as the `--print` path below; resolved above.
+			prompt_cache_key_inherited: cli
+				.prompt_cache_key
+				.as_deref()
+				.filter(|key| !key.is_empty())
+				.is_none()
+				&& rpc_cache_key.is_some(),
 			prompt_cache_key: rpc_cache_key,
 			provider_session_id: cli
 				.provider_session_id
@@ -1156,6 +1166,14 @@ fn run() -> std::result::Result<(), CliError> {
 	};
 	session.checkpoint_host.rehydrate(&store);
 	session.store = store;
+	// TS `sdk.ts:1505-1545`: an explicit `--model` wins; otherwise a restored
+	// session's recorded model/role decides the route, with the configured
+	// default as fallback.
+	if cli.model.is_none() && (restoring_session || explicitly_existing) {
+		if let Some(restored) = session.restore_persisted_model(cli.thinking.is_none()) {
+			eprintln!("Restored session model: {restored}");
+		}
+	}
 	// Restore the persisted goal mode from the active branch before any turn:
 	// a malformed/disabled record is cleared, an active replay is paused.
 	session.reconcile_goal_mode();
@@ -1460,6 +1478,70 @@ struct Session<'a> {
 }
 
 impl Session<'_> {
+	/// TS `sdk.ts:1505-1545`: with no explicit `--model`, a restored session
+	/// selects the first recorded model on its branch that exists in the
+	/// catalog and has usable auth. The ephemeral prewalk `fallback` role falls
+	/// back to the configured default, so the fast model does not survive
+	/// resume. Returns the selected `provider/model[:level]` string.
+	fn restore_persisted_model(&mut self, restore_thinking: bool) -> Option<String> {
+		let candidates = self
+			.store
+			.restorable_models(self.config.default_model.as_deref());
+		for candidate in candidates {
+			let Some((provider, rest)) = candidate.split_once('/') else {
+				continue;
+			};
+			if provider.is_empty() {
+				continue;
+			}
+			let (id, _) = runtime::split_effort(rest);
+			if id.is_empty()
+				|| !self
+					.catalog
+					.providers
+					.get(provider)
+					.is_some_and(|models| models.contains_key(id))
+			{
+				continue;
+			}
+			let same_route = self.provider.as_deref() == Some(provider)
+				&& self.api_key.as_deref().is_some_and(|key| !key.trim().is_empty());
+			if !same_route
+				&& !runtime::provider_has_configured_auth(
+					&self.catalog,
+					&self.config,
+					provider,
+					None,
+				)
+			{
+				continue;
+			}
+			let api_key = if same_route {
+				self.api_key.clone()
+			} else {
+				self.config.resolve_api_key(provider)
+			};
+			let changed = self.provider.as_deref() != Some(provider)
+				|| self.model.as_deref() != Some(id);
+			self.provider = Some(provider.to_string());
+			self.model = Some(id.to_string());
+			self.api_key = api_key;
+			if restore_thinking
+				&& let Some(level) = runtime::thinking_suffix(rest)
+			{
+				self.thinking = Some(level);
+			}
+			if changed {
+				invalidate_inherited_cache_key(
+					&mut self.prompt_cache_key,
+					&mut self.prompt_cache_key_source,
+				);
+			}
+			return Some(candidate);
+		}
+		None
+	}
+
 	fn select_model(&mut self, id: String) {
 		let provider = self.catalog.provider_of(&id).map(str::to_string);
 		let changed = self.model.as_deref() != Some(id.as_str()) || self.provider != provider;
@@ -2221,20 +2303,22 @@ impl Session<'_> {
 						&& let Some(arm) = prewalk_state.target().cloned()
 					{
 						let noop = prewalk::would_be_noop(
+							&prewalk_catalog,
 							&arm.target,
 							arm.thinking,
 							prewalk_provider.as_deref(),
 							prewalk_model.as_deref(),
 							prewalk_thinking,
 						);
+						// TS `isPrewalkImplementationAction` keys on the
+						// tool/typed tier only; a failed edit/write still counts.
 						let action_tool = tool_results.iter().find_map(|result| {
 							let name =
 								tools.get(&result.tool_call_id).map(String::as_str)?;
-							(!result.is_error
-								&& prewalk::is_implementation_action(
-									name,
-									result.details.as_ref(),
-								))
+							prewalk::is_implementation_action(
+								name,
+								result.details.as_ref(),
+							)
 							.then_some(name)
 						});
 						let todo_succeeded = tool_results.iter().any(|result| {

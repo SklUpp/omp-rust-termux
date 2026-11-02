@@ -34,7 +34,8 @@ use omp_cli::{
 		session::{FrameSink, RpcLaunch},
 		types::RpcHostUriSchemeDefinition,
 	},
-	runtime::PiAgentRunner,
+	prewalk::PrewalkArm,
+	runtime::{ModelSwitch, PiAgentRunner},
 	session::{
 		ContentPart, MessageContent, MessageEntry, SessionMessage, SessionOptions, SessionStore,
 		fork_session,
@@ -608,10 +609,13 @@ fn launch(port: u16, model: &str, provider: &str) -> RpcLaunch {
 		provider: Some(provider.to_string()),
 		api_key: Some("sk-test".to_string()),
 		thinking: None,
+		restore_model: false,
+		prewalk: None,
 		max_time: Some(Duration::from_secs(10)),
 		max_turns: 2,
 		tools_enabled: false,
 		prompt_cache_key: None,
+		prompt_cache_key_inherited: false,
 		provider_session_id: None,
 		store_options: SessionOptions {
 			enabled: false,
@@ -1674,6 +1678,97 @@ fn rpc_branch_rehydrates_checkpoint_state_for_the_selected_branch() {
 	assert!(final_request.contains("Branch-return summary"), "{final_request}");
 	assert!(final_request.contains("BRANCH-FINDINGS"), "{final_request}");
 	assert!(!final_request.contains("CHECKPOINT-OPEN"), "{final_request}");
+	drop(harness);
+	fs::remove_dir_all(&root).ok();
+}
+
+/// Prewalk through the RPC transport: the *same* session owner must journal
+/// the ephemeral role, actually continue on the target provider, and keep the
+/// switch out of the user's conversation (plan guidance scrubbed).
+#[test]
+fn rpc_prewalk_switches_after_todo_and_first_write() {
+	let root = checkpoint_root("prewalk");
+	let worktree = root.join("worktree");
+	let sessions = root.join("sessions");
+	let (port, requests) = spawn_tool_model(vec![
+		ToolScript {
+			text: "exploring".to_string(),
+			tool: Some((
+				"todo",
+				json!({ "op": "init", "list": [{ "phase": "P", "items": ["Do it"] }] }),
+			)),
+		},
+		ToolScript {
+			text: String::new(),
+			tool: Some(("write", json!({ "path": "probe.txt", "content": "done" }))),
+		},
+		ToolScript { text: "switched".to_string(), tool: None },
+	]);
+	let mut launch = launch(port, "local/mock-model", "local");
+	launch.config.providers.insert(
+		"fast".to_string(),
+		ProviderConfig {
+			base_url: Some(format!("http://127.0.0.1:{port}/v1")),
+			api_key: Some("sk-fast".to_string()),
+			..Default::default()
+		},
+	);
+	launch.cwd = worktree.clone();
+	launch.tools_enabled = true;
+	launch.max_turns = 8;
+	launch.store_options = checkpoint_session_options(&worktree, &sessions, Some("prewalk-rpc"));
+	launch.prewalk = Some(PrewalkArm {
+		target: ModelSwitch {
+			provider: "fast".to_string(),
+			model: "small".to_string(),
+			effort: None,
+			thinking: None,
+		},
+		thinking: None,
+	});
+	let harness = Harness::start(launch);
+	harness.send(json!({ "type": "prompt", "id": "p1", "message": "start" }));
+	harness.wait_frame("agent_end", timeout());
+
+	let bodies = requests
+		.lock()
+		.unwrap_or_else(std::sync::PoisonError::into_inner)
+		.clone();
+	assert_eq!(bodies.len(), 3, "prewalk request sequence: {bodies:#?}");
+	let first_model = bodies[0]["model"].as_str().unwrap_or_default();
+	assert_ne!(first_model, "small", "first turn must stay on the root model");
+	let switched = bodies[2].to_string();
+	assert!(
+		switched.contains("\"model\":\"small\""),
+		"turn after the write must run on the prewalk target: {switched}"
+	);
+	assert!(
+		!switched.contains("STOP: In NEXT reply"),
+		"consumed plan guidance must be scrubbed: {switched}"
+	);
+
+	let log = session_log(&sessions);
+	let entries: Vec<Value> = fs::read_to_string(&log)
+		.expect("session log")
+		.lines()
+		.filter_map(|line| serde_json::from_str(line).ok())
+		.collect();
+	let change = entries
+		.iter()
+		.find(|entry| entry["type"] == "model_change")
+		.expect("prewalk model_change entry");
+	assert_eq!(change["model"], "fast/small");
+	assert_eq!(change["role"], "fallback", "switch must be ephemeral on resume");
+	assert!(
+		!entries.iter().any(|entry| entry["type"] == "message"
+			&& entry.to_string().contains("STOP: In NEXT reply")),
+		"plan nudge must never be journaled"
+	);
+	assert!(
+		entries.iter().any(|entry| entry["type"] == "custom_message"
+			&& entry["customType"] == "prewalk-checklist"),
+		"checklist continuation must replay from the journal"
+	);
 	drop(harness);
 	fs::remove_dir_all(&root).ok();
 }

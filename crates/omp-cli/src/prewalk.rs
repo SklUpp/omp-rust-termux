@@ -112,7 +112,8 @@ pub fn resolve_policy(
 pub struct TurnBoundary<'a> {
 	pub has_tool_results: bool,
 	pub todo_succeeded: bool,
-	/// First successful action tool of this batch that actually mutates.
+	/// First action tool of this batch that actually mutates (success flag is
+	/// not part of the TS action check).
 	pub action: Option<&'a str>,
 	/// Whether the `todo` tool is offered to this run at all (TS gate).
 	pub todo_available: bool,
@@ -260,36 +261,35 @@ pub fn todo_available(tools_enabled: bool, selected: Option<&[String]>) -> bool 
 /// Whether a completed `edit`/`write` result is the implementation action that
 /// arms the hand-off (TS `isPrewalkImplementationAction`).
 ///
-/// A direct edit/write always counts. A `write` that dispatched an `xd://`
-/// device counts only when the staged action is a real mutation: `xd://resolve`
-/// applying an `ast_edit`/`lsp`/`debug` preview. Read-only device traffic never
-/// stages, `xd://reject` never mutates, and a bare `read` is not an action tool.
+/// A direct edit/write always counts, regardless of its success flag (the TS
+/// check does not consult `isError`). A `write` that dispatched an `xd://`
+/// device counts only when the staged action declared a mutating capability:
+/// `xdev.tier` is exactly `write` or `exec`. A missing tier (help lookup,
+/// unresolved approval, read-only device) declines. The source tool name is
+/// never consulted as a proxy.
 #[must_use]
 pub fn is_implementation_action(tool: &str, details: Option<&Value>) -> bool {
 	match tool {
 		"edit" => true,
 		"write" => match details.and_then(|details| details.get("xdev")) {
 			None => true,
-			Some(xdev) => {
-				let device = xdev.get("tool").and_then(Value::as_str);
-				let source = xdev
-					.get("inner")
-					.and_then(|inner| inner.get("sourceToolName"))
-					.and_then(Value::as_str);
-				device == Some("resolve")
-					&& matches!(source, Some("ast_edit" | "lsp" | "debug"))
-			},
+			Some(xdev) => matches!(
+				xdev.get("tier").and_then(Value::as_str),
+				Some("write" | "exec")
+			),
 		},
 		_ => false,
 	}
 }
 
 /// Whether the target already equals the active route (TS
-/// `prewalkWouldBeNoop`). Thinking comparison is selector-based: `auto`, `off`
-/// and concrete efforts are distinct states. Effort clamping by the target
-/// model is not modelled here (see the slice report).
+/// `prewalkWouldBeNoop`). Thinking is compared through
+/// [`runtime::resolve_thinking_effort`]: `auto` is distinct from concrete
+/// selectors, and both sides are clamped against the target model's declared
+/// efforts before equality.
 #[must_use]
 pub fn would_be_noop(
+	catalog: &crate::catalog::Catalog,
 	target: &ModelSwitch,
 	target_thinking: Option<CliThinking>,
 	current_provider: Option<&str>,
@@ -308,34 +308,31 @@ pub fn would_be_noop(
 	if base != target.model.as_str() {
 		return false;
 	}
-	let target_level = target_thinking.or(target.thinking);
-	match target_level {
-		None => true,
-		Some(level) => {
-			let current_level = current_thinking.or_else(|| suffix_selector(current_model));
-			current_level.is_some_and(|current| thinking_key(current) == thinking_key(level))
-		},
+	// TS `concreteThinkingLevel`: auto resolves to `undefined` for comparison;
+	// auto and a concrete selector are never no-ops of each other.
+	let Some(target_level) = target_thinking.or(target.thinking) else {
+		return true;
+	};
+	let current_level = current_thinking.or_else(|| suffix_selector(current_model));
+	let target_auto = target_level == CliThinking::Auto;
+	let current_auto = current_level == Some(CliThinking::Auto);
+	if target_auto != current_auto {
+		return false;
 	}
+	let target_concrete = (!target_auto).then_some(target_level);
+	let current_concrete = if current_auto { None } else { current_level };
+	runtime::resolve_thinking_effort(catalog, &target.provider, &target.model, target_concrete)
+		== runtime::resolve_thinking_effort(
+			catalog,
+			&target.provider,
+			&target.model,
+			current_concrete,
+		)
 }
 
 fn suffix_selector(model: &str) -> Option<CliThinking> {
 	let (_, suffix) = model.rsplit_once(':')?;
 	runtime::parse_cli_thinking(suffix)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ThinkingKey {
-	Off,
-	Auto,
-	Effort(&'static str),
-}
-
-fn thinking_key(level: CliThinking) -> ThinkingKey {
-	match level {
-		CliThinking::Off => ThinkingKey::Off,
-		CliThinking::Auto => ThinkingKey::Auto,
-		CliThinking::Effort(effort) => ThinkingKey::Effort(effort),
-	}
 }
 
 #[cfg(test)]
@@ -426,27 +423,61 @@ mod tests {
 	}
 
 	#[test]
-	fn device_actions_switch_only_for_staged_mutations() {
-		let resolve_ast = serde_json::json!({
-			"xdev": { "tool": "resolve", "inner": { "sourceToolName": "ast_edit" } }
+	fn device_actions_switch_only_for_typed_mutating_tier() {
+		// Tier is authoritative; the source tool name is deliberately misleading.
+		let resolve_write = serde_json::json!({
+			"xdev": { "tool": "resolve", "tier": "write", "inner": { "sourceToolName": "help" } }
 		});
-		let resolve_lsp = serde_json::json!({
-			"xdev": { "tool": "resolve", "inner": { "sourceToolName": "lsp" } }
+		let resolve_exec = serde_json::json!({
+			"xdev": { "tool": "resolve", "tier": "exec", "inner": {} }
+		});
+		let resolve_read = serde_json::json!({
+			"xdev": { "tool": "resolve", "tier": "read", "inner": { "sourceToolName": "ast_edit" } }
+		});
+		let resolve_unresolved = serde_json::json!({
+			"xdev": { "tool": "resolve", "inner": { "sourceToolName": "ast_edit" } }
 		});
 		let reject = serde_json::json!({
 			"xdev": { "tool": "reject", "inner": { "sourceToolName": "ast_edit" } }
 		});
-		assert!(is_implementation_action("write", Some(&resolve_ast)));
-		assert!(is_implementation_action("write", Some(&resolve_lsp)));
+		assert!(is_implementation_action("write", Some(&resolve_write)));
+		assert!(is_implementation_action("write", Some(&resolve_exec)));
+		assert!(!is_implementation_action("write", Some(&resolve_read)));
+		assert!(!is_implementation_action("write", Some(&resolve_unresolved)));
 		assert!(!is_implementation_action("write", Some(&reject)));
 		assert!(is_implementation_action("write", None));
-		assert!(!is_implementation_action("read", Some(&resolve_ast)));
+		assert!(!is_implementation_action("read", Some(&resolve_write)));
 		assert!(!is_implementation_action("lsp", None));
 	}
 
+	fn catalog_with_fast_small() -> crate::catalog::Catalog {
+		let mut catalog = crate::catalog::Catalog::default();
+		let mut models = std::collections::BTreeMap::new();
+		models.insert(
+			"small".to_string(),
+			crate::catalog::ModelInfo {
+				provider: "fast".to_string(),
+				reasoning: true,
+				efforts: Some(vec!["low".to_string(), "high".to_string()]),
+				..crate::catalog::ModelInfo::default()
+			},
+		);
+		models.insert(
+			"plain".to_string(),
+			crate::catalog::ModelInfo {
+				provider: "fast".to_string(),
+				..crate::catalog::ModelInfo::default()
+			},
+		);
+		catalog.providers.insert("fast".to_string(), models);
+		catalog
+	}
+
 	#[test]
-	fn noop_compares_provider_model_and_thinking_selector() {
+	fn noop_compares_provider_model_and_clamped_thinking() {
+		let catalog = catalog_with_fast_small();
 		assert!(would_be_noop(
+			&catalog,
 			&target(),
 			None,
 			Some("fast"),
@@ -454,20 +485,52 @@ mod tests {
 			None
 		));
 		assert!(would_be_noop(
+			&catalog,
 			&target(),
 			Some(CliThinking::Effort("high")),
 			Some("fast"),
 			Some("fast/small:high"),
 			None
 		));
+		// Both selectors clamp to the target's highest declared effort.
+		assert!(would_be_noop(
+			&catalog,
+			&target(),
+			Some(CliThinking::Effort("max")),
+			Some("fast"),
+			Some("fast/small:xhigh"),
+			None
+		));
 		assert!(!would_be_noop(
+			&catalog,
+			&target(),
+			Some(CliThinking::Effort("low")),
+			Some("fast"),
+			Some("fast/small:high"),
+			None
+		));
+		assert!(!would_be_noop(
+			&catalog,
 			&target(),
 			Some(CliThinking::Auto),
 			Some("fast"),
 			Some("fast/small:high"),
 			None
 		));
+		// A non-reasoning target resolves every concrete effort to none, so
+		// different selectors collapse exactly like the TS resolver.
+		let mut plain_target = target();
+		plain_target.model = "plain".to_string();
+		assert!(would_be_noop(
+			&catalog,
+			&plain_target,
+			Some(CliThinking::Effort("high")),
+			Some("fast"),
+			Some("fast/plain:low"),
+			None
+		));
 		assert!(!would_be_noop(
+			&catalog,
 			&target(),
 			None,
 			Some("slow"),

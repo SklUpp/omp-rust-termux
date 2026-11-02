@@ -87,6 +87,13 @@ pub struct AcpRecipe {
 	pub provider: Option<String>,
 	pub api_key: Option<String>,
 	pub thinking: Option<runtime::CliThinking>,
+	/// `--model` was explicit, so restoration must not override it.
+	pub model_explicit: bool,
+	/// Prewalk target resolved for explicit flags.
+	pub prewalk: Option<crate::prewalk::PrewalkArm>,
+	/// Settings-derived target for newly created ACP sessions.
+	pub prewalk_fresh: Option<crate::prewalk::PrewalkArm>,
+	pub prewalk_explicit: bool,
 	pub max_time: Option<Duration>,
 	pub max_turns: usize,
 	pub tools_enabled: bool,
@@ -118,6 +125,10 @@ impl AcpRecipe {
 			provider: None,
 			api_key: None,
 			thinking: None,
+			model_explicit: false,
+			prewalk: None,
+			prewalk_fresh: None,
+			prewalk_explicit: false,
 			max_time: None,
 			max_turns: 0,
 			tools_enabled: true,
@@ -245,10 +256,21 @@ impl AcpRuntime {
 			provider: self.recipe.provider.clone(),
 			api_key: self.recipe.api_key.clone(),
 			thinking: self.recipe.thinking,
+			restore_model: !fresh && !self.recipe.model_explicit,
+			// Settings enablement starts fresh sessions only; an explicit flag
+			// also arms a loaded one (TS policy).
+			prewalk: if fresh {
+				self.recipe.prewalk_fresh.clone()
+			} else if self.recipe.prewalk_explicit {
+				self.recipe.prewalk.clone()
+			} else {
+				None
+			},
 			max_time: self.recipe.max_time,
 			max_turns: self.recipe.max_turns,
 			tools_enabled: self.recipe.tools_enabled,
 			prompt_cache_key: None,
+			prompt_cache_key_inherited: false,
 			provider_session_id: None,
 			store_options,
 			steer: None,

@@ -120,10 +120,13 @@ pub struct RpcLaunch {
 	pub provider: Option<String>,
 	pub api_key:  Option<String>,
 	pub thinking: Option<runtime::CliThinking>,
-	pub max_time: Option<Duration>,
-	pub max_turns: usize,
-	pub tools_enabled: bool,
+	/// No explicit `--model` and an existing session: restore the recorded
+	/// branch model/role (TS `sdk.ts:1505-1545`).
+	pub restore_model: bool,
+	/// Armed prewalk target for this session; `None` leaves it disabled.
+	pub prewalk: Option<crate::prewalk::PrewalkArm>,
 	pub prompt_cache_key: Option<String>,
+	pub prompt_cache_key_inherited: bool,
 	pub provider_session_id: Option<String>,
 	pub store_options: SessionOptions,
 	/// Present when the host installed a live steering channel.
@@ -273,6 +276,9 @@ pub struct RpcSession {
 	pub(crate) thinking: Option<runtime::CliThinking>,
 	pub(crate) thinking_level: Option<String>,
 	pub(crate) prompt_cache_key: Option<String>,
+	pub(crate) prompt_cache_key_inherited: bool,
+	/// One-way prewalk state machine for this session.
+	pub(crate) prewalk: crate::prewalk::PrewalkState,
 	pub(crate) provider_session_id: Option<String>,
 	pub(crate) max_time: Option<Duration>,
 	pub(crate) max_turns: usize,
@@ -348,10 +354,13 @@ impl RpcSession {
 			provider,
 			api_key,
 			thinking,
+			restore_model,
+			prewalk,
 			max_time,
 			max_turns,
 			tools_enabled,
 			prompt_cache_key,
+			prompt_cache_key_inherited,
 			provider_session_id,
 			store_options,
 			steer,
@@ -413,6 +422,8 @@ impl RpcSession {
 			thinking,
 			thinking_level,
 			prompt_cache_key,
+			prompt_cache_key_inherited,
+			prewalk: crate::prewalk::PrewalkState::new(prewalk),
 			provider_session_id,
 			max_time,
 			max_turns: max_turns.max(1),
@@ -446,8 +457,84 @@ impl RpcSession {
 			plan_mode: crate::agent::PlanModeHooks::default(),
 			plan_mode_probe: None,
 		};
+		if restore_model
+			&& let Some(restored) = session.restore_persisted_model(thinking.is_none())
+		{
+			eprintln!("Restored session model: {restored}");
+		}
 		session.reconcile_goal_mode();
 		Ok(session)
+	}
+
+	/// Shared by RPC and ACP: the branch's recorded model/role picks the route
+	/// when the host supplied no explicit model. Authorization is required, as
+	/// upstream `hasModelAuth` gates each restore candidate.
+	fn restore_persisted_model(&mut self, restore_thinking: bool) -> Option<String> {
+		let candidates = self
+			.store
+			.restorable_models(self.config.default_model.as_deref());
+		for candidate in candidates {
+			let Some((provider, rest)) = candidate.split_once('/') else {
+				continue;
+			};
+			if provider.is_empty() {
+				continue;
+			}
+			let (id, _) = runtime::split_effort(rest);
+			if id.is_empty()
+				|| !self
+					.catalog
+					.providers
+					.get(provider)
+					.is_some_and(|models| models.contains_key(id))
+			{
+				continue;
+			}
+			let same_route = self.provider.as_deref() == Some(provider)
+				&& self.api_key.as_deref().is_some_and(|key| !key.trim().is_empty());
+			let stored_auth = self
+				.resolver
+				.peek_api_key(provider)
+				.ok()
+				.flatten()
+				.is_some_and(|key| !key.trim().is_empty());
+			if !same_route
+				&& !stored_auth
+				&& !runtime::provider_has_configured_auth(
+					&self.catalog,
+					&self.config,
+					provider,
+					None,
+				)
+			{
+				continue;
+			}
+			let api_key = if same_route {
+				self.api_key.clone()
+			} else {
+				self.config.resolve_api_key(provider)
+			};
+			let changed = self.provider.as_deref() != Some(provider)
+				|| self.model.as_deref() != Some(id);
+			self.provider = Some(provider.to_string());
+			self.model = Some(id.to_string());
+			self.api_key = api_key;
+			if restore_thinking
+				&& let Some(level) = runtime::thinking_suffix(rest)
+			{
+				self.thinking = Some(level);
+				self.thinking_level = match level {
+					runtime::CliThinking::Off => Some("off".to_string()),
+					runtime::CliThinking::Auto => None,
+					runtime::CliThinking::Effort(effort) => Some(effort.to_string()),
+				};
+			}
+			if changed {
+				self.prompt_cache_key_inherited = false;
+			}
+			return Some(candidate);
+		}
+		None
 	}
 
 	// ---------------------------------------------------------------- state --
@@ -2245,6 +2332,167 @@ impl RpcSession {
 		{
 			messages.push(Message::system(warning));
 		}
+
+		// Prewalk: advance the one-way switch at this settled boundary. A
+		// terminal provider turn never starts another request, so it neither
+		// swaps the provider nor injects guidance.
+		let terminal = matches!(
+			message.stop_reason,
+			Some(pi_agent::StopReason::Error | pi_agent::StopReason::Aborted)
+		);
+		if !terminal
+			&& let Some(arm) = self.prewalk.target().cloned()
+		{
+			let noop = crate::prewalk::would_be_noop(
+				&self.catalog,
+				&arm.target,
+				arm.thinking,
+				self.provider.as_deref(),
+				self.model.as_deref(),
+				self.thinking,
+			);
+			let action_tool = tool_results.iter().find_map(|result| {
+				let name = prepared
+					.tool_names
+					.get(&result.tool_call_id)
+					.map(String::as_str)?;
+				crate::prewalk::is_implementation_action(name, result.details.as_ref())
+					.then_some(name)
+			});
+			let todo_succeeded = tool_results.iter().any(|result| {
+				!result.is_error
+					&& prepared
+						.tool_names
+						.get(&result.tool_call_id)
+						.map(String::as_str)
+						== Some("todo")
+			});
+			let todo_available = crate::prewalk::todo_available(
+				self.tools_enabled,
+				self.config.tools.as_deref(),
+			);
+			let boundary = crate::prewalk::TurnBoundary {
+				has_tool_results: !tool_results.is_empty(),
+				todo_succeeded,
+				action: action_tool,
+				todo_available,
+				noop,
+			};
+			let action = self.prewalk.advance(&boundary);
+			for notice in &action.notices {
+				eprintln!("{notice}");
+			}
+			if action.scrub_plan {
+				decision.scrub_custom_type =
+					Some(crate::prewalk::PREWALK_PLAN_TYPE.to_string());
+			}
+			let mut guidance = action.guidance;
+			if let Some(target) = action.switch {
+				let api_key = if self.provider.as_deref() == Some(target.provider.as_str()) {
+					self.api_key.clone()
+				} else {
+					self.config.resolve_api_key(&target.provider).or_else(|| {
+						self.resolver
+							.peek_api_key(&target.provider)
+							.ok()
+							.flatten()
+							.filter(|key| !key.trim().is_empty())
+					})
+				};
+				let cache_key = if self.prompt_cache_key_inherited {
+					None
+				} else {
+					self.prompt_cache_key.clone()
+				};
+				match runtime::build_switch_provider(
+					&self.catalog,
+					&self.config,
+					&target,
+					api_key.clone(),
+					// Provider session belongs to the previous route.
+					None,
+					cache_key,
+				) {
+					Ok(provider) => {
+						// Ephemeral role: resume/fork fall back to the configured
+						// default instead of the fast model.
+						if self.store.enabled()
+							&& let Err(err) = self.store.append_model_change(
+								&format!("{}/{}", target.provider, target.model),
+								"fallback",
+							)
+						{
+							eprintln!("warning: cannot record prewalk model change: {err}");
+						}
+						for (custom_type, content) in &action.journal {
+							if self.store.enabled() {
+								if let Err(err) = self.store.append_custom_message(
+									custom_type,
+									content,
+									false,
+									serde_json::Value::Null,
+								) {
+									eprintln!("warning: {err}");
+								}
+							} else if let Some(messages) = self.in_memory_messages.as_mut() {
+								messages.push(Message::guidance(*custom_type, *content));
+							}
+						}
+						decision.provider = Some(provider);
+						decision.context_limit = Some(
+							self.catalog
+								.context_window(&target.provider, &target.model)
+								.unwrap_or(runtime::DEFAULT_CONTEXT_LIMIT),
+						);
+						decision.continue_turn |= action.continue_turn;
+						decision.guidance = guidance;
+						// Later prompts use the new route; the journal already
+						// carries the ephemeral role and inherited state is cut.
+						self.provider = Some(target.provider);
+						self.model = Some(target.model);
+						self.api_key = api_key;
+						if let Some(level) = action.switch_thinking {
+							self.thinking = Some(level);
+							self.thinking_level = match level {
+								runtime::CliThinking::Off => Some("off".to_string()),
+								runtime::CliThinking::Auto => None,
+								runtime::CliThinking::Effort(effort) => {
+									Some(effort.to_string())
+								},
+							};
+						}
+						self.provider_session_id = None;
+						if self.prompt_cache_key_inherited {
+							self.prompt_cache_key = None;
+							self.prompt_cache_key_inherited = false;
+						}
+					},
+					Err(err) => {
+						// Startup resolved this target; a setup failure here must
+						// not silently claim a switch.
+						eprintln!("warning: prewalk switch failed — {err}");
+						guidance.clear();
+					},
+				}
+			} else {
+				for (custom_type, content) in &action.journal {
+					if self.store.enabled() {
+						if let Err(err) = self.store.append_custom_message(
+							custom_type,
+							content,
+							false,
+							serde_json::Value::Null,
+						) {
+							eprintln!("warning: {err}");
+						}
+					} else if let Some(messages) = self.in_memory_messages.as_mut() {
+						messages.push(Message::guidance(*custom_type, *content));
+					}
+				}
+				decision.continue_turn |= action.continue_turn;
+				decision.guidance = guidance;
+			}
+		}
 		// A cut queued by an earlier turn must not mix with this turn's tail.
 		self.flush_pending_wire();
 		for entry in &valid {
@@ -2883,10 +3131,13 @@ mod tests {
 				provider: Some("local".to_string()),
 				api_key: Some("sk-test".to_string()),
 				thinking: None,
+				restore_model: false,
+				prewalk: None,
 				max_time: None,
 				max_turns: 8,
 				tools_enabled: true,
 				prompt_cache_key: None,
+				prompt_cache_key_inherited: false,
 				provider_session_id: None,
 				store_options: SessionOptions {
 					enabled: false,

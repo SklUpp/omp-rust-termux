@@ -79,6 +79,28 @@ pub fn is_propose_device_path(path: &str) -> bool {
 	matches!(parse_xd_target(path), Some(XdTarget::Device(device)) if device.eq_ignore_ascii_case(PROPOSE_DEVICE))
 }
 
+/// Capability tier of a staged action, serialized to the exact upstream
+/// strings (`read`/`write`/`exec`). `Option::None` on [`PendingAction::tier`]
+/// means the action did not declare a mutation capability; callers must not
+/// infer one from the source tool name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActionTier {
+	Read,
+	Write,
+	Exec,
+}
+
+impl ActionTier {
+	#[must_use]
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Self::Read => "read",
+			Self::Write => "write",
+			Self::Exec => "exec",
+		}
+	}
+}
+
 /// One staged action: the mutation applied by `xd://resolve` and the optional
 /// cleanup/undo run by `xd://reject`.
 #[async_trait]
@@ -87,6 +109,12 @@ pub trait PendingAction: Send + Sync {
 	fn label(&self) -> &str;
 	/// Tool that staged this action (`ast_edit`, …).
 	fn source_tool(&self) -> &str;
+	/// Capability this action mutates with, surfaced as the typed `xdev.tier`
+	/// exactly like the upstream device dispatch. `None` (help lookup,
+	/// unresolved approval) means the action declared no mutation capability.
+	fn tier(&self) -> Option<ActionTier> {
+		None
+	}
 
 	/// Apply the staged change. An `Err` leaves the entry pending; a cancelled
 	/// run must surface `ToolError::Aborted` rather than dropping the future,
@@ -327,6 +355,9 @@ fn resolve_details(
 		"sourceToolName": pending.source_tool(),
 		"label": pending.label(),
 	});
+	if let Some(tier) = pending.tier() {
+		details["tier"] = serde_json::Value::String(tier.as_str().to_string());
+	}
 	if let Some(source) = source {
 		details["sourceResultDetails"] = source;
 	}
@@ -393,6 +424,10 @@ mod tests {
 
 		fn source_tool(&self) -> &str {
 			"ast_edit"
+		}
+
+		fn tier(&self) -> Option<ActionTier> {
+			Some(ActionTier::Write)
 		}
 
 		async fn apply(&self, _ctx: &AgentContext, reason: &str) -> Result<ToolResult, ToolError> {
@@ -840,7 +875,12 @@ mod tests {
 
 		let discarded = store.reject(&ctx, "wrong callsites").await.expect("reject");
 		assert!(!discarded.is_error);
-		assert_eq!(discarded.details.as_ref().expect("details")["action"], "discard");
+		let discarded_details = discarded.details.as_ref().expect("details");
+		assert_eq!(discarded_details["action"], "discard");
+		assert_eq!(
+			discarded_details["tier"], "write",
+			"staged capability is typed, never inferred from the source tool"
+		);
 		assert_eq!(action.calls.load(Ordering::SeqCst), 0);
 		assert!(!dir.0.join("out.txt").exists());
 
@@ -873,6 +913,14 @@ mod tests {
 		assert_eq!(details["xdev"]["tool"], "resolve");
 		assert_eq!(details["xdev"]["inner"]["action"], "apply");
 		assert_eq!(details["xdev"]["inner"]["sourceToolName"], "ast_edit");
+		assert_eq!(
+			details["xdev"]["tier"], "write",
+			"xdev exposes the staged action's typed capability"
+		);
+		assert!(
+			details["xdev"]["inner"].get("tier").is_none(),
+			"tier is lifted to the device level, not duplicated inside the source result"
+		);
 		let again = dispatch(&tool, "xd://resolve", "again", &ctx).await.expect_err("consumed");
 		assert!(again.to_string().contains("No pending action to apply"));
 

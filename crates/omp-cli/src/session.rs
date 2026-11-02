@@ -1916,6 +1916,103 @@ impl SessionStore {
 				.any(|entry| entry.kind == "branch_summary" || entry.kind == "custom_message")
 	}
 
+	/// TS `getLastModelChangeRole` (`session-manager.ts:2526-2533`): role of
+	/// the newest `model_change` entry on the branch; a missing role means
+	/// `default`. `None` when the branch has no model change at all.
+	#[must_use]
+	pub fn last_model_change_role(&self) -> Option<String> {
+		self
+			.branch_entries()
+			.iter()
+			.rev()
+			.find(|entry| entry.kind == "model_change")
+			.map(|entry| {
+				entry
+					.extra
+					.get("role")
+					.and_then(serde_json::Value::as_str)
+					.unwrap_or("default")
+					.to_string()
+			})
+	}
+
+	/// TS `buildSessionContext` `models` map (`session-context.ts:250-276`):
+	/// role -> newest recorded model on the branch. Explicit `model_change`
+	/// entries win; assistant messages only infer `default` while no explicit
+	/// default exists (the pre-model_change legacy fallback).
+	#[must_use]
+	pub fn session_model_roles(&self) -> BTreeMap<String, String> {
+		let mut models = BTreeMap::new();
+		let mut has_explicit_default = false;
+		for entry in self.branch_entries() {
+			match entry.kind.as_str() {
+				"model_change" => {
+					let Some(model) = entry
+						.extra
+						.get("model")
+						.and_then(serde_json::Value::as_str)
+					else {
+						continue;
+					};
+					let role = entry
+						.extra
+						.get("role")
+						.and_then(serde_json::Value::as_str)
+						.unwrap_or("default");
+					models.insert(role.to_string(), model.to_string());
+					has_explicit_default |= role == "default";
+				},
+				"message" if !has_explicit_default => {
+					let Some(message) = entry.extra.get("message") else {
+						continue;
+					};
+					if message.get("role").and_then(serde_json::Value::as_str)
+						!= Some("assistant")
+					{
+						continue;
+					}
+					let (Some(provider), Some(model)) = (
+						message.get("provider").and_then(serde_json::Value::as_str),
+						message.get("model").and_then(serde_json::Value::as_str),
+					) else {
+						continue;
+					};
+					if !provider.is_empty() && !model.is_empty() {
+						models.insert(
+							"default".to_string(),
+							format!("{provider}/{model}"),
+						);
+					}
+				},
+				_ => {},
+			}
+		}
+		models
+	}
+
+	/// TS `getRestorableSessionModels` (`session-context.ts:86-103`) plus the
+	/// configured default as the final fallback when the branch records no
+	/// model at all (Rust sessions do not write an initial `default` entry).
+	#[must_use]
+	pub fn restorable_models(&self, configured_default: Option<&str>) -> Vec<String> {
+		let models = self.session_model_roles();
+		let default = models.get("default").map(String::as_str);
+		let mut candidates = match self.last_model_change_role().as_deref() {
+			None | Some("default" | "fallback") => default.map(str::to_string).into_iter().collect(),
+			Some(role) => match models.get(role) {
+				None => default.map(str::to_string).into_iter().collect(),
+				Some(role_model) if default.is_none() || default == Some(role_model.as_str()) => {
+					vec![role_model.clone()]
+				},
+				Some(role_model) => vec![role_model.clone(), default.unwrap().to_string()],
+			},
+		};
+		if candidates.is_empty() {
+			candidates.extend(configured_default.map(str::to_string));
+		}
+		candidates
+	}
+
 	/// Typed messages on the active branch, in branch order. Abandoned entries
 	/// stay in [`Self::messages`] but are excluded here (they are not ancestors
 	/// of the leaf).
@@ -5442,6 +5539,41 @@ mod tests {
 		assert_eq!(resumed.id(), "newer");
 		assert_eq!(resumed.history().to_vec(), vec![turn("new", "new answer")]);
 		assert!(resumed.take_warnings().is_empty());
+		fs::remove_dir_all(dir).ok();
+	}
+
+	#[test]
+	fn restorable_models_follow_the_last_model_change_role() {
+		let dir = temp_dir();
+		let mut store = SessionStore::open(&options(dir.clone(), Some("restore")));
+		assert_eq!(
+			store.restorable_models(Some("configured/default")),
+			vec!["configured/default".to_string()],
+			"a branch with no recorded model falls back to the configured default"
+		);
+		store
+			.append_model_change("fast/small", "fallback")
+			.expect("fallback change");
+		assert_eq!(
+			store.restorable_models(Some("configured/default")),
+			vec!["configured/default".to_string()],
+			"the ephemeral prewalk role must not restore the fast model"
+		);
+		store
+			.append_model_change("local/main", "default")
+			.expect("default change");
+		assert_eq!(
+			store.restorable_models(Some("configured/default")),
+			vec!["local/main".to_string()]
+		);
+		store
+			.append_model_change("vision/special", "vision")
+			.expect("role change");
+		assert_eq!(
+			store.restorable_models(Some("configured/default")),
+			vec!["vision/special".to_string(), "local/main".to_string()],
+			"a named role prefers its model, then the session default"
+		);
 		fs::remove_dir_all(dir).ok();
 	}
 

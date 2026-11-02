@@ -1752,15 +1752,21 @@ impl WriteTool {
 		} else {
 			store.reject(ctx, reason).await?
 		};
-		let inner = result.details.take();
-		result.details = Some(serde_json::json!({
-			"xdev": {
-				"tool": device,
-				"mode": "execute",
-				"args": { "reason": reason },
-				"inner": inner,
-			}
-		}));
+		let mut inner = result.details.take();
+		let tier = inner
+			.as_mut()
+			.and_then(|details| details.as_object_mut())
+			.and_then(|details| details.remove("tier"));
+		let mut xdev = serde_json::json!({
+			"tool": device,
+			"mode": "execute",
+			"args": { "reason": reason },
+			"inner": inner,
+		});
+		if let Some(tier) = tier {
+			xdev["tier"] = tier;
+		}
+		result.details = Some(serde_json::json!({ "xdev": xdev }));
 		Ok(result)
 	}
 

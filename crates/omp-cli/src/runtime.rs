@@ -2293,7 +2293,7 @@ fn apply_compat_flags(
 	let Some(compat) = compat else {
 		return;
 	};
-	for (key, slot) in flags {
+	for (key, slot) in flags.iter_mut() {
 		if let Some(value) = compat.get(*key).and_then(serde_json::Value::as_bool) {
 			**slot = value;
 		}
@@ -2344,28 +2344,65 @@ fn anthropic_thinking_budget(effort: &str) -> u32 {
 	}
 }
 
+/// TS `requireSupportedEffort` (`model-thinking.ts:868-879`): an effort the
+/// model does not declare is an error, never a silent clamp. `getSupportedEfforts`
+/// (`:824-829`) is `reasoning ? thinking.efforts : []`.
+fn require_supported_effort(
+	provider: &str,
+	model: &str,
+	reasoning: bool,
+	efforts: Option<&[String]>,
+	effort: &str,
+) -> std::result::Result<(), String> {
+	if !reasoning {
+		return Err(format!("Model {provider}/{model} does not support thinking"));
+	}
+	let levels = efforts.unwrap_or(&[]);
+	if levels.iter().any(|level| level == effort) {
+		return Ok(());
+	}
+	Err(format!(
+		"Thinking effort {effort} is not supported by {provider}/{model}. Supported efforts: {}",
+		levels.join(", ")
+	))
+}
+
 /// TS streaming `stream.ts` anthropic option fold: thinking is only requested
 /// when the model declares `reasoning`, the turn asks for an effort, and no
 /// external scratchpad replaces it. `display` mirrors the TS defaults because
-/// the adapter omits the field when it is unset.
+/// the adapter omits the field when it is unset. Effort is validated through
+/// [`require_supported_effort`] exactly where TS maps it: the adaptive and
+/// budget-effort modes only.
 fn anthropic_thinking(
-	reasoning: bool,
+	provider: &str,
+	model: &str,
+	info: Option<&crate::catalog::ModelInfo>,
 	compat: Option<&serde_json::Value>,
 	thinking: Option<&serde_json::Value>,
 	effort: Option<&str>,
 	force_off: bool,
-) -> AnthropicThinking {
+) -> std::result::Result<AnthropicThinking, String> {
+	let reasoning = info.is_some_and(|info| info.reasoning);
 	let mode = thinking
 		.and_then(|thinking| thinking.get("mode"))
 		.and_then(serde_json::Value::as_str);
 	let adaptive_only = anthropic_adaptive_only(mode, compat, thinking);
 	if !reasoning {
-		return AnthropicThinking { thinking: None, output_effort: None, adaptive_only };
+		return Ok(AnthropicThinking { thinking: None, output_effort: None, adaptive_only });
 	}
 	let Some(effort) = effort.filter(|_| !force_off) else {
 		let thinking = Some(AnthropicThinkingConfig::Disabled);
-		return AnthropicThinking { thinking, output_effort: None, adaptive_only };
+		return Ok(AnthropicThinking { thinking, output_effort: None, adaptive_only });
 	};
+	if matches!(mode, Some("anthropic-adaptive" | "anthropic-budget-effort")) {
+		require_supported_effort(
+			provider,
+			model,
+			reasoning,
+			info.and_then(|info| info.efforts.as_deref()),
+			effort,
+		)?;
+	}
 	let mapped = thinking
 		.and_then(|thinking| thinking.get("effortMap"))
 		.and_then(|map| map.get(effort))
@@ -2375,20 +2412,20 @@ fn anthropic_thinking(
 	if mode == Some("anthropic-adaptive") {
 		let display = json_flag(thinking, "supportsDisplay")
 			.and_then(|supported| supported.then(|| "summarized".to_string()));
-		AnthropicThinking {
+		Ok(AnthropicThinking {
 			thinking:      Some(AnthropicThinkingConfig::Adaptive { display }),
 			output_effort: (mapped != "adaptive").then_some(mapped),
 			adaptive_only,
-		}
+		})
 	} else {
-		AnthropicThinking {
+		Ok(AnthropicThinking {
 			thinking: Some(AnthropicThinkingConfig::Enabled {
 				budget_tokens: anthropic_thinking_budget(effort),
 				display:       Some("summarized".to_string()),
 			}),
 			output_effort: (mode == Some("anthropic-budget-effort")).then_some(mapped),
 			adaptive_only,
-		}
+		})
 	}
 }
 
@@ -2422,7 +2459,6 @@ fn wire_provider(
 	let compat = catalog.model_compat(target.provider, target.model);
 	let thinking = catalog.model_thinking(target.provider, target.model);
 	let setup = |err: pi_agent::ProviderError| format!("pi-agent provider setup failed: {err}");
-	let effort = target.effort.map(str::to_string);
 	match target.dialect {
 		WireDialect::OpenAiCompletions => {
 			// Per-model `compat.supportsUsageInStreaming` override, else the TS
@@ -2433,7 +2469,7 @@ fn wire_provider(
 				.unwrap_or(target.provider != "cerebras");
 			let provider = OpenAiCompatibleProvider::new(target.base_url, target.api_key, target.model)
 				.map_err(setup)?
-				.with_effort(effort)
+				.with_effort(target.effort.map(str::to_string))
 				.with_images(target.supports_images)
 				.with_prompt_cache_enabled(target.provider == "kimi-code")
 				.with_usage_in_streaming(usage_in_streaming)
@@ -2452,8 +2488,15 @@ fn wire_provider(
 				.with_images(target.supports_images)
 				.with_cloud(target.provider == "ollama-cloud")
 				.with_model_reasoning(info.is_some_and(|info| info.reasoning))
-				.with_reasoning(effort)
+				.with_reasoning(target.effort.map(str::to_string))
 				.with_disable_reasoning(config.external_thinking)
+				// Explicit `false` overrides the provider default; a model that
+				// declares nothing keeps emitting `num_predict`.
+				.with_omit_max_output_tokens(
+					catalog
+						.omit_max_output_tokens(target.provider, target.model)
+						.unwrap_or(false),
+				)
 				.with_effort_map(json_string_map(thinking, "effortMap"))
 				.with_max_tokens(info.and_then(|info| info.max_tokens));
 			Ok(Arc::new(provider))
@@ -2466,6 +2509,20 @@ fn wire_provider(
 			anthropic.supports_images = target.supports_images;
 			anthropic.provider_id = Some(target.provider.to_string());
 			anthropic.claude_code_session_id = session_id;
+			// Caller headers from `config.yml` (the CLI's own override) or the
+			// catalog provider block; enforced credential/beta headers still win.
+			anthropic.custom_headers = config
+				.providers
+				.get(target.provider)
+				.or_else(|| catalog.connections.get(target.provider))
+				.map(|provider| {
+					provider
+						.headers
+						.iter()
+						.map(|(name, value)| (name.clone(), value.clone()))
+						.collect()
+				})
+				.unwrap_or_default();
 			anthropic.idle_timeout = json_u64(compat, "streamIdleTimeoutMs")
 				.map(std::time::Duration::from_millis);
 			apply_compat_flags(compat, &[
@@ -2480,12 +2537,14 @@ fn wire_provider(
 				("disableStrictTools", &mut anthropic.disable_strict_tools),
 			]);
 			let thinking = anthropic_thinking(
-				info.is_some_and(|info| info.reasoning),
+				target.provider,
+				target.model,
+				info,
 				compat,
 				thinking,
 				target.effort,
 				config.external_thinking,
-			);
+			)?;
 			anthropic.thinking = thinking.thinking;
 			anthropic.output_effort = thinking.output_effort;
 			anthropic.adaptive_only_thinking = thinking.adaptive_only;
@@ -2758,6 +2817,7 @@ impl CliChildModelFactory {
 			.and_then(|provider| provider.base_url.as_deref());
 		let base_url = wire_base_url(&self.catalog, &provider, &model, cli_base_url, dialect)?;
 		let supports_images = self.catalog.supports_images(&provider, &model).unwrap_or(true);
+		let usage_in_streaming = self.catalog.supports_usage_in_streaming(&provider, &model);
 		Ok(ChildTarget {
 			provider,
 			model,
@@ -2766,9 +2826,7 @@ impl CliChildModelFactory {
 			supports_images,
 			effort,
 			dialect,
-			usage_in_streaming: self
-				.catalog
-				.supports_usage_in_streaming(&provider, &model),
+			usage_in_streaming,
 			connection,
 		})
 	}
@@ -2844,16 +2902,16 @@ impl ChildModelFactory for CliChildModelFactory {
 				},
 			};
 			let chosen_effort = effort
-				.map(str::to_string)
-				.or_else(|| target.effort.clone())
-				.or_else(|| fallback_effort.map(str::to_string));
+				.or(target.effort.as_deref())
+				.or(fallback_effort);
+			let model_label = format!("{}/{}", target.provider, target.model);
 			let selection = WireTarget {
 				dialect: target.dialect,
 				provider: &target.provider,
 				model: &target.model,
 				base_url: &target.base_url,
 				api_key: target.api_key.as_deref().unwrap_or_default(),
-				effort: chosen_effort.as_deref(),
+				effort: chosen_effort,
 				supports_images: target.supports_images,
 				usage_in_streaming: target.usage_in_streaming,
 			};
@@ -2865,11 +2923,7 @@ impl ChildModelFactory for CliChildModelFactory {
 						continue;
 					},
 				};
-			return Ok(ChildModel {
-				provider,
-				model: format!("{}/{}", target.provider, target.model),
-				role: None,
-			});
+			return Ok(ChildModel { provider, model: model_label, role: None });
 		}
 		Err(last_error.unwrap_or_else(|| format!("no model candidate for '{model}'")))
 	}

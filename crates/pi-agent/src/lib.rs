@@ -8,6 +8,8 @@ pub mod mcp;
 pub mod loop_module;
 pub mod process_broker;
 pub mod provider;
+pub mod provider_anthropic;
+pub mod provider_ollama;
 pub mod state;
 pub mod subagent_lifecycle;
 pub mod supervisor;

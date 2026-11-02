@@ -483,6 +483,7 @@ async fn read_archive_file(
 		url: archive,
 		bytes,
 		path: None,
+		writable: false,
 	};
 	let raw = is_raw(parsed);
 	let display_mode = tool.display_mode(raw, true);

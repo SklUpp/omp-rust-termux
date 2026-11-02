@@ -112,6 +112,7 @@ impl ProtocolHandler for BridgeHandler {
 			notes:        resource.notes,
 			immutable:    resource.immutable,
 			is_directory: false,
+			writable: self.writable,
 		})
 	}
 

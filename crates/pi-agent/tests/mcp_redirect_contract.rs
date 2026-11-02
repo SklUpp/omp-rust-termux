@@ -252,8 +252,8 @@ async fn same_origin_relative_redirect_keeps_auth_session_and_protocol_headers()
 	const AUTH: &str = "Bearer same-origin-contract-secret";
 
 	let server = spawn_mock(|request| {
-		let method = request
-			.json_body()
+		let body = request.json_body();
+		let method = body
 			.get("method")
 			.and_then(Value::as_str)
 			.unwrap_or("");

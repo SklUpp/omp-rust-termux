@@ -2009,9 +2009,18 @@ impl WriteTool {
 					.to_string(),
 			));
 		}
-		let (content, stripped, hash_lines) = self.prepare_conflict_content(&all_entries, content);
-		let directives = conflict::parse_bulk_directives(&content)
-			.map_err(ToolError::Rejected)?;
+		let (clean_content, stripped, hash_lines) = self.prepare_conflict_content(&all_entries, content);
+		// Directive ids resemble displayed line prefixes; prefer the authored directives.
+		let directives = match conflict::parse_bulk_directives(content) {
+			Ok(Some(directives)) => Ok(Some(directives)),
+			Ok(None) => conflict::parse_bulk_directives(&clean_content),
+			Err(raw_error) => match conflict::parse_bulk_directives(&clean_content) {
+				Ok(Some(directives)) => Ok(Some(directives)),
+				_ => Err(raw_error),
+			},
+		}
+		.map_err(ToolError::Rejected)?;
+		let content = clean_content;
 		if let Some(directives) = &directives {
 			let unknown: Vec<String> = directives
 				.keys()
@@ -4195,16 +4204,19 @@ mod plan_mode_tool_tests {
 		let ctx = AgentContext::new(cwd.clone());
 		let ids = register_conflicts(&ctx, &file);
 		assert_eq!(ids.len(), 2);
+		let unlisted_file = cwd.join("unlisted.txt");
+		std::fs::write(&unlisted_file, CONFLICTED).expect("seed unlisted");
+		let unlisted = register_conflicts(&ctx, &unlisted_file)[0];
 
 		let store = Arc::new(hashline::SnapshotStore::new());
 		store
-			.record(&hashline::canonical_key(&file), CONFLICTED, None)
+			.record(&hashline::canonical_key(&file), two_blocks, None)
 			.expect("seed snapshot");
 		let tool = WriteTool::with_pending(Arc::new(PendingStore::new()))
 			.with_snapshots(Some(Arc::clone(&store)));
 		let result = tool
 			.execute(
-				&json!({ "path": "conflict://*", "content": format!("#{} = @ours\n#{} = @theirs", ids[0], ids[1]) }),
+				&json!({ "path": "conflict://*", "content": format!("{}: @ours\n{}: @theirs", ids[0], ids[1]) }),
 				&ctx,
 			)
 			.await
@@ -4214,6 +4226,8 @@ mod plan_mode_tool_tests {
 			std::fs::read_to_string(&file).expect("file"),
 			"top\nours1\nmid\ntheirs2\n"
 		);
+		assert!(ctx.conflicts.get(unlisted).is_some());
+		assert_eq!(std::fs::read_to_string(&unlisted_file).expect("unlisted file"), CONFLICTED);
 		assert!(result.content.contains("Snapshots:"), "{}", result.content);
 		let head = store
 			.head(&hashline::canonical_key(&file))
@@ -4481,6 +4495,7 @@ mod plan_mode_tool_tests {
 		let file = artifacts.join("note.txt");
 		std::fs::write(&file, CONFLICTED).expect("seed");
 		let writable_file = cwd.join("writable.txt");
+		std::fs::write(&writable_file, CONFLICTED).expect("seed writable");
 
 		let ctx = AgentContext::new(cwd);
 		let mut scope = UrlScope::default();

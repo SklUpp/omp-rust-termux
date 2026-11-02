@@ -1510,7 +1510,16 @@ impl Session<'_> {
 			{
 				continue;
 			}
+			let candidate_endpoint = runtime::effective_endpoint(
+				&self.catalog,
+				&self.config,
+				provider,
+				id,
+			)
+			.ok();
 			let same_route = self.provider.as_deref() == Some(provider)
+				&& candidate_endpoint.is_some()
+				&& candidate_endpoint.as_deref() == self.root_base_url.as_deref()
 				&& self.api_key.as_deref().is_some_and(|key| !key.trim().is_empty());
 			if !same_route
 				&& !runtime::provider_has_configured_auth(

@@ -463,6 +463,7 @@ impl RpcSession {
 			plan_mode: crate::agent::PlanModeHooks::default(),
 			plan_mode_probe: None,
 		};
+		session.refresh_root_endpoint();
 		if restore_model
 			&& let Some(restored) = session.restore_persisted_model(thinking.is_none())
 		{
@@ -497,7 +498,16 @@ impl RpcSession {
 			{
 				continue;
 			}
+			let candidate_endpoint = runtime::effective_endpoint(
+				&self.catalog,
+				&self.config,
+				provider,
+				id,
+			)
+			.ok();
 			let same_route = self.provider.as_deref() == Some(provider)
+				&& candidate_endpoint.is_some()
+				&& candidate_endpoint.as_deref() == self.root_base_url.as_deref()
 				&& self.api_key.as_deref().is_some_and(|key| !key.trim().is_empty());
 			let stored_auth = self
 				.resolver

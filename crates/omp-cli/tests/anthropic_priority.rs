@@ -439,11 +439,14 @@ fn cli_priority_downgrade_reports_once_and_persists_the_reset() {
 		),
 	)
 	.expect("models.yml");
+	// Project settings.json is always merged (the legacy global file is skipped
+	// once a main YAML exists), so the fast-mode selection lives here.
+	std::fs::create_dir_all(cwd.join(".omp")).expect("project config dir");
 	std::fs::write(
-		agent.join("settings.json"),
+		cwd.join(".omp").join("settings.json"),
 		"{\"tier\":{\"anthropic\":\"priority\"}}",
 	)
-	.expect("settings.json");
+	.expect("project settings.json");
 
 	let run = |extra: &[&str]| {
 		let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_omp"));
@@ -617,11 +620,14 @@ fn downgrade_survives_a_tool_continuation_and_resume() {
 		),
 	)
 	.expect("models.yml");
+	// Project settings.json is always merged (the legacy global file is skipped
+	// once a main YAML exists), so the fast-mode selection lives here.
+	std::fs::create_dir_all(cwd.join(".omp")).expect("project config dir");
 	std::fs::write(
-		agent.join("settings.json"),
+		cwd.join(".omp").join("settings.json"),
 		"{\"tier\":{\"anthropic\":\"priority\"}}",
 	)
-	.expect("settings.json");
+	.expect("project settings.json");
 
 	let run = |extra: &[&str]| {
 		let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_omp"));

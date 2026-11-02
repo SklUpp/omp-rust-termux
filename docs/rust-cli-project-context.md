@@ -14,6 +14,8 @@ Approved exclusions remain: extension/hook/plugin execution and `plugin`/`instal
 
 Objective: complete the full plan, not a FIX-only queue. Current priority: safety/data-loss and confirmed CI failures first, then core tools, delegation, sessions, CLI modes/flags and live events. Authorization/discovery and frequently changing provider dialects have lower priority; preserve the existing provider path and unfinished auth work. No placeholders, no-op flags, external dependency installs or installed-CLI replacement.
 
+Current checkpoint (2026-11-02): verified published SHA `9a93ac0ec78f5b3df068b493891b176debc26f3b`, [Actions 41455688432](https://github.com/SklUpp/omp-termux/actions/runs/41455688432), all three jobs successful. Downloaded Android artifact SHA-256 `cd5c7c956665cec5b070b3a171e5f59cc5395c86f164e718f4ffde697fabe61b` matches its manifest; actual Bionic conflict RPC, gallery and TTSR smokes pass. New Prewalk and extended Ollama candidates remain unpublished. The dated snapshots below are historical; use the canonical plan's current checkpoint for acceptance. Only the already-started Ollama and Anthropic provider implementations are currently authorized; other dialects remain on hold.
+
 ## Current evidence state (2026-10-30)
 
 | Item | State |

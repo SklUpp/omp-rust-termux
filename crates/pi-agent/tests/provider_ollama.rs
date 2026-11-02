@@ -395,6 +395,43 @@ async fn hermes_wire_unwraps_nested_sibling_and_keeps_partial_wrapper() {
 }
 
 #[tokio::test]
+async fn hermes_deep_nesting_unwraps_without_stack_overflow() {
+	const DEPTH: usize = 4_000;
+	let open = "\x3cthink\x3e";
+	let close = "\x3c/think\x3e";
+	let mut thinking = String::new();
+	for _ in 0..DEPTH {
+		thinking.push_str(open);
+	}
+	thinking.push_str("\ndeep\n");
+	for _ in 0..DEPTH {
+		thinking.push_str(close);
+	}
+	let (base, request_rx) = serve_once(response(
+		"200 OK",
+		"application/x-ndjson",
+		"{\"message\":{\"content\":\"ok\"},\"done\":true}\n",
+	))
+	.await;
+	let mut assistant = Message::assistant("");
+	assistant.parts = vec![
+		ContentPart::thinking(thinking),
+		ContentPart::text("answer"),
+	];
+	assistant.provider = Some("anthropic".into());
+	assistant.api = Some("anthropic-messages".into());
+	assistant.model = Some("claude-3".into());
+	let provider = make_provider(&base, "hermes-3");
+	provider
+		.complete(&[Message::user("hi"), assistant], &[], &ToolChoice::Auto)
+		.await
+		.expect("complete");
+	let (_, body) = request_rx.await.expect("request");
+	let expected = format!("{open}\ndeep\n{close}\nanswer");
+	assert_eq!(body["messages"][1]["content"], expected);
+}
+
+#[tokio::test]
 async fn cloud_dialect_caps_tokens_strips_history_thinking_and_demotes_system() {
 	let (base, request_rx) = serve_once(response(
 		"200 OK",
@@ -1378,6 +1415,19 @@ fn test_retry_backoff_and_header_parsing() {
 		"Sun, 32 Nov 2094 08:49:37 GMT".parse().unwrap(),
 	);
 	assert_eq!(extract_retry_hint(&invalid_headers, ""), None);
+
+	for malformed in [
+		"Sun, 06 Nov 999999999999 08:49:37 GMT",
+		"Sun, 06 Nov 2147483647 08:49:37 GMT",
+		"Sunday, 06-Nov-2147483647 08:49:37 GMT",
+		"Sunday, 06-Nov--1 08:49:37 GMT",
+		"Sun Nov  6 08:49:37 999999999999",
+		"Sun, 06 Nov 9999 24:00:00 GMT",
+	] {
+		let mut headers = reqwest::header::HeaderMap::new();
+		headers.insert("retry-after", malformed.parse().unwrap());
+		assert_eq!(extract_retry_hint(&headers, ""), None, "{malformed}");
+	}
 
 	// Test parse error exclusion
 	assert!(is_llama_cpp_parse_error("Failed to parse tool call arguments as JSON: syntax error"));

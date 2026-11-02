@@ -592,63 +592,99 @@ pub fn demote_thinking(model_id: &str, thinking: &str) -> String {
 /// recursive complete wrappers and joins sibling complete wrappers with `\n`.
 /// Any partial/unbalanced wrapper returns the original text unchanged. ASCII
 /// trimming only, matching the source helpers.
+///
+/// Iterative with an explicit frame stack: candidate provider history can nest
+/// thousands of wrappers and must not consume process stack.
 fn unwrap_delimited_thinking(open: &str, close: &str, text: &str) -> String {
 	let end = trim_ascii_end(text, 0, text.len());
-	let mut cursor = trim_ascii_start(text, 0, end);
-	if cursor >= end || !text[cursor..].starts_with(open) {
+	let start = trim_ascii_start(text, 0, end);
+	if start >= end || !text[start..].starts_with(open) {
 		return text.to_string();
 	}
-	let mut segments = Vec::new();
-	while cursor < end {
-		if !text[cursor..].starts_with(open) {
+	let pairs = delimiter_pairs(text, open, close, start, end);
+	struct Level {
+		end: usize,
+		cursor: usize,
+		segments: Vec<String>,
+	}
+	let mut stack = vec![Level {
+		end,
+		cursor: start,
+		segments: Vec::new(),
+	}];
+	loop {
+		let Some(level) = stack.last_mut() else {
+			return text.to_string();
+		};
+		if level.cursor >= level.end {
+			let level = stack.pop().expect("level");
+			let joined = level.segments.join("\n");
+			match stack.last_mut() {
+				Some(parent) => parent.segments.push(joined),
+				None => return joined,
+			}
+			continue;
+		}
+		if !text[level.cursor..].starts_with(open) {
 			return text.to_string();
 		}
-		let inner_start = cursor + open.len();
-		let Some(inner_end) = find_delimited_thinking_close(open, close, text, inner_start, end)
+		let Some(&(_, close_at)) = pairs
+			.binary_search_by_key(&level.cursor, |(opened, _)| *opened)
+			.ok()
+			.map(|index| &pairs[index])
 		else {
 			return text.to_string();
 		};
-		let trimmed_end = trim_ascii_end(text, inner_start, inner_end);
-		let trimmed_start = trim_ascii_start(text, inner_start, trimmed_end);
-		segments.push(unwrap_delimited_thinking(
-			open,
-			close,
-			&text[trimmed_start..trimmed_end],
-		));
-		cursor = trim_ascii_start(text, inner_end + close.len(), end);
+		if close_at + close.len() > level.end {
+			return text.to_string();
+		}
+		let body_start = level.cursor + open.len();
+		let body_end = trim_ascii_end(text, body_start, close_at);
+		let body_start = trim_ascii_start(text, body_start, body_end);
+		level.cursor = trim_ascii_start(text, close_at + close.len(), level.end);
+		stack.push(Level {
+			end: body_end,
+			cursor: body_start,
+			segments: Vec::new(),
+		});
 	}
-	segments.join("\n")
 }
 
-/// Index of the `close` balancing the wrapper whose body starts at `from`.
-fn find_delimited_thinking_close(
+/// Single-pass open/close pairing (LIFO) over `[start, end)`. Sorted by open
+/// offset so nested body lookups are binary searches, not rescans.
+fn delimiter_pairs(
+	text: &str,
 	open: &str,
 	close: &str,
-	text: &str,
-	from: usize,
+	start: usize,
 	end: usize,
-) -> Option<usize> {
-	let mut depth = 1usize;
-	let mut cursor = from;
+) -> Vec<(usize, usize)> {
+	let mut pending = Vec::new();
+	let mut pairs = Vec::new();
+	let mut cursor = start;
 	while cursor < end {
 		let next_open = text[cursor..end].find(open).map(|index| cursor + index);
 		let next_close = text[cursor..end].find(close).map(|index| cursor + index);
 		match (next_open, next_close) {
 			(Some(open_at), Some(close_at)) if open_at < close_at => {
-				depth += 1;
+				pending.push(open_at);
 				cursor = open_at + open.len();
 			},
 			(_, Some(close_at)) => {
-				depth -= 1;
-				if depth == 0 {
-					return Some(close_at);
+				if let Some(open_at) = pending.pop() {
+					pairs.push((open_at, close_at));
 				}
 				cursor = close_at + close.len();
 			},
-			_ => return None,
+			(Some(open_at), None) => {
+				pending.push(open_at);
+				cursor = open_at + open.len();
+			},
+			(None, None) => break,
 		}
 	}
-	None
+	pairs.sort_unstable();
+	pairs
 }
 
 fn is_ascii_web_whitespace(byte: u8) -> bool {
@@ -3499,60 +3535,82 @@ fn parse_http_date_epoch(value: &str) -> Option<u64> {
 }
 
 fn parse_imf_date(rest: &str) -> Option<u64> {
-	let parts: Vec<&str> = rest.split_whitespace().collect();
-	if parts.len() != 5 || !parts[4].eq_ignore_ascii_case("GMT") {
+	let mut parts = rest.split_whitespace();
+	let day = parse_http_number(parts.next()?, 1, 2)?;
+	let month = http_month(parts.next()?)?;
+	let year = parse_http_number(parts.next()?, 4, 4)?;
+	let (hour, minute, second) = parse_http_time(parts.next()?)?;
+	if !parts.next()?.eq_ignore_ascii_case("GMT") || parts.next().is_some() {
 		return None;
 	}
-	let day: u32 = parts[0].parse().ok()?;
-	let month = http_month(parts[1])?;
-	let year: i32 = parts[2].parse().ok()?;
-	let (hour, minute, second) = parse_http_time(parts[3])?;
-	assemble_http_epoch(year, month, day, hour, minute, second)
+	assemble_http_epoch(i32::try_from(year).ok()?, month, day, hour, minute, second)
 }
 
 fn parse_rfc850_date(rest: &str) -> Option<u64> {
-	let parts: Vec<&str> = rest.split_whitespace().collect();
-	if parts.len() != 3 || !parts[2].eq_ignore_ascii_case("GMT") {
-		return None;
-	}
-	let date: Vec<&str> = parts[0].split('-').collect();
-	if date.len() != 3 {
-		return None;
-	}
-	let day: u32 = date[0].parse().ok()?;
-	let month = http_month(date[1])?;
-	let short_year: i32 = date[2].parse().ok()?;
-	// HTTP/1.1 two-digit window: 00-49 → 2000s, 50-99 → 1900s.
+	let mut parts = rest.split_whitespace();
+	let date = parts.next()?;
+	let (day_text, month_text, year_text) = {
+		let mut date_parts = date.split('-');
+		let day = date_parts.next()?;
+		let month = date_parts.next()?;
+		let year = date_parts.next()?;
+		if date_parts.next().is_some() {
+			return None;
+		}
+		(day, month, year)
+	};
+	let day = parse_http_number(day_text, 1, 2)?;
+	let month = http_month(month_text)?;
+	// RFC 850 year is exactly two digits; no wider parse can reach here.
+	let short_year = parse_http_number(year_text, 2, 2)?;
 	let year = if short_year <= 49 {
 		2000 + short_year
 	} else {
 		1900 + short_year
 	};
-	let (hour, minute, second) = parse_http_time(parts[1])?;
-	assemble_http_epoch(year, month, day, hour, minute, second)
+	let (hour, minute, second) = parse_http_time(parts.next()?)?;
+	if !parts.next()?.eq_ignore_ascii_case("GMT") || parts.next().is_some() {
+		return None;
+	}
+	assemble_http_epoch(
+		i32::try_from(year).ok()?,
+		month,
+		day,
+		hour,
+		minute,
+		second,
+	)
 }
 
 fn parse_asctime_date(value: &str) -> Option<u64> {
-	let parts: Vec<&str> = value.split_whitespace().collect();
-	if parts.len() != 5 {
+	let mut parts = value.split_whitespace();
+	let _weekday = parts.next()?;
+	let month = http_month(parts.next()?)?;
+	let day = parse_http_number(parts.next()?, 1, 2)?;
+	let (hour, minute, second) = parse_http_time(parts.next()?)?;
+	let year = parse_http_number(parts.next()?, 4, 4)?;
+	if parts.next().is_some() {
 		return None;
 	}
-	let month = http_month(parts[1])?;
-	let day: u32 = parts[2].parse().ok()?;
-	let (hour, minute, second) = parse_http_time(parts[3])?;
-	let year: i32 = parts[4].parse().ok()?;
-	assemble_http_epoch(year, month, day, hour, minute, second)
+	assemble_http_epoch(i32::try_from(year).ok()?, month, day, hour, minute, second)
+}
+
+/// ASCII digits only, bounded length, so server input cannot overflow a wider
+/// numeric parse or smuggle signs/whitespace.
+fn parse_http_number(value: &str, min_len: usize, max_len: usize) -> Option<u32> {
+	let bytes = value.as_bytes();
+	if bytes.len() < min_len || bytes.len() > max_len || !bytes.iter().all(u8::is_ascii_digit) {
+		return None;
+	}
+	value.parse().ok()
 }
 
 fn parse_http_time(value: &str) -> Option<(u64, u64, u64)> {
-	let parts: Vec<&str> = value.split(':').collect();
-	if parts.len() != 3 {
-		return None;
-	}
-	let hour: u64 = parts[0].parse().ok()?;
-	let minute: u64 = parts[1].parse().ok()?;
-	let second: u64 = parts[2].parse().ok()?;
-	if hour > 23 || minute > 59 || second > 59 {
+	let mut parts = value.split(':');
+	let hour = u64::from(parse_http_number(parts.next()?, 1, 2)?);
+	let minute = u64::from(parse_http_number(parts.next()?, 1, 2)?);
+	let second = u64::from(parse_http_number(parts.next()?, 1, 2)?);
+	if parts.next().is_some() || hour > 23 || minute > 59 || second > 59 {
 		return None;
 	}
 	Some((hour, minute, second))
@@ -3595,13 +3653,13 @@ fn assemble_http_epoch(
 }
 
 fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
-	let year = year - i32::from(month <= 2);
+	let year = i64::from(year) - i64::from(month <= 2);
 	let era = if year >= 0 { year } else { year - 399 } / 400;
 	let year_of_era = year - era * 400;
 	let month_prime = if month > 2 { month - 3 } else { month + 9 };
-	let day_of_year = (153 * month_prime + 2) / 5 + day - 1;
-	let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year as i32;
-	i64::from(era * 146_097 + day_of_era - 719_468)
+	let day_of_year = i64::from((153 * month_prime + 2) / 5 + day - 1);
+	let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+	era * 146_097 + day_of_era - 719_468
 }
 
 #[async_trait]

@@ -30,6 +30,11 @@ use crate::{
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Maximum characters of an error body or malformed record kept for diagnostics.
 const ERROR_BODY_CHARS: usize = 2048;
+/// Hard ceiling on bytes read from an HTTP error body before diagnostics.
+const ERROR_BODY_BYTES: usize = 64 * 1024;
+/// Hard ceiling on one NDJSON record; overflow is a terminal error, never a
+/// silently dropped or truncated success.
+const MAX_RECORD_BYTES: usize = 8 * 1024 * 1024;
 /// Ollama Cloud rejects `num_predict` above this value with HTTP 400.
 const OLLAMA_CLOUD_NUM_PREDICT_CAP: u64 = 65_536;
 /// `vision-guard.ts` placeholder for an image sent to a text-only model.
@@ -66,8 +71,81 @@ fn network_error(err: reqwest::Error) -> ProviderError {
 	ProviderError::Network(err.to_string())
 }
 
-fn snippet(text: &str) -> String {
-	text.chars().take(ERROR_BODY_CHARS).collect()
+/// Bearer token(s) this provider can put on the wire.
+fn credential_values(api_key: Option<&str>) -> Vec<String> {
+	api_key
+		.map(str::trim)
+		.filter(|value| !value.is_empty())
+		.map(|value| vec![value.to_string()])
+		.unwrap_or_default()
+}
+
+fn redact_with(text: &str, secrets: &[String]) -> String {
+	let mut redacted = text.to_string();
+	for secret in secrets {
+		redacted = redacted.replace(secret.as_str(), "[redacted]");
+	}
+	redacted
+}
+
+/// Redact before bounding so a credential cut by the character limit cannot
+/// survive as a prefix; `truncated` marks a byte-capped read.
+fn bounded_redaction(text: &str, secrets: &[String], truncated: bool) -> String {
+	let mut bounded: String = redact_with(text, secrets)
+		.chars()
+		.take(ERROR_BODY_CHARS)
+		.collect();
+	if truncated {
+		bounded.push_str("\n[truncated]");
+	}
+	bounded
+}
+
+/// Drop the incomplete trailing token of a byte-capped read: a credential cut
+/// by the ceiling would otherwise survive as its prefix.
+fn trim_partial_token(text: &mut String) {
+	let boundary = text
+		.char_indices()
+		.rev()
+		.find(|(_, ch)| {
+			ch.is_whitespace() || matches!(ch, '"' | '\'' | ',' | ':' | '{' | '}' | '[' | ']')
+		})
+		.map(|(index, ch)| index + ch.len_utf8());
+	if let Some(boundary) = boundary
+		&& boundary < text.len()
+	{
+		text.truncate(boundary);
+	}
+}
+
+struct BoundedBody {
+	text: String,
+	truncated: bool,
+}
+
+/// Read at most `limit` body bytes; never grows past the ceiling.
+async fn read_body_bounded(
+	response: reqwest::Response,
+	limit: usize,
+) -> Result<BoundedBody, ProviderError> {
+	let mut stream = response.bytes_stream();
+	let mut bytes: Vec<u8> = Vec::new();
+	let mut truncated = false;
+	while let Some(item) = stream.next().await {
+		let chunk = item.map_err(network_error)?;
+		if bytes.len() + chunk.len() > limit {
+			let room = limit.saturating_sub(bytes.len());
+			bytes.extend_from_slice(&chunk[..room]);
+			truncated = true;
+			break;
+		}
+		bytes.extend_from_slice(&chunk);
+	}
+	let mut text = String::from_utf8_lossy(&bytes).into_owned();
+	if truncated {
+		trim_partial_token(&mut text);
+	}
+	Ok(BoundedBody { text, truncated })
 }
 
 /// Ollama `think` value: `false` disables reasoning, an effort string selects it.
@@ -934,9 +1012,10 @@ impl ModelProvider for OllamaProvider {
 		}
 		let response = request.send().await.map_err(network_error)?;
 		let status = response.status();
+		let secrets = credential_values(self.api_key.as_deref());
 		if !status.is_success() {
-			let body = match response.text().await {
-				Ok(text) => snippet(&text),
+			let body = match read_body_bounded(response, ERROR_BODY_BYTES).await {
+				Ok(body) => bounded_redaction(&body.text, &secrets, body.truncated),
 				Err(err) => format!("<failed to read error body: {err}>"),
 			};
 			return Err(ProviderError::HttpStatus(status.as_u16(), body));
@@ -950,7 +1029,7 @@ impl ModelProvider for OllamaProvider {
 		// reasons/errors so the first three have a surface to hook; the markup
 		// healer needs the dialect scanner subsystem, which this crate does not
 		// have yet.
-		Ok(ndjson_stream(body))
+		Ok(ndjson_stream(body, secrets))
 	}
 }
 
@@ -1028,6 +1107,8 @@ struct NdjsonState<S> {
 	queue: VecDeque<Result<StreamChunk, ProviderError>>,
 	parse: ParseState,
 	finished: bool,
+	/// Effective bearer credential(s) scrubbed from parser diagnostics.
+	secrets: Vec<String>,
 }
 
 fn take_lines(buffer: &mut Vec<u8>) -> Vec<Vec<u8>> {
@@ -1114,6 +1195,7 @@ fn tool_arguments(call: &OllamaChunkToolCall) -> String {
 fn process_line(
 	line: &[u8],
 	state: &mut ParseState,
+	secrets: &[String],
 ) -> Result<Vec<StreamChunk>, ProviderError> {
 	let text = std::str::from_utf8(line).map_err(|err| {
 		ProviderError::Protocol(format!("invalid UTF-8 in Ollama stream record: {err}"))
@@ -1125,7 +1207,7 @@ fn process_line(
 	let chunk: OllamaChatChunk = serde_json::from_str(trimmed).map_err(|err| {
 		ProviderError::Protocol(format!(
 			"invalid Ollama stream record: {err}; record: {}",
-			snippet(trimmed)
+			bounded_redaction(trimmed, secrets, false)
 		))
 	})?;
 
@@ -1203,7 +1285,7 @@ fn process_line(
 /// record, an incomplete EOF tail or a transport failure ends the turn with a
 /// terminal [`StopReason::Error`] chunk that keeps the partial output, matching
 /// the TS adapter's `error` event.
-fn ndjson_stream<S, B, E>(body: S) -> ChunkStream
+fn ndjson_stream<S, B, E>(body: S, secrets: Vec<String>) -> ChunkStream
 where
 	S: Stream<Item = Result<B, E>> + Send + 'static,
 	B: AsRef<[u8]> + Send + 'static,
@@ -1215,6 +1297,7 @@ where
 		queue: VecDeque::new(),
 		parse: ParseState::default(),
 		finished: false,
+		secrets,
 	};
 	Box::pin(futures::stream::unfold(Some(state), |state| async move {
 		let mut state = state?;
@@ -1227,9 +1310,35 @@ where
 			}
 			match state.source.next().await {
 				Some(Ok(bytes)) => {
-					state.buffer.extend_from_slice(bytes.as_ref());
+					let incoming = bytes.as_ref();
+					// Reject growth of an unterminated record before allocating;
+					// chunks carrying newlines are drained below and covered by the
+					// tail bound.
+					if !incoming.contains(&b'\n')
+						&& state.buffer.len() + incoming.len() > MAX_RECORD_BYTES
+					{
+						state.queue.push_back(Ok(error_chunk(format!(
+							"Ollama stream record exceeded {MAX_RECORD_BYTES} bytes"
+						))));
+						state.finished = true;
+						continue;
+					}
+					state.buffer.extend_from_slice(incoming);
+					// Complete records are drained below; only the unterminated tail
+					// counts against the per-record ceiling.
+					let tail = match state.buffer.iter().rposition(|byte| *byte == b'\n') {
+						Some(position) => state.buffer.len() - position - 1,
+						None => state.buffer.len(),
+					};
+					if tail > MAX_RECORD_BYTES {
+						state.queue.push_back(Ok(error_chunk(format!(
+							"Ollama stream record exceeded {MAX_RECORD_BYTES} bytes"
+						))));
+						state.finished = true;
+						continue;
+					}
 					for line in take_lines(&mut state.buffer) {
-						match process_line(&line, &mut state.parse) {
+						match process_line(&line, &mut state.parse, &state.secrets) {
 							Ok(chunks) => state.queue.extend(chunks.into_iter().map(Ok)),
 							Err(err) => {
 								state.queue.push_back(Ok(error_chunk(err.to_string())));
@@ -1247,7 +1356,7 @@ where
 					let mut fatal = false;
 					if !state.buffer.is_empty() {
 						let tail = std::mem::take(&mut state.buffer);
-						match process_line(&tail, &mut state.parse) {
+						match process_line(&tail, &mut state.parse, &state.secrets) {
 							Ok(chunks) => state.queue.extend(chunks.into_iter().map(Ok)),
 							Err(err) => {
 								state.queue.push_back(Ok(error_chunk(err.to_string())));

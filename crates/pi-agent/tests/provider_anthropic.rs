@@ -135,7 +135,8 @@ fn official_api_key_request_shape_and_betas() {
 		"claude-sonnet",
 	)
 	.expect("provider")
-	.with_max_tokens(1024)
+	.with_max_tokens(8192)
+	.with_request_max_tokens(Some(1024))
 	.with_thinking(Some(AnthropicThinkingConfig::Enabled {
 		budget_tokens: 2048,
 		display: Some("summarized".to_string()),
@@ -216,6 +217,9 @@ fn official_api_key_request_shape_and_betas() {
 		.expect("auto request");
 	let auto_body = serde_json::to_value(&auto).expect("serialize");
 	assert_eq!(auto_body["thinking"]["type"], "enabled");
+	// Requested 1024 is raised to thinking budget + fallback headroom, still
+	// under the 8192 model ceiling.
+	assert_eq!(auto_body["max_tokens"], 6048);
 	assert_eq!(auto_body["thinking"]["budget_tokens"], 2048);
 	assert_eq!(auto_body["thinking"]["display"], "summarized");
 	assert_eq!(
@@ -1212,4 +1216,386 @@ fn gateway_flags_mid_system_strict_and_header_precedence() {
 	assert_eq!(headers.get("x-api-key").unwrap().to_str().unwrap(), "caller-key");
 	assert_eq!(headers.get("x-custom").unwrap().to_str().unwrap(), "kept");
 	assert!(headers.get("anthropic-beta").is_none());
+}
+
+// ─── Security and wire-boundary regressions ────────────────────────────────
+
+fn sse_events(events: &[(&str, Value)]) -> String {
+	let mut body = String::new();
+	for (name, data) in events {
+		body.push_str(&format!("event: {name}\ndata: {data}\n\n"));
+	}
+	body
+}
+
+#[tokio::test]
+async fn http_error_body_is_bounded_and_redacts_every_effective_credential() {
+	let api_key = "sk-configured-secret";
+	let custom = "custom-secret-token";
+	let mut body = format!("gateway rejected: {api_key} {custom} ");
+	// The read ceiling lands inside this run; the trailing credential must not
+	// survive as a prefix of the cut token.
+	body.push_str(&"a".repeat(70 * 1024));
+	body.push_str(custom);
+	let url = serve_responses(vec![response("500 Internal Server Error", "text/plain", &body)]).await;
+	let provider = AnthropicMessagesProvider::new(url, api_key, "model")
+		.expect("provider")
+		.with_max_retries(0)
+		.with_custom_headers(vec![
+			("Authorization".to_string(), format!("Bearer {custom}")),
+			("x-api-key".to_string(), custom.to_string()),
+		]);
+	let err = provider
+		.complete(&[Message::user("hi")], &[], &ToolChoice::Auto)
+		.await
+		.expect_err("HTTP failure");
+	match err {
+		ProviderError::HttpStatus(status, snippet) => {
+			assert_eq!(status, 500);
+			assert!(snippet.len() < 70 * 1024, "error body must be bounded");
+			assert!(snippet.contains("[redacted]"), "{snippet}");
+			assert!(snippet.contains("[truncated]"), "{snippet}");
+			assert!(!snippet.contains(api_key), "{snippet}");
+			assert!(!snippet.contains(custom), "{snippet}");
+			assert!(!snippet.contains("aaaaaaaaaa"), "cut token prefix leaked: {snippet}");
+		},
+		other => panic!("expected HttpStatus(500), got {other:?}"),
+	}
+}
+
+#[tokio::test]
+async fn refusal_details_and_sse_error_type_are_redacted() {
+	let api_key = "sk-config-secret";
+	let custom = "custom-refusal-token";
+	let refusal = json!({
+		"content": [{ "type": "text", "text": "refused" }],
+		"stop_reason": "refusal",
+		"stop_details": {
+			"type": "refusal",
+			"category": custom,
+			"explanation": format!("gateway echoed {api_key}")
+		}
+	})
+	.to_string();
+	let stream_error = sse_events(&[(
+		"error",
+		json!({
+			"type": "error",
+			"error": { "type": format!("{custom}_violation"), "message": format!("denied {api_key}") }
+		}),
+	)]);
+	let url = serve_responses(vec![
+		response("200 OK", "application/json", &refusal),
+		response("200 OK", "text/event-stream", &stream_error),
+	])
+	.await;
+	let headers = vec![
+		("Authorization".to_string(), format!("Bearer {custom}")),
+		("x-api-key".to_string(), custom.to_string()),
+	];
+	let provider = AnthropicMessagesProvider::new(url.clone(), api_key, "model")
+		.expect("provider")
+		.with_max_retries(0)
+		.with_custom_headers(headers.clone());
+	let message = provider
+		.complete(&[Message::user("hi")], &[], &ToolChoice::Auto)
+		.await
+		.expect("refusal completion");
+	let rendered = message.error_message.expect("refusal error message");
+	assert!(rendered.contains("[redacted]"), "{rendered}");
+	assert!(!rendered.contains(api_key), "{rendered}");
+	assert!(!rendered.contains(custom), "{rendered}");
+
+	let provider = AnthropicMessagesProvider::new(url, api_key, "model")
+		.expect("provider")
+		.with_max_retries(0)
+		.with_custom_headers(headers);
+	let mut stream = provider
+		.stream(&[Message::user("hi")], &[], &ToolChoice::Auto)
+		.await
+		.expect("error stream");
+	let err = stream.next().await.expect("item").expect_err("SSE error");
+	let rendered = format!("{err}");
+	assert!(rendered.contains("[redacted]"), "{rendered}");
+	assert!(!rendered.contains(api_key), "{rendered}");
+	assert!(!rendered.contains(custom), "{rendered}");
+}
+
+#[tokio::test]
+async fn split_signature_deltas_are_joined_and_emitted_once() {
+	let body = sse_events(&[
+		(
+			"message_start",
+			json!({ "type": "message_start", "message": { "usage": { "input_tokens": 3 } } }),
+		),
+		(
+			"content_block_start",
+			json!({
+				"type": "content_block_start",
+				"index": 0,
+				"content_block": { "type": "thinking", "thinking": "plan" }
+			}),
+		),
+		(
+			"content_block_delta",
+			json!({
+				"type": "content_block_delta",
+				"index": 0,
+				"delta": { "type": "signature_delta", "signature": "sig-" }
+			}),
+		),
+		(
+			"content_block_delta",
+			json!({
+				"type": "content_block_delta",
+				"index": 0,
+				"delta": { "type": "signature_delta", "signature": "part-2" }
+			}),
+		),
+		("content_block_stop", json!({ "type": "content_block_stop", "index": 0 })),
+		("message_stop", json!({ "type": "message_stop" })),
+	]);
+	let url = serve_responses(vec![response("200 OK", "text/event-stream", &body)]).await;
+	let provider = AnthropicMessagesProvider::new(url, "sk-key", "model")
+		.expect("provider")
+		.with_max_retries(0);
+	let mut stream = provider
+		.stream(&[Message::user("hi")], &[], &ToolChoice::Auto)
+		.await
+		.expect("stream");
+	let mut signatures = Vec::new();
+	while let Some(item) = stream.next().await {
+		let chunk = item.expect("chunk");
+		if let Some(signature) = chunk.signature {
+			signatures.push(signature);
+		}
+	}
+	assert_eq!(
+		signatures,
+		vec!["sig-part-2".to_string()],
+		"split deltas must produce one finalized signature"
+	);
+}
+
+#[tokio::test]
+async fn usage_only_message_delta_does_not_terminate_the_stream() {
+	let body = sse_events(&[
+		(
+			"message_start",
+			json!({ "type": "message_start", "message": { "usage": { "input_tokens": 1 } } }),
+		),
+		(
+			"message_delta",
+			json!({ "type": "message_delta", "usage": { "output_tokens": 4 } }),
+		),
+	]);
+	let url = serve_responses(vec![response("200 OK", "text/event-stream", &body)]).await;
+	let provider = AnthropicMessagesProvider::new(url, "sk-key", "model")
+		.expect("provider")
+		.with_max_retries(0);
+	let mut stream = provider
+		.stream(&[Message::user("hi")], &[], &ToolChoice::Auto)
+		.await
+		.expect("stream");
+	let mut error = None;
+	while let Some(item) = stream.next().await {
+		if let Err(err) = item {
+			error = Some(err);
+			break;
+		}
+	}
+	match error.expect("usage-only delta must not end the stream") {
+		ProviderError::Protocol(message) => {
+			assert!(message.contains("before message_stop"), "{message}");
+		},
+		other => panic!("expected truncation protocol error, got {other:?}"),
+	}
+}
+
+#[tokio::test]
+async fn large_but_legitimate_event_and_completion_bodies_pass_intact() {
+	let text = "y".repeat(200_000);
+	let body = sse_events(&[
+		("message_start", json!({ "type": "message_start", "message": {} })),
+		(
+			"content_block_start",
+			json!({
+				"type": "content_block_start",
+				"index": 0,
+				"content_block": { "type": "text", "text": "" }
+			}),
+		),
+		(
+			"content_block_delta",
+			json!({
+				"type": "content_block_delta",
+				"index": 0,
+				"delta": { "type": "text_delta", "text": text.clone() }
+			}),
+		),
+		("content_block_stop", json!({ "type": "content_block_stop", "index": 0 })),
+		("message_stop", json!({ "type": "message_stop" })),
+	]);
+	let completion_text = "z".repeat(256 * 1024);
+	let completion = json!({
+		"content": [{ "type": "text", "text": completion_text.clone() }],
+		"stop_reason": "end_turn"
+	})
+	.to_string();
+	let url = serve_responses(vec![
+		response("200 OK", "text/event-stream", &body),
+		response("200 OK", "application/json", &completion),
+	])
+	.await;
+	let provider = AnthropicMessagesProvider::new(url, "sk-key", "model")
+		.expect("provider")
+		.with_max_retries(0);
+	let mut stream = provider
+		.stream(&[Message::user("hi")], &[], &ToolChoice::Auto)
+		.await
+		.expect("stream");
+	let mut streamed = String::new();
+	while let Some(item) = stream.next().await {
+		let chunk = item.expect("chunk");
+		if let Some(delta) = chunk.content {
+			streamed.push_str(&delta);
+		}
+	}
+	assert_eq!(streamed.len(), text.len(), "large delta must not be truncated");
+	assert_eq!(streamed, text);
+
+	let message = provider
+		.complete(&[Message::user("hi")], &[], &ToolChoice::Auto)
+		.await
+		.expect("completion");
+	assert_eq!(message.content, completion_text, "success body must not be truncated");
+}
+
+#[tokio::test]
+async fn oversized_unterminated_sse_line_fails_instead_of_buffering() {
+	let mut line = String::from("data: ");
+	line.push_str(&"a".repeat(1024 * 1024 + 16));
+	let url = serve_responses(vec![response("200 OK", "text/event-stream", &line)]).await;
+	let provider = AnthropicMessagesProvider::new(url, "sk-key", "model")
+		.expect("provider")
+		.with_max_retries(0);
+	let mut stream = provider
+		.stream(&[Message::user("hi")], &[], &ToolChoice::Auto)
+		.await
+		.expect("stream");
+	let err = stream.next().await.expect("item").expect_err("line cap");
+	match err {
+		ProviderError::Protocol(message) => {
+			assert!(message.contains("line exceeded"), "{message}");
+		},
+		other => panic!("expected line-cap protocol error, got {other:?}"),
+	}
+}
+
+#[tokio::test]
+async fn first_event_deadline_ignores_a_slow_transport_drip() {
+	let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+	let addr = listener.local_addr().expect("addr");
+	tokio::spawn(async move {
+		let (mut socket, _) = listener.accept().await.expect("accept");
+		let _ = read_request(&mut socket).await;
+		let headers = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
+		let _ = socket.write_all(headers.as_bytes()).await;
+		for _ in 0..200 {
+			// Bytes, never a complete event: the absolute deadline must still fire.
+			let piece = b"data";
+			let mut framed = format!("{:x}\r\n", piece.len()).into_bytes();
+			framed.extend_from_slice(piece);
+			framed.extend_from_slice(b"\r\n");
+			if socket.write_all(&framed).await.is_err() {
+				return;
+			}
+			let _ = socket.flush().await;
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
+	});
+	let provider = AnthropicMessagesProvider::new(format!("http://{addr}"), "sk-key", "model")
+		.expect("provider")
+		.with_max_retries(0)
+		.with_stream_timeouts(Some(Duration::from_millis(150)), None);
+	let started = std::time::Instant::now();
+	let mut stream = provider
+		.stream(&[Message::user("hi")], &[], &ToolChoice::Auto)
+		.await
+		.expect("stream");
+	let item = tokio::time::timeout(Duration::from_secs(3), stream.next())
+		.await
+		.expect("drip must not hang the watchdog")
+		.expect("item");
+	let err = item.expect_err("a drip must not extend the first-event budget");
+	match err {
+		ProviderError::Network(message) => {
+			assert!(message.contains("first event"), "{message}");
+		},
+		other => panic!("expected first-event timeout, got {other:?}"),
+	}
+	assert!(
+		started.elapsed() < Duration::from_secs(2),
+		"the timeout must fire near its budget: {:?}",
+		started.elapsed()
+	);
+}
+
+#[test]
+fn escape_builtin_tool_names_prefixes_builtins_but_oauth_alone_keeps_them() {
+	let builtin = json!({
+		"type": "function",
+		"function": {
+			"name": "web_search",
+			"description": "Search",
+			"parameters": { "type": "object", "properties": {} }
+		}
+	});
+	let tools = vec![read_tool(), builtin];
+	let escaping = AnthropicMessagesProvider::new("http://127.0.0.1:9", "sk-key", "model")
+		.expect("provider")
+		.with_escape_builtin_tool_names(true);
+	let body = serde_json::to_value(
+		escaping
+			.build_request(&[Message::user("hi")], &tools, &ToolChoice::Auto, false)
+			.expect("request"),
+	)
+	.expect("serialize");
+	assert_eq!(body["tools"][0]["name"], "_read");
+	assert_eq!(body["tools"][1]["name"], "_web_search");
+
+	let oauth = AnthropicMessagesProvider::new("http://127.0.0.1:9", "sk-ant-oat-token", "model")
+		.expect("provider");
+	let body = serde_json::to_value(
+		oauth
+			.build_request(&[Message::user("hi")], &tools, &ToolChoice::Auto, false)
+			.expect("request"),
+	)
+	.expect("serialize");
+	assert_eq!(body["tools"][0]["name"], "_read");
+	assert_eq!(body["tools"][1]["name"], "web_search");
+}
+
+#[test]
+fn mixed_signed_and_unsigned_thinking_demotes_the_unsigned_half() {
+	let provider = AnthropicMessagesProvider::new("http://127.0.0.1:9", "sk-key", "model")
+		.expect("provider")
+		.with_replay_unsigned_thinking(true);
+	let mut message = Message::assistant("");
+	message.parts = vec![
+		ContentPart::thinking_with_signature("signed plan", "sig-1"),
+		ContentPart::thinking("unsigned plan"),
+	];
+	let body = serde_json::to_value(
+		provider
+			.build_request(&[message], &[], &ToolChoice::Auto, false)
+			.expect("request"),
+	)
+	.expect("serialize");
+	let content = body["messages"][0]["content"].as_array().expect("blocks");
+	assert_eq!(content.len(), 2, "unsigned half must not replay as thinking: {body}");
+	assert_eq!(content[0]["type"], "thinking");
+	assert_eq!(content[0]["signature"], "sig-1");
+	assert_eq!(content[1]["type"], "text");
+	assert_eq!(content[1]["text"], "unsigned plan");
 }

@@ -709,10 +709,15 @@ async fn explicit_stop_with_tool_calls_promotes_to_tool_use() {
 }
 
 #[tokio::test]
-async fn http_error_body_is_bounded_and_does_not_echo_the_api_key() {
-	let oversized = "x".repeat(3000);
+async fn http_error_body_is_bounded_and_redacts_the_effective_bearer_token() {
+	let key = "sk-ollama-secret-token";
+	let mut oversized = format!("gateway echoed {key} ");
+	// The read ceiling lands inside this run; the trailing credential must not
+	// survive as a prefix of the cut token.
+	oversized.push_str(&"a".repeat(70 * 1024));
+	oversized.push_str(key);
 	let (base, request_rx) = serve_once(response("500 Internal Server Error", "text/plain", &oversized)).await;
-	let provider = make_provider(&base, "m");
+	let provider = OllamaProvider::new(base.as_str(), key, "m").expect("provider");
 	let err = provider
 		.stream(&[Message::user("hi")], &[], &ToolChoice::Auto)
 		.await
@@ -723,11 +728,76 @@ async fn http_error_body_is_bounded_and_does_not_echo_the_api_key() {
 	match &err {
 		ProviderError::HttpStatus(status, body) => {
 			assert_eq!(*status, 500);
-			assert_eq!(body.chars().count(), 2048);
+			assert!(body.len() < 70 * 1024, "error body must be bounded: {}", body.len());
+			assert!(body.contains("[redacted]"), "{body}");
+			assert!(body.contains("[truncated]"), "{body}");
+			assert!(!body.contains(key), "{body}");
+			assert!(!body.contains("aaaaaaaaaa"), "cut token prefix leaked: {body}");
 		},
 		other => panic!("expected HttpStatus, got {other:?}"),
 	}
-	assert!(!err.to_string().contains("test-key"));
+	assert!(!err.to_string().contains(key));
+}
+
+#[tokio::test]
+async fn malformed_record_diagnostics_redact_the_bearer_token() {
+	let key = "sk-ollama-secret-token";
+	let record = format!("not-json echoed {key}\n");
+	let base = serve_chunked(vec![record.into_bytes()]).await;
+	let provider = OllamaProvider::new(base.as_str(), key, "m").expect("provider");
+	let chunks = drain(
+		provider
+			.stream(&[Message::user("hi")], &[], &ToolChoice::Auto)
+			.await
+			.expect("stream"),
+	)
+	.await
+	.expect("chunks");
+	let terminal = chunks.last().expect("terminal");
+	assert_eq!(terminal.stop_reason, Some(StopReason::Error));
+	let message = terminal.error_message.clone().expect("error message");
+	assert!(message.contains("[redacted]"), "{message}");
+	assert!(!message.contains(key), "{message}");
+}
+
+#[tokio::test]
+async fn oversized_ndjson_record_fails_instead_of_buffering() {
+	let huge = vec![b'a'; 8 * 1024 * 1024 + 16];
+	let base = serve_chunked(vec![huge]).await;
+	let provider = make_provider(&base, "m");
+	let chunks = drain(
+		provider
+			.stream(&[Message::user("hi")], &[], &ToolChoice::Auto)
+			.await
+			.expect("stream"),
+	)
+	.await
+	.expect("chunks");
+	let terminal = chunks.last().expect("terminal");
+	assert_eq!(terminal.stop_reason, Some(StopReason::Error));
+	assert!(
+		terminal
+			.error_message
+			.as_deref()
+			.unwrap_or_default()
+			.contains("exceeded"),
+		"{terminal:?}"
+	);
+}
+
+#[tokio::test]
+async fn large_but_legitimate_record_is_not_truncated() {
+	let text = "z".repeat(1024 * 1024);
+	let records = format!(
+		"{{\"message\":{{\"content\":\"{text}\"}},\"done\":false}}\n{{\"done\":true}}\n"
+	);
+	let chunks = drain_body(&records).await;
+	let streamed: String = chunks
+		.iter()
+		.filter_map(|chunk| chunk.content.as_deref())
+		.collect();
+	assert_eq!(streamed.len(), text.len(), "large record must not be truncated");
+	assert_eq!(streamed, text);
 }
 
 #[tokio::test]

@@ -47,6 +47,15 @@ const DEFAULT_MAX_TOKENS: u32 = 8192;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Maximum characters of an error response body kept for diagnostics.
 const ERROR_BODY_CHARS: usize = 2048;
+/// Hard ceiling on bytes read from an error body before diagnostics.
+const ERROR_BODY_BYTES: usize = 64 * 1024;
+/// Hard ceiling on a non-streaming success body. Overflow is an error: a
+/// truncated success would silently hand back an incomplete turn.
+const MAX_RESPONSE_BODY_BYTES: usize = 8 * 1024 * 1024;
+/// Hard ceiling on one unterminated SSE line.
+const MAX_SSE_LINE_BYTES: usize = 1024 * 1024;
+/// Hard ceiling on the accumulated `data` payload of one SSE event.
+const MAX_SSE_EVENT_BYTES: usize = 8 * 1024 * 1024;
 /// Prefix Anthropic applies to custom OAuth tool names.
 const CLAUDE_TOOL_PREFIX: char = '_';
 /// Built-in Anthropic tool names that must not be prefixed.
@@ -1206,9 +1215,12 @@ impl AnthropicMessagesProvider {
 	}
 
 	fn encode_tool_name(&self, name: &str) -> String {
-		if (self.is_oauth() || self.escape_builtin_tool_names)
-			&& !BUILTIN_TOOL_NAMES.contains(&name.to_ascii_lowercase().as_str())
-		{
+		// `escape_builtin_tool_names` is an explicit caller opt-in and prefixes
+		// every name, built-ins included; OAuth alone leaves built-ins bare.
+		let escape = self.escape_builtin_tool_names
+			|| (self.is_oauth()
+				&& !BUILTIN_TOOL_NAMES.contains(&name.to_ascii_lowercase().as_str()));
+		if escape {
 			format!("{CLAUDE_TOOL_PREFIX}{name}")
 		} else {
 			name.to_string()
@@ -1404,6 +1416,17 @@ impl AnthropicMessagesProvider {
 		let mut tool_blocks = Vec::new();
 		let mut saw_text = false;
 		let mut saw_tool_call_part = false;
+		// A message mixing signed and unsigned reasoning cannot replay the
+		// unsigned half as a thinking block: only a turn with no signed block at
+		// all may fall back to unsigned replay.
+		let has_signed = message.parts.iter().any(|part| {
+			matches!(
+				part,
+				ContentPart::Thinking { thinking_signature: Some(signature), .. }
+					if !signature.trim().is_empty()
+			)
+		});
+		let replay_unsigned = self.replay_unsigned_thinking && !has_signed;
 		for part in &message.parts {
 			match part {
 				ContentPart::Text { text } => {
@@ -1424,7 +1447,7 @@ impl AnthropicMessagesProvider {
 							thinking: thinking.clone(),
 							signature: signature.to_string(),
 						});
-					} else if self.replay_unsigned_thinking {
+					} else if replay_unsigned {
 						blocks.push(AnthropicBlock::Thinking {
 							thinking: thinking.clone(),
 							signature: String::new(),
@@ -1546,7 +1569,11 @@ impl AnthropicMessagesProvider {
 		let raw_stop = response.stop_reason.clone();
 		let stop_reason = raw_stop.as_deref().map(map_stop_reason);
 		let error_message = matches!(&stop_reason, Some(StopReason::Error)).then(|| {
-			stop_error_message(raw_stop.as_deref(), response.stop_details.as_ref())
+			stop_error_message(
+				raw_stop.as_deref(),
+				response.stop_details.as_ref(),
+				&self.credential_values(),
+			)
 		});
 		let mut parts = Vec::new();
 		let mut text = String::new();
@@ -1664,18 +1691,29 @@ impl ModelProvider for AnthropicMessagesProvider {
 			.await?;
 
 		let status = response.status();
-		let text = response.text().await.map_err(network_error)?;
+		let limit = if status.is_success() {
+			MAX_RESPONSE_BODY_BYTES
+		} else {
+			ERROR_BODY_BYTES
+		};
+		let body = read_body_bounded(response, limit).await?;
 		if !status.is_success() {
 			return Err(ProviderError::HttpStatus(
 				status.as_u16(),
-				self.redact_snippet(&text),
+				self.redact_snippet(&body.text, body.truncated),
 			));
 		}
+		if body.truncated {
+			return Err(ProviderError::Protocol(format!(
+				"Anthropic response body exceeded {MAX_RESPONSE_BODY_BYTES} bytes"
+			)));
+		}
 
+		let text = body.text;
 		let parsed: AnthropicResponse = serde_json::from_str(&text).map_err(|err| {
 			ProviderError::Protocol(format!(
 				"invalid Anthropic message body: {err}; body: {}",
-				self.redact_snippet(&text)
+				self.redact_snippet(&text, false)
 			))
 		})?;
 		Ok(self.from_response(parsed))
@@ -1695,20 +1733,20 @@ impl ModelProvider for AnthropicMessagesProvider {
 
 		let status = response.status();
 		if !status.is_success() {
-			let text = match response.text().await {
-				Ok(text) => self.redact_snippet(&text),
+			let text = match read_body_bounded(response, ERROR_BODY_BYTES).await {
+				Ok(body) => self.redact_snippet(&body.text, body.truncated),
 				Err(err) => format!("<failed to read error body: {err}>"),
 			};
 			return Err(ProviderError::HttpStatus(status.as_u16(), text));
 		}
 
-		let key = self.api_key.clone();
+		let secrets = self.credential_values();
 		let body = response
 			.bytes_stream()
 			.map(|item| item.map_err(|err| err.to_string()));
 		Ok(anthropic_sse_stream(
 			Box::pin(body),
-			key,
+			secrets,
 			self.first_event_timeout,
 			self.idle_timeout,
 		))
@@ -1772,12 +1810,12 @@ impl AnthropicMessagesProvider {
 		}
 	}
 
-	fn redact_snippet(&self, text: &str) -> String {
-		let bounded: String = text.chars().take(ERROR_BODY_CHARS).collect();
-		if self.api_key.is_empty() {
-			return bounded;
-		}
-		bounded.replace(&self.api_key, "[redacted]")
+	fn credential_values(&self) -> Vec<String> {
+		credential_values(&self.api_key, &self.custom_headers)
+	}
+
+	fn redact_snippet(&self, text: &str, truncated: bool) -> String {
+		bounded_redaction(text, &self.credential_values(), truncated)
 	}
 }
 
@@ -2533,7 +2571,7 @@ fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
 	let year_of_era = year - era * 400;
 	let month_prime = if month > 2 { month - 3 } else { month + 9 };
 	let day_of_year = (153 * month_prime + 2) / 5 + day - 1;
-		let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year as i32;
+	let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year as i32;
 	i64::from(era * 146_097 + day_of_era - 719_468)
 }
 
@@ -2549,6 +2587,107 @@ fn retry_delay_from_attempt(attempt: u32) -> Duration {
 
 fn network_error(err: reqwest::Error) -> ProviderError {
 	ProviderError::Network(err.to_string())
+}
+
+/// Every credential value this provider can actually put on the wire.
+///
+/// Custom `Authorization`/`x-api-key` headers may differ from the configured
+/// API key; a gateway echoing either must not leak it through diagnostics.
+fn credential_values(api_key: &str, custom_headers: &[(String, String)]) -> Vec<String> {
+	let mut values: Vec<String> = Vec::new();
+	let mut push = |value: &str| {
+		let value = value.trim();
+		if value.is_empty() || values.iter().any(|existing| existing == value) {
+			return;
+		}
+		values.push(value.to_string());
+	};
+	push(api_key);
+	for (name, value) in custom_headers {
+		if !matches!(name.to_ascii_lowercase().as_str(), "authorization" | "x-api-key") {
+			continue;
+		}
+		push(value);
+		if let Some(stripped) = value
+			.trim()
+			.strip_prefix("Bearer ")
+			.or_else(|| value.trim().strip_prefix("bearer "))
+		{
+			push(stripped);
+		}
+	}
+	// Longest first so a bearer token is replaced before a shorter overlap.
+	values.sort_by_key(|value| std::cmp::Reverse(value.len()));
+	values
+}
+
+fn redact_with(text: &str, secrets: &[String]) -> String {
+	let mut redacted = text.to_string();
+	for secret in secrets {
+		redacted = redacted.replace(secret.as_str(), "[redacted]");
+	}
+	redacted
+}
+
+/// Redact before bounding so a credential cut by the character limit cannot
+/// survive as a prefix; `truncated` marks a byte-capped read.
+fn bounded_redaction(text: &str, secrets: &[String], truncated: bool) -> String {
+	let mut bounded: String = redact_with(text, secrets)
+		.chars()
+		.take(ERROR_BODY_CHARS)
+		.collect();
+	if truncated {
+		bounded.push_str("\n[truncated]");
+	}
+	bounded
+}
+
+/// Drop the incomplete trailing token of a byte-capped read: a credential cut
+/// by the ceiling would otherwise survive as its prefix.
+fn trim_partial_token(text: &mut String) {
+	let boundary = text
+		.char_indices()
+		.rev()
+		.find(|(_, ch)| {
+			ch.is_whitespace() || matches!(ch, '"' | '\'' | ',' | ':' | '{' | '}' | '[' | ']')
+		})
+		.map(|(index, ch)| index + ch.len_utf8());
+	if let Some(boundary) = boundary
+		&& boundary < text.len()
+	{
+		text.truncate(boundary);
+	}
+}
+
+struct BoundedBody {
+	text: String,
+	truncated: bool,
+}
+
+/// Read at most `limit` body bytes; never grows past the ceiling even for an
+/// endless or huge response.
+async fn read_body_bounded(
+	response: reqwest::Response,
+	limit: usize,
+) -> Result<BoundedBody, ProviderError> {
+	let mut stream = response.bytes_stream();
+	let mut bytes: Vec<u8> = Vec::new();
+	let mut truncated = false;
+	while let Some(item) = stream.next().await {
+		let chunk = item.map_err(network_error)?;
+		if bytes.len() + chunk.len() > limit {
+			let room = limit.saturating_sub(bytes.len());
+			bytes.extend_from_slice(&chunk[..room]);
+			truncated = true;
+			break;
+		}
+		bytes.extend_from_slice(&chunk);
+	}
+	let mut text = String::from_utf8_lossy(&bytes).into_owned();
+	if truncated {
+		trim_partial_token(&mut text);
+	}
+	Ok(BoundedBody { text, truncated })
 }
 
 // ─── Response / usage ───────────────────────────────────────────────────────
@@ -2659,11 +2798,26 @@ fn map_stop_reason(reason: &str) -> StopReason {
 	}
 }
 
-fn stop_error_message(raw: Option<&str>, details: Option<&StopDetails>) -> String {
+fn stop_error_message(
+	raw: Option<&str>,
+	details: Option<&StopDetails>,
+	secrets: &[String],
+) -> String {
+	let bound = |text: String| -> String {
+		redact_with(&text, secrets)
+			.chars()
+			.take(ERROR_BODY_CHARS)
+			.collect()
+	};
 	if let Some(details) = details {
 		if details.kind == "refusal" {
-			let label = match details.category.as_deref().filter(|value| !value.is_empty()) {
-				Some(category) => format!("Refusal ({category})"),
+			let label = match details
+				.category
+				.as_deref()
+				.map(str::trim)
+				.filter(|value| !value.is_empty())
+			{
+				Some(category) => format!("Refusal ({})", redact_with(category, secrets)),
 				None => "Refusal".to_string(),
 			};
 			return match details
@@ -2672,17 +2826,19 @@ fn stop_error_message(raw: Option<&str>, details: Option<&StopDetails>) -> Strin
 				.map(str::trim)
 				.filter(|value| !value.is_empty())
 			{
-				Some(explanation) => format!("{label}: {explanation}"),
-				None => label,
+				Some(explanation) => {
+					bound(format!("{label}: {}", redact_with(explanation, secrets)))
+				},
+				None => bound(label),
 			};
 		}
 	}
-	match raw {
+	bound(match raw {
 		Some("refusal") => "Refusal (no details provided)".to_string(),
 		Some("sensitive") => "Content flagged by safety filters".to_string(),
 		Some(reason) => format!("Anthropic stream ended with stop_reason: {reason}"),
 		None => "Anthropic stream ended with stop_reason: unknown".to_string(),
-	}
+	})
 }
 
 #[derive(Debug, Deserialize)]
@@ -2732,6 +2888,9 @@ struct StreamState {
 	terminal_reason: Option<StopReason>,
 	terminal_error: Option<String>,
 	blocks: HashMap<u64, BlockKind>,
+	/// Signature fragments per thinking content block; emitted once, finalized,
+	/// at `content_block_stop` so split deltas cannot race a shared append path.
+	signatures: HashMap<u64, String>,
 	next_tool_index: usize,
 }
 
@@ -2749,7 +2908,7 @@ struct SseRecord {
 /// truncated stream.
 fn anthropic_sse_stream<S, B, E>(
 	body: S,
-	api_key: String,
+	secrets: Vec<String>,
 	first_event_timeout: Option<Duration>,
 	idle_timeout: Option<Duration>,
 ) -> ChunkStream
@@ -2768,8 +2927,10 @@ where
 		eof: bool,
 		saw_record: bool,
 		stream: StreamState,
-		api_key: String,
-		first_event_timeout: Option<Duration>,
+		secrets: Vec<String>,
+		/// Absolute instant by which the next complete record must arrive; reset
+		/// on a record boundary, never on a raw transport chunk.
+		deadline: Option<tokio::time::Instant>,
 		idle_timeout: Option<Duration>,
 	}
 
@@ -2784,8 +2945,9 @@ where
 			eof: false,
 			saw_record: false,
 			stream: StreamState::default(),
-			api_key,
-			first_event_timeout,
+			secrets,
+			deadline: first_event_timeout
+				.map(|budget| tokio::time::Instant::now() + budget),
 			idle_timeout,
 		},
 		|mut st| async move {
@@ -2833,8 +2995,15 @@ where
 					let line = line.trim_end_matches(|c| c == '\r' || c == '\n');
 					if line.is_empty() {
 						if let Some(record) = take_record(&mut st.event, &mut st.data) {
-							st.saw_record = true;
-							let results = handle_event(&record, &mut st.stream, &st.api_key);
+							// Only a complete non-ping record is progress: resetting
+							// on transport bytes would let a drip extend the budget.
+							if record.event.as_deref() != Some("ping") {
+								st.saw_record = true;
+								st.deadline = st
+									.idle_timeout
+									.map(|budget| tokio::time::Instant::now() + budget);
+							}
+							let results = handle_event(&record, &mut st.stream, &st.secrets);
 							st.pending.extend(results);
 						}
 						continue;
@@ -2849,17 +3018,21 @@ where
 							st.data.push('\n');
 						}
 						st.data.push_str(value.trim_start());
+						if st.data.len() > MAX_SSE_EVENT_BYTES {
+							st.done = true;
+							return Some((
+								Err(ProviderError::Protocol(format!(
+									"Anthropic stream event exceeded {MAX_SSE_EVENT_BYTES} bytes"
+								))),
+								st,
+							));
+						}
 					}
 					continue;
 				}
 
-				let timeout = if st.saw_record {
-					st.idle_timeout
-				} else {
-					st.first_event_timeout
-				};
-				let item = match timeout {
-					Some(budget) => match tokio::time::timeout(budget, st.body.next()).await {
+				let item = match st.deadline {
+					Some(deadline) => match tokio::time::timeout_at(deadline, st.body.next()).await {
 						Ok(item) => item,
 						Err(_) => {
 							st.done = true;
@@ -2874,7 +3047,39 @@ where
 					None => st.body.next().await,
 				};
 				match item {
-					Some(Ok(bytes)) => st.buf.extend_from_slice(bytes.as_ref()),
+					Some(Ok(bytes)) => {
+						let incoming = bytes.as_ref();
+						// Reject growth of an unterminated line before allocating;
+						// chunks carrying newlines are drained on the next pass and
+						// checked by the tail bound below.
+						if !incoming.contains(&b'\n')
+							&& st.buf.len() + incoming.len() > MAX_SSE_LINE_BYTES
+						{
+							st.done = true;
+							return Some((
+								Err(ProviderError::Protocol(format!(
+									"Anthropic stream line exceeded {MAX_SSE_LINE_BYTES} bytes without a newline"
+								))),
+								st,
+							));
+						}
+						st.buf.extend_from_slice(incoming);
+						// Bound the unterminated tail, not the whole buffer: complete
+						// lines ahead of it are drained before the next read.
+						let tail = match st.buf.iter().rposition(|byte| *byte == b'\n') {
+							Some(position) => st.buf.len() - position - 1,
+							None => st.buf.len(),
+						};
+						if tail > MAX_SSE_LINE_BYTES {
+							st.done = true;
+							return Some((
+								Err(ProviderError::Protocol(format!(
+									"Anthropic stream line exceeded {MAX_SSE_LINE_BYTES} bytes without a newline"
+								))),
+								st,
+							));
+						}
+					},
 					Some(Err(err)) => {
 						st.done = true;
 						return Some((Err(ProviderError::Network(err.to_string())), st));
@@ -2882,8 +3087,15 @@ where
 					None => {
 						st.eof = true;
 						if let Some(record) = take_record(&mut st.event, &mut st.data) {
-							st.saw_record = true;
-							let results = handle_event(&record, &mut st.stream, &st.api_key);
+							// Only a complete non-ping record is progress: resetting
+							// on transport bytes would let a drip extend the budget.
+							if record.event.as_deref() != Some("ping") {
+								st.saw_record = true;
+								st.deadline = st
+									.idle_timeout
+									.map(|budget| tokio::time::Instant::now() + budget);
+							}
+							let results = handle_event(&record, &mut st.stream, &st.secrets);
 							st.pending.extend(results);
 						}
 						continue;
@@ -2910,7 +3122,7 @@ fn take_record(event: &mut Option<String>, data: &mut String) -> Option<SseRecor
 fn handle_event(
 	record: &SseRecord,
 	state: &mut StreamState,
-	api_key: &str,
+	secrets: &[String],
 ) -> Vec<Result<StreamChunk, ProviderError>> {
 	if record.event.as_deref() == Some("ping") {
 		return Vec::new();
@@ -2937,14 +3149,15 @@ fn handle_event(
 		.or(record.event.as_deref())
 		.unwrap_or("");
 	if record.event.as_deref() == Some("error") || kind == "error" {
-		return vec![Err(stream_error(&parsed, api_key))];
+		return vec![Err(stream_error(&parsed, secrets))];
 	}
 	if !is_known_event(kind) {
 		return Vec::new();
 	}
 	if !state.started && kind != "message_start" {
 		return vec![Err(ProviderError::Protocol(format!(
-			"received {kind} before message_start"
+			"received {} before message_start",
+			redact_with(kind, secrets)
 		)))];
 	}
 
@@ -3071,12 +3284,28 @@ fn handle_event(
 					.filter(|text| !text.is_empty())
 					.map(|text| vec![Ok(reasoning_chunk(text, index))])
 					.unwrap_or_default(),
-				(BlockKind::Thinking, "signature_delta") => delta
-					.get("signature")
-					.and_then(serde_json::Value::as_str)
-					.filter(|signature| !signature.is_empty())
-					.map(|signature| vec![Ok(signature_chunk(signature, index))])
-					.unwrap_or_default(),
+				(BlockKind::Thinking, "signature_delta") => {
+					match delta
+						.get("signature")
+						.and_then(serde_json::Value::as_str)
+						.filter(|signature| !signature.is_empty())
+					{
+						// Deltas are fragments of one signature: concatenate here
+						// and emit the finished value once at `content_block_stop`.
+						Some(signature) => {
+							let slot = state.signatures.entry(index).or_default();
+							if slot.len() + signature.len() > MAX_SSE_LINE_BYTES {
+								vec![Err(ProviderError::Protocol(format!(
+									"Anthropic thinking signature exceeded {MAX_SSE_LINE_BYTES} bytes"
+								)))]
+							} else {
+								slot.push_str(signature);
+								Vec::new()
+							}
+						},
+						None => Vec::new(),
+					}
+				},
 				(BlockKind::Tool(tool_index), "input_json_delta") => delta
 					.get("partial_json")
 					.and_then(serde_json::Value::as_str)
@@ -3098,25 +3327,33 @@ fn handle_event(
 			}
 		},
 		"content_block_stop" => {
-			if let Some(index) = parsed.get("index").and_then(serde_json::Value::as_u64) {
-				state.blocks.remove(&index);
+			let Some(index) = parsed.get("index").and_then(serde_json::Value::as_u64) else {
+				return Vec::new();
+			};
+			state.blocks.remove(&index);
+			match state.signatures.remove(&index) {
+				Some(signature) if !signature.is_empty() => {
+					vec![Ok(signature_chunk(&signature, index))]
+				},
+				_ => Vec::new(),
 			}
-			Vec::new()
 		},
 		"message_delta" => {
-			state.terminal = true;
 			let delta = parsed.get("delta");
 			let raw_stop = delta
 				.and_then(|delta| delta.get("stop_reason"))
 				.and_then(serde_json::Value::as_str);
 			if let Some(raw_stop) = raw_stop {
+				// A usage-only delta is not a terminal signal: the stream must
+				// still carry `message_stop` or EOF reports truncation.
+				state.terminal = true;
 				let reason = map_stop_reason(raw_stop);
 				if matches!(&reason, StopReason::Error) {
 					let details = delta
 						.and_then(|delta| delta.get("stop_details"))
 						.and_then(|value| serde_json::from_value::<StopDetails>(value.clone()).ok());
 					state.terminal_error =
-						Some(stop_error_message(Some(raw_stop), details.as_ref()));
+						Some(stop_error_message(Some(raw_stop), details.as_ref(), secrets));
 				}
 				state.terminal_reason = Some(reason);
 			}
@@ -3208,25 +3445,23 @@ fn redacted_chunk(data: &str, index: u64) -> StreamChunk {
 	chunk
 }
 
-fn stream_error(event: &serde_json::Value, api_key: &str) -> ProviderError {
+fn stream_error(event: &serde_json::Value, secrets: &[String]) -> ProviderError {
 	let error_type = event
 		.get("error")
 		.and_then(|error| error.get("type"))
-		.and_then(serde_json::Value::as_str);
+		.and_then(serde_json::Value::as_str)
+		.map(|error_type| redact_with(error_type, secrets));
 	let message = event
 		.get("error")
 		.and_then(|error| error.get("message"))
 		.and_then(serde_json::Value::as_str)
 		.unwrap_or("Anthropic stream error");
-	let message = if api_key.is_empty() {
-		message.to_string()
-	} else {
-		message.replace(api_key, "[redacted]")
-	};
-	ProviderError::Protocol(match error_type {
+	let message = redact_with(message, secrets);
+	let rendered = match error_type {
 		Some(error_type) => format!("Anthropic stream error ({error_type}): {message}"),
 		None => format!("Anthropic stream error: {message}"),
-	})
+	};
+	ProviderError::Protocol(rendered.chars().take(ERROR_BODY_CHARS).collect())
 }
 
 // Explicit limits relative to the TS adapter (reported, not silently dropped):

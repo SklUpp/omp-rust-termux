@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use pi_agent::provider_ollama::{OllamaProvider, NON_VISION_IMAGE_PLACEHOLDER};
+use pi_agent::state::{Attribution, StopReason};
 use pi_agent::{
 	ChunkStream, ContentPart, Message, ModelProvider, ProviderError, StreamChunk, ToolCall,
 	ToolChoice,
@@ -120,6 +121,19 @@ async fn drain(mut stream: ChunkStream) -> Result<Vec<StreamChunk>, ProviderErro
 		chunks.push(item?);
 	}
 	Ok(chunks)
+}
+
+async fn drain_body(records: &str) -> Vec<StreamChunk> {
+	let base = serve_chunked(vec![records.as_bytes().to_vec()]).await;
+	let provider = make_provider(&base, "m");
+	drain(
+		provider
+			.stream(&[Message::user("hi")], &[], &ToolChoice::Auto)
+			.await
+			.expect("stream"),
+	)
+	.await
+	.expect("chunks")
 }
 
 fn tool(name: &str, description: &str) -> Value {
@@ -353,8 +367,21 @@ async fn stream_handles_fragmented_utf8_text_thinking_tools_and_usage() {
 
 	let done = chunks.last().expect("done");
 	assert!(done.is_done);
+	assert_eq!(done.stop_reason, Some(StopReason::ToolUse));
+	assert_eq!(done.error_message, None);
 	let usage = done.usage.expect("usage");
 	assert_eq!((usage.input, usage.output, usage.total_tokens), (12, 7, 19));
+
+	let indices: Vec<Option<usize>> = chunks
+		.iter()
+		.filter(|chunk| !chunk.is_done)
+		.map(|chunk| chunk.content_index)
+		.collect();
+	assert_eq!(
+		indices,
+		vec![Some(0), Some(0), Some(1), Some(1), Some(2), Some(3)],
+		"thinking 0, text 1, tool 2, text after the tool 3"
+	);
 
 	let mut reasoning = String::new();
 	let mut content = String::new();
@@ -374,26 +401,35 @@ async fn stream_handles_fragmented_utf8_text_thinking_tools_and_usage() {
 	assert_eq!(deltas[0].id.as_deref(), Some("ollama:2:read"));
 	assert_eq!(deltas[0].name.as_deref(), Some("read"));
 	assert_eq!(deltas[0].arguments_delta.as_deref(), Some("{\"path\":\"a\"}"));
+	assert_eq!(deltas[0].content_index, Some(2));
 
 	let mut assembler = pi_agent::StreamAssembler::new();
 	for chunk in &chunks {
-		assembler.push(chunk);
+		assembler.push(chunk).expect("indexed chunk");
 	}
 	let message = assembler.finish().expect("assembled");
+	assert_eq!(message.stop_reason, Some(StopReason::ToolUse));
 	assert_eq!(message.content, "Hello, worldafter");
-	assert_eq!(message.parts.len(), 3);
-	assert_eq!(message.parts[0], ContentPart::thinking("plan \u{2713}"));
+	assert_eq!(
+		message.parts,
+		vec![
+			ContentPart::thinking("plan \u{2713}"),
+			ContentPart::text("Hello, world"),
+			ContentPart::ToolCall {
+				id: "ollama:2:read".to_string(),
+				name: "read".to_string(),
+				arguments: json!({"path": "a"}),
+			},
+			ContentPart::text("after"),
+		]
+	);
 	assert_eq!(message.tool_calls.len(), 1);
 	assert_eq!(message.tool_calls[0].name, "read");
 	assert_eq!(message.tool_calls[0].arguments, json!({"path": "a"}));
 }
 
 #[tokio::test]
-async fn length_with_visible_content_keeps_text_and_reaches_the_shared_boundary() {
-	// TS sets `stopReason: "length"` here. `StreamChunk` has no stop field yet,
-	// so this fixture pins the adapter-visible behavior only: text survives and
-	// the terminal chunk is still marked done. The exact reason is computed in
-	// `map_done_reason` and reported to the parent as a seam gap.
+async fn length_with_visible_content_keeps_text_and_reports_length() {
 	let body = "{\"message\":{\"content\":\"partial\"},\"done\":true,\"done_reason\":\"length\",\"prompt_eval_count\":4,\"eval_count\":2}\n";
 	let base = serve_chunked(vec![body.as_bytes().to_vec()]).await;
 	let provider = make_provider(&base, "m");
@@ -406,9 +442,21 @@ async fn length_with_visible_content_keeps_text_and_reaches_the_shared_boundary(
 	.await
 	.expect("chunks");
 	assert_eq!(chunks[0].content.as_deref(), Some("partial"));
+	assert_eq!(chunks[0].content_index, Some(0));
 	let done = chunks.last().expect("done");
 	assert!(done.is_done);
+	assert_eq!(done.stop_reason, Some(StopReason::Length));
+	assert_eq!(done.error_message, None, "visible output is not an error");
 	assert_eq!(done.usage.expect("usage").total_tokens, 6);
+
+	let mut assembler = pi_agent::StreamAssembler::new();
+	for chunk in &chunks {
+		assembler.push(chunk).expect("indexed chunk");
+	}
+	let message = assembler.finish().expect("assembled");
+	assert_eq!(message.content, "partial");
+	assert_eq!(message.stop_reason, Some(StopReason::Length));
+	assert_eq!(message.error_message, None);
 }
 
 #[tokio::test]
@@ -427,22 +475,34 @@ async fn stream_flushes_an_eof_record_without_a_trailing_newline() {
 	assert_eq!(chunks.len(), 2);
 	assert_eq!(chunks[0].content.as_deref(), Some("tail"));
 	assert!(chunks[1].is_done);
+	assert_eq!(chunks[1].stop_reason, Some(StopReason::Stop));
+	assert_eq!(chunks[1].error_message, None);
 	assert!(chunks[1].usage.is_none());
 }
 
 #[tokio::test]
-async fn malformed_and_truncated_records_are_protocol_errors() {
+async fn malformed_and_truncated_records_end_in_a_terminal_error_event() {
 	let base = serve_chunked(vec![b"not-json\n".to_vec()]).await;
 	let provider = make_provider(&base, "m");
-	let err = drain(
+	let chunks = drain(
 		provider
 			.stream(&[Message::user("hi")], &[], &ToolChoice::Auto)
 			.await
 			.expect("stream"),
 	)
 	.await
-	.expect_err("malformed record");
-	assert!(matches!(&err, ProviderError::Protocol(_)), "{err:?}");
+	.expect("stream ends with an error event");
+	let terminal = chunks.last().expect("terminal");
+	assert!(terminal.is_done);
+	assert_eq!(terminal.stop_reason, Some(StopReason::Error));
+	assert!(
+		terminal
+			.error_message
+			.as_deref()
+			.unwrap_or_default()
+			.starts_with("invalid Ollama stream record:"),
+		"{terminal:?}"
+	);
 
 	let base = serve_chunked(vec![
 		b"{\"message\":{\"content\":\"x\"},\"done\":false}\n".to_vec(),
@@ -450,49 +510,217 @@ async fn malformed_and_truncated_records_are_protocol_errors() {
 	])
 	.await;
 	let provider = make_provider(&base, "m");
-	let err = drain(
+	let chunks = drain(
 		provider
 			.stream(&[Message::user("hi")], &[], &ToolChoice::Auto)
 			.await
 			.expect("stream"),
 	)
 	.await
-	.expect_err("truncated tail");
-	assert!(matches!(&err, ProviderError::Protocol(_)), "{err:?}");
+	.expect("stream ends with an error event");
+	assert_eq!(chunks.len(), 2, "partial output precedes the error event");
+	assert_eq!(chunks[0].content.as_deref(), Some("x"));
+	let terminal = chunks.last().expect("terminal");
+	assert!(terminal.is_done);
+	assert_eq!(terminal.stop_reason, Some(StopReason::Error));
+	assert!(
+		terminal
+			.error_message
+			.as_deref()
+			.unwrap_or_default()
+			.starts_with("invalid Ollama stream record:"),
+		"{terminal:?}"
+	);
 }
 
 #[tokio::test]
-async fn load_done_reason_and_empty_length_surface_as_errors() {
+async fn load_done_reason_and_empty_length_emit_partial_terminal_errors() {
+	const LOAD: &str = "Ollama loaded the model but generated nothing (done_reason: load): the request contained no user-role message.";
+	const EMPTY_LENGTH: &str = "Model returned no content: prompt filled the context window; raise Ollama num_ctx or shorten the prompt.";
+
 	let base = serve_chunked(vec![
+		b"{\"message\":{\"content\":\"partial\"},\"done\":false}\n".to_vec(),
 		b"{\"done\":true,\"done_reason\":\"load\",\"eval_count\":0}\n".to_vec(),
 	])
 	.await;
 	let provider = make_provider(&base, "m");
-	let err = drain(
+	let chunks = drain(
 		provider
 			.stream(&[Message::user("hi")], &[], &ToolChoice::Auto)
 			.await
 			.expect("stream"),
 	)
 	.await
-	.expect_err("load is an error");
-	assert!(matches!(&err, ProviderError::Protocol(_)), "{err:?}");
-	assert!(err.to_string().contains("no user-role message"), "{err}");
+	.expect("load is a terminal error event, not a transport failure");
+	assert_eq!(chunks.len(), 2, "the partial content event survives");
+	assert_eq!(chunks[0].content.as_deref(), Some("partial"));
+	let terminal = chunks.last().expect("terminal");
+	assert!(terminal.is_done);
+	assert_eq!(terminal.stop_reason, Some(StopReason::Error));
+	assert_eq!(terminal.error_message.as_deref(), Some(LOAD));
+	assert_eq!(terminal.usage.expect("usage").total_tokens, 0);
+
+	let mut assembler = pi_agent::StreamAssembler::new();
+	for chunk in &chunks {
+		assembler.push(chunk).expect("indexed chunk");
+	}
+	let message = assembler.finish().expect("assembled");
+	assert_eq!(message.content, "partial");
+	assert_eq!(message.stop_reason, Some(StopReason::Error));
+	assert_eq!(message.error_message.as_deref(), Some(LOAD));
 
 	let base = serve_chunked(vec![
 		b"{\"done\":true,\"done_reason\":\"length\",\"eval_count\":0}\n".to_vec(),
 	])
 	.await;
 	let provider = make_provider(&base, "m");
-	let err = drain(
+	let chunks = drain(
 		provider
 			.stream(&[Message::user("hi")], &[], &ToolChoice::Auto)
 			.await
 			.expect("stream"),
 	)
 	.await
-	.expect_err("empty length is an error");
-	assert!(err.to_string().contains("no content"), "{err}");
+	.expect("empty length is a terminal error event");
+	let terminal = chunks.last().expect("terminal");
+	assert!(terminal.is_done);
+	assert_eq!(terminal.stop_reason, Some(StopReason::Error));
+	assert_eq!(terminal.error_message.as_deref(), Some(EMPTY_LENGTH));
+}
+
+#[tokio::test]
+async fn complete_returns_the_partial_message_with_a_terminal_error() {
+	let body = concat!(
+		"{\"message\":{\"content\":\"partial\"},\"done\":false}\n",
+		"{\"done\":true,\"done_reason\":\"load\",\"eval_count\":0}\n",
+	);
+	let (base, _request_rx) = serve_once(response("200 OK", "application/x-ndjson", body)).await;
+	let provider = make_provider(&base, "m");
+	let message = provider
+		.complete(&[Message::user("hi")], &[], &ToolChoice::Auto)
+		.await
+		.expect("complete returns the partial message, like TS");
+	assert_eq!(message.content, "partial");
+	assert_eq!(message.stop_reason, Some(StopReason::Error));
+	assert_eq!(
+		message.error_message.as_deref(),
+		Some(
+			"Ollama loaded the model but generated nothing (done_reason: load): the request contained no user-role message."
+		)
+	);
+	assert_eq!(message.api.as_deref(), Some("ollama-chat"));
+	assert_eq!(message.provider.as_deref(), Some("ollama"));
+	assert_eq!(message.model.as_deref(), Some("m"));
+}
+
+#[tokio::test]
+async fn none_tool_choice_sends_the_wire_mode_and_keeps_offered_tools() {
+	let (base, request_rx) = serve_once(response(
+		"200 OK",
+		"application/x-ndjson",
+		"{\"message\":{\"content\":\"ok\"},\"done\":true}\n",
+	))
+	.await;
+	let provider = make_provider(&base, "m");
+	provider
+		.complete(
+			&[Message::user("hi")],
+			&[tool("read", "Read")],
+			&ToolChoice::None,
+		)
+		.await
+		.expect("complete");
+	let (_, body) = request_rx.await.expect("request");
+	assert_eq!(body["tool_choice"], "none");
+	assert_eq!(body["tools"].as_array().expect("tools").len(), 1);
+}
+
+#[tokio::test]
+async fn developer_attribution_selects_system_or_user_role() {
+	let (base, request_rx) = serve_once(response(
+		"200 OK",
+		"application/x-ndjson",
+		"{\"message\":{\"content\":\"ok\"},\"done\":true}\n",
+	))
+	.await;
+	let mut user_turn = Message::developer("captured user note");
+	user_turn.attribution = Some(Attribution::User);
+	let mut agent_turn = Message::developer("agent reminder");
+	agent_turn.attribution = Some(Attribution::Agent);
+	let plain_developer = Message::developer("no attribution");
+	let messages = vec![
+		Message::system("prefix"),
+		user_turn,
+		agent_turn,
+		plain_developer,
+		Message::user("hello"),
+	];
+	make_provider(&base, "m")
+		.complete(&messages, &[], &ToolChoice::Auto)
+		.await
+		.expect("complete");
+	let (_, body) = request_rx.await.expect("request");
+	let roles: Vec<&str> = body["messages"]
+		.as_array()
+		.expect("messages")
+		.iter()
+		.map(|message| message["role"].as_str().expect("role"))
+		.collect();
+	assert_eq!(roles, vec!["system", "user", "system", "system", "user"]);
+}
+
+#[tokio::test]
+async fn completed_message_carries_the_true_source_metadata() {
+	let (base, _request_rx) = serve_once(response(
+		"200 OK",
+		"application/x-ndjson",
+		"{\"message\":{\"content\":\"ok\"},\"done\":true}\n",
+	))
+	.await;
+	let provider = make_provider(&base, "llama3.2");
+	let message = provider
+		.complete(&[Message::user("hi")], &[], &ToolChoice::Auto)
+		.await
+		.expect("complete");
+	assert_eq!(message.api.as_deref(), Some("ollama-chat"));
+	assert_eq!(message.provider.as_deref(), Some("ollama"));
+	assert_eq!(message.model.as_deref(), Some("llama3.2"));
+	assert_eq!(provider.api(), Some("ollama-chat"));
+	assert_eq!(provider.provider(), Some("ollama"));
+	assert_eq!(provider.model(), Some("llama3.2"));
+
+	let cloud = make_provider(&base, "llama3.2").with_cloud(true);
+	assert_eq!(cloud.provider(), Some("ollama-cloud"));
+}
+
+#[tokio::test]
+async fn explicit_stop_with_tool_calls_promotes_to_tool_use() {
+	let without_reason = drain_body(
+		"{\"message\":{\"tool_calls\":[{\"function\":{\"name\":\"read\",\"arguments\":{\"path\":\"a\"}}}]},\"done\":false}\n{\"done\":true}\n",
+	)
+	.await;
+	assert_eq!(
+		without_reason.last().expect("terminal").stop_reason,
+		Some(StopReason::ToolUse)
+	);
+
+	let explicit_stop = drain_body(
+		"{\"message\":{\"tool_calls\":[{\"function\":{\"name\":\"read\",\"arguments\":{}}}]},\"done\":false}\n{\"done\":true,\"done_reason\":\"stop\"}\n",
+	)
+	.await;
+	assert_eq!(
+		explicit_stop.last().expect("terminal").stop_reason,
+		Some(StopReason::ToolUse)
+	);
+
+	let length_with_calls = drain_body(
+		"{\"message\":{\"tool_calls\":[{\"function\":{\"name\":\"read\",\"arguments\":{}}}]},\"done\":false}\n{\"done\":true,\"done_reason\":\"length\"}\n",
+	)
+	.await;
+	assert_eq!(
+		length_with_calls.last().expect("terminal").stop_reason,
+		Some(StopReason::Length)
+	);
 }
 
 #[tokio::test]

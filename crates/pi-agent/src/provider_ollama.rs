@@ -21,7 +21,9 @@ use crate::{
 		ChunkStream, ModelProvider, ProviderError, StreamAssembler, StreamChunk, ToolCallDelta,
 		ToolChoice,
 	},
-	state::{ContentPart, Message, Role, TokenUsage, normalize_image_payload},
+	state::{
+		Attribution, ContentPart, Message, Role, StopReason, TokenUsage, normalize_image_payload,
+	},
 };
 
 /// TCP/TLS connect budget; a live NDJSON completion owns no total timeout.
@@ -373,6 +375,9 @@ impl OllamaProvider {
 	) -> Result<(&'a [Value], Option<&'static str>), ProviderError> {
 		match tool_choice {
 			ToolChoice::Auto => Ok((tools, None)),
+			// `mapToolChoice`: `none` still sends the offered tools; the wire
+			// field alone forbids calling them.
+			ToolChoice::None => Ok((tools, Some("none"))),
 			ToolChoice::Required => Ok((tools, Some("required"))),
 			ToolChoice::Tool { name } => {
 				if name.trim().is_empty() {
@@ -422,15 +427,32 @@ impl OllamaProvider {
 	fn convert_messages(&self, messages: &[Message]) -> Vec<OllamaWireMessage> {
 		let call_names = tool_call_names(messages);
 		// The TS adapter receives system prompts separately and emits them first.
-		// Rust messages carry them inline, so a leading `Role::System` run is the
+		// Rust messages carry them inline, so a leading system-prompt run is the
 		// closest analogue of `systemPrompts.length`.
 		let prefix = messages
 			.iter()
-			.take_while(|message| message.role == Role::System)
+			.take_while(|message| is_system_prompt(message))
 			.count();
 		let mut converted: Vec<OllamaWireMessage> = messages
 			.iter()
-			.map(|message| convert_message(message, self.supports_images, &call_names))
+			.enumerate()
+			.map(|(index, message)| {
+				// `convertMessages`: a user-attributed developer turn after the
+				// static prefix drops to `user` so the in-conversation byte prefix
+				// stays stable; agent-attributed control turns stay `system`.
+				let developer_role =
+					if index < prefix || !is_user_attributed(message) {
+						"system"
+					} else {
+						"user"
+					};
+				convert_message(
+					message,
+					self.supports_images,
+					&call_names,
+					developer_role,
+				)
+			})
 			.collect();
 		if self.cloud {
 			// Ollama Cloud rejects `thinking` in assistant history.
@@ -452,6 +474,17 @@ impl OllamaProvider {
 		}
 		converted
 	}
+}
+
+/// TS `systemPrompts`: the static prefix emitted before conversation turns.
+/// Rust carries those prompts inline as leading `Role::System` turns; developer
+/// turns are conversation-level and never part of the immutable prefix.
+fn is_system_prompt(message: &Message) -> bool {
+	message.role == Role::System
+}
+
+fn is_user_attributed(message: &Message) -> bool {
+	matches!(message.attribution.as_ref(), Some(Attribution::User))
 }
 
 fn tool_name(tool: &Value) -> Option<&str> {
@@ -494,7 +527,12 @@ fn plain_content(message: &Message, supports_images: bool) -> (String, Option<Ve
 					omitted = true;
 				}
 			},
-			ContentPart::Thinking { .. } => {},
+			// Ollama's wire has no reasoning field for user/system/tool turns;
+			// `convertMessage` drops reasoning and never moves a tool call into
+			// `content` for a non-assistant turn.
+			ContentPart::Thinking { .. }
+			| ContentPart::RedactedThinking { .. }
+			| ContentPart::ToolCall { .. } => {},
 		}
 	}
 	let mut parts = Vec::with_capacity(2);
@@ -520,6 +558,7 @@ fn convert_message(
 	message: &Message,
 	supports_images: bool,
 	call_names: &HashMap<String, String>,
+	developer_role: &'static str,
 ) -> OllamaWireMessage {
 	match message.role {
 		Role::User => {
@@ -534,11 +573,13 @@ fn convert_message(
 			}
 		},
 		Role::System | Role::Developer => {
-			// TS promotes user-attributed developer turns to `user`; that
-			// attribution is not represented on `state::Message`.
 			let (content, images) = plain_content(message, supports_images);
 			OllamaWireMessage {
-				role: "system",
+				role: if message.role == Role::System {
+					"system"
+				} else {
+					developer_role
+				},
 				content,
 				images,
 				thinking: None,
@@ -566,18 +607,36 @@ fn convert_message(
 		Role::Assistant => {
 			let mut text_blocks = Vec::new();
 			let mut thinking_blocks = Vec::new();
+			let mut part_tool_calls = Vec::new();
 			if message.parts.is_empty() {
 				text_blocks.push(message.content.as_str());
 			} else {
 				for part in &message.parts {
 					match part {
 						ContentPart::Text { text } => text_blocks.push(text.as_str()),
-						ContentPart::Thinking { thinking } => thinking_blocks.push(thinking.as_str()),
-						ContentPart::Image { .. } => {},
+						ContentPart::Thinking { thinking, .. } => {
+							thinking_blocks.push(thinking.as_str())
+						},
+						ContentPart::ToolCall {
+							name, arguments, ..
+						} => part_tool_calls.push(OllamaWireToolCall {
+							kind: "function",
+							function: OllamaWireFunction {
+								name: name.clone(),
+								arguments: arguments.clone(),
+							},
+						}),
+						// `convertMessage` has no Ollama wire slot for redacted
+						// reasoning; the source block is intentionally skipped, as
+						// in TS.
+						ContentPart::RedactedThinking { .. } | ContentPart::Image { .. } => {},
 					}
 				}
 			}
-			let tool_calls = (!message.tool_calls.is_empty()).then(|| {
+			// TS reads calls from the ordered content blocks. Messages built
+			// before the content-part contract may only carry the execution
+			// projection, so fall back to it when no block holds a call.
+			let wire_calls = if part_tool_calls.is_empty() {
 				message
 					.tool_calls
 					.iter()
@@ -589,7 +648,10 @@ fn convert_message(
 						},
 					})
 					.collect()
-			});
+			} else {
+				part_tool_calls
+			};
+			let tool_calls = (!wire_calls.is_empty()).then_some(wire_calls);
 			let thinking = (!thinking_blocks.is_empty()).then(|| thinking_blocks.join("\n"));
 			let joined = text_blocks.join("\n");
 			let content = if joined.is_empty() && !message.content.is_empty() {
@@ -804,6 +866,20 @@ impl ModelProvider for OllamaProvider {
 		self.supports_images
 	}
 
+	/// TS `createEmptyOutput`: `api: "ollama-chat"`.
+	fn api(&self) -> Option<&str> {
+		Some("ollama-chat")
+	}
+
+	/// TS `model.provider`: local `ollama` or `ollama-cloud`.
+	fn provider(&self) -> Option<&str> {
+		Some(if self.cloud { "ollama-cloud" } else { "ollama" })
+	}
+
+	fn model(&self) -> Option<&str> {
+		Some(self.model.as_str())
+	}
+
 	/// Text-only models omit images through the vision guard instead of failing
 	/// the request; a supported image still has to be a valid local payload.
 	fn check_support(&self, messages: &[Message]) -> Result<(), ProviderError> {
@@ -831,9 +907,16 @@ impl ModelProvider for OllamaProvider {
 		let mut stream = self.stream(messages, tools, tool_choice).await?;
 		let mut assembler = StreamAssembler::new();
 		while let Some(item) = stream.next().await {
-			assembler.push(&item?);
+			assembler.push(&item?)?;
 		}
-		assembler.finish()
+		let mut message = assembler.finish()?;
+		// TS `createEmptyOutput` stamps the source on the assistant message so a
+		// later `transformMessages` pass can tell same-model replays from
+		// cross-model ones instead of guessing.
+		message.api = self.api().map(str::to_string);
+		message.provider = self.provider().map(str::to_string);
+		message.model = self.model().map(str::to_string);
+		Ok(message)
 	}
 
 	async fn stream(
@@ -860,9 +943,12 @@ impl ModelProvider for OllamaProvider {
 		let body = response
 			.bytes_stream()
 			.map(|item| item.map_err(|err| err.to_string()));
-		// ponytail: TS `withReplaySafeStreamRetry` (empty completion) and
-		// `StreamMarkupHealing` are not wrapped here; both need the shared
-		// stream to retain a terminal message/stop reason.
+		// ponytail: TS additionally wraps this request in `fetchWithRetry`,
+		// `withReplaySafeStreamRetry`, `armedPreResponseTimeout` and
+		// `StreamMarkupHealing`. The NDJSON parser now carries terminal stop
+		// reasons/errors so the first three have a surface to hook; the markup
+		// healer needs the dialect scanner subsystem, which this crate does not
+		// have yet.
 		Ok(ndjson_stream(body))
 	}
 }
@@ -872,12 +958,16 @@ impl ModelProvider for OllamaProvider {
 struct ParseState {
 	/// Number of content blocks TS would have pushed (`output.content.length`).
 	blocks: usize,
-	last_kind: Option<BlockKind>,
+	/// Kind of the block still receiving deltas, or `None` after a tool call.
+	active: Option<BlockKind>,
 	tool_index: usize,
 	saw_tool_calls: bool,
 	/// Cumulative `hasVisibleAssistantContent` (text/thinking/tool call).
 	visible: bool,
-	done: bool,
+	/// Last `done` record's usage and raw done-reason. The terminal event is
+	/// only emitted at EOF so a later record can still add content, matching
+	/// TS's post-loop finalization.
+	terminal: Option<(Option<TokenUsage>, StopReason)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -886,21 +976,49 @@ enum BlockKind {
 	Text,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StopReason {
-	Stop,
-	Length,
-	ToolUse,
-	Error,
+impl ParseState {
+	/// Open (or continue) a text/thinking block and return its content index.
+	fn open(&mut self, kind: BlockKind) -> usize {
+		if self.active == Some(kind) {
+			return self.blocks.saturating_sub(1);
+		}
+		self.active = Some(kind);
+		let index = self.blocks;
+		self.blocks += 1;
+		index
+	}
+
+	/// Each tool call is its own content block; the next delta opens a fresh
+	/// text/thinking block after it.
+	fn open_tool(&mut self) -> usize {
+		self.active = None;
+		let index = self.blocks;
+		self.blocks += 1;
+		index
+	}
 }
 
-impl ParseState {
-	fn account(&mut self, kind: BlockKind) {
-		if self.last_kind != Some(kind) {
-			self.blocks += 1;
-			self.last_kind = Some(kind);
-		}
+/// TS post-stream finalization: tool calls always mean "execute and continue",
+/// then the empty-`length` and `load` records become terminal errors that keep
+/// the partial message.
+fn finalize_stop(state: &ParseState, stop: StopReason) -> (StopReason, Option<String>) {
+	let mut stop = stop;
+	if matches!(stop, StopReason::Stop) && state.saw_tool_calls {
+		stop = StopReason::ToolUse;
 	}
+	if matches!(stop, StopReason::Length) && !state.visible {
+		return (
+			StopReason::Error,
+			Some(EMPTY_OLLAMA_LENGTH_COMPLETION_MESSAGE.to_string()),
+		);
+	}
+	if matches!(stop, StopReason::Error) {
+		return (
+			StopReason::Error,
+			Some(EMPTY_OLLAMA_LOAD_COMPLETION_MESSAGE.to_string()),
+		);
+	}
+	(stop, None)
 }
 
 struct NdjsonState<S> {
@@ -924,14 +1042,49 @@ fn take_lines(buffer: &mut Vec<u8>) -> Vec<Vec<u8>> {
 	lines
 }
 
-fn done_chunk(usage: Option<TokenUsage>) -> StreamChunk {
+fn delta_chunk(
+	content: Option<String>,
+	reasoning: Option<String>,
+	tool_call_deltas: Vec<ToolCallDelta>,
+	content_index: usize,
+) -> StreamChunk {
+	StreamChunk {
+		content,
+		reasoning,
+		tool_call_deltas,
+		usage: None,
+		is_done: false,
+		content_index: Some(content_index),
+		signature: None,
+		redacted: None,
+		stop_reason: None,
+		error_message: None,
+	}
+}
+
+fn done_chunk(
+	usage: Option<TokenUsage>,
+	stop_reason: StopReason,
+	error_message: Option<String>,
+) -> StreamChunk {
 	StreamChunk {
 		content: None,
 		reasoning: None,
 		tool_call_deltas: Vec::new(),
 		usage,
 		is_done: true,
+		content_index: None,
+		signature: None,
+		redacted: None,
+		stop_reason: Some(stop_reason),
+		error_message,
 	}
+}
+
+/// TS catch block: a failed record or transport ends the turn as an `error`
+/// event carrying the partial output, not as a thrown provider error.
+fn error_chunk(message: String) -> StreamChunk {
+	done_chunk(None, StopReason::Error, Some(message))
 }
 
 fn map_done_reason(reason: Option<&str>, saw_tool_calls: bool) -> StopReason {
@@ -976,24 +1129,23 @@ fn process_line(
 	})?;
 
 	let mut output = Vec::new();
-	let mut reasoning = None;
-	let mut content = None;
-	let mut tool_call_deltas = Vec::new();
 
 	if let Some(message) = chunk.message {
+		// TS pushes one event per block delta, thinking before text and tool
+		// calls after both, so each chunk carries exactly one content index.
 		if let Some(thinking) = message.thinking.filter(|value| !value.is_empty()) {
-			state.account(BlockKind::Thinking);
 			if !thinking.trim().is_empty() {
 				state.visible = true;
 			}
-			reasoning = Some(thinking);
+			let index = state.open(BlockKind::Thinking);
+			output.push(delta_chunk(None, Some(thinking), Vec::new(), index));
 		}
 		if let Some(delta) = message.content.filter(|value| !value.is_empty()) {
-			state.account(BlockKind::Text);
 			if !delta.trim().is_empty() {
 				state.visible = true;
 			}
-			content = Some(delta);
+			let index = state.open(BlockKind::Text);
+			output.push(delta_chunk(Some(delta), None, Vec::new(), index));
 		}
 		if let Some(calls) = message.tool_calls.filter(|calls| !calls.is_empty()) {
 			for call in calls {
@@ -1003,34 +1155,26 @@ fn process_line(
 					.and_then(|function| function.name.clone())
 					.unwrap_or_else(|| "unknown_tool".to_string());
 				let partial_json = tool_arguments(&call);
-				let id = format!("ollama:{}:{name}", state.blocks);
-				tool_call_deltas.push(ToolCallDelta {
+				let index = state.open_tool();
+				let id = format!("ollama:{index}:{name}");
+				let delta = ToolCallDelta {
 					index: state.tool_index,
 					id: Some(id),
 					name: Some(name),
 					arguments_delta: Some(partial_json),
-				});
+					content_index: Some(index),
+				};
 				state.tool_index += 1;
-				state.blocks += 1;
-				state.last_kind = None;
 				state.saw_tool_calls = true;
 				state.visible = true;
+				output.push(delta_chunk(None, None, vec![delta], index));
 			}
 		}
 	}
 
-	if reasoning.is_some() || content.is_some() || !tool_call_deltas.is_empty() {
-		output.push(StreamChunk {
-			content,
-			reasoning,
-			tool_call_deltas,
-			usage: None,
-			is_done: false,
-		});
-	}
-
 	if chunk.done == Some(true) {
-		state.done = true;
+		// TS updates `output.stopReason`/usage here but only pushes the
+		// terminal event after the read loop, so keep the finalization for EOF.
 		let input = chunk.prompt_eval_count.unwrap_or(0);
 		let output_tokens = chunk.eval_count.unwrap_or(0);
 		let usage = TokenUsage {
@@ -1041,24 +1185,10 @@ fn process_line(
 			total_tokens: input.saturating_add(output_tokens),
 			reasoning_tokens: None,
 		};
-		let stop = map_done_reason(chunk.done_reason.as_deref(), state.saw_tool_calls);
-		// ponytail: `StreamChunk`/`Message` carry no stop-reason or error field,
-		// so only the fatal cases can cross the trait. `length` with visible
-		// output and `toolUse` vs `stop` need a shared-type extension.
-		match stop {
-			StopReason::Error => {
-				return Err(ProviderError::Protocol(
-					EMPTY_OLLAMA_LOAD_COMPLETION_MESSAGE.to_string(),
-				))
-			},
-			StopReason::Length if !state.visible => {
-				return Err(ProviderError::Protocol(
-					EMPTY_OLLAMA_LENGTH_COMPLETION_MESSAGE.to_string(),
-				))
-			},
-			_ => {},
-		}
-		output.push(done_chunk(Some(usage)));
+		state.terminal = Some((
+			Some(usage),
+			map_done_reason(chunk.done_reason.as_deref(), state.saw_tool_calls),
+		));
 	}
 
 	Ok(output)
@@ -1068,7 +1198,9 @@ fn process_line(
 ///
 /// Records may be split across transport chunks, including in the middle of a
 /// UTF-8 sequence; the stream may end without a trailing newline. A malformed
-/// record or an incomplete EOF tail is a [`ProviderError::Protocol`].
+/// record, an incomplete EOF tail or a transport failure ends the turn with a
+/// terminal [`StopReason::Error`] chunk that keeps the partial output, matching
+/// the TS adapter's `error` event.
 fn ndjson_stream<S, B, E>(body: S) -> ChunkStream
 where
 	S: Stream<Item = Result<B, E>> + Send + 'static,
@@ -1086,9 +1218,6 @@ where
 		let mut state = state?;
 		loop {
 			if let Some(item) = state.queue.pop_front() {
-				if item.is_err() {
-					state.finished = true;
-				}
 				return Some((item, Some(state)));
 			}
 			if state.finished {
@@ -1101,16 +1230,15 @@ where
 						match process_line(&line, &mut state.parse) {
 							Ok(chunks) => state.queue.extend(chunks.into_iter().map(Ok)),
 							Err(err) => {
-								state.queue.push_back(Err(err));
+								state.queue.push_back(Ok(error_chunk(err.to_string())));
+								state.finished = true;
 								break;
 							},
 						}
 					}
 				},
 				Some(Err(err)) => {
-					state
-						.queue
-						.push_back(Err(ProviderError::Network(err.to_string())));
+					state.queue.push_back(Ok(error_chunk(err.to_string())));
 					state.finished = true;
 				},
 				None => {
@@ -1120,17 +1248,21 @@ where
 						match process_line(&tail, &mut state.parse) {
 							Ok(chunks) => state.queue.extend(chunks.into_iter().map(Ok)),
 							Err(err) => {
-								state.queue.push_back(Err(err));
+								state.queue.push_back(Ok(error_chunk(err.to_string())));
 								fatal = true;
 							},
 						}
 					}
-					if !fatal
-						&& state.queue.iter().all(|item| item.is_ok())
-						&& !state.parse.done
-					{
-						state.queue.push_back(Ok(done_chunk(None)));
-						state.parse.done = true;
+					if !fatal {
+						let (usage, raw_stop) = state
+							.parse
+							.terminal
+							.take()
+							.unwrap_or((None, StopReason::Stop));
+						let (stop, error_message) = finalize_stop(&state.parse, raw_stop);
+						state
+							.queue
+							.push_back(Ok(done_chunk(usage, stop, error_message)));
 					}
 					state.finished = true;
 				},
@@ -1169,7 +1301,7 @@ mod tests {
 		}];
 		let messages = vec![Message::user("hi"), assistant, message_tool(None, "call_1")];
 		let names = tool_call_names(&messages);
-		let converted = convert_message(&messages[2], false, &names);
+		let converted = convert_message(&messages[2], false, &names, "system");
 		assert_eq!(converted.tool_name.as_deref(), Some("read"));
 	}
 
@@ -1225,13 +1357,34 @@ mod tests {
 	}
 
 	#[test]
-	fn done_reason_mapping_matches_ts_before_the_shared_boundary() {
+	fn done_reason_and_terminal_finalization_match_ts() {
 		assert_eq!(map_done_reason(Some("length"), false), StopReason::Length);
 		assert_eq!(map_done_reason(Some("tool_calls"), false), StopReason::ToolUse);
 		assert_eq!(map_done_reason(Some("load"), false), StopReason::Error);
 		assert_eq!(map_done_reason(None, true), StopReason::ToolUse);
 		assert_eq!(map_done_reason(Some("stop"), true), StopReason::Stop);
 		assert_eq!(map_done_reason(None, false), StopReason::Stop);
+
+		let mut with_tools = ParseState::default();
+		with_tools.saw_tool_calls = true;
+		assert_eq!(
+			finalize_stop(&with_tools, StopReason::Stop),
+			(StopReason::ToolUse, None)
+		);
+
+		let empty_length = finalize_stop(&ParseState::default(), StopReason::Length);
+		assert_eq!(empty_length.0, StopReason::Error);
+		assert_eq!(
+			empty_length.1.as_deref(),
+			Some(EMPTY_OLLAMA_LENGTH_COMPLETION_MESSAGE)
+		);
+
+		let load = finalize_stop(&ParseState::default(), StopReason::Error);
+		assert_eq!(load.0, StopReason::Error);
+		assert_eq!(
+			load.1.as_deref(),
+			Some(EMPTY_OLLAMA_LOAD_COMPLETION_MESSAGE)
+		);
 	}
 
 	#[test]
@@ -1269,7 +1422,7 @@ mod tests {
 				text: "answer".to_string(),
 			},
 		];
-		let converted = convert_message(&message, false, &HashMap::new());
+		let converted = convert_message(&message, false, &HashMap::new(), "system");
 		assert_eq!(converted.role, "assistant");
 		assert_eq!(converted.content, "answer");
 		assert_eq!(converted.thinking.as_deref(), Some("plan"));

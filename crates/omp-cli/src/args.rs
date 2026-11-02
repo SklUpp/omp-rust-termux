@@ -1202,9 +1202,9 @@ pub enum Command {
 
 	/// Inspect and test Time-Traveling Stream Rules (TTSR).
 	///
-	/// Loads the embedded `builtin-defaults` set plus on-disk native/agent rule
-	/// providers. Plugin-marketplace rules are an explicit unsupported source in
-	/// this native runtime, matching the plugin-execution boundary.
+	/// Loads the embedded `builtin-defaults` set, on-disk native/agent providers,
+	/// and configured `config.extensions` rule roots. Marketplace-installed
+	/// plugin roots remain an explicit unsupported source in this native runtime.
 	Ttsr {
 		/// Action: `list` (default), `test`, or `scan`.
 		#[arg(value_name = "ACTION", value_parser = ["list", "test", "scan"])]

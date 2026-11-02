@@ -208,7 +208,7 @@ fn gallery_covers_every_runtime_tool() {
 		.map(|(name, _)| (*name).to_string())
 		.chain(crate::runtime::DELEGATION_TOOLS.iter().map(|name| (*name).to_string()))
 		.collect();
-	expected.extend(["checkpoint", "rewind", "goal"].map(str::to_string));
+	expected.extend(["checkpoint", "rewind", "goal", "think"].map(str::to_string));
 	expected.sort();
 	expected.dedup();
 	assert_eq!(gallery_known_tools(), expected, "gallery table must cover the Rust tool roster");
@@ -427,7 +427,11 @@ fn setup_python_probe_rejects_missing_interpreter() {
 		.enable_all()
 		.build()
 		.expect("runtime");
-	let (available, path) = runtime.block_on(probe_python(dir.path(), Some("/nonexistent/python-c5")));
+	let (available, path) = runtime.block_on(probe_python(
+		dir.path(),
+		Some("/nonexistent/python-c5"),
+		&dir.path().join("python-env"),
+	));
 	assert!(!available);
 	assert!(path.is_none());
 }
@@ -735,25 +739,206 @@ fn grievance_human_output_escapes_terminal_controls() {
 
 #[cfg(unix)]
 #[test]
-fn gzip_ref_scan_and_walkers_are_bounded() {
-	let dir = TempDir::new("gc-bounds");
+fn walkers_do_not_follow_symlink_cycles() {
+	let dir = TempDir::new("gc-walk-bounds");
 	let loop_dir = dir.path().join("sessions/project/loop");
 	fs::create_dir_all(&loop_dir).expect("loop dir");
 	std::os::unix::fs::symlink(&loop_dir, loop_dir.join("cycle")).expect("cycle symlink");
 	dir.write("sessions/project/s.jsonl", "{}");
 	assert_eq!(walk_visible_files(&dir.path().join("sessions"), is_jsonl_name).len(), 1);
 	assert_eq!(collect_jsonl_files(&loop_dir, ".jsonl").len(), 0);
+}
 
-	let gz_path = dir.path().join("oversized.jsonl.gz");
+struct ChunkReader {
+	data: Vec<u8>,
+	pos:  usize,
+	step: usize,
+}
+
+impl std::io::Read for ChunkReader {
+	fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+		let remaining = self.data.len() - self.pos;
+		let count = remaining.min(buffer.len()).min(self.step);
+		buffer[..count].copy_from_slice(&self.data[self.pos..self.pos + count]);
+		self.pos += count;
+		Ok(count)
+	}
+}
+
+#[test]
+fn gzip_ref_scan_streams_large_archives_and_chunk_boundaries() {
+	let a = "a".repeat(64);
+	let b = "b".repeat(64);
+	let ref_a = format!("blob:sha256:{a}");
+	let ref_b = format!("blob:sha256:{b}");
+
+	let mut payload = vec![b'.'; BLOB_SCAN_CHUNK - 10];
+	payload.extend_from_slice(ref_a.as_bytes());
+	payload.extend_from_slice(b" tail ");
+	payload.extend_from_slice(ref_b.as_bytes());
+	let mut hashes = HashSet::new();
+	let mut reader = ChunkReader { data: payload, pos: 0, step: 7 };
+	scan_blob_refs_reader(&mut reader, Path::new("chunked.jsonl"), &mut hashes).expect("chunked scan");
+	assert!(hashes.contains(&a), "reference spanning a chunk boundary");
+	assert!(hashes.contains(&b), "reference after the boundary");
+
+	let dir = TempDir::new("gc-gzip-large");
+	let gz_path = dir.path().join("large.jsonl.gz");
 	let mut encoder = flate2::write::GzEncoder::new(
 		fs::File::create(&gz_path).expect("gz"),
-		flate2::Compression::best(),
+		flate2::Compression::fast(),
 	);
 	use std::io::Write as _;
-	encoder
-		.write_all(&vec![b'x'; (DEFAULT_MAX_SCAN_BYTES + 1) as usize])
-		.expect("write gz");
+	let padding = vec![b'x'; DEFAULT_MAX_SCAN_BYTES as usize + 1024 * 1024];
+	encoder.write_all(&padding).expect("padding");
+	encoder.write_all(ref_a.as_bytes()).expect("ref");
 	encoder.finish().expect("finish");
-	let error = read_gzip_text(&gz_path).expect_err("expansion cap");
-	assert!(error.contains("gzip expansion exceeds"), "{error}");
+	let mut hashes = HashSet::new();
+	scan_blob_ref_file(&gz_path, true, &mut hashes).expect("large gzip scan");
+	assert!(hashes.contains(&a), "large archive refs are not rejected");
+}
+
+#[test]
+fn gc_agent_dir_uses_its_own_settings() {
+	let dir = TempDir::new("gc-agent-settings");
+	let agent = dir.path().join("alt-agent");
+	dir.write(
+		"alt-agent/config.yml",
+		"gc:\n  blobs: false\n  archive: false\n  wal: false\n",
+	);
+	let opts = GcOptions {
+		json:                    true,
+		agent_dir:               Some(agent),
+		blobs:                   false,
+		archive:                 false,
+		wal:                     false,
+		cold_archive_after_days: None,
+		retain_newest_global:    None,
+		retain_newest_per_cwd:   None,
+	};
+	let (code, value, stderr) = gc_json(&opts, dir.path());
+	assert_eq!(code, 0, "{stderr}");
+	assert!(value.get("blobs").is_none(), "{value}");
+	assert!(value.get("archive").is_none(), "{value}");
+	assert!(value.get("wal").is_none(), "{value}");
+}
+
+#[test]
+fn gc_agent_dir_text_escapes_controls() {
+	let result = json!({ "agentDir": "/tmp/\u{1b}]0;x", "apply": false, "lockPath": "/tmp/x" });
+	let text = gc_text(&result);
+	assert!(!text.contains('\u{1b}'), "{text}");
+	assert!(text.contains("\\u{1b}"), "{text}");
+}
+
+#[test]
+fn ttsr_preview_escapes_terminal_controls() {
+	let dir = TempDir::new("ttsr-preview-escape");
+	let rule = dir.write(
+		"plain.md",
+		"---\ncondition: 'trigger'\n---\nBody\n",
+	);
+	let opts = TtsrOptions {
+		action:  Some("test".to_string()),
+		snippet: Some("trigger\u{1b}]52;c;x".to_string()),
+		file:    None,
+		rule:    Some(rule),
+		source:  Some("text".to_string()),
+		tool:    None,
+		path:    None,
+		verbose: false,
+		json:    false,
+		no_gitignore: false,
+		max_bytes: None,
+	};
+	let mut out = Vec::new();
+	let mut err = Vec::new();
+	run_ttsr(&opts, dir.path(), &mut out, &mut err).expect("ttsr test");
+	let text = String::from_utf8(out).expect("utf8");
+	assert!(!text.contains('\u{1b}'), "{text}");
+	assert!(text.contains("\\u{1b}"), "{text}");
+}
+
+#[test]
+fn python_candidates_use_reported_managed_env_order() {
+	let dir = TempDir::new("python-candidates");
+	let venv = dir.path().join("project/.venv");
+	let venv_python = if cfg!(windows) {
+		venv.join("Scripts/python.exe")
+	} else {
+		venv.join("bin/python")
+	};
+	dir.write(
+		&venv_python.strip_prefix(dir.path()).expect("relative").to_string_lossy(),
+		"x",
+	);
+	let managed = dir.path().join("custom/python-env");
+	let managed_python = if cfg!(windows) {
+		managed.join("Scripts/python.exe")
+	} else {
+		managed.join("bin/python")
+	};
+	dir.write(
+		&managed_python.strip_prefix(dir.path()).expect("relative").to_string_lossy(),
+		"x",
+	);
+	let mut base = HashMap::new();
+	base.insert("PATH".to_string(), String::new());
+	let cwd = dir.path().join("project");
+	let candidates = python_candidates(&cwd, &base, None, &managed);
+	assert_eq!(candidates.first().map(|runtime| runtime.program.clone()), Some(venv_python));
+	assert_eq!(candidates.get(1).map(|runtime| runtime.program.clone()), Some(managed_python));
+
+	let no_venv = dir.path().join("no-venv");
+	fs::create_dir_all(&no_venv).expect("cwd");
+	let candidates = python_candidates(&no_venv, &base, None, &managed);
+	assert_eq!(candidates.first().map(|runtime| runtime.program.clone()), Some(managed_python));
+}
+
+#[test]
+fn grievances_missing_table_is_empty_but_corrupt_or_busy_fails() {
+	let dir = TempDir::new("grievance-errors");
+	let opts = GrievancesOptions { limit: 20, tool: None, json: false };
+
+	let missing = dir.path().join("missing-table.db");
+	let connection = rusqlite::Connection::open(&missing).expect("db");
+	connection
+		.execute_batch("CREATE TABLE unrelated (id INTEGER);")
+		.expect("schema");
+	drop(connection);
+	let mut out = Vec::new();
+	list_grievances_in(&missing, &opts, &mut out).expect("missing table is empty");
+	assert!(String::from_utf8(out).expect("utf8").contains("No grievances recorded yet."));
+
+	let corrupt = dir.path().join("corrupt.db");
+	fs::write(&corrupt, b"not a sqlite database").expect("corrupt db");
+	let mut out = Vec::new();
+	assert!(list_grievances_in(&corrupt, &opts, &mut out).is_err());
+
+	let busy = dir.path().join("busy.db");
+	let writer = rusqlite::Connection::open(&busy).expect("busy db");
+	writer
+		.execute_batch(
+			"CREATE TABLE grievances (id INTEGER PRIMARY KEY, model TEXT, version TEXT, tool TEXT, report TEXT);\nPRAGMA locking_mode = EXCLUSIVE;\nBEGIN EXCLUSIVE;",
+		)
+		.expect("lock");
+	let mut out = Vec::new();
+	assert!(list_grievances_in(&busy, &opts, &mut out).is_err(), "busy must fail closed");
+}
+
+#[test]
+fn ttsr_discovers_configured_extension_rules() {
+	let dir = TempDir::new("ttsr-extension-rules");
+	dir.write(".omp/config.yml", "extensions:\n  - ext\n");
+	dir.write(
+		"ext/rules/extension-rule.md",
+		"---\ncondition: 'extension trigger'\n---\nExtension body\n",
+	);
+	let rules = discover_rules(dir.path(), &dir.path().join("agent"));
+	let rule = rules
+		.iter()
+		.find(|rule| rule.name == "extension-rule")
+		.expect("extension rule");
+	assert_eq!(rule.provider, "omp-plugins");
+	assert_eq!(rule.condition, Some(vec!["extension trigger".to_string()]));
 }

@@ -75,14 +75,6 @@ fn setting_bool(cwd: &Path, key: &str, default: bool) -> bool {
 	}
 }
 
-fn setting_number(cwd: &Path, key: &str, default: u64) -> u64 {
-	match setting_value(cwd, key) {
-		Some(Value::Number(value)) => value.as_u64().unwrap_or(default),
-		Some(Value::String(value)) => value.trim().parse().unwrap_or(default),
-		_ => default,
-	}
-}
-
 fn setting_strings(cwd: &Path, key: &str) -> Vec<String> {
 	match setting_value(cwd, key) {
 		Some(Value::Array(items)) => items
@@ -623,6 +615,26 @@ fn discover_rules(cwd: &Path, agent_dir: &Path) -> Vec<Rule> {
 		push(30, rule);
 	}
 
+	// `config.extensions` roots follow the existing native agent convention:
+	// `<extension-root>/rules/{*.md,*.mdc}` as the `omp-plugins` provider at
+	// priority 90. Marketplace-installed roots are still an unsupported source.
+	let extension_roots = crate::config::Config::load_run(&[], Some(cwd))
+		.ok()
+		.and_then(|config| config.extensions)
+		.unwrap_or_default();
+	for root in extension_roots {
+		let rules_dir = crate::dirs::absolute(cwd, &root).join("rules");
+		for path in read_dir_files(&rules_dir, &["md", "mdc"]) {
+			let suffix = path
+				.extension()
+				.and_then(|ext| ext.to_str())
+				.map(|ext| format!(".{ext}"));
+			if let Some(rule) = load_rule_file(&path, "omp-plugins", None, suffix.as_deref()) {
+				push(90, rule);
+			}
+		}
+	}
+
 	// TypeScript `loadCapability<Rule>` includes the embedded `builtin-defaults`
 	// provider at priority 1 unless `ttsr.builtinRules` is disabled.
 	if setting_bool(cwd, "ttsr.builtinRules", true) {
@@ -898,10 +910,10 @@ fn compile_rule_rules(cwd: &Path, agent_dir: &Path) -> Vec<Rule> {
 	// TS pipeline: loadCapability<Rule> providers (builtin, agents, cursor,
 	// windsurf, cline, github, builtin-defaults, claude-plugins, omp-plugins)
 	// -> name dedupe by provider priority -> TtsrManager.addRule.
-	// This native runtime embeds builtin-defaults and the on-disk providers.
-	// Plugin marketplaces are an explicit unsupported source: like
-	// `agents.rs`, the native runtime has no plugin catalog loader, so
-	// claude-plugins/omp-plugins rule roots are not read or silently merged.
+	// This native runtime embeds builtin-defaults, on-disk providers, and
+	// configured `config.extensions` rule roots. Marketplace-installed plugin
+	// roots remain an explicit unsupported source (no catalog loader), and are
+	// never partially merged.
 	let enabled = setting_bool(cwd, "ttsr.enabled", true);
 	if !enabled {
 		return Vec::new();
@@ -1328,7 +1340,13 @@ fn run_ttsr_test(opts: &TtsrOptions, cwd: &Path, out: &mut dyn Write, err: &mut 
 		out,
 		&format!("TTSR test — source={ctx_label}{path_label} snippet={}b", report["snippetBytes"]),
 	)?;
-	write_line(out, &format!("  \"{}\"\n", preview_snippet(&snippet)))?;
+	write_line(
+		out,
+		&format!(
+			"  \"{}\"\n",
+			escape_terminal_text(&preview_snippet(&snippet), false)
+		),
+	)?;
 	if let Some(note) = inference_note {
 		write_line(out, &format!("note: {}\n", escape_terminal_text(&note, false)))?;
 	}
@@ -1621,7 +1639,8 @@ fn run_ttsr_scan(opts: &TtsrOptions, cwd: &Path, out: &mut dyn Write, err: &mut 
 	let files = discover_scan_files(&scan_dir, gitignore);
 
 	if files.is_empty() {
-		let message = format!("No files found to scan in {}", scan_dir.display());
+		let scan_label = escape_terminal_text(&scan_dir.to_string_lossy(), false);
+		let message = format!("No files found to scan in {scan_label}");
 		if opts.json {
 			write_line(
 				out,
@@ -1798,7 +1817,7 @@ fn run_ttsr_scan(opts: &TtsrOptions, cwd: &Path, out: &mut dyn Write, err: &mut 
 		out,
 		&format!(
 			"TTSR scan — directory={} files={} scanned={} rules={} gitignore={} max-bytes={}",
-			scan_dir.display(),
+			escape_terminal_text(&scan_dir.to_string_lossy(), false),
 			files.len(),
 			scanned_files,
 			plans.len(),
@@ -1942,13 +1961,14 @@ struct GalleryTool {
 
 /// Headless renderer fixtures for every tool this native runtime can register:
 /// `BUILTIN_TOOLS`, `DELEGATION_TOOLS`, and the conditionally mounted
-/// `checkpoint`/`rewind`/`goal` tools. No TypeScript-only tool is listed.
+/// `checkpoint`/`rewind`/`goal`/`think` tools. No TypeScript-only tool is
+/// listed.
 ///
 /// Contract: deterministic ANSI/`--plain` lifecycle preview from call args and
 /// result text. It is **not** a byte-for-byte port of the TypeScript TUI
 /// `ToolExecutionComponent`; this binary has no TUI renderer layer. Add a
 /// per-tool renderer here if tool-specific framing is required.
-const GALLERY_TOOLS: [GalleryTool; 19] = [
+const GALLERY_TOOLS: [GalleryTool; 20] = [
 	GalleryTool { name: "read", args: r#"{"path":"src/main.ts","offset":1,"limit":40}"#, result: "     1\tconst app = createApp();" },
 	GalleryTool { name: "glob", args: r#"{"pattern":"src/**/*.ts"}"#, result: "src/main.ts\nsrc/util.ts" },
 	GalleryTool { name: "grep", args: r#"{"pattern":"TODO","path":"src"}"#, result: "src/main.ts:12: // TODO: cache" },
@@ -1966,6 +1986,7 @@ const GALLERY_TOOLS: [GalleryTool; 19] = [
 	GalleryTool { name: "task", args: r#"{"task":"Add tests","agent":"task"}"#, result: "Subagent completed: 3 files changed" },
 	GalleryTool { name: "hub", args: r#"{"action":"list"}"#, result: "No background agents" },
 	GalleryTool { name: "goal", args: r#"{"goal":"Ship the headless preview"}"#, result: "Goal updated" },
+	GalleryTool { name: "think", args: r#"{"thought":"Check the cache path"}"#, result: "Recorded private thought" },
 	GalleryTool { name: "checkpoint", args: r#"{"label":"before-edit"}"#, result: "Checkpoint created" },
 	GalleryTool { name: "rewind", args: r#"{"label":"before-edit"}"#, result: "Rewound to before-edit" },
 ];
@@ -2110,6 +2131,14 @@ fn autoqa_db_path() -> PathBuf {
 	dirs::root_subdir("autoqa.db", AgentDirCategory::Data)
 }
 
+fn grievance_table_missing(error: &rusqlite::Error) -> bool {
+	matches!(
+		error,
+		rusqlite::Error::SqliteFailure(_, Some(message))
+			if message.contains("no such table: grievances")
+	)
+}
+
 fn list_grievances_in(db_path: &Path, opts: &GrievancesOptions, out: &mut dyn Write) -> Result<u8> {
 	if !db_path.exists() {
 		if opts.json {
@@ -2128,6 +2157,9 @@ fn list_grievances_in(db_path: &Path, opts: &GrievancesOptions, out: &mut dyn Wr
 		rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
 	)
 	.map_err(|error| Error::new(error.to_string()))?;
+	connection
+		.busy_timeout(std::time::Duration::from_secs(5))
+		.map_err(|error| Error::new(error.to_string()))?;
 
 	let mut rows = Vec::new();
 	let query = if opts.tool.is_some() {
@@ -2154,9 +2186,9 @@ fn list_grievances_in(db_path: &Path, opts: &GrievancesOptions, out: &mut dyn Wr
 	};
 	let mapped = match read_rows() {
 		Ok(rows) => rows,
-		// A database without the auto-QA table is an empty report, not a crash:
-		// the read-only slice never creates or migrates the schema.
-		Err(rusqlite::Error::SqliteFailure(_, _)) => Vec::new(),
+		// Only a database without the auto-QA table is an empty report. Busy,
+		// corrupt, or otherwise unreadable databases fail closed.
+		Err(error) if grievance_table_missing(&error) => Vec::new(),
 		Err(error) => return Err(Error::new(error.to_string())),
 	};
 	for row in mapped {
@@ -2393,36 +2425,6 @@ fn walk_visible_files(root: &Path, matches: fn(&str) -> bool) -> Vec<PathBuf> {
 	files
 }
 
-fn read_text_file(path: &Path) -> std::result::Result<Option<String>, String> {
-	match fs::read(path) {
-		Ok(bytes) => Ok(Some(String::from_utf8_lossy(&bytes).into_owned())),
-		Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-		Err(error) => Err(format!("{}: {error}", path.display())),
-	}
-}
-
-fn read_gzip_text(path: &Path) -> std::result::Result<Option<String>, String> {
-	let file = match fs::File::open(path) {
-		Ok(file) => file,
-		Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-		Err(error) => return Err(format!("{}: {error}", path.display())),
-	};
-	let decoder = GzDecoder::new(file);
-	let mut limited = decoder.take(DEFAULT_MAX_SCAN_BYTES.saturating_add(1));
-	let mut bytes = Vec::new();
-	limited
-		.read_to_end(&mut bytes)
-		.map_err(|error| format!("{}: {error}", path.display()))?;
-	if bytes.len() as u64 > DEFAULT_MAX_SCAN_BYTES {
-		return Err(format!(
-			"{}: gzip expansion exceeds {} bytes",
-			path.display(),
-			DEFAULT_MAX_SCAN_BYTES
-		));
-	}
-	Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
-}
-
 fn read_text_window(path: &Path, offset: u64, max_bytes: u64) -> Option<String> {
 	let mut file = fs::File::open(path).ok()?;
 	file.seek(SeekFrom::Start(offset)).ok()?;
@@ -2452,14 +2454,29 @@ fn ascii_eq_ignore_case(left: &[u8], right: &[u8]) -> bool {
 			.all(|(left, right)| left.eq_ignore_ascii_case(right))
 }
 
-/// Equivalent of `/\bblob:sha256:([a-f0-9]{64})\b/gi` + lowercase + hash test.
-fn extract_blob_refs(text: &str, hashes: &mut HashSet<String>) {
-	const NEEDLE: &[u8] = b"blob:sha256:";
-	let bytes = text.as_bytes();
-	for start in 0..bytes.len() {
-		let hash_start = start + NEEDLE.len();
+const BLOB_REF_NEEDLE: &[u8] = b"blob:sha256:";
+const BLOB_REF_LEN: usize = 12 + 64;
+/// Retain the byte before a possible trailing match so a reference spanning a
+/// chunk boundary is rescanned with its leading word boundary intact.
+const BLOB_SCAN_OVERLAP: usize = BLOB_REF_LEN + 1;
+const BLOB_SCAN_CHUNK: usize = 64 * 1024;
+
+/// Equivalent of `/blob:sha256:([a-f0-9]{64})/gi` + lowercase + hash test,
+/// restricted to one rolling window. A match ending exactly at a non-EOF window
+/// boundary is deferred to the next window instead of being accepted early.
+fn extract_blob_refs_window(
+	bytes: &[u8],
+	scan_start: usize,
+	eof: bool,
+	hashes: &mut HashSet<String>,
+) {
+	for start in scan_start..bytes.len() {
+		let hash_start = start + BLOB_REF_NEEDLE.len();
 		let hash_end = hash_start + 64;
-		if hash_end > bytes.len() || !ascii_eq_ignore_case(&bytes[start..hash_start], NEEDLE) {
+		if hash_end > bytes.len() || (hash_end == bytes.len() && !eof) {
+			continue;
+		}
+		if !ascii_eq_ignore_case(&bytes[start..hash_start], BLOB_REF_NEEDLE) {
 			continue;
 		}
 		if start > 0 && is_word_byte(bytes[start - 1]) {
@@ -2476,9 +2493,63 @@ fn extract_blob_refs(text: &str, hashes: &mut HashSet<String>) {
 			.iter()
 			.map(|byte| char::from(byte.to_ascii_lowercase()))
 			.collect();
-		if hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-			hashes.insert(hash);
+		hashes.insert(hash);
+	}
+}
+
+/// Stream a reference log through a bounded rolling window: peak memory is one
+/// chunk plus the overlap, independent of decompressed archive size.
+fn scan_blob_refs_reader<R: Read>(
+	reader: &mut R,
+	path: &Path,
+	hashes: &mut HashSet<String>,
+) -> std::result::Result<(), String> {
+	let mut buffer = vec![0u8; BLOB_SCAN_CHUNK];
+	let mut carry: Vec<u8> = Vec::new();
+	let mut data: Vec<u8> = Vec::new();
+	let mut data_start = 0usize;
+	loop {
+		let read = reader
+			.read(&mut buffer)
+			.map_err(|error| format!("{}: {error}", path.display()))?;
+		let eof = read == 0;
+		data.clear();
+		data.reserve(carry.len() + read);
+		data.extend_from_slice(&carry);
+		data.extend_from_slice(&buffer[..read]);
+		// When the window starts after byte 0 its first byte is only the
+		// leading-boundary byte; the first possible match starts at index 1 and
+		// retains its preceding byte. A window that still starts at byte 0 can
+		// scan index 0 because there is no preceding stream byte at all.
+		let scan_start = usize::from(data_start > 0);
+		extract_blob_refs_window(&data, scan_start, eof, hashes);
+		if eof {
+			break;
 		}
+		let keep = data.len().min(BLOB_SCAN_OVERLAP);
+		data_start += data.len() - keep;
+		carry.clear();
+		carry.extend_from_slice(&data[data.len() - keep..]);
+	}
+	Ok(())
+}
+
+fn scan_blob_ref_file(
+	path: &Path,
+	gzip: bool,
+	hashes: &mut HashSet<String>,
+) -> std::result::Result<(), String> {
+	let file = match fs::File::open(path) {
+		Ok(file) => file,
+		Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+		Err(error) => return Err(format!("{}: {error}", path.display())),
+	};
+	if gzip {
+		let mut decoder = GzDecoder::new(file);
+		scan_blob_refs_reader(&mut decoder, path, hashes)
+	} else {
+		let mut reader = io::BufReader::new(file);
+		scan_blob_refs_reader(&mut reader, path, hashes)
 	}
 }
 
@@ -2495,18 +2566,11 @@ fn collect_referenced_blob_hashes(
 	files.dedup();
 	let mut hashes = HashSet::new();
 	for file in files {
-		let text = if file
+		let gzip = file
 			.file_name()
 			.and_then(|name| name.to_str())
-			.is_some_and(is_compressed_jsonl_name)
-		{
-			read_gzip_text(&file)?
-		} else {
-			read_text_file(&file)?
-		};
-		if let Some(text) = text {
-			extract_blob_refs(&text, &mut hashes);
-		}
+			.is_some_and(is_compressed_jsonl_name);
+		scan_blob_ref_file(&file, gzip, &mut hashes)?;
 	}
 	Ok(hashes)
 }
@@ -2852,7 +2916,7 @@ fn run_wal_gc(paths: &GcPaths) -> Value {
 }
 
 fn gc_text(result: &Value) -> String {
-	let agent_dir = result["agentDir"].as_str().unwrap_or_default();
+	let agent_dir = escape_terminal_text(result["agentDir"].as_str().unwrap_or_default(), false);
 	let mut lines = vec![format!("GC dry-run ({agent_dir})")];
 	if let Some(blobs) = result.get("blobs") {
 		lines.push(format!(
@@ -2899,6 +2963,137 @@ fn gc_text(result: &Value) -> String {
 	format!("{}\n", lines.join("\n"))
 }
 
+enum ConfigLayer {
+	Yaml(yaml::Value),
+	Json(Value),
+}
+
+fn yaml_lookup<'a>(mut value: &'a yaml::Value, segments: &[&str]) -> Option<&'a yaml::Value> {
+	for segment in segments {
+		value = value.get(segment)?;
+	}
+	Some(value)
+}
+
+fn json_lookup<'a>(mut value: &'a Value, segments: &[&str]) -> Option<&'a Value> {
+	for segment in segments {
+		value = value.get(*segment)?;
+	}
+	Some(value)
+}
+
+fn read_yaml_layer(path: &Path) -> Option<ConfigLayer> {
+	let text = fs::read_to_string(path).ok()?;
+	yaml::parse(&text).ok().map(ConfigLayer::Yaml)
+}
+
+fn read_json_layer(path: &Path) -> Option<ConfigLayer> {
+	let text = fs::read_to_string(path).ok()?;
+	serde_json::from_str(&text).ok().map(ConfigLayer::Json)
+}
+
+fn first_layer(paths: &[PathBuf], json_last: bool) -> Option<ConfigLayer> {
+	for path in paths {
+		if let Some(layer) = read_yaml_layer(path) {
+			return Some(layer);
+		}
+	}
+	if json_last {
+		for path in paths {
+			if let Some(layer) = read_json_layer(path) {
+				return Some(layer);
+			}
+		}
+	}
+	None
+}
+
+fn global_gc_layer(agent_dir: &Path) -> Option<ConfigLayer> {
+	first_layer(
+		&[
+			agent_dir.join("config.yml"),
+			agent_dir.join("config.yaml"),
+			agent_dir.join("settings.json"),
+		],
+		true,
+	)
+}
+
+fn project_gc_layers(cwd: &Path) -> Vec<ConfigLayer> {
+	let root = cwd.join(".omp");
+	[
+		root.join("config.yml"),
+		root.join("config.yaml"),
+		root.join("settings.json"),
+	]
+	.iter()
+	.filter_map(|path| read_yaml_layer(path).or_else(|| read_json_layer(path)))
+	.collect()
+}
+
+fn layer_bool(layer: &ConfigLayer, segments: &[&str]) -> Option<bool> {
+	match layer {
+		ConfigLayer::Yaml(value) => {
+			let value = yaml_lookup(value, segments)?;
+			value
+				.as_bool()
+				.or_else(|| value.as_str()?.parse::<bool>().ok())
+		},
+		ConfigLayer::Json(value) => {
+			let value = json_lookup(value, segments)?;
+			value
+				.as_bool()
+				.or_else(|| value.as_str()?.parse::<bool>().ok())
+		},
+	}
+}
+
+fn layer_number(layer: &ConfigLayer, segments: &[&str]) -> Option<f64> {
+	match layer {
+		ConfigLayer::Yaml(value) => {
+			let value = yaml_lookup(value, segments)?;
+			match value {
+				yaml::Value::Int(number) => Some(*number as f64),
+				yaml::Value::Float(number) => Some(*number),
+				yaml::Value::Str(text) => text.parse::<f64>().ok(),
+				_ => None,
+			}
+		},
+		ConfigLayer::Json(value) => {
+			let value = json_lookup(value, segments)?;
+			value
+				.as_f64()
+				.or_else(|| value.as_str()?.parse::<f64>().ok())
+		},
+	}
+}
+
+
+fn gc_config_bool(cwd: &Path, agent_dir: &Path, key: &str, default: bool) -> bool {
+	let segments: Vec<&str> = key.split('.').collect();
+	for layer in project_gc_layers(cwd) {
+		if let Some(value) = layer_bool(&layer, &segments) {
+			return value;
+		}
+	}
+	global_gc_layer(agent_dir)
+		.and_then(|layer| layer_bool(&layer, &segments))
+		.unwrap_or(default)
+}
+
+fn gc_config_number(cwd: &Path, agent_dir: &Path, key: &str, default: u64) -> u64 {
+	let segments: Vec<&str> = key.split('.').collect();
+	for layer in project_gc_layers(cwd) {
+		if let Some(value) = layer_number(&layer, &segments) {
+			return value.max(0.0) as u64;
+		}
+	}
+	global_gc_layer(agent_dir)
+		.and_then(|layer| layer_number(&layer, &segments))
+		.map(|number| number.max(0.0) as u64)
+		.unwrap_or(default)
+}
+
 pub fn run_gc(opts: &GcOptions, cwd: &Path, out: &mut dyn Write, err: &mut dyn Write) -> Result<u8> {
 	let paths = GcPaths::resolve(opts.agent_dir.as_deref(), cwd);
 	let selected = opts.blobs || opts.archive || opts.wal;
@@ -2906,23 +3101,23 @@ pub fn run_gc(opts: &GcOptions, cwd: &Path, out: &mut dyn Write, err: &mut dyn W
 		(opts.blobs, opts.archive, opts.wal)
 	} else {
 		(
-			setting_bool(cwd, "gc.blobs", true),
-			setting_bool(cwd, "gc.archive", true),
-			setting_bool(cwd, "gc.wal", true),
+			gc_config_bool(cwd, &paths.agent_dir, "gc.blobs", true),
+			gc_config_bool(cwd, &paths.agent_dir, "gc.archive", true),
+			gc_config_bool(cwd, &paths.agent_dir, "gc.wal", true),
 		)
 	};
 	let cold_days = opts
 		.cold_archive_after_days
 		.map(u64::from)
-		.unwrap_or_else(|| setting_number(cwd, "gc.coldArchiveAfterDays", 30));
+		.unwrap_or_else(|| gc_config_number(cwd, &paths.agent_dir, "gc.coldArchiveAfterDays", 30));
 	let retain_global = opts
 		.retain_newest_global
 		.map(u64::from)
-		.unwrap_or_else(|| setting_number(cwd, "gc.retainNewestGlobal", 20));
+		.unwrap_or_else(|| gc_config_number(cwd, &paths.agent_dir, "gc.retainNewestGlobal", 20));
 	let retain_cwd = opts
 		.retain_newest_per_cwd
 		.map(u64::from)
-		.unwrap_or_else(|| setting_number(cwd, "gc.retainNewestPerCwd", 10));
+		.unwrap_or_else(|| gc_config_number(cwd, &paths.agent_dir, "gc.retainNewestPerCwd", 10));
 
 	let mut result = json!({
 		"agentDir": display_path(&paths.agent_dir),
@@ -2933,7 +3128,7 @@ pub fn run_gc(opts: &GcOptions, cwd: &Path, out: &mut dyn Write, err: &mut dyn W
 		match run_blob_gc(&paths) {
 			Ok(blobs) => result["blobs"] = blobs,
 			Err(message) => {
-				write_line(err, &format!("error: {message}"))?;
+				write_line(err, &format!("error: {}", escape_terminal_text(&message, false)))?;
 				return Ok(1);
 			},
 		}
@@ -2999,20 +3194,103 @@ fn python_env_dir() -> PathBuf {
 	dirs::root_subdir("python-env", AgentDirCategory::Data)
 }
 
-fn managed_python_path() -> PathBuf {
+fn managed_python_binary(env_dir: &Path) -> PathBuf {
 	if cfg!(windows) {
-		python_env_dir().join("Scripts").join("python.exe")
+		env_dir.join("Scripts").join("python.exe")
 	} else {
-		python_env_dir().join("bin").join("python")
+		env_dir.join("bin").join("python")
 	}
 }
 
-async fn probe_python(cwd: &Path, interpreter: Option<&str>) -> (bool, Option<PathBuf>) {
+fn managed_python_path() -> PathBuf {
+	managed_python_binary(&python_env_dir())
+}
+
+fn venv_runtime(venv: &Path, base: &HashMap<String, String>) -> Option<pi_agent::eval::env::InterpreterRuntime> {
+	let bin = if cfg!(windows) {
+		venv.join("Scripts")
+	} else {
+		venv.join("bin")
+	};
+	let program = if cfg!(windows) {
+		bin.join("python.exe")
+	} else {
+		bin.join("python")
+	};
+	if !program.is_file() {
+		return None;
+	}
+	let mut env = base.clone();
+	env.insert("VIRTUAL_ENV".to_string(), venv.display().to_string());
+	let separator = if cfg!(windows) { ";" } else { ":" };
+	let bin_text = bin.display().to_string();
+	let path = match env.get("PATH") {
+		Some(current) if !current.is_empty() => format!("{bin_text}{separator}{current}"),
+		_ => bin_text,
+	};
+	env.insert("PATH".to_string(), path);
+	Some(pi_agent::eval::env::InterpreterRuntime {
+		program: program.clone(),
+		env,
+		label: program.display().to_string(),
+		venv: Some(venv.to_path_buf()),
+	})
+}
+
+/// Mirrors TS setup/runtime candidate order while substituting the reported
+/// profile/XDG-aware managed env for the shared helper's `$HOME/.omp` default:
+/// explicit interpreter, active/project venv, managed env, PATH.
+fn python_candidates(
+	cwd: &Path,
+	base: &HashMap<String, String>,
+	interpreter: Option<&str>,
+	managed_env: &Path,
+) -> Vec<pi_agent::eval::env::InterpreterRuntime> {
+	if let Some(interpreter) = interpreter {
+		return vec![pi_agent::eval::env::explicit_python(interpreter, cwd, base)];
+	}
+	let mut candidates = Vec::new();
+	let mut seen = HashSet::new();
+	let mut push = |runtime: pi_agent::eval::env::InterpreterRuntime| {
+		if seen.insert(runtime.program.clone()) {
+			candidates.push(runtime);
+		}
+	};
+	let venv = base
+		.get("VIRTUAL_ENV")
+		.map(PathBuf::from)
+		.or_else(|| base.get("CONDA_PREFIX").map(PathBuf::from))
+		.or_else(|| {
+			[cwd.join(".venv"), cwd.join("venv")]
+				.into_iter()
+				.find(|candidate| candidate.is_dir())
+		});
+	if let Some(venv) = venv {
+		if let Some(runtime) = venv_runtime(&venv, base) {
+			push(runtime);
+		}
+	}
+	if let Some(runtime) = venv_runtime(managed_env, base) {
+		push(runtime);
+	}
+	for binary in ["python", "python3"] {
+		if let Some(program) = pi_agent::eval::env::which(binary, base) {
+			push(pi_agent::eval::env::InterpreterRuntime::new(program, base.clone()));
+		}
+	}
+	candidates
+}
+
+async fn probe_python(
+	cwd: &Path,
+	interpreter: Option<&str>,
+	managed_env: &Path,
+) -> (bool, Option<PathBuf>) {
 	let env: HashMap<String, String> = std::env::vars_os()
 		.filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
 		.collect();
 	let base = pi_agent::eval::env::filter_env(pi_agent::eval::types::EvalLanguage::Py, &env);
-	let runtimes = pi_agent::eval::env::enumerate_python(cwd, &base, interpreter);
+	let runtimes = python_candidates(cwd, &base, interpreter, managed_env);
 	if runtimes.is_empty() {
 		return (false, None);
 	}
@@ -3047,8 +3325,9 @@ fn run_setup_python(opts: &SetupOptions, cwd: &Path, out: &mut dyn Write, err: &
 		.enable_all()
 		.build()
 		.map_err(|error| Error::new(error.to_string()))?;
-	let (available, python_path) = runtime.block_on(probe_python(cwd, interpreter.as_deref()));
 	let managed = managed_python_path();
+	let (available, python_path) =
+		runtime.block_on(probe_python(cwd, interpreter.as_deref(), &python_env_dir()));
 	let using_managed = python_path.as_deref() == Some(managed.as_path());
 
 	if opts.json {

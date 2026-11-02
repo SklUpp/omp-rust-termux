@@ -2861,6 +2861,27 @@ async fn spawn_recording_openai_server(
 	(url, rx)
 }
 
+/// Serve one raw SSE body on a real localhost socket, then close the
+/// connection: the EOF behaviour under test is what a provider sees when it
+/// omits the `[DONE]` sentinel.
+async fn spawn_sse_server(body: String) -> String {
+	let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+	let port = listener.local_addr().expect("local addr").port();
+	tokio::spawn(async move {
+		if let Ok((mut stream, _)) = listener.accept().await {
+			let _ = read_http_json_request(&mut stream).await;
+			let response = format!(
+				"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+				body.len(),
+				body
+			);
+			let _ = stream.write_all(response.as_bytes()).await;
+			let _ = stream.flush().await;
+		}
+	});
+	format!("http://127.0.0.1:{port}")
+}
+
 /// Serve one canned assistant `message` object per request and forward each
 /// parsed request body, so a test can drive the real HTTP wire end to end.
 async fn spawn_scripted_chat_server(
@@ -2898,6 +2919,58 @@ async fn spawn_scripted_chat_server(
 	});
 
 	(url, rx)
+}
+
+#[tokio::test]
+async fn openai_eof_after_finish_reason_ends_the_stream_turn() {
+	let dir = TempDir::new("eof-finish-reason");
+	let body = "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":\"length\"}]}\n\n"
+		.to_string();
+	let url = spawn_sse_server(body).await;
+	let provider =
+		OpenAiCompatibleProvider::new(url, "fake-key", "gpt-4o").expect("provider build");
+	let agent = AgentLoop::new(config(&dir.path, 3), Arc::new(provider), ToolRegistry::new());
+	let mut state = AgentState::default();
+	let (events_tx, events_rx) = tokio::sync::mpsc::channel(8);
+	let drainer = spawn_drainer(events_rx);
+
+	let turns = agent
+		.run_dialog_with("go", &mut state, None, Some(events_tx))
+		.await
+		.expect("EOF after finish_reason is a complete turn, not a truncation");
+
+	assert_eq!(turns.len(), 1);
+	assert_eq!(turns[0].message.stop_reason, Some(StopReason::Length));
+	assert_eq!(turns[0].message.content, "partial");
+	assert!(turns[0].is_completed);
+	let _ = drainer.await.expect("drainer");
+}
+
+#[tokio::test]
+async fn openai_eof_without_done_or_finish_reason_stays_a_protocol_error() {
+	let dir = TempDir::new("eof-truncated");
+	let body =
+		"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n".to_string();
+	let url = spawn_sse_server(body).await;
+	let provider =
+		OpenAiCompatibleProvider::new(url, "fake-key", "gpt-4o").expect("provider build");
+	let agent = AgentLoop::new(config(&dir.path, 3), Arc::new(provider), ToolRegistry::new());
+	let mut state = AgentState::default();
+	let (events_tx, events_rx) = tokio::sync::mpsc::channel(8);
+	let drainer = spawn_drainer(events_rx);
+
+	let err = agent
+		.run_dialog_with("go", &mut state, None, Some(events_tx))
+		.await
+		.expect_err("neither [DONE] nor finish_reason means the body was truncated");
+
+	match err {
+		AgentError::Provider(ProviderError::Protocol(message)) => {
+			assert!(message.contains("stream ended before completion"), "{message}");
+		},
+		other => panic!("expected protocol truncation error, got {other:?}"),
+	}
+	let _ = drainer.await.expect("drainer");
 }
 
 #[tokio::test]

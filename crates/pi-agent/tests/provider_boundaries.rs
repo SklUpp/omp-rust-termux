@@ -402,6 +402,80 @@ async fn openai_finish_reason_reaches_complete_and_stream_messages() {
 }
 
 #[tokio::test]
+async fn openai_finish_reason_closes_eof_without_done_and_keeps_usage() {
+	for (reason, expected_stop, expected_error) in [
+		("length", StopReason::Length, None),
+		("content_filter", StopReason::Error, Some("Provider finish_reason: content_filter")),
+		("stop", StopReason::Stop, None),
+	] {
+		let body = format!(
+			"data: {{\"choices\":[{{\"delta\":{{\"content\":\"partial\"}},\"finish_reason\":\"{reason}\"}}]}}\n\n"
+		);
+		let url = serve_responses(vec![response("200 OK", "text/event-stream", &body)]).await;
+		let provider = OpenAiCompatibleProvider::new(url, "key", "model").expect("provider");
+		let mut stream = provider
+			.stream(&[Message::user("hi")], &[], &ToolChoice::Auto)
+			.await
+			.expect("stream");
+
+		let mut chunks = Vec::new();
+		while let Some(item) = stream.next().await {
+			chunks.push(item.expect("chunk"));
+		}
+		let (last, earlier) = chunks.split_last().expect("terminal chunk");
+		assert!(last.is_done, "{reason}: EOF after finish_reason must terminate");
+		assert_eq!(last.stop_reason, Some(expected_stop), "{reason}");
+		assert_eq!(last.error_message.as_deref(), expected_error, "{reason}");
+		assert!(
+			earlier.iter().all(|chunk| !chunk.is_done),
+			"{reason}: only the synthetic terminal chunk may be done"
+		);
+
+		let mut assembler = StreamAssembler::new();
+		for chunk in &chunks {
+			assembler.push(chunk).expect("assemble");
+		}
+		let message = assembler.finish().expect("finish");
+		assert_eq!(message.stop_reason, Some(expected_stop), "{reason}");
+		assert_eq!(message.content, "partial", "{reason}");
+	}
+
+	// `stop` then a trailing usage trailer and EOF: the usage must survive the
+	// synthetic terminator and the turn must end normally.
+	let body = concat!(
+		"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+		"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+		"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2,\"total_tokens\":5}}\n\n"
+	);
+	let url = serve_responses(vec![response("200 OK", "text/event-stream", body)]).await;
+	let provider = OpenAiCompatibleProvider::new(url, "key", "model").expect("provider");
+	let mut stream = provider
+		.stream(&[Message::user("hi")], &[], &ToolChoice::Auto)
+		.await
+		.expect("stream");
+	let mut chunks = Vec::new();
+	while let Some(item) = stream.next().await {
+		chunks.push(item.expect("chunk"));
+	}
+	assert!(
+		chunks.iter().any(|chunk| chunk.usage.is_some()),
+		"the trailing usage chunk must not be cut"
+	);
+	let last = chunks.last().expect("terminal chunk");
+	assert!(last.is_done);
+	assert_eq!(last.stop_reason, Some(StopReason::Stop));
+
+	let mut assembler = StreamAssembler::new();
+	for chunk in &chunks {
+		assembler.push(chunk).expect("assemble");
+	}
+	let message = assembler.finish().expect("finish");
+	assert_eq!(message.stop_reason, Some(StopReason::Stop));
+	assert_eq!(message.content, "hi");
+	assert_eq!(message.usage.expect("usage retained").total_tokens, 5);
+}
+
+#[tokio::test]
 async fn forced_tool_choice_requires_an_offered_function_shaped_tool() {
 	let provider = OpenAiCompatibleProvider::new("http://127.0.0.1:9", "key", "model")
 		.expect("provider");

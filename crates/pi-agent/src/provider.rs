@@ -1560,7 +1560,10 @@ pub fn parse_sse_line(line: &str) -> Option<Result<StreamChunk, ProviderError>> 
 ///
 /// Records may be split across transport chunks and the stream may end without a
 /// trailing newline; both are handled by buffering until `\n` and flushing the
-/// tail on EOF. `[DONE]` terminates the stream.
+/// tail on EOF. `[DONE]` terminates the stream. EOF after a `finish_reason` also
+/// terminates it: the final reason is carried on a synthetic done chunk
+/// (TS accepts a closed body after the terminal reason, but keeps draining
+/// usage trailers before that).
 pub fn sse_stream<S, B, E>(body: S) -> ChunkStream
 where
 	S: Stream<Item = Result<B, E>> + Send + Unpin + 'static,
@@ -1572,10 +1575,48 @@ where
 		buf: Vec<u8>,
 		pending: VecDeque<StreamChunk>,
 		done: bool,
+		/// Last terminal reason seen, used to close an EOF without `[DONE]`.
+		stop_reason: Option<StopReason>,
+		error_message: Option<String>,
+	}
+
+	/// Remember the terminal reason a parsed chunk carried.
+	fn record_terminal(
+		chunk: &StreamChunk,
+		stop_reason: &mut Option<StopReason>,
+		error_message: &mut Option<String>,
+	) {
+		if chunk.stop_reason.is_some() || chunk.error_message.is_some() {
+			*stop_reason = chunk.stop_reason;
+			*error_message = chunk.error_message.clone();
+		}
+	}
+
+	/// Synthetic terminal chunk for a body that ended after `finish_reason`.
+	fn terminal_chunk(stop_reason: Option<StopReason>, error_message: Option<String>) -> StreamChunk {
+		StreamChunk {
+			content: None,
+			reasoning: None,
+			tool_call_deltas: Vec::new(),
+			usage: None,
+			is_done: true,
+			content_index: None,
+			signature: None,
+			redacted: None,
+			stop_reason,
+			error_message,
+		}
 	}
 
 	futures::stream::unfold(
-		State { body, buf: Vec::new(), pending: VecDeque::new(), done: false },
+		State {
+			body,
+			buf: Vec::new(),
+			pending: VecDeque::new(),
+			done: false,
+			stop_reason: None,
+			error_message: None,
+		},
 		|mut st| async move {
 			loop {
 				if let Some(chunk) = st.pending.pop_front() {
@@ -1592,7 +1633,10 @@ where
 					let line: Vec<u8> = st.buf.drain(..=pos).collect();
 					match parse_sse_line(&String::from_utf8_lossy(&line)) {
 						None => {},
-						Some(Ok(chunk)) => st.pending.push_back(chunk),
+						Some(Ok(chunk)) => {
+							record_terminal(&chunk, &mut st.stop_reason, &mut st.error_message);
+							st.pending.push_back(chunk);
+						},
 						Some(Err(err)) => {
 							st.done = true;
 							return Some((Err(err), st));
@@ -1609,11 +1653,39 @@ where
 					},
 					None => {
 						st.done = true;
-						if st.buf.is_empty() {
+						// Flush the tail record first: it may carry the terminal
+						// reason or a trailing usage trailer.
+						let mut tail_done = false;
+						if !st.buf.is_empty() {
+							let line: Vec<u8> = std::mem::take(&mut st.buf);
+							match parse_sse_line(&String::from_utf8_lossy(&line)) {
+								None => {},
+								Some(Ok(chunk)) => {
+									record_terminal(
+										&chunk,
+										&mut st.stop_reason,
+										&mut st.error_message,
+									);
+									tail_done = chunk.is_done;
+									st.pending.push_back(chunk);
+								},
+								Some(Err(err)) => return Some((Err(err), st)),
+							}
+						}
+						// A closed body after `finish_reason` is a complete turn
+						// (TS); synthesize the terminator so the assembler sees
+						// `is_done` instead of a truncated stream. Without either
+						// `[DONE]` or a reason, keep the truncation error.
+						if !tail_done
+							&& (st.stop_reason.is_some() || st.error_message.is_some())
+						{
+							st.pending
+								.push_back(terminal_chunk(st.stop_reason, st.error_message.clone()));
+						}
+						if st.pending.is_empty() {
 							return None;
 						}
-						let line: Vec<u8> = std::mem::take(&mut st.buf);
-						return parse_sse_line(&String::from_utf8_lossy(&line)).map(|res| (res, st));
+						continue;
 					},
 				}
 			}

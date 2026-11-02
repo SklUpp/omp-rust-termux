@@ -940,3 +940,51 @@ fn prewalk_explicit_into_switches_on_first_write_when_todo_is_not_offered() {
 	b.stop();
 	fs::remove_dir_all(base).ok();
 }
+
+/// The action check keys on the tool, not its success flag. A write that fails
+/// (`is_error: true`) still arms the hand-off after `todo` was unavailable.
+#[test]
+fn prewalk_switches_after_a_failed_write() {
+	let a = MockWireServer::start(vec![tool_sse(&[(
+		"call-write",
+		"write",
+		serde_json::json!({"path": ".", "content": "x"}),
+	)])]);
+	let b = MockWireServer::start(vec![text_sse("switched after the failed write")]);
+	let base = temp_dir("prewalk-failed-write");
+	let (agent_dir, cwd, sessions) = setup_two_providers(&base, a.port, b.port, "");
+	let run_out = run(
+		omp(&agent_dir, &cwd, &sessions).args([
+			"--yolo",
+			"--tools",
+			"write,read",
+			"--prewalk-into",
+			"mockB/model-b",
+			"--session-id",
+			"prewalk-failed-write",
+			"-p",
+			"write now",
+		]),
+	);
+	assert!(
+		run_out.status.success(),
+		"failed-write prewalk run failed: {}",
+		String::from_utf8_lossy(&run_out.stderr)
+	);
+	assert_eq!(a.request_count(), 1);
+	assert_eq!(
+		b.request_count(),
+		1,
+		"a failed write is still the implementation action"
+	);
+	assert_eq!(b.request(0)["model"], "model-b");
+	assert!(
+		String::from_utf8_lossy(&run_out.stderr).contains("Prewalk: switched"),
+		"the switch must be announced: {}",
+		String::from_utf8_lossy(&run_out.stderr)
+	);
+
+	a.stop();
+	b.stop();
+	fs::remove_dir_all(base).ok();
+}

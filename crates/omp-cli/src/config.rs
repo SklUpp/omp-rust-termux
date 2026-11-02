@@ -603,8 +603,10 @@ pub struct Config {
 	/// Ephemeral `--service-tier` (OpenAI wire; `none`/empty omit).
 	pub service_tier:         Option<String>,
 	/// `tier.openai` / `tier.anthropic` / `tier.google` settings (TS
-	/// `buildServiceTierByFamily`). `"none"` and values the family cannot
-	/// realize are dropped at parse time.
+	/// `buildServiceTierByFamily`). Values the family cannot realize are dropped
+	/// at parse time; explicit `"none"` / `null` is retained as a sentinel so
+	/// higher layers can clear a lower layer's configured tier, and dropped
+	/// when resolving the effective map in [`Config::configured_service_tiers`].
 	pub tier_openai:          Option<String>,
 	pub tier_anthropic:       Option<String>,
 	pub tier_google:          Option<String>,

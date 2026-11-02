@@ -1077,10 +1077,33 @@ impl RpcSession {
 		// fixed level, or a different resolved level. Re-applying the same level
 		// (and rejected input, which returns above) keeps the inherited key.
 		let was_auto = self.thinking == Some(runtime::CliThinking::Auto);
+		// TS stores and compares the *resolved* level (`model-controls.ts:541-552`).
+		// A restored raw suffix such as `max` may resolve to `high`, and a
+		// non-reasoning target resolves every raw effort to `None`; comparing the
+		// raw identifier would report a false change and drop the inherited key.
+		let previous_effective = match self.thinking {
+			Some(runtime::CliThinking::Off) => Some("off".to_string()),
+			Some(thinking @ runtime::CliThinking::Effort(_)) => {
+				self.model.as_deref().and_then(|model| {
+					let provider = self
+						.provider
+						.as_deref()
+						.or_else(|| self.catalog.provider_of(model))
+						.unwrap_or_default();
+					runtime::resolve_thinking_effort(
+						&self.catalog,
+						provider,
+						model,
+						Some(thinking),
+					)
+				})
+			},
+			_ => None,
+		};
 		let changed = match parsed {
 			runtime::CliThinking::Auto => !was_auto,
 			runtime::CliThinking::Off => {
-				was_auto || self.thinking_level.as_deref() != Some("off")
+				was_auto || previous_effective.as_deref() != Some("off")
 			},
 			runtime::CliThinking::Effort(_) => {
 				let provider = self
@@ -1096,7 +1119,7 @@ impl RpcSession {
 						Some(parsed),
 					)
 				});
-				was_auto || effective.as_deref() != self.thinking_level.as_deref()
+				was_auto || effective.as_deref() != previous_effective.as_deref()
 			},
 		};
 		self.thinking = Some(parsed);

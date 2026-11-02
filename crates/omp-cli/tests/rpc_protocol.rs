@@ -2026,6 +2026,80 @@ fn rpc_thinking_change_drops_inherited_cache_key_but_noop_keeps_it() {
 	drop(harness);
 }
 
+/// A restored raw suffix can clamp to a different identifier: `max` resolves to
+/// `high` on this catalog, so selecting `high` is a no-op and must keep the
+/// inherited key; a real change to `low` then drops it.
+#[test]
+fn rpc_thinking_restored_clamped_noop_keeps_inherited_cache_key() {
+	let (port, requests, _) = spawn_tool_model_with_auth(vec![
+		ToolScript { text: "one".to_string(), tool: None },
+		ToolScript { text: "two".to_string(), tool: None },
+	]);
+	let mut launch = launch(port, "model-a", "mock");
+	launch.catalog = Arc::new(effort_catalog());
+	// Recorded as `:max`; this catalog only advertises low/high, so its
+	// effective level is high both before and after selecting high.
+	launch.thinking = Some(CliThinking::Effort("max"));
+	launch.thinking_level = Some("max".to_string());
+	launch.prompt_cache_key = Some("header-cache-1".to_string());
+	launch.prompt_cache_key_inherited = true;
+	launch.max_turns = 2;
+	let harness = Harness::start(launch);
+
+	harness.send(json!({ "type": "set_thinking_level", "id": "t1", "level": "high" }));
+	harness.wait_for(
+		|frames| frames.iter().any(|frame| frame["id"] == "t1"),
+		timeout(),
+	);
+	harness.send(json!({ "type": "prompt", "id": "p1", "message": "one" }));
+	harness.wait_for(
+		|frames| {
+			frames
+				.iter()
+				.filter(|frame| frame["type"] == "agent_end")
+				.count()
+				>= 1
+		},
+		timeout(),
+	);
+
+	harness.send(json!({ "type": "set_thinking_level", "id": "t2", "level": "low" }));
+	harness.wait_for(
+		|frames| frames.iter().any(|frame| frame["id"] == "t2"),
+		timeout(),
+	);
+	harness.send(json!({ "type": "prompt", "id": "p2", "message": "two" }));
+	harness.wait_for(
+		|frames| {
+			frames
+				.iter()
+				.filter(|frame| frame["type"] == "agent_end")
+				.count()
+				>= 2
+		},
+		timeout(),
+	);
+
+	let bodies = requests
+		.lock()
+		.unwrap_or_else(std::sync::PoisonError::into_inner)
+		.clone();
+	assert_eq!(bodies.len(), 2, "{bodies:#?}");
+	assert_eq!(
+		bodies[0]["prompt_cache_key"], "header-cache-1",
+		"restored max->high is the same effective level: {}",
+		bodies[0]
+	);
+	assert_eq!(bodies[0]["reasoning_effort"], "high");
+	assert!(
+		bodies[1].get("prompt_cache_key").is_none(),
+		"a real low change must drop the inherited key: {}",
+		bodies[1]
+	);
+	assert_eq!(bodies[1]["reasoning_effort"], "low");
+	drop(harness);
+}
+
 /// An explicit `--prompt-cache-key` is not inherited identity and survives an
 /// actual thinking change.
 #[test]

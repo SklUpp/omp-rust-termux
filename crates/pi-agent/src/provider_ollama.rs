@@ -575,9 +575,13 @@ pub fn demote_thinking(model_id: &str, thinking: &str) -> String {
 		"anthropic" => thinking.to_string(),
 		"harmony" | "gemma" => format!("\x3cthink\x3e\n{thinking}\n\x3c/think\x3e"),
 		"gemini" => format!("```thinking\n{thinking}\n```"),
-		"qwen3" | "deepseek" | "kimi" | "glm" | "hermes" => {
-			// TS `renderDelimitedThinking`: never double-wrap an already-delimited
-			// block (`dialect/rendering.ts:270-273`, Hermes `THINK_OPEN <think>`).
+		"qwen3" | "deepseek" | "kimi" | "glm" => {
+			// These dialect `renderThinking`s wrap directly (no pre-unwrap).
+			format!("\x3cthink\x3e\n{thinking}\n\x3c/think\x3e")
+		},
+		"hermes" => {
+			// Hermes uses `renderDelimitedThinking`, which unwraps complete
+			// wrappers (`dialect/rendering.ts:270-273`).
 			let inner = unwrap_delimited_thinking("\x3cthink\x3e", "\x3c/think\x3e", thinking);
 			format!("\x3cthink\x3e\n{inner}\n\x3c/think\x3e")
 		},

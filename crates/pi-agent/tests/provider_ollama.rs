@@ -469,6 +469,34 @@ async fn hermes_deep_sibling_nesting_outputs_exact_flat_text() {
 }
 
 #[tokio::test]
+async fn qwen3_history_double_wraps_existing_think_block_on_wire() {
+	let (base, request_rx) = serve_once(response(
+		"200 OK",
+		"application/x-ndjson",
+		"{\"message\":{\"content\":\"ok\"},\"done\":true}\n",
+	))
+	.await;
+	let mut assistant = Message::assistant("");
+	assistant.parts = vec![
+		ContentPart::thinking("\x3cthink\x3e\nplan\n\x3c/think\x3e"),
+		ContentPart::text("answer"),
+	];
+	assistant.provider = Some("anthropic".into());
+	assistant.api = Some("anthropic-messages".into());
+	assistant.model = Some("claude-3".into());
+	let provider = make_provider(&base, "qwen-2.5-coder");
+	provider
+		.complete(&[Message::user("hi"), assistant], &[], &ToolChoice::Auto)
+		.await
+		.expect("complete");
+	let (_, body) = request_rx.await.expect("request");
+	assert_eq!(
+		body["messages"][1]["content"],
+		"\x3cthink\x3e\n\x3cthink\x3e\nplan\n\x3c/think\x3e\n\x3c/think\x3e\nanswer"
+	);
+}
+
+#[tokio::test]
 async fn cloud_dialect_caps_tokens_strips_history_thinking_and_demotes_system() {
 	let (base, request_rx) = serve_once(response(
 		"200 OK",
@@ -1371,6 +1399,10 @@ fn test_history_thinking_demotion_target_dialects() {
 	assert_eq!(
 		demote_thinking("hermes-3", "\x3cthink\x3e\nstep 1\n\x3c/think\x3e"),
 		"\x3cthink\x3e\nstep 1\n\x3c/think\x3e"
+	);
+	assert_eq!(
+		demote_thinking("qwen-2.5-coder", "\x3cthink\x3e\nstep 1\n\x3c/think\x3e"),
+		"\x3cthink\x3e\n\x3cthink\x3e\nstep 1\n\x3c/think\x3e\n\x3c/think\x3e"
 	);
 	assert_eq!(
 		demote_thinking(

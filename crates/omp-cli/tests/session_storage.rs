@@ -1,12 +1,12 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use omp_cli::dirs;
 use omp_cli::session::{
-	MessageContent, MessageEntry, SessionMessage, SessionOptions, SessionStore, ToolCallRecord,
-	TurnRecord, compute_default_session_dir, continue_recent_with_breadcrumb, fork_session,
-	import_legacy_v1, overlay_title_slot, overwrite_title_slot_rolled_back, parse_title_slot,
-	read_terminal_breadcrumb, resolve_resumable_session, serialize_title_slot,
+	ContentPart, MessageContent, MessageEntry, SessionMessage, SessionOptions, SessionStore,
+	ToolCallRecord, TurnRecord, compute_default_session_dir, continue_recent_with_breadcrumb,
+	fork_session, import_legacy_v1, overlay_title_slot, overwrite_title_slot_rolled_back,
+	parse_title_slot, read_terminal_breadcrumb, resolve_resumable_session, serialize_title_slot,
 	session_matches_resume_arg, write_terminal_breadcrumb,
 };
 
@@ -1022,4 +1022,296 @@ fn branch_to_and_parent_lineage_survive_reload() {
 	);
 
 	fs::remove_dir_all(dir).ok();
+}
+
+/// C1f acceptance: a real TypeScript-written v3 JSONL session must survive
+/// `read -> append -> reread`, keep interleaved text/image part order and
+/// canonical stop reasons, and keep pre-existing logs usable through resume
+/// and fork (TS fixture and legacy Rust v1 log).
+#[test]
+fn ts_v3_session_round_trip_preserves_ordered_parts_stop_reasons_and_resume_fork() {
+	const ORIGINAL_ID: &str = "01a178ce-3463-7504-8047-ca4fab78a16b";
+	let fixture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+		.join("tests/fixtures/v3_session.jsonl");
+	assert!(fixture_path.is_file(), "real TS v3 fixture must exist");
+
+	let temp = temp_dir("ts-roundtrip");
+	// TS-style file name (`file_safe_timestamp` + `_` + session id) so resume
+	// selection and id-prefix resolution exercise the real naming contract.
+	let session_file = temp
+		.join(format!("2026-10-26T15-22-22-179Z_{ORIGINAL_ID}.jsonl"));
+	fs::copy(&fixture_path, &session_file).expect("copy TS fixture");
+
+	let part_signature = |content: &MessageContent| -> Vec<String> {
+		content
+			.parts()
+			.into_iter()
+			.map(|part| {
+				format!(
+					"{}|{}|{}|{}",
+					part.kind,
+					part.text.as_deref().unwrap_or_default(),
+					part.data.as_deref().unwrap_or_default(),
+					part.mime_type.as_deref().unwrap_or_default()
+				)
+			})
+			.collect()
+	};
+	let expected = |lines: &[&str]| lines.iter().map(|line| line.to_string()).collect::<Vec<_>>();
+
+	let mut store = SessionStore::open(&SessionOptions {
+		enabled: true,
+		cwd: PathBuf::from("/work/ts-roundtrip"),
+		model: None,
+		provider: None,
+		dir: Some(temp.clone()),
+		id: Some(ORIGINAL_ID.to_string()),
+		continue_latest: false,
+		parent_session: None,
+		no_title: true,
+	});
+	assert!(
+		store.enabled(),
+		"store must open the real TS fixture: {:?}",
+		store.take_warnings()
+	);
+	assert_eq!(store.header().expect("header").id, ORIGINAL_ID);
+
+	// READ: the TS-written text/image order is surfaced exactly.
+	let read_messages = store.messages();
+	assert_eq!(read_messages.len(), 3, "fixture has user/assistant/toolResult");
+	assert_eq!(
+		part_signature(&read_messages[0].message.content),
+		expected(&["text|hello from test user||", "image||aGVsbG8=|image/png"]),
+		"user text+image order must be preserved"
+	);
+	assert_eq!(
+		part_signature(&read_messages[2].message.content),
+		expected(&["text|file content||", "image||aW1hZ2VkYXRh|image/png"]),
+		"toolResult text+image order must be preserved"
+	);
+
+	// WRITE: append a message with interleaved text/image parts and an assistant
+	// carrying a canonical stop reason, then reopen from disk.
+	store
+		.append_message(&MessageEntry::new(
+			"roundtrip-user",
+			Some("59e1c6b4".to_string()),
+			"2026-10-26T15:22:23.000Z",
+			SessionMessage::user(
+				MessageContent::Parts(vec![
+					ContentPart::text("first text"),
+					ContentPart::image("aW1nLW9uZQ==", "image/png"),
+					ContentPart::text("second text"),
+					ContentPart::image("aW1nLXR3bw==", "image/jpeg"),
+				]),
+				1_793_028_143_000,
+			),
+		))
+		.expect("append interleaved user message");
+	store
+		.append_message(&MessageEntry::new(
+			"roundtrip-assistant",
+			Some("roundtrip-user".to_string()),
+			"2026-10-26T15:22:23.001Z",
+			SessionMessage::assistant(
+				MessageContent::Text("round-trip answer".to_string()),
+				"openai-completions",
+				"openai",
+				"gpt-4o",
+				None,
+				"length",
+				1_793_028_143_001,
+			),
+		))
+		.expect("append assistant message");
+	drop(store);
+
+	// READ AGAIN (resume): every message survives, in order, with canonical
+	// stop reasons untouched.
+	let mut resumed = SessionStore::open(&SessionOptions {
+		enabled: true,
+		cwd: PathBuf::from("/work/ts-roundtrip"),
+		model: None,
+		provider: None,
+		dir: Some(temp.clone()),
+		id: None,
+		continue_latest: true,
+		parent_session: None,
+		no_title: true,
+	});
+	assert!(
+		resumed.enabled(),
+		"resumed store must reopen the round-tripped log: {:?}",
+		resumed.take_warnings()
+	);
+	assert_eq!(resumed.header().expect("resumed header").id, ORIGINAL_ID);
+	let resumed_messages = resumed.messages();
+	assert_eq!(resumed_messages.len(), 5, "both appended messages must persist");
+	assert_eq!(
+		part_signature(&resumed_messages[3].message.content),
+		expected(&[
+			"text|first text||",
+			"image||aW1nLW9uZQ==|image/png",
+			"text|second text||",
+			"image||aW1nLXR3bw==|image/jpeg",
+		]),
+		"interleaved text/image order must survive write -> reread"
+	);
+	assert_eq!(
+		resumed_messages[1].message.stop_reason.as_deref(),
+		Some("toolUse"),
+		"TS canonical stop reason must survive unchanged"
+	);
+	assert_eq!(
+		resumed_messages[4].message.stop_reason.as_deref(),
+		Some("length"),
+		"appended canonical stop reason must survive unchanged"
+	);
+
+	// Resume replay surface: the runtime history conversion keeps the same
+	// interleaved order when rehydrating a resumed session.
+	let history = resumed.history();
+	assert_eq!(history.len(), 2, "fixture turn plus appended turn");
+	let replay = omp_cli::runtime::history_messages(history).expect("resume replay");
+	let replay_user = replay
+		.iter()
+		.find(|message| message.role == pi_agent::Role::User && message.parts.len() == 4)
+		.expect("appended user message must replay with all four parts");
+	let replay_signature: Vec<String> = replay_user
+		.parts
+		.iter()
+		.map(|part| match part {
+			pi_agent::ContentPart::Text { text } => format!("text|{text}"),
+			pi_agent::ContentPart::Image { data, mime_type } => {
+				format!("image|{data}|{mime_type}")
+			},
+			pi_agent::ContentPart::Thinking { thinking } => format!("thinking|{thinking}"),
+		})
+		.collect();
+	assert_eq!(
+		replay_signature,
+		expected(&[
+			"text|first text",
+			"image|aW1nLW9uZQ==|image/png",
+			"text|second text",
+			"image|aW1nLXR3bw==|image/jpeg",
+		]),
+		"resume replay must keep interleaved text/image order"
+	);
+
+	// Resume selector resolves the pre-existing TS session by id prefix.
+	let resolved = resolve_resumable_session(
+		"01a178ce",
+		Path::new("/work/ts-roundtrip"),
+		Some(&temp),
+		false,
+	)
+	.expect("resolve resume selector")
+	.expect("id-prefix must resolve the TS session");
+	assert_eq!(resolved, session_file);
+
+	// FORK: the round-tripped TS session still forks with lineage and parts.
+	let ts_fork_dir = temp.join("ts-forks");
+	fs::create_dir_all(&ts_fork_dir).expect("create TS fork dir");
+	let forked_path = fork_session(&session_file, None, Some(&ts_fork_dir)).expect("fork TS session");
+	assert!(forked_path.is_file());
+	let mut forked = SessionStore::open(&SessionOptions {
+		enabled: true,
+		cwd: PathBuf::from("/work/ts-roundtrip"),
+		model: None,
+		provider: None,
+		dir: Some(ts_fork_dir.clone()),
+		id: None,
+		// ponytail: one fork per dir keeps `continue_latest` unambiguous; parse
+		// the fork header id if several forks ever share a directory.
+		continue_latest: true,
+		parent_session: None,
+		no_title: true,
+	});
+	assert!(forked.enabled(), "fork must reopen: {:?}", forked.take_warnings());
+	let forked_header = forked.header().expect("forked header");
+	assert_ne!(forked_header.id, ORIGINAL_ID, "fork gets a new session id");
+	assert_eq!(
+		forked_header.parent_session.as_deref(),
+		Some(ORIGINAL_ID),
+		"fork must record the TS parent session"
+	);
+	let forked_messages = forked.messages();
+	assert_eq!(forked_messages.len(), 5, "fork must carry every message");
+	assert_eq!(
+		part_signature(&forked_messages[3].message.content),
+		expected(&[
+			"text|first text||",
+			"image||aW1nLW9uZQ==|image/png",
+			"text|second text||",
+			"image||aW1nLXR3bw==|image/jpeg",
+		]),
+		"fork must preserve interleaved part order"
+	);
+	assert_eq!(forked_messages[1].message.stop_reason.as_deref(), Some("toolUse"));
+	assert_eq!(forked_messages[4].message.stop_reason.as_deref(), Some("length"));
+
+	// Old Rust session no-regression: the legacy v1 log still imports,
+	// resumes, and forks after the TS round-trip surface is exercised.
+	let legacy_fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+		.join("tests/fixtures/v1_session.jsonl");
+	assert!(legacy_fixture.is_file(), "legacy v1 fixture must exist");
+	let legacy_source = temp.join("v1-source.jsonl");
+	fs::copy(&legacy_fixture, &legacy_source).expect("copy v1 fixture");
+	let imported_dir = temp.join("v3-from-v1");
+	fs::create_dir_all(&imported_dir).expect("create import dir");
+	let imported_path = import_legacy_v1(&legacy_source, &imported_dir, None).expect("import v1");
+
+	let mut imported = SessionStore::open(&SessionOptions {
+		enabled: true,
+		cwd: PathBuf::from("/work/legacy"),
+		model: None,
+		provider: None,
+		dir: Some(imported_dir.clone()),
+		id: None,
+		continue_latest: true,
+		parent_session: None,
+		no_title: true,
+	});
+	assert!(
+		imported.enabled(),
+		"imported legacy session must resume: {:?}",
+		imported.take_warnings()
+	);
+	assert_eq!(imported.history().len(), 1);
+	assert_eq!(imported.history()[0].prompt, "fix the bug");
+	assert_eq!(
+		imported.history()[0].stop_reason, "stop",
+		"legacy `end_turn` must migrate to the canonical `stop`"
+	);
+	let imported_id = imported.header().expect("imported header").id.clone();
+
+	let legacy_fork_dir = temp.join("legacy-forks");
+	fs::create_dir_all(&legacy_fork_dir).expect("create legacy fork dir");
+	let legacy_fork_path =
+		fork_session(&imported_path, None, Some(&legacy_fork_dir)).expect("fork imported v1");
+	assert!(legacy_fork_path.is_file());
+	let legacy_fork = SessionStore::open(&SessionOptions {
+		enabled: true,
+		cwd: PathBuf::from("/work/legacy"),
+		model: None,
+		provider: None,
+		dir: Some(legacy_fork_dir),
+		id: None,
+		continue_latest: true,
+		parent_session: None,
+		no_title: true,
+	});
+	assert!(legacy_fork.enabled(), "legacy fork must reopen");
+	assert_eq!(
+		legacy_fork.header().expect("legacy fork header").parent_session.as_deref(),
+		Some(imported_id.as_str()),
+		"legacy fork must record the imported parent"
+	);
+	assert_eq!(legacy_fork.history().len(), 1, "legacy fork keeps its turn");
+	assert_eq!(legacy_fork.history()[0].prompt, "fix the bug");
+	assert_eq!(legacy_fork.history()[0].assistant, "done");
+
+	fs::remove_dir_all(temp).ok();
 }

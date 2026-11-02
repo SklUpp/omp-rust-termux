@@ -368,3 +368,133 @@ async fn spawned_event_precedes_readiness_with_private_spec() {
 	);
 	manager.stop("pending", None, 2_000).await.expect("stop");
 }
+
+/// Wait for the kernel to drop `pid`: the generation's waiter has reaped it, so
+/// absence proves no orphan and no zombie survived cleanup. (The PTY master fd
+/// stays open only as long as the settled record is retained for inspection.)
+async fn assert_reaped(pid: u32) {
+	for _ in 0..60 {
+		if !alive(pid) {
+			return;
+		}
+		tokio::time::sleep(Duration::from_millis(50)).await;
+	}
+	panic!("process {pid} still exists after cleanup (orphan or zombie)");
+}
+
+fn pty_launch(dir: &TempDir, name: &str, command: &str) -> ProcessSpec {
+	let mut launch = spec(dir, name, "sh", &["-c", command]);
+	launch.pty = true;
+	// PTY spawns clear the environment; `sh` needs it to resolve its own PATH.
+	launch.env = std::env::vars().collect();
+	launch
+}
+
+/// C1d detached+pty: even the manager allowed to own `detached` supervision
+/// refuses it with a PTY, and the rejected launch registers/spawns nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn detached_with_pty_is_rejected_without_spawning() {
+	let dir = TempDir::new("detached-pty");
+	let manager = Arc::new(ProcessManager::new_keepalive(dir.path.clone()));
+	let mut launch = pty_launch(&dir, "flat", "exec sleep 30");
+	launch.detached = true;
+	let error = manager.start(launch, None).await.expect_err("detached+pty must be rejected");
+	assert!(error.to_string().contains("cannot allocate a PTY"), "unexpected error: {error}");
+	assert!(manager.list(None).is_empty(), "rejected launch registered a record");
+}
+
+/// C1d log-or-port readiness: a port alone satisfies readiness when no log
+/// pattern is configured; the observable condition is the loopback connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn port_readiness_alone_reaches_ready() {
+	let dir = TempDir::new("port-ready");
+	let manager = Arc::new(ProcessManager::new(dir.path.clone()));
+	let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.expect("bind loopback");
+	let port = listener.local_addr().expect("local addr").port();
+	let mut launch = spec(&dir, "probe", "sh", &["-c", "sleep 30"]);
+	launch.ready = Some(ReadySpec {
+		log: None,
+		port: Some(port),
+		host: Some("127.0.0.1".to_string()),
+		timeout_ms: 3_000,
+	});
+	let outcome = manager.start(launch, None).await.expect("start");
+	assert!(!outcome.ready_timed_out, "port readiness timed out");
+	assert_eq!(outcome.snapshot.state, ProcessState::Ready);
+	assert!(outcome.snapshot.ready_pending.is_none(), "ready left a pending condition");
+	let pid = outcome.snapshot.pid.expect("pid");
+	manager.stop("probe", None, 2_000).await.expect("stop");
+	assert_reaped(pid).await;
+}
+
+/// C1d broker-owned cleanup (settle): the broker-owned manager reaps the PTY
+/// child it owns when the process settles; a retained record must not retain
+/// the OS process.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn broker_owned_stop_reaps_pty_child() {
+	let dir = TempDir::new("broker-settle");
+	let manager = Arc::new(ProcessManager::new_keepalive(dir.path.clone()));
+	let started =
+		manager.start(pty_launch(&dir, "worker", "exec sleep 30"), None).await.expect("start");
+	let pid = started.snapshot.pid.expect("pty pid");
+	assert!(alive(pid), "pty child never started");
+	let stopped = manager.stop("worker", None, 2_000).await.expect("stop");
+	assert!(terminal(stopped.state), "stop left {:?}", stopped.state);
+	assert_reaped(pid).await;
+}
+
+/// C1d broker-owned cleanup (shutdown): broker shutdown kills owned
+/// non-detached children while retaining the log tree for replay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn broker_owned_shutdown_reaps_pty_child_and_keeps_logs() {
+	let dir = TempDir::new("broker-shutdown");
+	let manager = Arc::new(ProcessManager::new_keepalive(dir.path.clone()));
+	let started =
+		manager.start(pty_launch(&dir, "worker", "exec sleep 30"), None).await.expect("start");
+	let pid = started.snapshot.pid.expect("pty pid");
+	assert!(alive(pid), "pty child never started");
+	manager.shutdown();
+	assert_reaped(pid).await;
+	assert!(
+		dir.path.join("worker").join("output.log").exists(),
+		"broker shutdown discarded the replay log"
+	);
+}
+
+/// C1d cancellation + broker-owned cleanup: dropping a broker-owned `start`
+/// future at its readiness await must reap the OS child, not just clear the
+/// snapshot pid.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_broker_pty_launch_reaps_os_child() {
+	let dir = TempDir::new("broker-cancel");
+	let manager = Arc::new(ProcessManager::new_keepalive(dir.path.clone()));
+	let mut launch = pty_launch(&dir, "cancel", "echo $$ > child.pid; exec sleep 30");
+	launch.ready = Some(ReadySpec {
+		log: Some("NEVER_MATCH_THIS".to_string()),
+		port: None,
+		host: None,
+		timeout_ms: 30_000,
+	});
+	let running = Arc::clone(&manager);
+	let task = tokio::spawn(async move { running.start(launch, None).await });
+	let pid_path = dir.path.join("child.pid");
+	let mut child_pid = None;
+	for _ in 0..60 {
+		if let Ok(text) = std::fs::read_to_string(&pid_path) {
+			if let Ok(parsed) = text.trim().parse::<u32>() {
+				child_pid = Some(parsed);
+				break;
+			}
+		}
+		tokio::time::sleep(Duration::from_millis(50)).await;
+	}
+	let child_pid = child_pid.expect("pty child never wrote its pid");
+	assert!(alive(child_pid), "pty child {child_pid} was not running before cancellation");
+	task.abort();
+	let _ = task.await;
+	assert_reaped(child_pid).await;
+	assert!(
+		terminal(state_of(&manager, "cancel").unwrap_or(ProcessState::Exited)),
+		"cancelled broker launch left a live record"
+	);
+}

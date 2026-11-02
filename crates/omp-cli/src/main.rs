@@ -2219,7 +2219,7 @@ impl Session<'_> {
 					if message
 						.disabled_features
 						.as_deref()
-						.is_some_and(|features| features.contains("priority"))
+						.is_some_and(|features| features.iter().any(|feature| feature == "priority"))
 						&& self.service_tier_by_family.get("anthropic").map(String::as_str)
 							== Some("priority")
 					{

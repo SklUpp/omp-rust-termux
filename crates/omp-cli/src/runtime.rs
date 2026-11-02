@@ -2540,12 +2540,12 @@ struct WireTarget<'a> {
 /// Build the provider the resolved dialect names. This is the only place the
 /// CLI chooses an adapter, so the root turn and every child share one mapping.
 fn wire_provider(
-	service_tier: Option<String>,
 	catalog: &crate::catalog::Catalog,
 	config: &crate::config::Config,
 	target: &WireTarget<'_>,
 	session_id: Option<String>,
 	prompt_cache_key: Option<String>,
+	service_tier: Option<String>,
 ) -> std::result::Result<Arc<dyn ModelProvider>, String> {
 	let info = catalog
 		.providers
@@ -2627,7 +2627,6 @@ fn wire_provider(
 				.map(|tokens| u32::try_from(tokens).unwrap_or(u32::MAX));
 			anthropic.supports_images = target.supports_images;
 			anthropic.provider_id = Some(target.provider.to_string());
-			anthropic.service_tier = service_tier;
 			anthropic.claude_code_session_id = session_id;
 			// Caller headers from `config.yml` (the CLI's own override) or the
 			// catalog provider block; enforced credential/beta headers still win.
@@ -2668,7 +2667,9 @@ fn wire_provider(
 			anthropic.thinking = thinking.thinking;
 			anthropic.output_effort = thinking.output_effort;
 			anthropic.adaptive_only_thinking = thinking.adaptive_only;
-			let provider = AnthropicMessagesProvider::from_config(anthropic).map_err(setup)?;
+			let provider = AnthropicMessagesProvider::from_config(anthropic)
+				.map_err(setup)?
+				.with_service_tier(service_tier);
 			Ok(Arc::new(provider))
 		},
 	}
@@ -3025,13 +3026,13 @@ pub fn provider_has_configured_auth(
 /// session belonged to the previous route (TS
 /// `setModelWithProviderSessionReset`), so it must not leak to the new one.
 pub fn build_switch_provider(
-	service_tier_by_family: &std::collections::BTreeMap<String, String>,
 	catalog: &crate::catalog::Catalog,
 	config: &crate::config::Config,
 	target: &ModelSwitch,
 	api_key: Option<String>,
 	provider_session_id: Option<String>,
 	prompt_cache_key: Option<String>,
+	service_tier_by_family: &std::collections::BTreeMap<String, String>,
 ) -> std::result::Result<Arc<dyn ModelProvider>, String> {
 	let pattern = format!("{}/{}", target.provider, target.model);
 	let candidate = candidate_for(catalog, config, Some(&target.provider), &pattern)?;

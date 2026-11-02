@@ -2715,7 +2715,6 @@ impl SessionStore {
 						tc.is_error,
 						now_ms,
 					)
-					disabled_features: None,
 				};
 				if let Some(details) = &tc.details {
 					message.extra.insert("details".to_string(), details.clone());

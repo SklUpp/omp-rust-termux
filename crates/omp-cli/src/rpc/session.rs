@@ -449,7 +449,6 @@ impl RpcSession {
 			thinking_level,
 			prompt_cache_key,
 			prompt_cache_key_inherited,
-			service_tier_explicit,
 			prewalk: crate::prewalk::PrewalkState::new(prewalk),
 			provider_session_id,
 			max_time,
@@ -2310,7 +2309,7 @@ impl RpcSession {
 		if message
 			.disabled_features
 			.as_deref()
-			.is_some_and(|features| features.contains("priority"))
+			.is_some_and(|features| features.iter().any(|feature| feature == "priority"))
 			&& self.service_tiers.get("anthropic").map(String::as_str) == Some("priority")
 		{
 			// TS `agent-session.ts:2880-2889`: the server rejected priority, so

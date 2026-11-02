@@ -1912,7 +1912,6 @@ mod tests {
 			..pi_agent::TokenUsage::default()
 		});
 		message
-		disabled_features: None,
 	}
 
 	fn seed(input: u64, output: u64) -> TokenCounters {

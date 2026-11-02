@@ -125,6 +125,9 @@ pub struct RpcLaunch {
 	pub restore_model: bool,
 	/// Armed prewalk target for this session; `None` leaves it disabled.
 	pub prewalk: Option<crate::prewalk::PrewalkArm>,
+	pub max_time: Option<Duration>,
+	pub max_turns: usize,
+	pub tools_enabled: bool,
 	pub prompt_cache_key: Option<String>,
 	pub prompt_cache_key_inherited: bool,
 	pub provider_session_id: Option<String>,

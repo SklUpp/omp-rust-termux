@@ -51,8 +51,9 @@ pub struct ModelInfo {
 	/// connection's `api`; a provider-level `api` never masks a declared
 	/// per-model one (TS `modelDef.api ?? providerApi`).
 	pub api:             Option<String>,
-	/// Per-model `baseUrl`, as authored. `None` inherits the connection's
-	/// `baseUrl`; consumers resolve that fallback, the loader does not.
+	/// Per-model `baseUrl`: authored for `models.yml` models, and replaced by
+	/// the provider `baseUrl` for bundled `models.json` rows (TS transport
+	/// override). `None` leaves the connection's `baseUrl` to the consumer.
 	pub base_url:        Option<String>,
 	/// Sparse `compat` block resolved for this model: the provider-level
 	/// block is the base and the model's own keys win (`models.yml` models,
@@ -100,6 +101,72 @@ struct ModelEntry {
 	compat: Option<serde_json::Value>,
 }
 
+/// One authored `models.yml` model plus the authored-ness a same-id patch
+/// needs: TS `applyModelPatch` leaves the bundled row's fields alone when the
+/// definition omits them, while `false`/`0` are authored values.
+struct YamlModel {
+	info:      ModelInfo,
+	/// `None` when the definition has no `reasoning` key.
+	reasoning: Option<bool>,
+}
+
+impl YamlModel {
+	/// Model inserted when the provider/id has no bundled row yet.
+	fn finish(self) -> ModelInfo {
+		let mut info = self.info;
+		info.cost = normalize_cost(info.cost);
+		info
+	}
+
+	/// TS `applyModelPatch(..., "replace")` for a same-id `models.yml`
+	/// definition: authored fields win, omitted ones keep the bundled row's
+	/// value, `api`/`baseUrl` come from the definition (the provider fallback
+	/// is the consumer's connection lookup), and the `compat` block is the
+	/// definition's own provider+model merge — bundled transport metadata is
+	/// deliberately not re-merged (model-patch transport policy `replace`).
+	fn patch(self, base: ModelInfo) -> ModelInfo {
+		let YamlModel { info, reasoning } = self;
+		let compat = info.compat;
+		let thinking_declared = info.thinking.is_some();
+		let supports_usage_in_streaming =
+			compat_bool(compat.as_ref(), "supportsUsageInStreaming");
+		ModelInfo {
+			provider:        info.provider,
+			context_window:  info.context_window.or(base.context_window),
+			input:           info.input.or(base.input),
+			name:            info.name.or(base.name),
+			max_tokens:      info.max_tokens.or(base.max_tokens),
+			reasoning:       reasoning.unwrap_or(base.reasoning),
+			efforts:         if thinking_declared { info.efforts } else { base.efforts },
+			cost:            patch_cost(base.cost.as_ref(), info.cost.as_ref()),
+			api:             info.api,
+			base_url:        info.base_url,
+			compat,
+			thinking:        info.thinking.or(base.thinking),
+			supports_usage_in_streaming,
+		}
+	}
+}
+
+/// TS `applyModelPatch` cost merge: authored rates win per rate, the bundled
+/// row keeps the rates the definition omits. The result stays normalized.
+fn patch_cost(
+	base: Option<&serde_json::Value>,
+	patch: Option<&serde_json::Value>,
+) -> Option<serde_json::Value> {
+	let Some(patch) = patch.and_then(serde_json::Value::as_object) else {
+		return base.cloned();
+	};
+	let mut merged = base
+		.and_then(serde_json::Value::as_object)
+		.cloned()
+		.unwrap_or_default();
+	for (key, value) in patch {
+		merged.insert(key.clone(), value.clone());
+	}
+	normalize_cost(Some(serde_json::Value::Object(merged)))
+}
+
 /// Boolean key from a sparse `compat` block; non-object or non-bool → `None`.
 fn compat_bool(compat: Option<&serde_json::Value>, key: &str) -> Option<bool> {
 	compat?.get(key)?.as_bool()
@@ -112,7 +179,12 @@ fn merge_compat(
 	base: Option<&serde_json::Value>,
 	over: Option<&serde_json::Value>,
 ) -> Option<serde_json::Value> {
+	// TS `mergeCompat` treats a falsy side as absent: a bare `compat:` key in
+	// `models.yml` parses as null and must neither erase nor surface as a block.
+	let base = base.filter(|value| !value.is_null());
+	let over = over.filter(|value| !value.is_null());
 	match (base, over) {
+		(None, None) => None,
 		(None, over) => over.cloned(),
 		(base, None) => base.cloned(),
 		(Some(base), Some(over)) => Some(merge_compat_value(base, over)),
@@ -137,21 +209,34 @@ fn merge_compat_value(base: &serde_json::Value, over: &serde_json::Value) -> ser
 }
 
 /// Bundled `models.json` rows are materialized, so a `models.yml` provider
-/// block acts as a user override: its keys win over the row's own compat
-/// (TS `#loadBuiltInModels` `mergeCompat(model.compatConfig,
-/// providerOverride.compat)`). Per-model `api`/`baseUrl` are untouched.
-fn apply_provider_compat(
+/// block acts as a user override, exactly like TS `#loadBuiltInModels`:
+/// `baseUrl` replaces the row endpoint (`#applyProviderTransportOverride`,
+/// `override.baseUrl ?? entry.baseUrl`) and `compat` keys win over the row's
+/// own block (`mergeCompat(model.compatConfig, providerOverride.compat)`).
+/// The provider `api` never replaces a row's dialect, and this runs before
+/// the `models.yml` model merge so an authored model's own `baseUrl` wins.
+fn apply_provider_overrides(
 	providers: &mut BTreeMap<String, BTreeMap<String, ModelInfo>>,
+	connections: &BTreeMap<String, ProviderConfig>,
 	provider_compat: &BTreeMap<String, serde_json::Value>,
 ) {
 	for (provider_id, models) in providers {
-		let Some(over) = provider_compat.get(provider_id) else {
+		let base_url = connections
+			.get(provider_id)
+			.and_then(|connection| connection.base_url.as_deref());
+		let over = provider_compat.get(provider_id);
+		if base_url.is_none() && over.is_none() {
 			continue;
-		};
+		}
 		for info in models.values_mut() {
-			info.compat = merge_compat(info.compat.as_ref(), Some(over));
-			info.supports_usage_in_streaming =
-				compat_bool(info.compat.as_ref(), "supportsUsageInStreaming");
+			if let Some(base_url) = base_url {
+				info.base_url = Some(base_url.to_string());
+			}
+			if let Some(over) = over {
+				info.compat = merge_compat(info.compat.as_ref(), Some(over));
+				info.supports_usage_in_streaming =
+					compat_bool(info.compat.as_ref(), "supportsUsageInStreaming");
+			}
 		}
 	}
 }
@@ -221,10 +306,21 @@ impl Catalog {
 		if let Some(path) = json_paths.iter().find(|path| path.is_file()) {
 			let mut catalog = Self::from_json(path)?;
 			catalog.connections = connections;
-			apply_provider_compat(&mut catalog.providers, &provider_compat);
+			apply_provider_overrides(&mut catalog.providers, &catalog.connections, &provider_compat);
 			if let Some((providers, _)) = yml_providers {
+				// TS `#mergeCustomModels` + `applyModelPatch`: a `models.yml`
+				// definition for the same `provider + id` patches the row (its
+				// authored fields win, omitted ones keep the row's value) and
+				// every other definition is appended.
 				for (provider_id, models) in providers {
-					catalog.providers.entry(provider_id).or_insert(models);
+					let entries = catalog.providers.entry(provider_id).or_default();
+					for (id, model) in models {
+						if let Some(base) = entries.remove(&id) {
+							entries.insert(id, model.patch(base));
+						} else {
+							entries.insert(id, model.finish());
+						}
+					}
 				}
 			}
 			return Ok(catalog);
@@ -232,6 +328,16 @@ impl Catalog {
 		if let Some((providers, path)) = yml_providers
 			&& !providers.is_empty()
 		{
+			let providers: BTreeMap<String, BTreeMap<String, ModelInfo>> = providers
+				.into_iter()
+				.map(|(provider_id, models)| {
+					let models: BTreeMap<String, ModelInfo> = models
+						.into_iter()
+						.map(|(id, model)| (id, model.finish()))
+						.collect();
+					(provider_id, models)
+				})
+				.collect();
 			return Ok(Self { providers, connections, source: path });
 		}
 		Err(Error::new(
@@ -304,7 +410,7 @@ fn normalize_cost(cost: Option<serde_json::Value>) -> Option<serde_json::Value> 
 fn yml_sections(
 	path: &Path,
 ) -> Result<(
-	BTreeMap<String, BTreeMap<String, ModelInfo>>,
+	BTreeMap<String, BTreeMap<String, YamlModel>>,
 	BTreeMap<String, ProviderConfig>,
 	BTreeMap<String, serde_json::Value>,
 )> {
@@ -324,7 +430,10 @@ fn yml_sections(
 			// Provider-level `compat` is a default for every model below it;
 			// a model-level key wins (TS `mergeCompat(providerCompat,
 			// modelDef.compat)`), and never masks a per-model `api`/`baseUrl`.
-			let provider_compat = provider.get("compat").map(yaml_json);
+			let provider_compat = provider
+				.get("compat")
+				.map(yaml_json)
+				.filter(|value| !value.is_null());
 			if let Some(compat) = &provider_compat {
 				provider_compat_by_id.insert(id.clone(), compat.clone());
 			}
@@ -352,11 +461,15 @@ fn yml_sections(
 									.collect()
 							});
 						let thinking = item.get("thinking").map(yaml_json);
-						let model_compat = item.get("compat").map(yaml_json);
+						let model_compat = item
+							.get("compat")
+							.map(yaml_json)
+							.filter(|value| !value.is_null());
 						let compat = merge_compat(provider_compat.as_ref(), model_compat.as_ref());
-						models.insert(
-							model_id.to_string(),
-							ModelInfo {
+						let reasoning =
+							item.get("reasoning").and_then(yaml::Value::as_bool);
+						models.insert(model_id.to_string(), YamlModel {
+							info: ModelInfo {
 								provider: id.clone(),
 								context_window,
 								input,
@@ -365,10 +478,7 @@ fn yml_sections(
 									.get("maxTokens")
 									.and_then(yaml::Value::to_text)
 									.and_then(|cap| cap.parse::<u64>().ok()),
-								reasoning: item
-									.get("reasoning")
-									.and_then(yaml::Value::as_bool)
-									.unwrap_or(false),
+								reasoning: reasoning.unwrap_or(false),
 								efforts: thinking_efforts(thinking.clone()),
 								cost: yml_cost(item),
 								api: item.get("api").and_then(yaml::Value::to_text),
@@ -380,7 +490,8 @@ fn yml_sections(
 								compat,
 								thinking,
 							},
-						);
+							reasoning,
+						});
 					}
 				}
 			}
@@ -427,22 +538,21 @@ fn json_rate(value: f64) -> serde_json::Value {
 	}
 }
 
-/// `models.yml` `cost` block as the object `models.json` carries (missing
-/// rates default to 0, matching `buildModel`).
+/// `models.yml` `cost` block with only the authored rates, so a same-id patch
+/// leaves the bundled rates it omits alone (TS `applyModelPatch`).
+/// [`normalize_cost`] fills zeros for standalone models.
 fn yml_cost(item: &yaml::Value) -> Option<serde_json::Value> {
 	let cost = item.get("cost")?;
-	let rate = |key: &str| {
-		cost
-			.get(key)
-			.and_then(yaml_rate)
-			.map_or_else(|| serde_json::json!(0), json_rate)
-	};
-	Some(serde_json::json!({
-		"input": rate("input"),
-		"output": rate("output"),
-		"cacheRead": rate("cacheRead"),
-		"cacheWrite": rate("cacheWrite"),
-	}))
+	let pairs = cost.as_map()?;
+	let mut rates = serde_json::Map::new();
+	for (key, value) in pairs {
+		if matches!(key.as_str(), "input" | "output" | "cacheRead" | "cacheWrite")
+			&& let Some(rate) = yaml_rate(value)
+		{
+			rates.insert(key.clone(), json_rate(rate));
+		}
+	}
+	Some(serde_json::Value::Object(rates))
 }
 
 impl Catalog {
@@ -507,7 +617,9 @@ impl Catalog {
 		self.providers.get(provider)?.get(model)?.api.as_deref()
 	}
 
-	/// Declared per-model `baseUrl`, without the connection fallback.
+	/// Per-model `baseUrl`: bundled rows already carry the `models.yml`
+	/// provider override, `models.yml` models keep their own, and `None`
+	/// falls back to the connection's `baseUrl`.
 	#[must_use]
 	pub fn model_base_url(&self, provider: &str, model: &str) -> Option<&str> {
 		self

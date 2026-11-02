@@ -5,6 +5,7 @@ pub mod checkpoint;
 pub mod edit_variants;
 pub mod hashline;
 pub mod hub;
+pub mod hub_park;
 pub mod internal_urls;
 pub mod internal_urls_github;
 pub mod pending;

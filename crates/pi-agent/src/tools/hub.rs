@@ -11,9 +11,8 @@
 //! scoped to the caller's own children, while messaging has a flat namespace —
 //! siblings may message each other. Process visibility hides other agents'
 //! processes from a child; root sees everything, and stdin/signals/stop/
-//! restart are owner-scoped. Receipts report only outcomes this build can
-//! actually produce (`injected`/`failed`); there is no park/revive lifecycle,
-//! so `woken` and `revived` are never claimed.
+//! restart are owner-scoped. Parked and idle lifecycle rows are revived through
+//! [`super::hub_park`], so receipts report `injected`, `revived`, or `failed`.
 
 use std::{collections::HashSet, sync::Arc, time::Duration};
 
@@ -247,8 +246,7 @@ pub struct HubPeerInfo {
 #[serde(rename_all = "camelCase")]
 pub struct HubRosterCounts {
 	pub running: usize,
-	/// Settled agents. Unlike upstream `idle`, these are terminal in this
-	/// build: they cannot be woken. Rows carry their real status.
+	/// Non-running, non-parked rows: adopted idle agents plus settled jobs.
 	pub idle: usize,
 	pub parked: usize,
 	pub shown: usize,
@@ -478,7 +476,7 @@ impl Tool for HubTool {
 				},
 				"timeoutMs": { "type": "number", "description": "wait/send await: timeout in milliseconds (0 waits indefinitely)" },
 				"peek": { "type": "boolean", "description": "inbox: list messages without consuming them" },
-				"status": { "type": "string", "description": "list: filter by running or a terminal status" },
+				"status": { "type": "string", "description": "list: filter by running, idle, parked, or a terminal status" },
 				"limit": { "type": "integer", "description": "list: max peer rows; default 32, max 100" },
 				"name": { "type": "string", "description": "Process ops: supervised process name (send/wait switch to the process when present)" },
 				"application": { "type": "string", "description": "start: executable to launch (PATH-resolved)" },
@@ -1656,20 +1654,42 @@ impl HubTool {
 						error: None,
 					},
 					Err(error) => {
-						// Failed live hand-off: buffer only when a later drain is
-						// actually reachable (root turn boundary or a still-running
-						// child waiting on `wait`/`inbox`). A terminal child cannot
-						// be revived, so leave no unreachable mail behind.
-						let reachable = known
-							&& (target == MAIN_AGENT_ID
-								|| self.agent_running(target));
-						if reachable {
-							mailbox.buffer(msg);
-						}
-						IrcDeliveryReceipt {
-							to: target.clone(),
-							outcome: "failed".to_string(),
-							error: Some(error),
+						// A parked/idle lifecycle row is revived here (or refused
+						// with its exact reason). Anything the manager does not own
+						// keeps the historical live-hand-off behavior.
+						if let Some(delegated) = super::hub_park::delegate_send(
+							&self.supervisor,
+							target,
+							format_incoming(&msg),
+						) {
+							match delegated {
+								Ok(outcome) => IrcDeliveryReceipt {
+									to: target.clone(),
+									outcome: outcome.as_str().to_string(),
+									error: None,
+								},
+								Err(revive_error) => IrcDeliveryReceipt {
+									to: target.clone(),
+									outcome: "failed".to_string(),
+									error: Some(revive_error),
+								},
+							}
+						} else {
+							// Failed live hand-off: buffer only when a later drain is
+							// actually reachable (root turn boundary or a still-running
+							// child waiting on `wait`/`inbox`). A terminal child cannot
+							// be revived, so leave no unreachable mail behind.
+							let reachable = known
+								&& (target == MAIN_AGENT_ID
+									|| self.agent_running(target));
+							if reachable {
+								mailbox.buffer(msg);
+							}
+							IrcDeliveryReceipt {
+								to: target.clone(),
+								outcome: "failed".to_string(),
+								error: Some(error),
+							}
 						}
 					},
 				}
@@ -1862,35 +1882,17 @@ impl HubTool {
 			})
 			.unwrap_or(DEFAULT_HUB_LIST_LIMIT);
 		let mailbox = self.supervisor.mailbox();
-		let all = self.peer_records();
-		let running = all
-			.iter()
-			.filter(|record| record.status == ChildStatus::Running)
-			.count();
-		let idle = all.len() - running;
-		let mut selected: Vec<ChildRecord> = all
-			.into_iter()
-			.filter(|record| match status_filter {
-				None => true,
-				Some("running") => record.status == ChildStatus::Running,
-				Some("idle") => record.status != ChildStatus::Running,
-				Some("parked") => false,
-				Some(other) => job_status(record) == other,
-			})
-			.collect();
-		selected.sort_by(|left, right| {
-			let left_running = left.status == ChildStatus::Running;
-			let right_running = right.status == ChildStatus::Running;
-			right_running
-				.cmp(&left_running)
-				.then(right.started_at.unwrap_or_default().cmp(&left.started_at.unwrap_or_default()))
-		});
-		let truncated = selected.len().saturating_sub(limit);
-		selected.truncate(limit);
-		let peers: Vec<HubPeerInfo> = selected
-			.into_iter()
-			.map(|record| HubPeerInfo {
-				status: job_status(&record).to_string(),
+		let lifecycle = super::hub_park::roster(&self.supervisor);
+		let mut rows: Vec<HubPeerInfo> = Vec::new();
+		let mut seen = HashSet::new();
+		for record in self.peer_records() {
+			seen.insert(record.id.clone());
+			let status = lifecycle
+				.iter()
+				.find(|row| row.id == record.id)
+				.map_or_else(|| job_status(&record).to_string(), |row| row.status.as_str().to_string());
+			rows.push(HubPeerInfo {
+				status,
 				unread: mailbox.unread_count(&record.id),
 				last_activity: record
 					.started_at
@@ -1900,12 +1902,55 @@ impl HubTool {
 				kind: "sub".to_string(),
 				parent_id: record.parent_id,
 				id: record.id,
+			});
+		}
+		for row in lifecycle {
+			if row.id == sender || seen.contains(&row.id) {
+				continue;
+			}
+			rows.push(HubPeerInfo {
+				status:        row.status.as_str().to_string(),
+				unread:        row.unread,
+				last_activity: row.last_activity,
+				display_name:  row.display_name,
+				kind:          "sub".to_string(),
+				parent_id:     row.parent_id,
+				id:            row.id,
+			});
+		}
+		let total = rows.len();
+		let running = rows.iter().filter(|row| row.status == "running").count();
+		let parked = rows.iter().filter(|row| row.status == "parked").count();
+		// `idle` keeps its historical meaning: every row that is neither running
+		// nor parked (an adopted idle agent plus settled jobs).
+		let idle = total.saturating_sub(running + parked);
+		let mut selected: Vec<HubPeerInfo> = rows
+			.into_iter()
+			.filter(|row| match status_filter {
+				None => true,
+				Some(status) => row.status == status,
 			})
 			.collect();
+		selected.sort_by(|left, right| {
+			fn rank(status: &str) -> u8 {
+				match status {
+					"running" => 0,
+					"idle" => 1,
+					"parked" => 2,
+					_ => 3,
+				}
+			}
+			rank(&left.status)
+				.cmp(&rank(&right.status))
+				.then(right.last_activity.cmp(&left.last_activity))
+		});
+		let truncated = selected.len().saturating_sub(limit);
+		selected.truncate(limit);
+		let peers = selected;
 		let counts = HubRosterCounts {
 			running,
 			idle,
-			parked: 0,
+			parked,
 			shown: peers.len(),
 			truncated,
 		};

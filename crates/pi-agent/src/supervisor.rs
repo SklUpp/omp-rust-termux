@@ -1722,6 +1722,23 @@ impl Supervisor {
 			.unwrap_or_else(|poison| poison.into_inner()) = root;
 	}
 
+	/// Directory child transcripts are created in, when one was installed.
+	#[must_use]
+	pub fn child_session_root(&self) -> Option<PathBuf> {
+		self
+			.child_session_root
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner())
+			.clone()
+	}
+
+	/// Stable identity for this supervisor instance, used to key the lifecycle
+	/// manager that owns its park/revive rows.
+	#[must_use]
+	pub fn instance_key(&self) -> &str {
+		&self.process_owner_ns
+	}
+
 	/// Real transcript log for one child, when a session root was installed.
 	#[must_use]
 	pub fn child_session_file(&self, id: &str) -> Option<PathBuf> {

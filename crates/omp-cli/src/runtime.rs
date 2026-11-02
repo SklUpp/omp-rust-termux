@@ -140,6 +140,10 @@ struct SessionResources {
 	/// post-shutdown accounting drain can still queue its persistence before
 	/// the session log closes; `None` when no run installed one.
 	goal:       Mutex<Option<Arc<crate::goal::GoalRuntime>>>,
+	/// Park/revive manager for this scope's supervisor. The supervisor's
+	/// registry only holds a weak reference, so this slot is what keeps the
+	/// manager (and its live actors) alive between turns of the same scope.
+	lifecycle:  Mutex<Option<Arc<pi_agent::subagent_lifecycle::SubagentLifecycleManager>>>,
 }
 
 /// Closed scopes stay as tombstones so a late or stale run cannot recreate
@@ -583,6 +587,7 @@ impl PiAgentRunner {
 							value:  None,
 						}),
 						goal:       Mutex::new(None),
+						lifecycle:  Mutex::new(None),
 					});
 					lifecycle.slots.insert(
 						scope.clone(),
@@ -1528,6 +1533,38 @@ impl AgentRunner for PiAgentRunner {
 				supervisor.set_url_scope(Arc::clone(scope));
 			}
 			supervisor.set_child_session_root(request.child_session_root.clone());
+			// Park/revive is per scope: attach once, before the first spawn, so
+			// every contract written by task.rs is owned by this manager and a
+			// restart scan happens exactly once per supervisor generation.
+			{
+				let mut lifecycle = resources
+					.lifecycle
+					.lock()
+					.map_err(|_| Error::new("subagent lifecycle lock poisoned"))?;
+				if lifecycle.is_none() {
+					let manager = pi_agent::subagent_lifecycle::attach(
+						&supervisor,
+						pi_agent::subagent_lifecycle::DEFAULT_AGENT_IDLE_TTL_MS,
+						Arc::new(
+							pi_agent::task_persisted_revive::DefaultPersistedReviverFactory::new(
+								supervisor.provider(),
+								supervisor.root_registry(),
+							)
+							.with_approver(supervisor.child_approver()),
+						),
+					);
+					// `history://<id>` reads tombstoned transcripts too, so it
+					// follows the manager (one handler per session router; a
+					// shared router keeps the newest scope's manager).
+					if let Some(router) = &request.internal_urls {
+						let _ = pi_agent::tools::hub_park::register_history(
+							router,
+							Arc::clone(&manager),
+						);
+					}
+					*lifecycle = Some(manager);
+				}
+			}
 			let isolation_base =
 				crate::worktree_cmd::resolve_base(request.config.worktree_base.as_deref())
 					.map_err(|message| Error::new(message))?;

@@ -9,7 +9,9 @@ pub mod loop_module;
 pub mod process_broker;
 pub mod provider;
 pub mod state;
+pub mod subagent_lifecycle;
 pub mod supervisor;
+pub mod task_persisted_revive;
 pub mod tokenizer;
 pub mod tools;
 

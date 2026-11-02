@@ -16,8 +16,9 @@ use super::{
 	Tool, ToolError,
 	registry::ToolRegistry,
 	task_catalog::{
-		AgentCatalog, AgentDefinition, AgentSource, ChildModel, ChildModelFactory, SchemaMode,
-		Spawns, array_valued_labels, normalize_schema, thinking_to_effort, validate_output,
+		AgentCatalog, AgentDefinition, AgentSource, ChildModel, ChildModelFactory, HandoffTarget,
+		SchemaMode, Spawns, array_valued_labels, normalize_schema, thinking_to_effort,
+		validate_output,
 	},
 	task_isolation::{
 		self, IsolationArtifacts, IsolationFinalize, IsolationMergeMode, IsolationReport,
@@ -28,6 +29,7 @@ use crate::{
 	loop_module::{AgentError, AgentEvent, AgentLoop, SteeringEvent},
 	state::{AgentConfig, AgentContext, AgentState, Message, TokenUsage, ToolResult, TurnResult},
 	supervisor::{ChildGuard, ChildSpawn, Supervisor, cap_result_text},
+	task_persisted_revive::PersistedChildSession,
 };
 
 #[derive(Clone)]
@@ -670,6 +672,21 @@ impl TaskTool {
 			system_prompt: child_system_prompt(&item.agent, prompt_schema.as_ref()),
 			cwd: child_cwd,
 		};
+		// The eval bridge (`run_eval_agent`) spawns with `invocation_task = false`
+		// and must not leave revivable contracts: TS disables keep-alive there.
+		if invocation_task {
+			persist_child_contract(
+				&self.supervisor,
+				&child_id,
+				&child_name,
+				&item,
+				&child_config,
+				&child_registry,
+				resolved_model.as_deref(),
+				model_role.as_deref(),
+				prompt_schema.as_ref(),
+			);
+		}
 
 		let child_approver = self.supervisor.child_approver();
 
@@ -1024,11 +1041,25 @@ impl TaskTool {
 					self
 						.supervisor
 						.mark_completed(&outstanding_id, duration_ms, &output);
+					if invocation_task {
+						adopt_keep_alive_child(
+							&self.supervisor,
+							&outstanding_id,
+							result.isolation.is_some(),
+						);
+					}
 				},
 				TerminalMark::Failed(message) => {
 					self
 						.supervisor
 						.mark_failed(&outstanding_id, duration_ms, &message);
+					if invocation_task {
+						adopt_keep_alive_child(
+							&self.supervisor,
+							&outstanding_id,
+							result.isolation.is_some(),
+						);
+					}
 				},
 				TerminalMark::Aborted(reason) => {
 					// An abort can follow real completed turns (yield-abort, a
@@ -1037,6 +1068,7 @@ impl TaskTool {
 					self
 						.supervisor
 						.mark_aborted_with_usage(&outstanding_id, &reason, result.usage);
+					tombstone_aborted_child(&self.supervisor, &outstanding_id, &reason);
 				},
 			}
 		}
@@ -1407,6 +1439,7 @@ async fn run_background_child(
 		.resolve_model(&item.agent, item.effort.as_deref())
 		.map_err(AgentError::Internal)?;
 	let child_active_model = child_model.as_ref().map(|model| model.model.clone());
+	let child_model_role = child_model.as_ref().and_then(|model| model.role.clone());
 	let child_provider = child_model.map_or_else(
 		|| supervisor.provider(),
 		|model| model.provider,
@@ -1458,6 +1491,17 @@ async fn run_background_child(
 		system_prompt: child_system_prompt(&item.agent, prompt_schema.as_ref()),
 		cwd: child_cwd,
 	};
+	persist_child_contract(
+		&supervisor,
+		&child_id,
+		&item.name,
+		&item,
+		&child_config,
+		&child_registry,
+		child_active_model.as_deref(),
+		child_model_role.as_deref(),
+		prompt_schema.as_ref(),
+	);
 	let child_approver = supervisor.child_approver();
 	let assignment = if let Some(context) = &item.context {
 		format!("{context}\n\n{}", item.task)
@@ -1600,6 +1644,7 @@ fn settle_background_result(
 			supervisor.append_child_transcript(&id, &messages);
 			if cancelled {
 				supervisor.mark_aborted(&id, "cancelled during isolation finalize");
+				tombstone_aborted_child(&supervisor, &id, "cancelled during isolation finalize");
 				// The turns ran and their provider requests were charged: keep
 				// that usage (write-once) instead of reporting an unknown abort.
 				fill(child_usage(&turns));
@@ -1607,10 +1652,9 @@ fn settle_background_result(
 			}
 			let (base, aborted, reason) = summarize_turns(&turns);
 			if aborted {
-				supervisor.mark_aborted(
-					&id,
-					reason.as_deref().unwrap_or("aborted by yield"),
-				);
+				let reason = reason.as_deref().unwrap_or("aborted by yield");
+				supervisor.mark_aborted(&id, reason);
+				tombstone_aborted_child(&supervisor, &id, reason);
 				fill(child_usage(&turns));
 				return;
 			}
@@ -1631,6 +1675,7 @@ fn settle_background_result(
 				);
 				supervisor.mark_failed_with_usage(&id, duration_ms, &envelope, usage);
 				supervisor.enqueue_delivery(&id, envelope);
+				adopt_keep_alive_child(&supervisor, &id, isolation.is_some());
 				return;
 			}
 			let output = if finalized.stderr.is_empty() {
@@ -1653,12 +1698,14 @@ fn settle_background_result(
 			);
 			supervisor.mark_completed_with_usage(&id, duration_ms, &envelope, usage);
 			supervisor.enqueue_delivery(&id, envelope);
+			adopt_keep_alive_child(&supervisor, &id, isolation.is_some());
 		},
 		Err(AgentError::Interrupted) => {
 			// The loop discarded its turns on cancellation, but every request it
 			// completed was charged: `observed` carries exactly those counters,
 			// and stays `None` when nothing completed (unknown, never zero).
 			supervisor.mark_aborted(&id, "aborted");
+			tombstone_aborted_child(&supervisor, &id, "aborted");
 			fill(observed);
 		},
 		Err(error) => {
@@ -1676,6 +1723,7 @@ fn settle_background_result(
 			);
 			supervisor.mark_failed_with_usage(&id, duration_ms, &envelope, observed);
 			supervisor.enqueue_delivery(&id, envelope);
+			tombstone_aborted_child(&supervisor, &id, &message);
 		},
 	}
 }
@@ -2043,6 +2091,101 @@ fn child_system_prompt(agent: &AgentDefinition, schema: Option<&Value>) -> Optio
 		prompt.push_str("\n```");
 	}
 	Some(prompt)
+}
+
+/// Persist the child's `session_init` contract beside its JSONL transcript.
+///
+/// Only lifecycle-enabled sessions (a manager is attached) write contracts, so
+/// builds and tests without park/revive keep their current on-disk behavior.
+/// The contract is captured at spawn from executor-owned values, before the
+/// loop consumes them; a parked child is later revived from exactly this
+/// record rather than today's root options.
+fn persist_child_contract(
+	supervisor: &Arc<Supervisor>,
+	child_id: &str,
+	display_name: &str,
+	item: &TaskItemSpec,
+	config: &AgentConfig,
+	registry: &ToolRegistry,
+	resolved_model: Option<&str>,
+	model_role: Option<&str>,
+	output_schema: Option<&Value>,
+) {
+	if crate::subagent_lifecycle::lookup(supervisor).is_none() {
+		return;
+	}
+	let Some(root) = supervisor
+		.child_session_file(child_id)
+		.and_then(|path| path.parent().map(std::path::Path::to_path_buf))
+	else {
+		return;
+	};
+	let tools = registry.names();
+	let spawns = item.agent.spawns.as_ref().map(Spawns::error_text);
+	let advisor = item.agent.advisor.as_ref().map(|advisor| match advisor {
+		HandoffTarget::Default => "on".to_string(),
+		HandoffTarget::Pattern(pattern) => pattern.clone(),
+	});
+	let read_only = Some(!tools.iter().any(|name| name.as_str() == "write"));
+	let contract = PersistedChildSession {
+		id:               child_id.to_string(),
+		agent:            Some(item.agent.name.clone()),
+		task:             item.task.clone(),
+		system_prompt:    config.system_prompt.clone().unwrap_or_default(),
+		tools,
+		model_role:       model_role.map(str::to_string),
+		resolved_model:   resolved_model.map(str::to_string),
+		output_schema:    output_schema.cloned(),
+		output_schema_mode: output_schema
+			.map(|_| item.schema_mode.as_str().to_string()),
+		restrict_tool_names: Some(true),
+		spawns,
+		read_summarize:   item.agent.read_summarize,
+		advisor,
+		read_only,
+		cwd:              config.cwd.clone(),
+		max_turns:        config.max_turns,
+		context_limit:    config.context_limit,
+		display_name:     Some(display_name.to_string()),
+		parent_id:        None,
+	};
+	if let Err(error) = contract.write(&root) {
+		eprintln!(
+			"warning: cannot persist child session contract for {child_id}: {error}"
+		);
+	}
+}
+
+/// Hand a finished, non-isolated child to the lifecycle manager (`idle`), so
+/// hub can list it as parked after the idle TTL and revive it on send.
+fn adopt_keep_alive_child(supervisor: &Arc<Supervisor>, child_id: &str, isolated: bool) {
+	if isolated {
+		return;
+	}
+	let Some(manager) = crate::subagent_lifecycle::lookup(supervisor) else {
+		return;
+	};
+	let Some(root) = supervisor
+		.child_session_file(child_id)
+		.and_then(|path| path.parent().map(std::path::Path::to_path_buf))
+	else {
+		return;
+	};
+	let Some(contract) = PersistedChildSession::load(&root, child_id) else {
+		return;
+	};
+	if let Err(error) = manager.adopt(child_id, Some(contract)) {
+		eprintln!("warning: cannot adopt keep-alive child {child_id}: {error}");
+	}
+}
+
+/// A hard-aborted child is durable as a tombstone: its transcript stays
+/// readable through `history://`, but a restart must not rediscover the
+/// spawn-time contract as a revivable parked agent.
+fn tombstone_aborted_child(supervisor: &Arc<Supervisor>, child_id: &str, reason: &str) {
+	if let Some(manager) = crate::subagent_lifecycle::lookup(supervisor) {
+		manager.tombstone(child_id, reason);
+	}
 }
 
 struct AssembledYield {

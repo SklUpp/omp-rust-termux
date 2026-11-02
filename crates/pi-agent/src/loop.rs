@@ -10,8 +10,8 @@ use crate::{
 	provider::{ModelProvider, ProviderError, StreamAssembler, ToolChoice},
 	state::{
 		AgentConfig, AgentContext, AgentState, ContentPart, Exhaustion, Message, Role,
-		SoftToolRequirement, TokenUsage, ToolApprover, ToolCall, ToolPolicy, ToolResult, TurnResult,
-		TurnStatus,
+		SoftToolRequirement, StopReason, TokenUsage, ToolApprover, ToolCall, ToolPolicy, ToolResult,
+		TurnResult, TurnStatus,
 	},
 	supervisor::BackgroundResultSink,
 	tools::{registry::ToolRegistry, scheduler::ToolScheduler},
@@ -19,6 +19,28 @@ use crate::{
 
 /// Messages that must survive compaction even when over budget.
 const MIN_RECENT_MESSAGES: usize = 4;
+
+/// Terminal status for an assistant message.
+///
+/// An explicit provider reason wins over the tool-call heuristic so truncation
+/// (`length`), refusal/error text and abort survive instead of becoming `stop`.
+fn assistant_status(message: &Message, tool_use: bool) -> TurnStatus {
+	match message.stop_reason {
+		Some(StopReason::Length) => TurnStatus::Length,
+		Some(StopReason::Error) => TurnStatus::Error(
+			message.error_message.clone().unwrap_or_else(|| "provider error".to_string()),
+		),
+		Some(StopReason::Aborted) => TurnStatus::Aborted,
+		Some(StopReason::ToolUse) => TurnStatus::ToolUse,
+		Some(StopReason::Stop) | None => {
+			if tool_use {
+				TurnStatus::ToolUse
+			} else {
+				TurnStatus::EndTurn
+			}
+		},
+	}
+}
 
 /// Tool result recorded for calls that were cancelled before producing output.
 ///
@@ -857,11 +879,10 @@ impl AgentLoop {
 			});
 
 			if let Some(events_sink) = events.as_ref() {
-				let status = if assistant.tool_calls.is_empty() && !soft_non_compliant {
-					TurnStatus::EndTurn
-				} else {
-					TurnStatus::ToolUse
-				};
+				let status = assistant_status(
+					&assistant,
+					!assistant.tool_calls.is_empty() || soft_non_compliant,
+				);
 				let _ = events_sink
 					.send(AgentEvent::MessageEnd { message: assistant.clone(), status })
 					.await;
@@ -950,7 +971,7 @@ impl AgentLoop {
 						.send(AgentEvent::TurnEnd {
 							message: assistant.clone(),
 							tool_results: results.clone(),
-							status: TurnStatus::ToolUse,
+							status: assistant_status(&assistant, true),
 						})
 						.await;
 				}
@@ -988,7 +1009,7 @@ impl AgentLoop {
 						.send(AgentEvent::TurnEnd {
 							message: assistant.clone(),
 							tool_results: Vec::new(),
-							status: TurnStatus::EndTurn,
+							status: assistant_status(&assistant, false),
 						})
 						.await;
 				}
@@ -1083,7 +1104,7 @@ impl AgentLoop {
 			let status = if cancelled {
 				TurnStatus::Aborted
 			} else {
-				TurnStatus::ToolUse
+				assistant_status(&assistant, true)
 			};
 
 			// Ack first (the consumer takes it on `TurnEnd`), with the boundary
@@ -1203,6 +1224,24 @@ impl AgentLoop {
 		outcome
 	}
 
+	/// Stamp the provider's configured source route on a produced message.
+	///
+	/// Signed/redacted reasoning is only replayable to the provider/model that
+	/// issued it, so the route must travel with the message instead of being
+	/// inferred later from a session default.
+	fn with_source(&self, mut message: Message) -> Message {
+		if message.api.is_none() {
+			message.api = self.provider.api().map(str::to_string);
+		}
+		if message.provider.is_none() {
+			message.provider = self.provider.provider().map(str::to_string);
+		}
+		if message.model.is_none() {
+			message.model = self.provider.model().map(str::to_string);
+		}
+		message
+	}
+
 	/// Ask the provider for one assistant turn.
 	///
 	/// With an event sink the turn is streamed, so text reaches the consumer
@@ -1240,17 +1279,17 @@ impl AgentLoop {
 								None => {
 									tokio::select! {
 										_ = cancellation_token.cancelled() => return Err(AgentError::Interrupted),
-										res = &mut complete_fut => return Ok(res?),
+										res = &mut complete_fut => return Ok(self.with_source(res?)),
 									}
 								}
 							},
-							res = &mut complete_fut => return Ok(res?),
+							res = &mut complete_fut => return Ok(self.with_source(res?)),
 						}
 					}
 					None => {
 						tokio::select! {
 							_ = cancellation_token.cancelled() => return Err(AgentError::Interrupted),
-							res = &mut complete_fut => return Ok(res?),
+							res = &mut complete_fut => return Ok(self.with_source(res?)),
 						}
 					}
 				}
@@ -1325,7 +1364,7 @@ impl AgentLoop {
 				Some(rx) if rx_open => {
 					tokio::select! {
 						_ = cancellation_token.cancelled() => {
-							let partial = assembler.finish_partial();
+							let partial = self.with_source(assembler.finish_partial());
 							let _ = events.send(AgentEvent::MessageEnd { message: partial.clone(), status: TurnStatus::Aborted }).await;
 							let _ = events.send(AgentEvent::TurnEnd {
 								message: partial,
@@ -1337,7 +1376,7 @@ impl AgentLoop {
 						event = rx.recv() => match event {
 							Some(SteeringEvent::Interrupt) => {
 								cancellation_token.cancel();
-								let partial = assembler.finish_partial();
+								let partial = self.with_source(assembler.finish_partial());
 								let _ = events.send(AgentEvent::MessageEnd { message: partial.clone(), status: TurnStatus::Aborted }).await;
 								let _ = events.send(AgentEvent::TurnEnd {
 									message: partial,
@@ -1361,7 +1400,7 @@ impl AgentLoop {
 				_ => {
 					tokio::select! {
 						_ = cancellation_token.cancelled() => {
-							let partial = assembler.finish_partial();
+							let partial = self.with_source(assembler.finish_partial());
 							let _ = events.send(AgentEvent::MessageEnd { message: partial.clone(), status: TurnStatus::Aborted }).await;
 							let _ = events.send(AgentEvent::TurnEnd {
 								message: partial,
@@ -1381,7 +1420,7 @@ impl AgentLoop {
 			let chunk = match chunk {
 				Ok(c) => c,
 				Err(err) => {
-					let partial = assembler.finish_partial();
+					let partial = self.with_source(assembler.finish_partial());
 					let _ = events.send(AgentEvent::MessageEnd { message: partial.clone(), status: TurnStatus::Error(err.to_string()) }).await;
 					let _ = events.send(AgentEvent::TurnEnd {
 						message: partial,
@@ -1409,14 +1448,23 @@ impl AgentLoop {
 					.await;
 			}
 			done = chunk.is_done;
-			assembler.push(&chunk);
+			if let Err(err) = assembler.push(&chunk) {
+				let partial = self.with_source(assembler.finish_partial());
+				let _ = events.send(AgentEvent::MessageEnd { message: partial.clone(), status: TurnStatus::Error(err.to_string()) }).await;
+				let _ = events.send(AgentEvent::TurnEnd {
+					message: partial,
+					tool_results: Vec::new(),
+					status: TurnStatus::Error(err.to_string()),
+				}).await;
+				return Err(err.into());
+			}
 			if done {
 				break;
 			}
 		}
 
 		if !done {
-			let partial = assembler.finish_partial();
+			let partial = self.with_source(assembler.finish_partial());
 			let err_msg = "stream ended before completion".to_string();
 			let _ = events.send(AgentEvent::MessageEnd { message: partial.clone(), status: TurnStatus::Error(err_msg.clone()) }).await;
 			let _ = events.send(AgentEvent::TurnEnd {
@@ -1426,9 +1474,9 @@ impl AgentLoop {
 			}).await;
 			return Err(ProviderError::Protocol(err_msg).into());
 		}
-		let partial = assembler.finish_partial();
+		let partial = self.with_source(assembler.finish_partial());
 		let message = match assembler.finish() {
-			Ok(message) => message,
+			Ok(message) => self.with_source(message),
 			Err(err) => {
 				let _ = events.send(AgentEvent::MessageEnd { message: partial.clone(), status: TurnStatus::Error(err.to_string()) }).await;
 				let _ = events.send(AgentEvent::TurnEnd {

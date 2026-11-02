@@ -3180,6 +3180,7 @@ mod tests {
 			cache_write: 2,
 			total_tokens: 23,
 			reasoning_tokens: Some(4),
+			..TokenUsage::default()
 		};
 		let envelope = task_result_envelope(
 			"task-1",

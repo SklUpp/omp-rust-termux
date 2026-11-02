@@ -31,6 +31,7 @@ fn delta(
 		id: id.map(str::to_string),
 		name: name.map(str::to_string),
 		arguments_delta: arguments_delta.map(str::to_string),
+		content_index: None,
 	}
 }
 
@@ -41,6 +42,11 @@ fn chunk(content: Option<&str>, deltas: Vec<ToolCallDelta>) -> StreamChunk {
 		usage: None,
 		reasoning: None,
 		is_done: false,
+		content_index: None,
+		signature: None,
+		redacted: None,
+		stop_reason: None,
+		error_message: None,
 	}
 }
 
@@ -110,42 +116,59 @@ async fn serve_responses(responses: Vec<Vec<u8>>) -> String {
 }
 
 #[test]
-fn assembler_merges_duplicate_indices_and_sorts_out_of_order_calls() {
+fn assembler_merges_duplicate_indices_and_keeps_content_order() {
 	let mut assembler = StreamAssembler::new();
-	assembler.push(&chunk(
-		None,
-		vec![delta(2, None, Some("third"), Some("{}"))],
-	));
-	assembler.push(&chunk(
-		Some("A"),
-		vec![delta(0, Some("call_a"), Some("read"), Some("{\"path\":\"a"))],
-	));
-	assembler.push(&chunk(
-		Some("B"),
-		vec![delta(0, Some("call_a2"), None, Some(".txt\"}"))],
-	));
-	assembler.push(&chunk(
-		Some("C"),
-		vec![delta(1, Some("call_b"), Some("bash"), Some("echo hi"))],
-	));
+	assembler
+		.push(&chunk(None, vec![delta(2, None, Some("third"), Some("{}"))]))
+		.expect("first call");
+	assembler
+		.push(&chunk(
+			Some("A"),
+			vec![delta(0, Some("call_a"), Some("read"), Some("{\"path\":\"a"))],
+		))
+		.expect("second");
+	assembler
+		.push(&chunk(
+			Some("B"),
+			vec![delta(0, Some("call_a2"), None, Some(".txt\"}"))],
+		))
+		.expect("third");
+	assembler
+		.push(&chunk(
+			Some("C"),
+			vec![delta(1, Some("call_b"), Some("bash"), Some("echo hi"))],
+		))
+		.expect("fourth");
 
 	let message = assembler.finish().expect("assembled turn");
 	assert_eq!(message.content, "ABC");
 	assert_eq!(message.tool_calls.len(), 3);
 
+	// Calls keep their streamed content position, not their slot number: the
+	// call that opened the first block is first, and text after it stays after.
+	assert_eq!(message.tool_calls[0].id, "call_2");
+	assert_eq!(message.tool_calls[0].name, "third");
+	assert_eq!(message.tool_calls[0].arguments, json!({}));
+
 	// Index 0 was emitted twice: one call, later id wins, arguments joined.
-	assert_eq!(message.tool_calls[0].id, "call_a2");
-	assert_eq!(message.tool_calls[0].name, "read");
-	assert_eq!(message.tool_calls[0].arguments, json!({ "path": "a.txt" }));
+	assert_eq!(message.tool_calls[1].id, "call_a2");
+	assert_eq!(message.tool_calls[1].name, "read");
+	assert_eq!(message.tool_calls[1].arguments, json!({ "path": "a.txt" }));
 
 	// Non-JSON arguments stay verbatim instead of being dropped.
-	assert_eq!(message.tool_calls[1].id, "call_b");
-	assert_eq!(message.tool_calls[1].arguments, json!("echo hi"));
+	assert_eq!(message.tool_calls[2].id, "call_b");
+	assert_eq!(message.tool_calls[2].arguments, json!("echo hi"));
 
-	// Missing ids fall back to the index; empty arguments become an object.
-	assert_eq!(message.tool_calls[2].id, "call_2");
-	assert_eq!(message.tool_calls[2].name, "third");
-	assert_eq!(message.tool_calls[2].arguments, json!({}));
+	let kinds: Vec<&str> = message
+		.parts
+		.iter()
+		.map(|part| match part {
+			pi_agent::ContentPart::ToolCall { .. } => "toolCall",
+			pi_agent::ContentPart::Text { .. } => "text",
+			_ => "other",
+		})
+		.collect();
+	assert_eq!(kinds, ["toolCall", "text", "toolCall", "toolCall"]);
 }
 
 #[tokio::test]

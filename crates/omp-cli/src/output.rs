@@ -335,6 +335,8 @@ impl<W: Write, E: Write> Reporter<W, E> {
 							writeln!(self.out, "{text}")?;
 						}
 					},
+					// Encrypted reasoning is never rendered.
+					pi_agent::StreamBlockKind::Redacted => {},
 				}
 			}
 		}
@@ -359,13 +361,15 @@ fn message_blocks(
 		.parts
 		.iter()
 		.filter_map(|part| match part {
-			pi_agent::ContentPart::Thinking { thinking } => {
+			pi_agent::ContentPart::Thinking { thinking, .. } => {
 				Some((pi_agent::StreamBlockKind::Thinking, thinking.clone()))
 			},
 			pi_agent::ContentPart::Text { text } => {
 				Some((pi_agent::StreamBlockKind::Text, text.clone()))
 			},
-			pi_agent::ContentPart::Image { .. } => None,
+			pi_agent::ContentPart::Image { .. }
+			| pi_agent::ContentPart::RedactedThinking { .. }
+			| pi_agent::ContentPart::ToolCall { .. } => None,
 		})
 		.collect();
 	if blocks.is_empty() && !message.content.is_empty() {
@@ -383,19 +387,45 @@ fn format_ts_assistant_message(
 	stop_reason: Option<&str>,
 	timestamp: u64,
 ) -> serde_json::Value {
+	// The assembled message records the route/reason that actually served it;
+	// explicit event values are only the fallback.
+	let api = message.api.as_deref().unwrap_or(api);
+	let provider = message.provider.as_deref().unwrap_or(provider);
+	let model = message.model.as_deref().unwrap_or(model);
+	let stop_reason = message.stop_reason.map(pi_agent::StopReason::as_str).or(stop_reason);
 	let mut content = Vec::new();
+	let mut has_tool_part = false;
 	for part in &message.parts {
 		match part {
-			pi_agent::ContentPart::Thinking { thinking } => {
-				content.push(serde_json::json!({
+			pi_agent::ContentPart::Thinking { thinking, thinking_signature } => {
+				let mut block = serde_json::json!({
 					"type": "thinking",
 					"thinking": thinking,
+				});
+				if let Some(signature) = thinking_signature {
+					block["thinkingSignature"] = serde_json::json!(signature);
+				}
+				content.push(block);
+			},
+			pi_agent::ContentPart::RedactedThinking { data } => {
+				content.push(serde_json::json!({
+					"type": "redactedThinking",
+					"data": data,
 				}));
 			},
 			pi_agent::ContentPart::Text { text } => {
 				content.push(serde_json::json!({
 					"type": "text",
 					"text": text,
+				}));
+			},
+			pi_agent::ContentPart::ToolCall { id, name, arguments } => {
+				has_tool_part = true;
+				content.push(serde_json::json!({
+					"type": "toolCall",
+					"id": id,
+					"name": name,
+					"arguments": arguments,
 				}));
 			},
 			pi_agent::ContentPart::Image { .. } => {},
@@ -411,13 +441,15 @@ fn format_ts_assistant_message(
 			"text": message.content,
 		}));
 	}
-	for call in &message.tool_calls {
-		content.push(serde_json::json!({
-			"type": "toolCall",
-			"id": call.id,
-			"name": call.name,
-			"arguments": call.arguments,
-		}));
+	if !has_tool_part {
+		for call in &message.tool_calls {
+			content.push(serde_json::json!({
+				"type": "toolCall",
+				"id": call.id,
+				"name": call.name,
+				"arguments": call.arguments,
+			}));
+		}
 	}
 	let stop_reason_ts = match stop_reason {
 		Some("tool_use") | Some("toolUse") => "toolUse",
@@ -447,6 +479,9 @@ fn format_ts_assistant_message(
 	// zeros-as-fact. `cost` is omitted too because no price is known here.
 	if let Some(usage) = crate::session::reported_usage(message) {
 		asst["usage"] = serde_json::json!(usage);
+	}
+	if let Some(error) = &message.error_message {
+		asst["errorMessage"] = serde_json::json!(error);
 	}
 	asst
 }
@@ -496,9 +531,25 @@ fn format_ts_message(
 							"type": "text",
 							"text": text,
 						}),
-						pi_agent::ContentPart::Thinking { thinking } => serde_json::json!({
-							"type": "thinking",
-							"thinking": thinking,
+						pi_agent::ContentPart::Thinking { thinking, thinking_signature } => {
+							let mut block = serde_json::json!({
+								"type": "thinking",
+								"thinking": thinking,
+							});
+							if let Some(signature) = thinking_signature {
+								block["thinkingSignature"] = serde_json::json!(signature);
+							}
+							block
+						},
+						pi_agent::ContentPart::RedactedThinking { data } => serde_json::json!({
+							"type": "redactedThinking",
+							"data": data,
+						}),
+						pi_agent::ContentPart::ToolCall { id, name, arguments } => serde_json::json!({
+							"type": "toolCall",
+							"id": id,
+							"name": name,
+							"arguments": arguments,
 						}),
 						pi_agent::ContentPart::Image { data, mime_type } => serde_json::json!({
 							"type": "image",
@@ -641,6 +692,7 @@ mod tests {
 				cache_write: 1,
 				total_tokens: 17,
 				reasoning_tokens: None,
+				..pi_agent::TokenUsage::default()
 			});
 			reporter.event(&Event::message_end(asst)).expect("event");
 			reporter.finish().expect("finish");

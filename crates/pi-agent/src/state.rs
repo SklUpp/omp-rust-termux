@@ -16,6 +16,26 @@ pub enum Role {
 	Developer,
 }
 
+/// Anthropic cache-creation breakdown (TS `usage.cttl`). Components are only
+/// present when the provider reported a positive count, and their sum is the
+/// cache-write counter.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheTtlUsage {
+	#[serde(default, rename = "ephemeral5m", skip_serializing_if = "Option::is_none")]
+	pub ephemeral_5m: Option<u64>,
+	#[serde(default, rename = "ephemeral1h", skip_serializing_if = "Option::is_none")]
+	pub ephemeral_1h: Option<u64>,
+}
+
+/// Anthropic server-side tool usage (TS `usage.server`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServerToolUsage {
+	#[serde(default, rename = "webSearch", skip_serializing_if = "Option::is_none")]
+	pub web_search: Option<u64>,
+	#[serde(default, rename = "webFetch", skip_serializing_if = "Option::is_none")]
+	pub web_fetch: Option<u64>,
+}
+
 /// Token usage for exactly one model request, as its provider reported it.
 ///
 /// Mirrors the TS `Usage` token counters (`packages/catalog/src/types.ts`,
@@ -43,6 +63,21 @@ pub struct TokenUsage {
 	/// `calculateOpenAIUsageAccounting` adds the key only when positive).
 	#[serde(default, rename = "reasoningTokens", skip_serializing_if = "Option::is_none")]
 	pub reasoning_tokens: Option<u64>,
+	/// Anthropic cache-creation breakdown. Present only when the provider
+	/// reported it; components are positive-only.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub cttl: Option<CacheTtlUsage>,
+	/// Anthropic server-side tool usage (web search/fetch).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub server: Option<ServerToolUsage>,
+}
+
+fn add_optional(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+	match (left, right) {
+		(Some(left), Some(right)) => Some(left.saturating_add(right)),
+		(Some(value), None) | (None, Some(value)) => Some(value),
+		(None, None) => None,
+	}
 }
 
 impl TokenUsage {
@@ -60,6 +95,23 @@ impl TokenUsage {
 			(Some(total), None) => Some(total),
 			(None, Some(reported)) => Some(reported),
 			(None, None) => None,
+		};
+		// Extras describe request snapshots. Aggregating several requests sums
+		// the reported components; single-snapshot consumers assign the value
+		// directly so a provider-cleared extra becomes `None`.
+		self.cttl = match (self.cttl, usage.cttl) {
+			(Some(total), Some(reported)) => Some(CacheTtlUsage {
+				ephemeral_5m: add_optional(total.ephemeral_5m, reported.ephemeral_5m),
+				ephemeral_1h: add_optional(total.ephemeral_1h, reported.ephemeral_1h),
+			}),
+			(total, reported) => total.or(reported),
+		};
+		self.server = match (self.server, usage.server) {
+			(Some(total), Some(reported)) => Some(ServerToolUsage {
+				web_search: add_optional(total.web_search, reported.web_search),
+				web_fetch:  add_optional(total.web_fetch, reported.web_fetch),
+			}),
+			(total, reported) => total.or(reported),
 		};
 	}
 }
@@ -90,12 +142,70 @@ pub struct ToolResult {
 	pub details: Option<serde_json::Value>,
 }
 
+/// Terminal reason the provider gave for an assistant message (TS `StopReason`).
+///
+/// `Length` is truncation, not a clean stop; `Error` carries the reason text on
+/// [`Message::error_message`]. Consumers must never fold either into `Stop`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum StopReason {
+	Stop,
+	Length,
+	ToolUse,
+	Error,
+	Aborted,
+}
+
+impl StopReason {
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Self::Stop => "stop",
+			Self::Length => "length",
+			Self::ToolUse => "toolUse",
+			Self::Error => "error",
+			Self::Aborted => "aborted",
+		}
+	}
+
+	/// Parse a persisted/session reason. Unknown values stay `None` instead of
+	/// being invented or folded into `stop`.
+	pub fn parse(value: &str) -> Option<Self> {
+		match value {
+			"stop" | "end_turn" => Some(Self::Stop),
+			"length" | "max_tokens" => Some(Self::Length),
+			"toolUse" | "tool_use" => Some(Self::ToolUse),
+			"error" => Some(Self::Error),
+			"aborted" => Some(Self::Aborted),
+			_ => None,
+		}
+	}
+}
+
+/// Who initiated a message, for billing/attribution semantics (TS
+/// `MessageAttribution`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Attribution {
+	User,
+	Agent,
+}
+
+impl Attribution {
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Self::User => "user",
+			Self::Agent => "agent",
+		}
+	}
+}
+
 /// Completion status of an assistant turn.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TurnStatus {
 	EndTurn,
 	ToolUse,
+	Length,
 	Aborted,
 	Error(String),
 }
@@ -273,9 +383,23 @@ pub enum ContentPart {
 	#[serde(rename = "text")]
 	Text { text: String },
 	/// Provider-supplied public reasoning block (TS `ThinkingContent`). Never
-	/// replayed outbound and never mixed into the answer text.
+	/// mixed into the answer text; replayed only by the provider that signed it.
 	#[serde(rename = "thinking")]
-	Thinking { thinking: String },
+	Thinking {
+		thinking: String,
+		/// Opaque signature that makes same-provider replay valid. Absence is a
+		/// legitimate legacy/unsigned block, never a loss.
+		#[serde(
+			rename = "thinkingSignature",
+			default,
+			skip_serializing_if = "Option::is_none"
+		)]
+		thinking_signature: Option<String>,
+	},
+	/// Provider-encrypted reasoning (TS `RedactedThinkingContent`): preserved
+	/// verbatim for same-provider replay, never rendered as answer text.
+	#[serde(rename = "redactedThinking")]
+	RedactedThinking { data: String },
 	#[serde(rename = "image")]
 	Image {
 		#[serde(rename = "data", alias = "data_base64")]
@@ -283,6 +407,10 @@ pub enum ContentPart {
 		#[serde(rename = "mimeType", alias = "mime_type")]
 		mime_type: String,
 	},
+	/// Tool invocation in its streamed content position (TS `ToolCall` block).
+	/// [`Message::tool_calls`] is the execution projection of these blocks.
+	#[serde(rename = "toolCall")]
+	ToolCall { id: String, name: String, arguments: serde_json::Value },
 }
 
 impl ContentPart {
@@ -291,7 +419,25 @@ impl ContentPart {
 	}
 
 	pub fn thinking(thinking: impl Into<String>) -> Self {
-		Self::Thinking { thinking: thinking.into() }
+		Self::Thinking { thinking: thinking.into(), thinking_signature: None }
+	}
+
+	pub fn thinking_with_signature(
+		thinking: impl Into<String>,
+		signature: impl Into<String>,
+	) -> Self {
+		Self::Thinking {
+			thinking: thinking.into(),
+			thinking_signature: Some(signature.into()),
+		}
+	}
+
+	pub fn redacted_thinking(data: impl Into<String>) -> Self {
+		Self::RedactedThinking { data: data.into() }
+	}
+
+	pub fn tool_call(id: impl Into<String>, name: impl Into<String>, arguments: serde_json::Value) -> Self {
+		Self::ToolCall { id: id.into(), name: name.into(), arguments }
 	}
 
 	pub fn is_thinking(&self) -> bool {
@@ -300,9 +446,42 @@ impl ContentPart {
 
 	pub fn as_thinking(&self) -> Option<&str> {
 		match self {
-			Self::Thinking { thinking } => Some(thinking),
+			Self::Thinking { thinking, .. } => Some(thinking),
 			_ => None,
 		}
+	}
+
+	pub fn thinking_signature(&self) -> Option<&str> {
+		match self {
+			Self::Thinking { thinking_signature, .. } => thinking_signature.as_deref(),
+			_ => None,
+		}
+	}
+
+	pub fn is_redacted_thinking(&self) -> bool {
+		matches!(self, Self::RedactedThinking { .. })
+	}
+
+	pub fn as_redacted_thinking(&self) -> Option<&str> {
+		match self {
+			Self::RedactedThinking { data } => Some(data),
+			_ => None,
+		}
+	}
+
+	pub fn is_tool_call(&self) -> bool {
+		matches!(self, Self::ToolCall { .. })
+	}
+
+	/// Reasoning blocks are persisted and conditionally replayed, never sent as
+	/// visible prompt text.
+	pub fn is_reasoning(&self) -> bool {
+		self.is_thinking() || self.is_redacted_thinking()
+	}
+
+	/// Parts that carry ordinary prompt content for an OpenAI-compatible body.
+	pub fn is_replayable_content(&self) -> bool {
+		matches!(self, Self::Text { .. } | Self::Image { .. })
 	}
 
 	pub fn image(data: impl Into<String>, mime_type: impl Into<String>) -> Result<Self, String> {
@@ -377,6 +556,24 @@ pub struct Message {
 	/// nothing at all.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub usage: Option<TokenUsage>,
+	/// Provider's terminal reason. `None` means the adapter did not report one;
+	/// consumers derive `stop`/`toolUse` only in that case, never for `length`.
+	#[serde(rename = "stopReason", default, skip_serializing_if = "Option::is_none")]
+	pub stop_reason: Option<StopReason>,
+	/// Provider error/refusal text when `stop_reason` is `error`.
+	#[serde(rename = "errorMessage", default, skip_serializing_if = "Option::is_none")]
+	pub error_message: Option<String>,
+	/// Source route needed to decide whether signed/redacted reasoning may be
+	/// replayed: a signature is only valid back to the provider/model that
+	/// issued it.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub api: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub provider: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub model: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub attribution: Option<Attribution>,
 }
 
 #[derive(Deserialize)]
@@ -401,6 +598,18 @@ struct RawMessage {
 	is_error: bool,
 	#[serde(default)]
 	usage: Option<TokenUsage>,
+	#[serde(rename = "stopReason", default)]
+	stop_reason: Option<StopReason>,
+	#[serde(rename = "errorMessage", default)]
+	error_message: Option<String>,
+	#[serde(default)]
+	api: Option<String>,
+	#[serde(default)]
+	provider: Option<String>,
+	#[serde(default)]
+	model: Option<String>,
+	#[serde(default)]
+	attribution: Option<Attribution>,
 }
 
 impl<'de> Deserialize<'de> for Message {
@@ -438,6 +647,12 @@ impl<'de> Deserialize<'de> for Message {
 			tool_call_id: raw.tool_call_id,
 			is_error: raw.is_error,
 			usage: raw.usage,
+			stop_reason: raw.stop_reason,
+			error_message: raw.error_message,
+			api: raw.api,
+			provider: raw.provider,
+			model: raw.model,
+			attribution: raw.attribution,
 		})
 	}
 }
@@ -452,6 +667,12 @@ impl Message {
 			tool_call_id: None,
 			is_error: false,
 			usage: None,
+			stop_reason: None,
+			error_message: None,
+			api: None,
+			provider: None,
+			model: None,
+			attribution: None,
 		}
 	}
 
@@ -466,6 +687,12 @@ impl Message {
 			tool_call_id: None,
 			is_error: false,
 			usage: None,
+			stop_reason: None,
+			error_message: None,
+			api: None,
+			provider: None,
+			model: None,
+			attribution: None,
 		}
 	}
 
@@ -479,6 +706,12 @@ impl Message {
 			tool_call_id: None,
 			is_error: false,
 			usage: None,
+			stop_reason: None,
+			error_message: None,
+			api: None,
+			provider: None,
+			model: None,
+			attribution: None,
 		}
 	}
 
@@ -500,6 +733,12 @@ impl Message {
 			tool_call_id: None,
 			is_error: false,
 			usage: None,
+			stop_reason: None,
+			error_message: None,
+			api: None,
+			provider: None,
+			model: None,
+			attribution: None,
 		}
 	}
 
@@ -524,6 +763,12 @@ impl Message {
 			tool_call_id: None,
 			is_error: false,
 			usage: None,
+			stop_reason: None,
+			error_message: None,
+			api: None,
+			provider: None,
+			model: None,
+			attribution: None,
 		}
 	}
 
@@ -545,6 +790,12 @@ impl Message {
 			tool_call_id: None,
 			is_error: false,
 			usage: None,
+			stop_reason: None,
+			error_message: None,
+			api: None,
+			provider: None,
+			model: None,
+			attribution: None,
 		}
 	}
 
@@ -558,6 +809,12 @@ impl Message {
 			tool_call_id: None,
 			is_error: false,
 			usage: None,
+			stop_reason: None,
+			error_message: None,
+			api: None,
+			provider: None,
+			model: None,
+			attribution: None,
 		}
 	}
 
@@ -571,6 +828,12 @@ impl Message {
 			tool_call_id: Some(tool_call_id.into()),
 			is_error: false,
 			usage: None,
+			stop_reason: None,
+			error_message: None,
+			api: None,
+			provider: None,
+			model: None,
+			attribution: None,
 		}
 	}
 
@@ -589,6 +852,12 @@ impl Message {
 			tool_call_id: Some(tool_call_id.into()),
 			is_error,
 			usage: None,
+			stop_reason: None,
+			error_message: None,
+			api: None,
+			provider: None,
+			model: None,
+			attribution: None,
 		}
 	}
 	pub fn tool_with_status_and_parts(
@@ -607,6 +876,12 @@ impl Message {
 			tool_call_id: Some(tool_call_id.into()),
 			is_error,
 			usage: None,
+			stop_reason: None,
+			error_message: None,
+			api: None,
+			provider: None,
+			model: None,
+			attribution: None,
 		}
 	}
 }

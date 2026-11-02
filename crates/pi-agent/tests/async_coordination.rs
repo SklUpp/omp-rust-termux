@@ -90,6 +90,11 @@ fn text_stream(reply: &str) -> ChunkStream {
 			usage: None,
 			reasoning: None,
 			is_done: false,
+			content_index: None,
+			signature: None,
+			redacted: None,
+			stop_reason: None,
+			error_message: None,
 		}),
 		Ok(StreamChunk {
 			content: None,
@@ -97,6 +102,11 @@ fn text_stream(reply: &str) -> ChunkStream {
 			usage: None,
 			reasoning: None,
 			is_done: true,
+			content_index: None,
+			signature: None,
+			redacted: None,
+			stop_reason: None,
+			error_message: None,
 		}),
 	];
 	Box::pin(futures::stream::iter(items))

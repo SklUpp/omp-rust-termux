@@ -576,9 +576,12 @@ fn flush_run(run: &mut Vec<MessageEntry>, messages: &mut Vec<Message>) -> Result
 	if run.is_empty() {
 		return Ok(());
 	}
-	let turns = crate::session::derive_turn_history(run)?;
+	// Direct entry replay keeps thinking signatures, redacted blocks and
+	// terminal reasons; `derive_turn_history` is a lossy text view only.
+	messages.extend(
+		crate::runtime::history_messages_from_entries(run).map_err(|err| err.to_string())?,
+	);
 	run.clear();
-	messages.extend(crate::runtime::history_messages(&turns).map_err(|err| err.to_string())?);
 	Ok(())
 }
 

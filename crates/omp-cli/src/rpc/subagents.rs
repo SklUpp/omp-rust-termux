@@ -242,17 +242,18 @@ fn agent_event_frames(event: &AgentEvent, buffer: &mut StreamBuffer) -> Vec<Valu
 /// order, exactly like the finalized message.
 fn stream_snapshot(buffer: &StreamBuffer) -> Message {
 	let mut message = Message::assistant(buffer.text());
-	if buffer
-		.blocks
-		.iter()
-		.any(|(kind, _)| *kind == StreamBlockKind::Thinking)
-	{
+	if buffer.blocks.iter().any(|(kind, _)| {
+		matches!(*kind, StreamBlockKind::Thinking | StreamBlockKind::Redacted)
+	}) {
 		message.parts = buffer
 			.blocks
 			.iter()
 			.map(|(kind, text)| match kind {
 				StreamBlockKind::Thinking => pi_agent::ContentPart::thinking(text.clone()),
 				StreamBlockKind::Text => pi_agent::ContentPart::Text { text: text.clone() },
+				StreamBlockKind::Redacted => {
+					pi_agent::ContentPart::redacted_thinking(text.clone())
+				},
 			})
 			.collect();
 	}
@@ -265,6 +266,7 @@ fn stop_reason(status: &TurnStatus) -> &'static str {
 	match status {
 		TurnStatus::EndTurn => "stop",
 		TurnStatus::ToolUse => "toolUse",
+		TurnStatus::Length => "length",
 		TurnStatus::Aborted => "aborted",
 		TurnStatus::Error(_) => "error",
 	}

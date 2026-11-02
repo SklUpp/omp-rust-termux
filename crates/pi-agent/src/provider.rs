@@ -49,6 +49,9 @@ pub enum ToolChoice {
 	/// Let the model decide (the default; the wire field is omitted entirely).
 	#[default]
 	Auto,
+	/// Forbid tool calls for this request (`tool_choice: "none"`). Distinct from
+	/// [`Self::Auto`], which leaves the field out.
+	None,
 	/// Force exactly this tool. Only adapters that support forced selection may
 	/// accept it; the name must be non-empty and offered in the same request.
 	Tool { name: String },
@@ -63,6 +66,8 @@ pub enum ToolChoice {
 pub enum StreamBlockKind {
 	Thinking,
 	Text,
+	/// Provider-encrypted reasoning; carried opaque, never printed as answer.
+	Redacted,
 }
 
 /// First-occurrence block cursor (TS `appendText`/`appendThinking`): a new block
@@ -107,11 +112,30 @@ pub struct StreamChunk {
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub usage: Option<TokenUsage>,
 	pub is_done: bool,
+	/// Position of this delta's block in the assistant content array, spanning
+	/// text, thinking, redacted and tool-call blocks. `None` keeps the legacy
+	/// first-occurrence flip order used by OpenAI-compatible dialects.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub content_index: Option<usize>,
+	/// Signature for the thinking block at `content_index` (Anthropic
+	/// `signature_delta`). Rejected when it cannot be attached to that block.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub signature: Option<String>,
+	/// Opaque encrypted reasoning appended to the block at `content_index`.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub redacted: Option<String>,
+	/// Provider terminal reason, normally on the done chunk.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub stop_reason: Option<crate::state::StopReason>,
+	/// Provider error/refusal text paired with `stop_reason == error`.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub error_message: Option<String>,
 }
 
 /// Incremental delta for a tool call.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolCallDelta {
+	/// Tool-call slot this delta belongs to (stable across argument chunks).
 	pub index: usize,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub id: Option<String>,
@@ -119,6 +143,11 @@ pub struct ToolCallDelta {
 	pub name: Option<String>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub arguments_delta: Option<String>,
+	/// Content-array position of this call's `ToolCall` block. Required when a
+	/// dialect interleaves calls with text; otherwise the call opens the next
+	/// free block.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub content_index: Option<usize>,
 }
 
 /// Pinned async stream of chunks.
@@ -149,6 +178,22 @@ pub trait ModelProvider: Send + Sync {
 		tools: &[serde_json::Value],
 		tool_choice: &ToolChoice,
 	) -> Result<ChunkStream, ProviderError>;
+
+	/// Dialect name stamped on produced messages (TS `AssistantMessage.api`),
+	/// e.g. `openai-completions`, `anthropic-messages`, `ollama`.
+	fn api(&self) -> Option<&str> {
+		None
+	}
+
+	/// Configured gateway/provider identity stamped on produced messages.
+	fn provider(&self) -> Option<&str> {
+		None
+	}
+
+	/// Model id stamped on produced messages.
+	fn model(&self) -> Option<&str> {
+		None
+	}
 
 	/// Whether this provider supports multimodal image inputs.
 	fn supports_images(&self) -> bool {
@@ -207,6 +252,9 @@ pub struct OpenAiCompatibleProvider {
 	force_reasoning_off: bool,
 	/// OpenAI `service_tier`; omitted when unset/`none`/empty.
 	service_tier: Option<String>,
+	/// Configured provider id (catalog key) stamped on produced messages so
+	/// signed reasoning is only replayed to the route that issued it.
+	provider_id: Option<String>,
 }
 
 impl OpenAiCompatibleProvider {
@@ -252,7 +300,15 @@ impl OpenAiCompatibleProvider {
 			usage_in_streaming: true,
 			force_reasoning_off: false,
 			service_tier: None,
+			provider_id: None,
 		}
+	}
+
+	/// Stamp the configured provider/catalog id on produced messages.
+	pub fn with_provider_id(mut self, provider_id: impl Into<String>) -> Self {
+		let provider_id = provider_id.into();
+		self.provider_id = (!provider_id.trim().is_empty()).then_some(provider_id);
+		self
 	}
 
 	/// Enable or disable multimodal image support.
@@ -361,6 +417,7 @@ impl OpenAiCompatibleProvider {
 	) -> Result<OpenAiChatRequest, ProviderError> {
 		let tool_choice = match tool_choice {
 			ToolChoice::Auto => None,
+			ToolChoice::None => Some(OpenAiToolChoice::Mode(OpenAiToolChoiceMode::None)),
 			ToolChoice::Required => Some(OpenAiToolChoice::Mode(OpenAiToolChoiceMode::Required)),
 			ToolChoice::Tool { name } => {
 				if name.trim().is_empty() {
@@ -407,6 +464,18 @@ impl OpenAiCompatibleProvider {
 
 #[async_trait]
 impl ModelProvider for OpenAiCompatibleProvider {
+	fn api(&self) -> Option<&str> {
+		Some("openai-completions")
+	}
+
+	fn provider(&self) -> Option<&str> {
+		self.provider_id.as_deref()
+	}
+
+	fn model(&self) -> Option<&str> {
+		Some(&self.model)
+	}
+
 	fn supports_images(&self) -> bool {
 		self.supports_images
 	}
@@ -495,19 +564,67 @@ impl ModelProvider for OpenAiCompatibleProvider {
 /// request, and the terminal usage-only trailer repeats the counters.
 #[derive(Debug, Default)]
 pub struct StreamAssembler {
-	/// Content blocks in first-occurrence order (TS `output.content`), so the
-	/// finalized parts order matches the streamed `contentIndex` order even when
-	/// the provider sends the answer before its reasoning.
-	blocks: Vec<(StreamBlockKind, String)>,
-	calls:  BTreeMap<usize, PendingCall>,
-	usage:  Option<TokenUsage>,
+	/// Assistant content blocks keyed by their stream `contentIndex` (TS
+	/// `output.content`). One map holds text, thinking, redacted and tool-call
+	/// blocks, so a call that precedes later text keeps its boundary instead of
+	/// being regrouped by a separate accumulator.
+	blocks:        BTreeMap<usize, AssembledBlock>,
+	/// Tool-call slot index (OpenAI `tool_calls[].index`) to the content block
+	/// it owns, so continuation deltas that omit the content index route back.
+	tool_blocks:   BTreeMap<usize, usize>,
+	usage:         Option<TokenUsage>,
+	stop_reason:   Option<crate::state::StopReason>,
+	error_message: Option<String>,
+}
+
+#[derive(Debug)]
+enum AssembledBlock {
+	Text(String),
+	Thinking { text: String, signature: Option<String> },
+	Redacted(String),
+	ToolCall(PendingCall),
+}
+
+impl AssembledBlock {
+	fn matches(&self, kind: StreamBlockKind) -> bool {
+		matches!(
+			(self, kind),
+			(Self::Text(_), StreamBlockKind::Text)
+				| (Self::Thinking { .. }, StreamBlockKind::Thinking)
+				| (Self::Redacted(_), StreamBlockKind::Redacted)
+		)
+	}
 }
 
 #[derive(Debug, Default)]
 struct PendingCall {
-	id: Option<String>,
-	name: Option<String>,
+	tool_index: usize,
+	id:        Option<String>,
+	name:      Option<String>,
 	arguments: String,
+}
+
+impl PendingCall {
+	/// Resolve the call, rejecting a completed call with no usable tool name.
+	fn resolve(self) -> Result<ToolCall, ProviderError> {
+		let Some(name) = self.name.filter(|n| !n.trim().is_empty()) else {
+			return Err(ProviderError::Protocol(format!(
+				"streamed tool call at index {} is missing or has empty tool name",
+				self.tool_index
+			)));
+		};
+		let arguments = if self.arguments.trim().is_empty() {
+			serde_json::Value::Object(serde_json::Map::new())
+		} else {
+			serde_json::from_str(&self.arguments)
+				.unwrap_or(serde_json::Value::String(self.arguments))
+		};
+		Ok(ToolCall {
+			id: self.id.unwrap_or_else(|| format!("call_{}", self.tool_index)),
+			name,
+			arguments,
+		})
+	}
 }
 
 impl StreamAssembler {
@@ -516,68 +633,207 @@ impl StreamAssembler {
 	}
 
 	/// Fold one streamed chunk into the accumulated turn.
-	pub fn push(&mut self, chunk: &StreamChunk) {
+	///
+	/// Explicit `content_index` values are authoritative; when absent, a delta
+	/// joins the last block of the same kind or opens the next free block (the
+	/// legacy OpenAI-compatible flip order).
+	pub fn push(&mut self, chunk: &StreamChunk) -> Result<(), ProviderError> {
 		// TS `openai-completions.ts:1160-1192`: reasoning in one chunk precedes
 		// its content, which is what decides first-occurrence block order.
 		if let Some(delta) = chunk.reasoning.as_deref().filter(|delta| !delta.is_empty()) {
-			self.append(StreamBlockKind::Thinking, delta);
+			self.append(chunk.content_index, StreamBlockKind::Thinking, delta)?;
 		}
 		if let Some(delta) = chunk.content.as_deref().filter(|delta| !delta.is_empty()) {
-			self.append(StreamBlockKind::Text, delta);
+			self.append(chunk.content_index, StreamBlockKind::Text, delta)?;
+		}
+		if let Some(data) = chunk.redacted.as_deref().filter(|data| !data.is_empty()) {
+			self.append(chunk.content_index, StreamBlockKind::Redacted, data)?;
+		}
+		if let Some(signature) = &chunk.signature {
+			let index = chunk.content_index.ok_or_else(|| {
+				ProviderError::Protocol(
+					"thinking signature arrived without a content index".to_string(),
+				)
+			})?;
+			match self.blocks.get_mut(&index) {
+				Some(AssembledBlock::Thinking { signature: slot, .. }) => match slot {
+					Some(existing) if existing != signature => {
+						return Err(ProviderError::Protocol(format!(
+							"thinking block {index} received a second, different signature"
+						)));
+					},
+					Some(_) => {},
+					None => *slot = Some(signature.clone()),
+				},
+				_ => {
+					return Err(ProviderError::Protocol(format!(
+						"thinking signature refers to non-thinking block {index}"
+					)));
+				},
+			}
 		}
 		if let Some(usage) = chunk.usage {
 			self.usage = Some(usage);
 		}
-		for delta in &chunk.tool_call_deltas {
-			let pending = self.calls.entry(delta.index).or_default();
-			if let Some(id) = &delta.id {
-				pending.id = Some(id.clone());
-			}
-			if let Some(name) = &delta.name {
-				pending.name = Some(name.clone());
-			}
-			if let Some(arguments) = &delta.arguments_delta {
-				pending.arguments.push_str(arguments);
-			}
+		if let Some(reason) = chunk.stop_reason {
+			self.stop_reason = Some(reason);
 		}
+		if let Some(message) = &chunk.error_message {
+			self.error_message = Some(message.clone());
+		}
+		for delta in &chunk.tool_call_deltas {
+			self.push_tool_delta(delta)?;
+		}
+		Ok(())
 	}
 
-	/// Append a delta, opening a new block when the kind flips.
-	fn append(&mut self, kind: StreamBlockKind, delta: &str) {
-		match self.blocks.last_mut() {
-			Some((current, text)) if *current == kind => text.push_str(delta),
-			_ => self.blocks.push((kind, delta.to_string())),
+	/// Append a text/thinking/redacted delta, opening a block when needed.
+	fn append(
+		&mut self,
+		index: Option<usize>,
+		kind: StreamBlockKind,
+		delta: &str,
+	) -> Result<(), ProviderError> {
+		let index = match index {
+			Some(index) => index,
+			None => match self.blocks.last_key_value() {
+				Some((&last, block)) if block.matches(kind) => last,
+				_ => self.next_index(),
+			},
+		};
+		match self.blocks.get_mut(&index) {
+			Some(block) if block.matches(kind) => match block {
+				AssembledBlock::Text(text)
+				| AssembledBlock::Redacted(text) => text.push_str(delta),
+				AssembledBlock::Thinking { text, .. } => text.push_str(delta),
+				AssembledBlock::ToolCall(_) => unreachable!("matches() excluded tool calls"),
+			},
+			Some(_) => {
+				return Err(ProviderError::Protocol(format!(
+					"content index {index} carries conflicting block kinds"
+				)));
+			},
+			None => {
+				self.blocks.insert(
+					index,
+					match kind {
+						StreamBlockKind::Text => AssembledBlock::Text(delta.to_string()),
+						StreamBlockKind::Thinking => AssembledBlock::Thinking {
+							text:      delta.to_string(),
+							signature: None,
+						},
+						StreamBlockKind::Redacted => AssembledBlock::Redacted(delta.to_string()),
+					},
+				);
+			},
 		}
+		Ok(())
+	}
+
+	fn push_tool_delta(&mut self, delta: &ToolCallDelta) -> Result<(), ProviderError> {
+		let known = self.tool_blocks.get(&delta.index).copied();
+		let content_index = match (delta.content_index, known) {
+			(Some(explicit), Some(existing)) if explicit != existing => {
+				return Err(ProviderError::Protocol(format!(
+					"tool call {} moved from content index {existing} to {explicit}",
+					delta.index
+				)));
+			},
+			(Some(explicit), _) => explicit,
+			(None, Some(existing)) => existing,
+			(None, None) => self.next_index(),
+		};
+		let block = self.blocks.entry(content_index).or_insert_with(|| {
+			AssembledBlock::ToolCall(PendingCall { tool_index: delta.index, ..Default::default() })
+		});
+		let AssembledBlock::ToolCall(pending) = block else {
+			return Err(ProviderError::Protocol(format!(
+				"tool call {} collides with a non-tool block at content index {content_index}",
+				delta.index
+			)));
+		};
+		pending.tool_index = delta.index;
+		if let Some(id) = &delta.id {
+			pending.id = Some(id.clone());
+		}
+		if let Some(name) = &delta.name {
+			pending.name = Some(name.clone());
+		}
+		if let Some(arguments) = &delta.arguments_delta {
+			pending.arguments.push_str(arguments);
+		}
+		self.tool_blocks.insert(delta.index, content_index);
+		Ok(())
+	}
+
+	fn next_index(&self) -> usize {
+		self.blocks.keys().next_back().map_or(0, |index| index + 1)
 	}
 
 	/// The answer text: every text block, in block order.
 	fn text(&self) -> String {
 		self
 			.blocks
-			.iter()
-			.filter(|(kind, _)| *kind == StreamBlockKind::Text)
-			.map(|(_, text)| text.as_str())
+			.values()
+			.filter_map(|block| match block {
+				AssembledBlock::Text(text) => Some(text.as_str()),
+				_ => None,
+			})
 			.collect()
 	}
 
-	/// Ordered parts, empty when no reasoning streamed so text-only messages
-	/// keep the plain string wire form.
-	fn parts(&self) -> Vec<crate::state::ContentPart> {
-		if !self
-			.blocks
-			.iter()
-			.any(|(kind, _)| *kind == StreamBlockKind::Thinking)
-		{
-			return Vec::new();
+	/// Ordered parts, empty when only plain answer text streamed so text-only
+	/// messages keep the string wire form. Tool calls are included while
+	/// finalizing; a partial/aborted turn omits them because they never ran.
+	fn parts(&self, include_tools: bool) -> Result<Vec<crate::state::ContentPart>, ProviderError> {
+		let has_structured = self.blocks.values().any(|block| {
+			matches!(
+				block,
+				AssembledBlock::Thinking { .. } | AssembledBlock::Redacted(_)
+			) || (include_tools && matches!(block, AssembledBlock::ToolCall(_)))
+		});
+		if !has_structured {
+			return Ok(Vec::new());
 		}
-		self
-			.blocks
-			.iter()
-			.map(|(kind, text)| match kind {
-				StreamBlockKind::Thinking => crate::state::ContentPart::thinking(text.clone()),
-				StreamBlockKind::Text => crate::state::ContentPart::Text { text: text.clone() },
-			})
-			.collect()
+		let mut parts = Vec::with_capacity(self.blocks.len());
+		for block in self.blocks.values() {
+			match block {
+				AssembledBlock::Text(text) => {
+					parts.push(crate::state::ContentPart::Text { text: text.clone() });
+				},
+				AssembledBlock::Thinking { text, signature } => {
+					parts.push(match signature {
+						Some(signature) => crate::state::ContentPart::thinking_with_signature(
+							text.clone(),
+							signature.clone(),
+						),
+						None => crate::state::ContentPart::thinking(text.clone()),
+					});
+				},
+				AssembledBlock::Redacted(data) => {
+					parts.push(crate::state::ContentPart::redacted_thinking(data.clone()));
+				},
+				AssembledBlock::ToolCall(pending) => {
+					if include_tools {
+						// Resolution is repeated in `finish`; a partial turn never
+						// reaches this branch. Cloning keeps block order exact.
+						let call = PendingCall {
+							tool_index: pending.tool_index,
+							id:        pending.id.clone(),
+							name:      pending.name.clone(),
+							arguments: pending.arguments.clone(),
+						}
+						.resolve()?;
+						parts.push(crate::state::ContentPart::ToolCall {
+							id:        call.id,
+							name:      call.name,
+							arguments: call.arguments,
+						});
+					}
+				},
+			}
+		}
+		Ok(parts)
 	}
 
 	/// Finish the turn, producing an assistant message with reassembled tool calls.
@@ -585,29 +841,24 @@ impl StreamAssembler {
 	/// Returns a protocol error if any completed tool call lacks a name.
 	pub fn finish(self) -> Result<Message, ProviderError> {
 		let content = self.text();
-		let parts = self.parts();
-		let mut tool_calls = Vec::with_capacity(self.calls.len());
-		for (index, pending) in self.calls {
-			let Some(name) = pending.name.filter(|n| !n.trim().is_empty()) else {
-				return Err(ProviderError::Protocol(format!(
-					"streamed tool call at index {index} is missing or has empty tool name"
-				)));
-			};
-			let arguments = if pending.arguments.trim().is_empty() {
-				serde_json::Value::Object(serde_json::Map::new())
-			} else {
-				serde_json::from_str(&pending.arguments)
-					.unwrap_or(serde_json::Value::String(pending.arguments))
-			};
-			tool_calls.push(ToolCall {
-				id: pending.id.unwrap_or_else(|| format!("call_{index}")),
-				name,
-				arguments,
-			});
-		}
+		let parts = self.parts(true)?;
+		// Execution projection of the ordered ToolCall blocks, same order.
+		let tool_calls: Vec<ToolCall> = parts
+			.iter()
+			.filter_map(|part| match part {
+				crate::state::ContentPart::ToolCall { id, name, arguments } => Some(ToolCall {
+					id: id.clone(),
+					name: name.clone(),
+					arguments: arguments.clone(),
+				}),
+				_ => None,
+			})
+			.collect();
 		let mut message = Message::assistant_with_tools(content, tool_calls);
 		message.parts = parts;
 		message.usage = self.usage;
+		message.stop_reason = self.stop_reason;
+		message.error_message = self.error_message;
 		Ok(message)
 	}
 
@@ -617,8 +868,10 @@ impl StreamAssembler {
 	/// cancelled request is accounted exactly once instead of silently dropped.
 	pub(crate) fn finish_partial(&self) -> Message {
 		let mut message = Message::assistant(self.text());
-		message.parts = self.parts();
+		message.parts = self.parts(false).unwrap_or_default();
 		message.usage = self.usage;
+		message.stop_reason = self.stop_reason;
+		message.error_message = self.error_message.clone();
 		message
 	}
 }
@@ -674,6 +927,7 @@ pub enum OpenAiToolChoice {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OpenAiToolChoiceMode {
+	None,
 	Required,
 }
 
@@ -942,6 +1196,8 @@ pub fn normalize_usage(raw: &OpenAiUsage) -> TokenUsage {
 			.as_ref()
 			.and_then(|details| details.reasoning_tokens)
 			.filter(|tokens| *tokens > 0),
+		// OpenAI reports no Anthropic cache-ttl/server-tool breakdown.
+		..TokenUsage::default()
 	}
 }
 
@@ -965,8 +1221,11 @@ pub fn to_openai_messages(messages: &[Message]) -> Result<Vec<OpenAiMessage>, Pr
 								text_parts.push(text.clone());
 							}
 						}
-						// Public reasoning is print/persist only; never replayed.
-						crate::state::ContentPart::Thinking { .. } => {}
+						// Public/redacted reasoning is print/persist only; never
+						// replayed to an OpenAI-compatible endpoint.
+						crate::state::ContentPart::Thinking { .. }
+						| crate::state::ContentPart::RedactedThinking { .. } => {}
+						crate::state::ContentPart::ToolCall { .. } => {}
 						crate::state::ContentPart::Image { data, mime_type } => {
 							let (clean_b64, mime) = crate::state::normalize_image_payload(data, mime_type)
 								.map_err(|err| ProviderError::UnsupportedImage(format!("invalid image payload: {err}")))?;
@@ -1048,7 +1307,9 @@ pub fn to_openai_messages(messages: &[Message]) -> Result<Vec<OpenAiMessage>, Pr
 			)
 		};
 
-		let has_parts = m.parts.iter().any(|part| !part.is_thinking());
+		// ToolCall blocks are rendered from `m.tool_calls`; reasoning never
+		// reaches this wire, so neither forces the structured-content form.
+		let has_parts = m.parts.iter().any(crate::state::ContentPart::is_replayable_content);
 		let content = if m.has_image() || has_parts {
 			let mut parts = Vec::new();
 			for part in &m.parts {
@@ -1060,8 +1321,11 @@ pub fn to_openai_messages(messages: &[Message]) -> Result<Vec<OpenAiMessage>, Pr
 							});
 						}
 					}
-					// Public reasoning is print/persist only; never replayed.
-					crate::state::ContentPart::Thinking { .. } => {}
+					// Public/redacted reasoning is print/persist only; never
+					// replayed to an OpenAI-compatible endpoint.
+					crate::state::ContentPart::Thinking { .. }
+					| crate::state::ContentPart::RedactedThinking { .. }
+					| crate::state::ContentPart::ToolCall { .. } => {}
 					crate::state::ContentPart::Image { data, mime_type } => {
 						let (clean_b64, mime) = crate::state::normalize_image_payload(data, mime_type)
 							.map_err(|err| ProviderError::UnsupportedImage(format!("invalid image payload: {err}")))?;
@@ -1156,6 +1420,11 @@ pub fn parse_sse_line(line: &str) -> Option<Result<StreamChunk, ProviderError>> 
 			tool_call_deltas: Vec::new(),
 			usage: None,
 			is_done: true,
+			content_index: None,
+			signature: None,
+			redacted: None,
+			stop_reason: None,
+			error_message: None,
 		}));
 	}
 
@@ -1194,11 +1463,25 @@ pub fn parse_sse_line(line: &str) -> Option<Result<StreamChunk, ProviderError>> 
 						id: tc.id,
 						name,
 						arguments_delta,
+						content_index: None,
 					});
 				}
 			}
 
-			Some(Ok(StreamChunk { content, reasoning, tool_call_deltas, usage, is_done: false }))
+			Some(Ok(StreamChunk {
+				content,
+				reasoning,
+				tool_call_deltas,
+				usage,
+				is_done: false,
+				// OpenAI-compatible deltas carry no explicit block index, so the
+				// assembler keeps its legacy flip order for them.
+				content_index: None,
+				signature: None,
+				redacted: None,
+				stop_reason: None,
+				error_message: None,
+			}))
 		},
 		Err(err) => Some(Err(ProviderError::Serialization(err))),
 	}
@@ -1295,11 +1578,17 @@ mod tests {
 				id: Some("call_1".into()),
 				name: None,
 				arguments_delta: Some("{}".into()),
+				content_index: None,
 			}],
 			usage: None,
 			reasoning: None,
 			is_done: false,
-		});
+			content_index: None,
+			signature: None,
+			redacted: None,
+			stop_reason: None,
+			error_message: None,
+		}).unwrap();
 		let err = assembler.finish().unwrap_err();
 		assert!(matches!(err, ProviderError::Protocol(_)));
 	}
@@ -1314,11 +1603,17 @@ mod tests {
 				id: Some("call_1".into()),
 				name: Some("   ".into()),
 				arguments_delta: Some("{}".into()),
+				content_index: None,
 			}],
 			usage: None,
 			reasoning: None,
 			is_done: false,
-		});
+			content_index: None,
+			signature: None,
+			redacted: None,
+			stop_reason: None,
+			error_message: None,
+		}).unwrap();
 		let err = assembler.finish().unwrap_err();
 		assert!(matches!(err, ProviderError::Protocol(_)));
 	}
@@ -1333,11 +1628,17 @@ mod tests {
 				id: Some("call_1".into()),
 				name: Some("read".into()),
 				arguments_delta: Some("{}".into()),
+				content_index: None,
 			}],
 			usage: None,
 			reasoning: None,
 			is_done: false,
-		});
+			content_index: None,
+			signature: None,
+			redacted: None,
+			stop_reason: None,
+			error_message: None,
+		}).unwrap();
 		let msg = assembler.finish().unwrap();
 		assert_eq!(msg.content, "text");
 		assert_eq!(msg.tool_calls.len(), 1);
@@ -1491,6 +1792,12 @@ mod tests {
 			tool_call_id: Some("c1".to_string()),
 			is_error: false,
 			usage: None,
+			stop_reason: None,
+			error_message: None,
+			api: None,
+			provider: None,
+			model: None,
+			attribution: None,
 		};
 		let err = to_openai_messages(&[t1]).unwrap_err();
 		assert!(matches!(err, ProviderError::UnsupportedImage(_)));

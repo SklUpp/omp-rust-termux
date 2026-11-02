@@ -1830,7 +1830,7 @@ async fn sse_stream_handles_records_split_across_transport_chunks() {
 	while let Some(chunk) = stream.next().await {
 		let chunk = chunk.expect("chunk");
 		saw_done |= chunk.is_done;
-		assembler.push(&chunk);
+		assembler.push(&chunk).expect("assembler push");
 	}
 
 	assert!(saw_done);
@@ -1907,6 +1907,11 @@ fn text_chunk(delta: &str) -> StreamChunk {
 		usage: None,
 		reasoning: None,
 		is_done: false,
+		content_index: None,
+		signature: None,
+		redacted: None,
+		stop_reason: None,
+		error_message: None,
 	}
 }
 
@@ -1923,15 +1928,32 @@ fn tool_delta(
 			id: id.map(ToString::to_string),
 			name: name.map(ToString::to_string),
 			arguments_delta: arguments_delta.map(ToString::to_string),
+			content_index: None,
 		}],
 		usage: None,
 		reasoning: None,
 		is_done: false,
+		content_index: None,
+		signature: None,
+		redacted: None,
+		stop_reason: None,
+		error_message: None,
 	}
 }
 
 fn done_chunk() -> StreamChunk {
-	StreamChunk { content: None, reasoning: None, tool_call_deltas: Vec::new(), usage: None, is_done: true }
+	StreamChunk {
+		content: None,
+		reasoning: None,
+		tool_call_deltas: Vec::new(),
+		usage: None,
+		is_done: true,
+		content_index: None,
+		signature: None,
+		redacted: None,
+		stop_reason: None,
+		error_message: None,
+	}
 }
 
 /// Drains the event channel concurrently with the dialog: `run_dialog_with`
@@ -2036,11 +2058,18 @@ async fn streaming_rejects_missing_tool_name() {
 			id: Some("call_abc".to_string()),
 			name: None,
 			arguments_delta: Some("{\"path\":\"x\"}".to_string()),
+			content_index: None,
 		}],
 		usage: None,
 		reasoning: None,
 		is_done: true,
-	});
+		content_index: None,
+		signature: None,
+		redacted: None,
+		stop_reason: None,
+		error_message: None,
+	})
+	.expect("assembler push");
 
 	let result = assembler.finish();
 	assert!(result.is_err(), "StreamAssembler::finish must reject tool call without name");
@@ -3406,6 +3435,12 @@ fn directly_constructed_message_with_content_and_image_part_preserves_both_on_wi
 		tool_call_id: None,
 		is_error: false,
 		usage: None,
+		stop_reason: None,
+		error_message: None,
+		api: None,
+		provider: None,
+		model: None,
+		attribution: None,
 	};
 	let wire = pi_agent::to_openai_messages(&[msg]).expect("openai messages");
 	let val = serde_json::to_value(&wire[0]).expect("serialize");

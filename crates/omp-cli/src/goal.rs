@@ -1606,6 +1606,7 @@ fn token_usage_from_counters(usage: TokenCounters) -> pi_agent::TokenUsage {
 			.saturating_add(usage.cache_read)
 			.saturating_add(usage.cache_write),
 		reasoning_tokens: None,
+		..pi_agent::TokenUsage::default()
 	}
 }
 

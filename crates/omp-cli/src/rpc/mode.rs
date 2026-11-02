@@ -124,6 +124,7 @@ impl EventFrames {
 			.map(|(kind, text)| match kind {
 				StreamBlockKind::Thinking => json!({ "type": "thinking", "thinking": text }),
 				StreamBlockKind::Text => json!({ "type": "text", "text": text }),
+				StreamBlockKind::Redacted => json!({ "type": "redactedThinking", "data": text }),
 			})
 			.collect()
 	}

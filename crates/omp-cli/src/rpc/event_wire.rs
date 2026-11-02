@@ -21,8 +21,18 @@ pub fn now_ms() -> u64 {
 pub fn content_block(part: &ContentPart) -> Value {
 	match part {
 		ContentPart::Text { text } => json!({ "type": "text", "text": text }),
-		ContentPart::Thinking { thinking } => {
-			json!({ "type": "thinking", "thinking": thinking })
+		ContentPart::Thinking { thinking, thinking_signature } => {
+			let mut block = json!({ "type": "thinking", "thinking": thinking });
+			if let Some(signature) = thinking_signature {
+				block["thinkingSignature"] = json!(signature);
+			}
+			block
+		},
+		ContentPart::RedactedThinking { data } => {
+			json!({ "type": "redactedThinking", "data": data })
+		},
+		ContentPart::ToolCall { id, name, arguments } => {
+			json!({ "type": "toolCall", "id": id, "name": name, "arguments": arguments })
 		},
 		ContentPart::Image { data, mime_type } => {
 			json!({ "type": "image", "data": data, "mimeType": mime_type })
@@ -79,9 +89,29 @@ pub fn assistant_message(
 	stop_reason: &str,
 	timestamp_ms: u64,
 ) -> Value {
+	let api = message.api.as_deref().unwrap_or(api);
+	let provider = message.provider.as_deref().unwrap_or(provider);
+	let model = message.model.as_deref().unwrap_or(model);
+	let stop_reason = message
+		.stop_reason
+		.map(pi_agent::StopReason::as_str)
+		.unwrap_or(stop_reason);
 	let mut content = content_blocks(&message.parts);
+	let has_tool_part = message.parts.iter().any(ContentPart::is_tool_call);
 	if content.is_empty() && !message.content.is_empty() {
 		content.push(json!({ "type": "text", "text": message.content }));
+	}
+	// Completion responses keep calls in `tool_calls` only; streamed turns
+	// already carry them as ordered ToolCall parts.
+	if !has_tool_part {
+		for call in &message.tool_calls {
+			content.push(json!({
+				"type": "toolCall",
+				"id": call.id,
+				"name": call.name,
+				"arguments": call.arguments,
+			}));
+		}
 	}
 	let usage = message.usage.as_ref().map_or(Value::Null, |usage| {
 		json!({
@@ -92,7 +122,7 @@ pub fn assistant_message(
 			"totalTokens": usage.total_tokens,
 		})
 	});
-	json!({
+	let mut wire = json!({
 		"role": "assistant",
 		"content": content,
 		"api": api,
@@ -101,7 +131,11 @@ pub fn assistant_message(
 		"usage": usage,
 		"stopReason": stop_reason,
 		"timestamp": timestamp_ms,
-	})
+	});
+	if let Some(error) = &message.error_message {
+		wire["errorMessage"] = json!(error);
+	}
+	wire
 }
 
 /// `message_update` frame: delta plus the current snapshot and the streamed

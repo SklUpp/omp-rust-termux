@@ -31,6 +31,7 @@ fn usage(input: u64, output: u64, cache_read: u64, cache_write: u64) -> TokenUsa
 		cache_write,
 		total_tokens: input + output + cache_read + cache_write,
 		reasoning_tokens: None,
+		..TokenUsage::default()
 	}
 }
 
@@ -127,7 +128,7 @@ async fn streamed_usage_only_trailer_attaches_the_request_snapshot() {
 
 	let mut assembler = StreamAssembler::new();
 	while let Some(chunk) = chunks.next().await {
-		assembler.push(&chunk.expect("chunk"));
+		assembler.push(&chunk.expect("chunk")).expect("assembler push");
 	}
 	let message = assembler.finish().expect("finish");
 
@@ -161,7 +162,7 @@ async fn duplicate_usage_snapshots_are_replaced_not_added() {
 
 	let mut assembler = StreamAssembler::new();
 	while let Some(chunk) = chunks.next().await {
-		assembler.push(&chunk.expect("chunk"));
+		assembler.push(&chunk.expect("chunk")).expect("assembler push");
 	}
 
 	assert_eq!(
@@ -196,7 +197,7 @@ async fn two_streamed_requests_report_separate_usage() {
 			.expect("stream");
 		let mut assembler = StreamAssembler::new();
 		while let Some(chunk) = chunks.next().await {
-			assembler.push(&chunk.expect("chunk"));
+			assembler.push(&chunk.expect("chunk")).expect("assembler push");
 		}
 		messages.push(assembler.finish().expect("finish"));
 	}
@@ -243,7 +244,7 @@ async fn missing_usage_stays_unknown() {
 
 	let mut assembler = StreamAssembler::new();
 	while let Some(chunk) = chunks.next().await {
-		assembler.push(&chunk.expect("chunk"));
+		assembler.push(&chunk.expect("chunk")).expect("assembler push");
 	}
 
 	assert_eq!(
@@ -394,6 +395,11 @@ impl ModelProvider for FailingAfterUsageProvider {
 				usage: Some(usage),
 				reasoning: None,
 				is_done: false,
+				content_index: None,
+				signature: None,
+				redacted: None,
+				stop_reason: None,
+				error_message: None,
 			}),
 			Err(ProviderError::Network("connection dropped".to_string())),
 		];

@@ -557,6 +557,87 @@ impl ContentPart {
 		}
 		self.extra.get("thinking").and_then(serde_json::Value::as_str)
 	}
+
+	/// Signed public reasoning: the signature rides the existing passthrough so
+	/// same-provider replay keeps it and every other reader ignores it.
+	#[must_use]
+	pub fn thinking_with_signature(text: impl Into<String>, signature: impl Into<String>) -> Self {
+		let mut part = Self::thinking(text);
+		part.extra.insert(
+			"thinkingSignature".to_string(),
+			serde_json::json!(signature.into()),
+		);
+		part
+	}
+
+	#[must_use]
+	pub fn thinking_signature(&self) -> Option<&str> {
+		if self.kind != "thinking" {
+			return None;
+		}
+		self.extra
+			.get("thinkingSignature")
+			.and_then(serde_json::Value::as_str)
+	}
+
+	/// Provider-encrypted reasoning kept verbatim, never rendered.
+	#[must_use]
+	pub fn redacted_thinking(data: impl Into<String>) -> Self {
+		Self {
+			kind: "redactedThinking".to_string(),
+			text: None,
+			data: Some(data.into()),
+			mime_type: None,
+			extra: serde_json::Map::new(),
+		}
+	}
+
+	#[must_use]
+	pub fn is_redacted_thinking(&self) -> bool {
+		self.kind == "redactedThinking"
+	}
+
+	/// Tool invocation in stream content order (TS `ToolCall` block).
+	#[must_use]
+	pub fn tool_call(
+		id: impl Into<String>,
+		name: impl Into<String>,
+		arguments: serde_json::Value,
+	) -> Self {
+		let mut extra = serde_json::Map::new();
+		extra.insert("id".to_string(), serde_json::json!(id.into()));
+		extra.insert("name".to_string(), serde_json::json!(name.into()));
+		extra.insert("arguments".to_string(), arguments);
+		Self {
+			kind: "toolCall".to_string(),
+			text: None,
+			data: None,
+			mime_type: None,
+			extra,
+		}
+	}
+
+	/// Convert one native agent part without dropping signature, redaction or
+	/// tool-call ordering.
+	#[must_use]
+	pub fn from_agent_part(part: &pi_agent::ContentPart) -> Option<Self> {
+		match part {
+			pi_agent::ContentPart::Text { text } => Some(Self::text(text.clone())),
+			pi_agent::ContentPart::Thinking { thinking, thinking_signature } => {
+				Some(match thinking_signature {
+					Some(signature) => Self::thinking_with_signature(thinking.clone(), signature.clone()),
+					None => Self::thinking(thinking.clone()),
+				})
+			},
+			pi_agent::ContentPart::RedactedThinking { data } => {
+				Some(Self::redacted_thinking(data.clone()))
+			},
+			pi_agent::ContentPart::ToolCall { id, name, arguments } => {
+				Some(Self::tool_call(id.clone(), name.clone(), arguments.clone()))
+			},
+			pi_agent::ContentPart::Image { .. } => None,
+		}
+	}
 }
 
 /// Message content: TS `string | (TextContent | ImageContent)[]` form.
@@ -626,6 +707,10 @@ pub struct SessionMessage {
 	pub provider: Option<String>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub model: Option<String>,
+	/// TS `MessageAttribution` ("user" | "agent"), retained typed so resume and
+	/// fork re-emit it instead of depending on the `extra` map.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub attribution: Option<String>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub usage: Option<Usage>,
 	#[serde(default, rename = "stopReason", skip_serializing_if = "Option::is_none")]
@@ -665,6 +750,7 @@ impl SessionMessage {
 			api: None,
 			provider: None,
 			model: None,
+			attribution: None,
 			usage: None,
 			stop_reason: None,
 			error_message: None,
@@ -704,6 +790,7 @@ impl SessionMessage {
 			api: Self::opt_meta(api),
 			provider: Self::opt_meta(provider),
 			model: Self::opt_meta(model),
+			attribution: None,
 			usage,
 			stop_reason: canon_stop,
 			error_message: None,
@@ -729,6 +816,7 @@ impl SessionMessage {
 			api: None,
 			provider: None,
 			model: None,
+			attribution: None,
 			usage: None,
 			stop_reason: None,
 			error_message: None,
@@ -2373,6 +2461,7 @@ impl SessionStore {
 					api: None,
 					provider: self.provider.clone(),
 					model: self.model.clone(),
+					attribution: None,
 					usage: None,
 					stop_reason: Some(if turn.stop_reason.is_empty() {
 						if turn.tool_calls.is_empty() { "stop".to_string() } else { "toolUse".to_string() }
@@ -4142,6 +4231,7 @@ pub fn import_legacy_v1(
 					api: None,
 					provider: provider.clone(),
 					model: model.clone(),
+					attribution: None,
 					usage: None,
 					stop_reason: Some("toolUse".to_string()),
 					error_message: None,
@@ -4202,6 +4292,7 @@ pub fn import_legacy_v1(
 				api: None,
 				provider: provider.clone(),
 				model: model.clone(),
+				attribution: None,
 				usage: None,
 				stop_reason,
 				error_message: None,

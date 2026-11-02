@@ -1851,8 +1851,10 @@ impl RpcSession {
 				AgentContentPart::Image { data, mime_type } => {
 					images.push(ContentPart::image(data, mime_type));
 				},
-				// A user message never carries provider reasoning.
-				AgentContentPart::Thinking { .. } => {},
+				// A user message never carries provider reasoning or tool calls.
+				AgentContentPart::Thinking { .. }
+				| AgentContentPart::RedactedThinking { .. }
+				| AgentContentPart::ToolCall { .. } => {},
 			}
 		}
 		let joined = text.join("\n");
@@ -1945,8 +1947,10 @@ impl RpcSession {
 							AgentContentPart::Image { data, mime_type } => {
 								Some(ContentPart::image(data, mime_type))
 							},
-							AgentContentPart::Text { .. } => None,
-							AgentContentPart::Thinking { .. } => None,
+							AgentContentPart::Text { .. }
+							| AgentContentPart::Thinking { .. }
+							| AgentContentPart::RedactedThinking { .. }
+							| AgentContentPart::ToolCall { .. } => None,
 						})
 						.collect();
 					prepared.tool_images.insert(id.clone(), converted);
@@ -1996,33 +2000,31 @@ impl RpcSession {
 
 		let mut parts = Vec::new();
 		// Streamed block order, not a regrouped one: the persisted content array
-		// is what the host saw in `contentIndex` order.
+		// is what the host saw in `contentIndex` order, tool calls included.
+		let mut has_tool_part = false;
 		for part in &message.parts {
-			match part {
-				pi_agent::ContentPart::Thinking { thinking } => {
-					parts.push(ContentPart::thinking(thinking.clone()));
-				},
-				pi_agent::ContentPart::Text { text } => {
-					parts.push(ContentPart::text(text.clone()));
-				},
-				pi_agent::ContentPart::Image { .. } => {},
+			// Assistant content never persisted images before; keep that shape.
+			if matches!(part, pi_agent::ContentPart::Image { .. }) {
+				continue;
+			}
+			if let Some(part) = ContentPart::from_agent_part(part) {
+				has_tool_part |= part.kind == "toolCall";
+				parts.push(part);
 			}
 		}
-		if message.parts.is_empty() && !message.content.is_empty() {
+		if parts.is_empty() && !message.content.is_empty() {
 			parts.push(ContentPart::text(message.content.clone()));
 		}
-		for call in &message.tool_calls {
-			let mut part = ContentPart {
-				kind: "toolCall".to_string(),
-				text: None,
-				data: None,
-				mime_type: None,
-				extra: serde_json::Map::new(),
-			};
-			part.extra.insert("id".to_string(), json!(call.id));
-			part.extra.insert("name".to_string(), json!(call.name));
-			part.extra.insert("arguments".to_string(), call.arguments.clone());
-			parts.push(part);
+		// Only legacy/completion messages lack ToolCall parts; append their
+		// execution projection at the end, never alongside ordered blocks.
+		if !has_tool_part {
+			for call in &message.tool_calls {
+				parts.push(ContentPart::tool_call(
+					call.id.clone(),
+					call.name.clone(),
+					call.arguments.clone(),
+				));
+			}
 		}
 		let content = if parts.is_empty() {
 			MessageContent::Text(String::new())
@@ -2030,24 +2032,35 @@ impl RpcSession {
 			MessageContent::Parts(parts)
 		};
 
-		let asst_api = api
-			.map(str::to_string)
-			.or_else(|| {
+		// The assembled message knows the route that actually served it; the
+		// event/config values are only a fallback for adapters that omit it.
+		let asst_api = message.api.clone().or_else(|| {
+			api.map(str::to_string).or_else(|| {
 				provider
 					.or(prepared.provider_fallback.as_deref())
 					.and_then(|p| self.config.providers.get(p).and_then(|c| c.api.clone()))
 			})
-			.unwrap_or_default();
-		let asst_provider = provider
-			.map(str::to_string)
+		})
+		.unwrap_or_default();
+		let asst_provider = message
+			.provider
+			.clone()
+			.or_else(|| provider.map(str::to_string))
 			.or_else(|| prepared.provider_fallback.clone())
 			.unwrap_or_default();
-		let asst_model = model
-			.map(str::to_string)
+		let asst_model = message
+			.model
+			.clone()
+			.or_else(|| model.map(str::to_string))
 			.or_else(|| prepared.model_fallback.clone())
 			.unwrap_or_default();
 
-		let canon_stop = session::canonical_stop_reason(stop_reason);
+		// The message's own terminal reason is authoritative; the event string
+		// only covers adapters that do not report one.
+		let canon_stop = message
+			.stop_reason
+			.map(pi_agent::StopReason::as_str)
+			.unwrap_or_else(|| session::canonical_stop_reason(stop_reason));
 		// One persisted usage per assistant message: `TurnEnd` repeats the same
 		// message snapshot as `MessageEnd`, so the usage is read here only and
 		// never added on the event stream.
@@ -2060,9 +2073,10 @@ impl RpcSession {
 			canon_stop,
 			now_ms,
 		);
-		if canon_stop == "aborted" {
-			asst_msg.error_message = Some("Interrupted by user".to_string());
-		}
+		asst_msg.error_message = message.error_message.clone().or_else(|| {
+			(canon_stop == "aborted").then(|| "Interrupted by user".to_string())
+		});
+		asst_msg.attribution = message.attribution.map(|value| value.as_str().to_string());
 		let asst_id = format!("msg-{}", output::session_id());
 		let asst_entry = MessageEntry::new(
 			asst_id.clone(),

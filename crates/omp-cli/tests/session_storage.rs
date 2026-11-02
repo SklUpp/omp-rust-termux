@@ -1186,7 +1186,9 @@ fn ts_v3_session_round_trip_preserves_ordered_parts_stop_reasons_and_resume_fork
 			pi_agent::ContentPart::Image { data, mime_type } => {
 				format!("image|{data}|{mime_type}")
 			},
-			pi_agent::ContentPart::Thinking { thinking } => format!("thinking|{thinking}"),
+			pi_agent::ContentPart::Thinking { thinking, .. } => format!("thinking|{thinking}"),
+			pi_agent::ContentPart::RedactedThinking { data } => format!("redacted|{data}"),
+			pi_agent::ContentPart::ToolCall { id, .. } => format!("toolCall|{id}"),
 		})
 		.collect();
 	assert_eq!(
@@ -1314,4 +1316,116 @@ fn ts_v3_session_round_trip_preserves_ordered_parts_stop_reasons_and_resume_fork
 	assert_eq!(legacy_fork.history()[0].assistant, "done");
 
 	fs::remove_dir_all(temp).ok();
+}
+
+#[test]
+fn signed_reasoning_and_length_terminal_survive_session_resume_and_replay() {
+	let dir = temp_dir("signed-resume");
+	let mut store = SessionStore::open(&SessionOptions {
+		enabled: true,
+		cwd: PathBuf::from("/work/signed"),
+		model: Some("anthropic/claude".to_string()),
+		provider: Some("anthropic".to_string()),
+		dir: Some(dir.clone()),
+		id: Some("signed-resume".to_string()),
+		continue_latest: false,
+		parent_session: None,
+		no_title: true,
+	});
+	assert!(store.enabled(), "store must be enabled: {:?}", store.take_warnings());
+
+	store
+		.append_message(&MessageEntry::new(
+			"msg-u",
+			None,
+			"2026-11-02T10:00:00.000Z",
+			SessionMessage::user(MessageContent::Text("inspect".to_string()), 1),
+		))
+		.expect("append user");
+	let mut assistant = SessionMessage::assistant(
+		MessageContent::Parts(vec![
+			ContentPart::thinking_with_signature("plan", "sig-resume"),
+			ContentPart::redacted_thinking("opaque"),
+			ContentPart::text("answer"),
+			ContentPart::tool_call("call-1", "read", serde_json::json!({ "path": "a" })),
+		]),
+		"anthropic-messages",
+		"anthropic",
+		"claude",
+		None,
+		"length",
+		2,
+	);
+	assistant.error_message = Some("max tokens".to_string());
+	assistant.attribution = Some("agent".to_string());
+	store
+		.append_message(&MessageEntry::new(
+			"msg-a",
+			Some("msg-u".to_string()),
+			"2026-11-02T10:00:01.000Z",
+			assistant,
+		))
+		.expect("append assistant");
+	store
+		.append_message(&MessageEntry::new(
+			"msg-t",
+			Some("msg-a".to_string()),
+			"2026-11-02T10:00:02.000Z",
+			SessionMessage::tool_result(
+				"call-1",
+				"read",
+				MessageContent::Text("file".to_string()),
+				false,
+				3,
+			),
+		))
+		.expect("append tool result");
+
+	// On-disk wire keeps the typed fields, not just the flatten passthrough.
+	let raw = fs::read_to_string(store.file().expect("store file")).expect("read session");
+	assert!(raw.contains("\"thinkingSignature\":\"sig-resume\""));
+	assert!(raw.contains("\"type\":\"redactedThinking\""));
+	assert!(raw.contains("\"stopReason\":\"length\""));
+	assert!(raw.contains("\"errorMessage\":\"max tokens\""));
+	assert!(raw.contains("\"attribution\":\"agent\""));
+
+	drop(store);
+	let reloaded = SessionStore::open(&SessionOptions {
+		enabled: true,
+		cwd: PathBuf::from("/work/signed"),
+		model: None,
+		provider: None,
+		dir: Some(dir.clone()),
+		id: Some("signed-resume".to_string()),
+		continue_latest: false,
+		parent_session: None,
+		no_title: true,
+	});
+	assert!(reloaded.enabled(), "reload must succeed");
+	let history = omp_cli::runtime::history_messages_from_entries(reloaded.messages())
+		.expect("lossless resume history");
+	let assistant = history
+		.iter()
+		.find(|message| message.role == pi_agent::Role::Assistant)
+		.expect("assistant message");
+	assert_eq!(assistant.stop_reason, Some(pi_agent::StopReason::Length));
+	assert_eq!(assistant.error_message.as_deref(), Some("max tokens"));
+	assert_eq!(assistant.provider.as_deref(), Some("anthropic"));
+	assert_eq!(assistant.model.as_deref(), Some("claude"));
+	assert_eq!(assistant.attribution, Some(pi_agent::Attribution::Agent));
+	assert_eq!(assistant.parts[0].thinking_signature(), Some("sig-resume"));
+	assert_eq!(assistant.parts[1].as_redacted_thinking(), Some("opaque"));
+	assert!(matches!(assistant.parts[2], pi_agent::ContentPart::Text { .. }));
+	assert_eq!(assistant.tool_calls.len(), 1);
+	assert_eq!(assistant.tool_calls[0].id, "call-1");
+	assert!(matches!(assistant.parts[3], pi_agent::ContentPart::ToolCall { .. }));
+
+	// Cross-provider replay strips signed/redacted reasoning but keeps the call.
+	let wire = pi_agent::to_openai_messages(&history).expect("wire");
+	let wire = serde_json::to_string(&wire).expect("serialize wire");
+	assert!(!wire.contains("sig-resume"));
+	assert!(!wire.contains("opaque"));
+	assert!(wire.contains("\"tool_calls\""));
+
+	fs::remove_dir_all(dir).ok();
 }

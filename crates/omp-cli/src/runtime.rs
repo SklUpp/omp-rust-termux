@@ -1458,7 +1458,10 @@ impl AgentRunner for PiAgentRunner {
 			.with_session_id(request.provider_session_id.clone())
 			.with_prompt_cache_key(request.prompt_cache_key.clone())
 			.with_force_reasoning_off(request.config.external_thinking)
-			.with_service_tier(request.config.service_tier.clone());
+			.with_service_tier(request.config.service_tier.clone())
+			// Assembly stamps the real route on produced messages so signed
+			// reasoning is only replayed to the provider that issued it.
+			.with_provider_id(plan_provider.clone());
 		let config = AgentConfig {
 			max_turns: plan.max_turns,
 			context_limit: plan.context_limit,
@@ -1864,6 +1867,7 @@ impl AgentRunner for PiAgentRunner {
 						let stop_reason = match status {
 							pi_agent::TurnStatus::EndTurn => "stop",
 							pi_agent::TurnStatus::ToolUse => "toolUse",
+							pi_agent::TurnStatus::Length => "length",
 							pi_agent::TurnStatus::Aborted => "aborted",
 							pi_agent::TurnStatus::Error(_) => "error",
 						}
@@ -1953,6 +1957,7 @@ impl AgentRunner for PiAgentRunner {
 						let stop_reason = match status {
 							pi_agent::TurnStatus::EndTurn => "stop",
 							pi_agent::TurnStatus::ToolUse => "toolUse",
+							pi_agent::TurnStatus::Length => "length",
 							pi_agent::TurnStatus::Aborted => "aborted",
 							pi_agent::TurnStatus::Error(_) => "error",
 						}
@@ -2499,7 +2504,8 @@ impl ChildModelFactory for CliChildModelFactory {
 							.unwrap_or(provider_id != "cerebras"),
 					)
 					.with_force_reasoning_off(self.config.external_thinking)
-					.with_service_tier(self.config.service_tier.clone()),
+					.with_service_tier(self.config.service_tier.clone())
+					.with_provider_id(provider_id.clone()),
 				Err(error) => {
 					last_error = Some(error.to_string());
 					continue;
@@ -4243,6 +4249,183 @@ fn convert_content_parts(
 	Ok(pi_parts)
 }
 
+fn session_attribution(value: Option<&str>) -> Option<pi_agent::Attribution> {
+	match value {
+		Some("user") => Some(pi_agent::Attribution::User),
+		Some("agent") => Some(pi_agent::Attribution::Agent),
+		_ => None,
+	}
+}
+
+/// Convert one persisted content part back to the agent representation without
+/// dropping a thinking signature, redacted payload or tool-call block.
+fn convert_agent_content_part(
+	part: &crate::session::ContentPart,
+	context_label: &str,
+	index: usize,
+) -> Result<pi_agent::ContentPart, Error> {
+	match part.kind.as_str() {
+		"text" => {
+			let Some(text) = part.text.clone() else {
+				return Err(Error::new(format!(
+					"{context_label} contains malformed text part missing text at index {index}"
+				)));
+			};
+			Ok(pi_agent::ContentPart::Text { text })
+		},
+		"thinking" => {
+			let Some(thinking) = part.thinking_text() else {
+				return Err(Error::new(format!(
+					"{context_label} contains malformed thinking part missing thinking at index {index}"
+				)));
+			};
+			Ok(match part.thinking_signature() {
+				Some(signature) => {
+					pi_agent::ContentPart::thinking_with_signature(thinking, signature)
+				},
+				None => pi_agent::ContentPart::thinking(thinking),
+			})
+		},
+		"redactedThinking" => {
+			let Some(data) = part.data.clone() else {
+				return Err(Error::new(format!(
+					"{context_label} contains malformed redactedThinking part missing data at index {index}"
+				)));
+			};
+			Ok(pi_agent::ContentPart::redacted_thinking(data))
+		},
+		"toolCall" => {
+			let id = part
+				.extra
+				.get("id")
+				.and_then(serde_json::Value::as_str)
+				.ok_or_else(|| {
+					Error::new(format!(
+						"{context_label} contains toolCall part missing id at index {index}"
+					))
+				})?;
+			let name = part
+				.extra
+				.get("name")
+				.and_then(serde_json::Value::as_str)
+				.ok_or_else(|| {
+					Error::new(format!(
+						"{context_label} contains toolCall part missing name at index {index}"
+					))
+				})?;
+			let arguments = part
+				.extra
+				.get("arguments")
+				.cloned()
+				.unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+			Ok(pi_agent::ContentPart::tool_call(id, name, arguments))
+		},
+		"image" => convert_content_parts(std::slice::from_ref(part), context_label)?
+			.into_iter()
+			.next()
+			.ok_or_else(|| Error::new(format!("{context_label} dropped image part at index {index}"))),
+		other => Err(Error::new(format!(
+			"{context_label} contains unsupported content part kind {other:?} at index {index}"
+		))),
+	}
+}
+
+fn apply_session_metadata(message: &mut pi_agent::Message, source: &crate::session::SessionMessage) {
+	message.api = source.api.clone();
+	message.provider = source.provider.clone();
+	message.model = source.model.clone();
+	message.attribution = session_attribution(source.attribution.as_deref());
+}
+
+/// Replay persisted branch entries as provider-ready history.
+///
+/// Unlike the lossy [`history_messages`] `TurnRecord` view, this keeps every
+/// ordered assistant block, signature, redaction and terminal reason, which is
+/// what resumed/forked signed-reasoning turns need.
+pub fn history_messages_from_entries(
+	entries: &[crate::session::MessageEntry],
+) -> Result<Vec<pi_agent::Message>, Error> {
+	let mut messages = Vec::with_capacity(entries.len());
+	for entry in entries {
+		let source = &entry.message;
+		match source.role.as_str() {
+			"user" => {
+				let parts = source.content.parts();
+				let mut message = if parts.is_empty() {
+					pi_agent::Message::user(source.content.text())
+				} else {
+					pi_agent::Message::user_with_parts(convert_content_parts(
+						&parts,
+						"session history",
+					)?)
+				};
+				apply_session_metadata(&mut message, source);
+				messages.push(message);
+			},
+			"developer" => {
+				let mut message = pi_agent::Message::developer(source.content.text());
+				apply_session_metadata(&mut message, source);
+				messages.push(message);
+			},
+			"assistant" => {
+				let source_parts = source.content.parts();
+				let mut parts = Vec::with_capacity(source_parts.len());
+				for (index, part) in source_parts.iter().enumerate() {
+					parts.push(convert_agent_content_part(part, "assistant history", index)?);
+				}
+				let tool_calls: Vec<pi_agent::ToolCall> = parts
+					.iter()
+					.filter_map(|part| match part {
+						pi_agent::ContentPart::ToolCall { id, name, arguments } => {
+							Some(pi_agent::ToolCall {
+								id:        id.clone(),
+								name:      name.clone(),
+								arguments: arguments.clone(),
+							})
+						},
+						_ => None,
+					})
+					.collect();
+				let mut message =
+					pi_agent::Message::assistant_with_tools(source.content.text(), tool_calls);
+				message.parts = parts;
+				message.stop_reason = source
+					.stop_reason
+					.as_deref()
+					.and_then(pi_agent::StopReason::parse);
+				message.error_message = source.error_message.clone();
+				apply_session_metadata(&mut message, source);
+				messages.push(message);
+			},
+			"toolResult" => {
+				let parts = source.content.parts();
+				let content = source.content.text();
+				let name = source.tool_name.as_deref().unwrap_or("tool");
+				let id = source.tool_call_id.clone().unwrap_or_default();
+				let is_error = source.is_error.unwrap_or(false);
+				let message = if parts.is_empty() {
+					pi_agent::Message::tool_with_status(id, name, content, is_error)
+				} else {
+					pi_agent::Message::tool_with_status_and_parts(
+						id,
+						name,
+						content,
+						convert_content_parts(&parts, "tool result history")?,
+						is_error,
+					)
+				};
+				messages.push(message);
+			},
+			other => {
+				return Err(Error::new(format!(
+					"session history contains unsupported message role {other:?}"
+				)));
+			},
+		}
+	}
+	Ok(messages)
+}
+
 /// Convert the CLI prompt/parts into the same user message the runner appends,
 /// so the no-session mirror stays byte-identical to the loop.
 pub fn user_message_from_parts(
@@ -5192,6 +5375,8 @@ mod tests {
 			.map(|part| match part {
 				pi_agent::ContentPart::Text { .. } => "text",
 				pi_agent::ContentPart::Thinking { .. } => "thinking",
+				pi_agent::ContentPart::RedactedThinking { .. } => "redactedThinking",
+				pi_agent::ContentPart::ToolCall { .. } => "toolCall",
 				pi_agent::ContentPart::Image { .. } => "image",
 			})
 			.collect();

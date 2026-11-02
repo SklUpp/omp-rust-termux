@@ -602,21 +602,25 @@ fn unwrap_delimited_thinking(open: &str, close: &str, text: &str) -> String {
 		return text.to_string();
 	}
 	let pairs = delimiter_pairs(text, open, close, start, end);
+	enum Token {
+		Range(usize, usize),
+		Newline,
+	}
 	struct Level {
 		start: usize,
 		end: usize,
 		cursor: usize,
 		segments: usize,
-		piece_start: usize,
+		checkpoint: usize,
 		root: bool,
 	}
-	let mut pieces: Vec<String> = Vec::new();
+	let mut tokens: Vec<Token> = Vec::new();
 	let mut stack = vec![Level {
 		start,
 		end,
 		cursor: start,
 		segments: 0,
-		piece_start: 0,
+		checkpoint: 0,
 		root: true,
 	}];
 	loop {
@@ -626,65 +630,66 @@ fn unwrap_delimited_thinking(open: &str, close: &str, text: &str) -> String {
 		if level.cursor >= level.end {
 			let level = stack.pop().expect("level");
 			if stack.is_empty() {
-				// One final materialization; ancestors never re-copy subtrees.
-				return pieces.join("\n");
+				// Single materialization: ranges point into `text`, newline tokens
+				// are separators. Total length is checked before allocation.
+				let total = tokens.iter().try_fold(0usize, |total, token| {
+					total.checked_add(match token {
+						Token::Range(start, end) => end - start,
+						Token::Newline => 1,
+					})
+				});
+				let Some(total) = total else {
+					return text.to_string();
+				};
+				let mut out = String::with_capacity(total);
+				for token in &tokens {
+					match token {
+						Token::Range(start, end) => out.push_str(&text[*start..*end]),
+						Token::Newline => out.push('\n'),
+					}
+				}
+				return out;
 			}
 			if level.segments == 0 {
-				pieces.push(String::new());
+				tokens.push(Token::Range(level.start, level.end));
 			}
 			continue;
 		}
-		if !text[level.cursor..].starts_with(open) {
+		let close_at = if text[level.cursor..].starts_with(open) {
+			pairs
+				.binary_search_by_key(&level.cursor, |(opened, _)| *opened)
+				.ok()
+				.map(|index| pairs[index].1)
+				.filter(|close_at| close_at + close.len() <= level.end)
+		} else {
+			None
+		};
+		let Some(close_at) = close_at else {
 			// TS returns *this call's* text: the whole root input at depth 0,
 			// otherwise the trimmed body slice handed to the recursive call.
 			let level = stack.pop().expect("level");
-			let fallback = if level.root {
+			if level.root {
 				return text.to_string();
-			} else {
-				text[level.start..level.end].to_string()
-			};
-			pieces.truncate(level.piece_start);
-			pieces.push(fallback);
-			continue;
-		}
-		let Some(&(_, close_at)) = pairs
-			.binary_search_by_key(&level.cursor, |(opened, _)| *opened)
-			.ok()
-			.map(|index| &pairs[index])
-		else {
-			let level = stack.pop().expect("level");
-			let fallback = if level.root {
-				return text.to_string();
-			} else {
-				text[level.start..level.end].to_string()
-			};
-			pieces.truncate(level.piece_start);
-			pieces.push(fallback);
+			}
+			tokens.truncate(level.checkpoint);
+			tokens.push(Token::Range(level.start, level.end));
 			continue;
 		};
-		if close_at + close.len() > level.end {
-			let level = stack.pop().expect("level");
-			let fallback = if level.root {
-				return text.to_string();
-			} else {
-				text[level.start..level.end].to_string()
-			};
-			pieces.truncate(level.piece_start);
-			pieces.push(fallback);
-			continue;
-		}
 		let body_start = level.cursor + open.len();
 		let body_end = trim_ascii_end(text, body_start, close_at);
 		let body_start = trim_ascii_start(text, body_start, body_end);
 		level.cursor = trim_ascii_start(text, close_at + close.len(), level.end);
+		if level.segments > 0 {
+			tokens.push(Token::Newline);
+		}
 		level.segments += 1;
-		let piece_start = pieces.len();
+		let checkpoint = tokens.len();
 		stack.push(Level {
 			start: body_start,
 			end: body_end,
 			cursor: body_start,
 			segments: 0,
-			piece_start,
+			checkpoint,
 			root: false,
 		});
 	}

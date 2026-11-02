@@ -432,6 +432,43 @@ async fn hermes_deep_nesting_unwraps_without_stack_overflow() {
 }
 
 #[tokio::test]
+async fn hermes_deep_sibling_nesting_outputs_exact_flat_text() {
+	const DEPTH: usize = 3_000;
+	let open = "\x3cthink\x3e";
+	let close = "\x3c/think\x3e";
+	let mut thinking = format!("{open}z{close}");
+	for _ in 0..DEPTH {
+		thinking = format!("{open}{thinking}{close}{open}x{close}");
+	}
+	thinking = format!("{open}{thinking}{close}");
+	let (base, request_rx) = serve_once(response(
+		"200 OK",
+		"application/x-ndjson",
+		"{\"message\":{\"content\":\"ok\"},\"done\":true}\n",
+	))
+	.await;
+	let mut assistant = Message::assistant("");
+	assistant.parts = vec![
+		ContentPart::thinking(thinking),
+		ContentPart::text("answer"),
+	];
+	assistant.provider = Some("anthropic".into());
+	assistant.api = Some("anthropic-messages".into());
+	assistant.model = Some("claude-3".into());
+	let provider = make_provider(&base, "hermes-3");
+	provider
+		.complete(&[Message::user("hi"), assistant], &[], &ToolChoice::Auto)
+		.await
+		.expect("complete");
+	let (_, body) = request_rx.await.expect("request");
+	let expected = format!(
+		"{open}\nz{}\n{close}\nanswer",
+		"\nx".repeat(DEPTH)
+	);
+	assert_eq!(body["messages"][1]["content"], expected);
+}
+
+#[tokio::test]
 async fn cloud_dialect_caps_tokens_strips_history_thinking_and_demotes_system() {
 	let (base, request_rx) = serve_once(response(
 		"200 OK",

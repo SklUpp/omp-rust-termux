@@ -5,8 +5,10 @@
 //! streaming, abort, queued follow-up, EOF drain and `abort_bash`.
 
 use std::{
+	fs,
 	io::{BufRead, Read, Write},
 	net::{TcpListener, TcpStream},
+	path::{Path, PathBuf},
 	sync::{
 		Arc, Mutex,
 		mpsc::{self, Receiver, Sender},
@@ -33,7 +35,10 @@ use omp_cli::{
 		types::RpcHostUriSchemeDefinition,
 	},
 	runtime::PiAgentRunner,
-	session::SessionOptions,
+	session::{
+		ContentPart, MessageContent, MessageEntry, SessionMessage, SessionOptions, SessionStore,
+		fork_session,
+	},
 };
 
 #[test]
@@ -435,6 +440,84 @@ fn spawn_model_recording(scripts: Vec<StreamScript>) -> (u16, Arc<Mutex<Vec<Stri
 	(port, prompts)
 }
 
+/// One scripted assistant response that may also call a tool.
+struct ToolScript {
+	text: String,
+	tool: Option<(&'static str, Value)>,
+}
+
+/// [`spawn_model`] variant that emits one tool call and records every request
+/// body, so a test can assert exactly which conversation the provider saw.
+fn spawn_tool_model(scripts: Vec<ToolScript>) -> (u16, Arc<Mutex<Vec<Value>>>) {
+	let requests: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+	let recorded = Arc::clone(&requests);
+	let listener = TcpListener::bind("127.0.0.1:0").expect("bind model");
+	let port = listener.local_addr().expect("addr").port();
+	thread::spawn(move || {
+		for (index, script) in scripts.into_iter().enumerate() {
+			let Ok((mut stream, _)) = listener.accept() else {
+				return;
+			};
+			stream
+				.set_read_timeout(Some(Duration::from_secs(5)))
+				.expect("read timeout");
+			let Some(request) = read_request(&mut stream) else {
+				continue;
+			};
+			let body_start = request
+				.windows(4)
+				.position(|window| window == b"\r\n\r\n")
+				.map_or(0, |index| index + 4);
+			if let Ok(value) = serde_json::from_slice::<Value>(&request[body_start..]) {
+				recorded
+					.lock()
+					.unwrap_or_else(std::sync::PoisonError::into_inner)
+					.push(value);
+			}
+			let _ = stream.write_all(
+				b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+				  Cache-Control: no-cache\r\nConnection: close\r\n\r\n",
+			);
+			if !script.text.is_empty() {
+				let body = serde_json::to_string(&script.text).expect("json text");
+				let _ = stream.write_all(
+					format!(
+						"data: {{\"id\":\"chatcmpl-test\",\"object\":\"chat.completion.chunk\",\
+						 \"choices\":[{{\"index\":0,\"delta\":{{\"content\":{body}}},\
+						 \"finish_reason\":null}}]}}\n\n"
+					)
+					.as_bytes(),
+				);
+			}
+			if let Some((name, arguments)) = script.tool {
+				let chunk = json!({
+					"id": "chatcmpl-test",
+					"object": "chat.completion.chunk",
+					"choices": [{
+						"index": 0,
+						"delta": {
+							"tool_calls": [{
+								"index": 0,
+								"id": format!("call-{index}"),
+								"type": "function",
+								"function": {
+									"name": name,
+									"arguments": arguments.to_string(),
+								}
+							}]
+						},
+						"finish_reason": null
+					}]
+				});
+				let _ = stream.write_all(format!("data: {chunk}\n\n").as_bytes());
+			}
+			let _ = stream.write_all(b"data: [DONE]\n\n");
+			let _ = stream.flush();
+		}
+	});
+	(port, requests)
+}
+
 /// Text of the last `user` message in an OpenAI-compatible request body.
 fn user_prompt(request: &[u8]) -> Option<String> {
 	let body_start = request.windows(4).position(|window| window == b"\r\n\r\n")? + 4;
@@ -547,6 +630,93 @@ fn launch(port: u16, model: &str, provider: &str) -> RpcLaunch {
 
 fn timeout() -> Duration {
 	Duration::from_secs(10)
+}
+
+/// Unique per-test root so parallel checkpoint scenarios never share a log.
+fn checkpoint_root(label: &str) -> PathBuf {
+	static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+	let next = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+	let root = std::env::temp_dir().join(format!(
+		"omp-rpc-checkpoint-{}-{label}-{next}",
+		std::process::id()
+	));
+	fs::create_dir_all(root.join("worktree")).expect("worktree dir");
+	root
+}
+
+fn checkpoint_session_options(worktree: &Path, dir: &Path, id: Option<&str>) -> SessionOptions {
+	SessionOptions {
+		enabled: true,
+		cwd: worktree.to_path_buf(),
+		model: Some("local/mock-model".to_string()),
+		provider: Some("local".to_string()),
+		dir: Some(dir.to_path_buf()),
+		id: id.map(str::to_string),
+		continue_latest: id.is_none(),
+		parent_session: None,
+		no_title: true,
+	}
+}
+
+/// [`launch`] with the checkpoint pair mounted and a persisted session log.
+fn launch_checkpoint(
+	port: u16,
+	worktree: &Path,
+	session_dir: &Path,
+	id: Option<&str>,
+) -> RpcLaunch {
+	let mut launch = launch(port, "local/mock-model", "local");
+	launch.cwd = worktree.to_path_buf();
+	launch.config.checkpoint.enabled = Some(true);
+	launch.tools_enabled = true;
+	launch.max_turns = 8;
+	launch.store_options = checkpoint_session_options(worktree, session_dir, id);
+	launch
+}
+
+/// Only session log in `dir`; fails loudly when a scenario wrote none or two.
+fn session_log(dir: &Path) -> PathBuf {
+	let mut logs: Vec<PathBuf> = fs::read_dir(dir)
+		.expect("session dir")
+		.filter_map(|entry| entry.ok().map(|entry| entry.path()))
+		.filter(|path| {
+			path.extension().and_then(|extension| extension.to_str()) == Some("jsonl")
+		})
+		.collect();
+	assert_eq!(logs.len(), 1, "expected one session log in {}", dir.display());
+	logs.pop().expect("session log")
+}
+
+/// The exact scenario the parent asked for, run through `RpcMode`:
+/// checkpoint tool call, an exploratory assistant turn, then `rewind`.
+///
+/// Returns the persisted log, every provider request body in order, and the
+/// RPC frames emitted for the run.
+fn run_checkpoint_rewind(root: &Path) -> (PathBuf, Vec<Value>, Vec<Value>) {
+	let worktree = root.join("worktree");
+	let sessions = root.join("sessions");
+	let (port, requests) = spawn_tool_model(vec![
+		ToolScript {
+			text: String::new(),
+			tool: Some(("checkpoint", json!({ "goal": "map it" }))),
+		},
+		ToolScript { text: "EXPLORATORY-SECRET".to_string(), tool: None },
+		ToolScript {
+			text: String::new(),
+			tool: Some(("rewind", json!({ "report": "CONCISE-FINDINGS" }))),
+		},
+		ToolScript { text: "FINAL-ANSWER".to_string(), tool: None },
+	]);
+	let harness = Harness::start(launch_checkpoint(port, &worktree, &sessions, Some("cp-smoke")));
+	harness.send(json!({ "type": "prompt", "id": "p1", "message": "start investigation" }));
+	let frames = harness.wait_frame("agent_end", timeout());
+	let bodies = requests
+		.lock()
+		.unwrap_or_else(std::sync::PoisonError::into_inner)
+		.clone();
+	let log = session_log(&sessions);
+	drop(harness);
+	(log, bodies, frames)
 }
 
 #[test]
@@ -993,4 +1163,296 @@ fn compact_and_handoff_reject_while_a_login_owns_the_store() {
 	// EOF must not wait for the parked login: teardown cancels it, which withdraws
 	// the prompt, so the mode thread joins instead of hanging on the store lock.
 	assert!(harness.join().is_ok(), "EOF must finish while a login is open");
+}
+
+/// Plan C2e through the RPC transport: `checkpoint` → exploratory assistant
+/// turn → `rewind` must cut the conversation the next provider request sees,
+/// while the abandoned entries stay in the JSONL log and nothing on disk is
+/// rolled back.
+#[test]
+fn rpc_checkpoint_rewind_replaces_context_and_keeps_abandoned_entries() {
+	let root = checkpoint_root("rewind");
+	let worktree = root.join("worktree");
+	let tracked = worktree.join("plan.md");
+	fs::write(&tracked, "untouched worktree file\n").expect("worktree file");
+	let worktree_before: Vec<PathBuf> = {
+		let mut entries: Vec<PathBuf> = fs::read_dir(&worktree)
+			.expect("worktree")
+			.filter_map(|entry| entry.ok().map(|entry| entry.path()))
+			.collect();
+		entries.sort();
+		entries
+	};
+
+	let (log, bodies, frames) = run_checkpoint_rewind(&root);
+
+	assert_eq!(bodies.len(), 4, "provider requests: {bodies:#?}");
+	let body = |index: usize| bodies[index].to_string();
+	assert!(body(0).contains("start investigation"));
+	assert!(
+		body(1).contains("Checkpoint: map it"),
+		"checkpoint result missing from second request: {}",
+		body(1)
+	);
+	assert!(body(2).contains("EXPLORATORY-SECRET"));
+	assert!(
+		body(2).contains("You MUST call rewind"),
+		"pre-yield guard missing from exploratory turn: {}",
+		body(2)
+	);
+	// The turn-end ack must carry the rebuilt conversation: the retained report
+	// and branch summary replace the exploratory tail.
+	assert!(
+		body(3).contains("Branch-return summary"),
+		"rewound context missing: {}",
+		body(3)
+	);
+	assert!(body(3).contains("CONCISE-FINDINGS"));
+	assert!(body(3).contains("Checkpoint called and rewound"));
+	assert!(
+		!body(3).contains("EXPLORATORY-SECRET"),
+		"abandoned exploration leaked into the next request: {}",
+		body(3)
+	);
+
+	let agent_end = frames
+		.iter()
+		.rev()
+		.find(|frame| frame["type"] == "agent_end")
+		.expect("agent_end");
+	assert_eq!(agent_end["willContinue"], false);
+	assert!(
+		!agent_end.to_string().contains("EXPLORATORY-SECRET"),
+		"abandoned turn leaked into agent_end: {agent_end}"
+	);
+
+	// Conversation-only rewind: the log keeps every abandoned entry.
+	let persisted = fs::read_to_string(&log).expect("read session log");
+	assert!(
+		persisted.contains("EXPLORATORY-SECRET"),
+		"abandoned assistant entry must stay persisted"
+	);
+	assert!(persisted.contains("CONCISE-FINDINGS"));
+	assert!(persisted.contains("branch_summary"));
+	assert!(persisted.contains("rewind-report"));
+
+	// No filesystem rollback: the worktree is byte-identical and unchanged.
+	assert_eq!(
+		fs::read_to_string(&tracked).expect("tracked file"),
+		"untouched worktree file\n"
+	);
+	let worktree_after: Vec<PathBuf> = {
+		let mut entries: Vec<PathBuf> = fs::read_dir(&worktree)
+			.expect("worktree")
+			.filter_map(|entry| entry.ok().map(|entry| entry.path()))
+			.collect();
+		entries.sort();
+		entries
+	};
+	assert_eq!(
+		worktree_after, worktree_before,
+		"rewind must not change the worktree"
+	);
+	fs::remove_dir_all(&root).ok();
+}
+
+fn first_header_id(path: &Path) -> String {
+	let content = fs::read_to_string(path).expect("read forked session");
+	content
+		.lines()
+		.filter_map(|line| serde_json::from_str::<Value>(line).ok())
+		.find(|value| value["type"] == "session")
+		.and_then(|value| value["id"].as_str().map(str::to_string))
+		.expect("forked session header id")
+}
+
+/// A reopened log (restart) and a forked log must both restore the completed
+/// rewind: the retained report is context, and `rewind` is rejected.
+#[test]
+fn rpc_completed_rewind_survives_restart_and_fork() {
+	let root = checkpoint_root("resume");
+	let (log, _, _) = run_checkpoint_rewind(&root);
+	let worktree = root.join("worktree");
+	let sessions = root.join("sessions");
+
+	let reopen = |dir: &Path, id: &str, label: &str| {
+		let (port, requests) = spawn_tool_model(vec![
+			ToolScript {
+				text: String::new(),
+				tool: Some(("rewind", json!({ "report": "again" }))),
+			},
+			ToolScript { text: format!("{label}-DONE"), tool: None },
+		]);
+		let harness = Harness::start(launch_checkpoint(port, &worktree, dir, Some(id)));
+		harness.send(json!({ "type": "prompt", "id": "p1", "message": "resume" }));
+		harness.wait_frame("agent_end", timeout());
+		let bodies = requests
+			.lock()
+			.unwrap_or_else(std::sync::PoisonError::into_inner)
+			.clone();
+		drop(harness);
+		bodies
+	};
+
+	let restarted = reopen(&sessions, "cp-smoke", "restart");
+	assert_eq!(restarted.len(), 2, "restart requests: {restarted:#?}");
+	assert!(
+		restarted[0].to_string().contains("CONCISE-FINDINGS"),
+		"completed rewind report missing after restart: {}",
+		restarted[0]
+	);
+	assert!(
+		restarted[1].to_string().contains("Checkpoint already completed"),
+		"completed guard not restored after restart: {}",
+		restarted[1]
+	);
+
+	let fork_dir = root.join("forks");
+	let forked = fork_session(&log, Some(&worktree), Some(&fork_dir)).expect("fork session");
+	let fork_id = first_header_id(&forked);
+	let forked_requests = reopen(&fork_dir, &fork_id, "fork");
+	assert_eq!(forked_requests.len(), 2, "fork requests: {forked_requests:#?}");
+	assert!(
+		forked_requests[0].to_string().contains("CONCISE-FINDINGS"),
+		"completed rewind report missing after fork: {}",
+		forked_requests[0]
+	);
+	assert!(
+		forked_requests[1].to_string().contains("Checkpoint already completed"),
+		"completed guard not restored after fork: {}",
+		forked_requests[1]
+	);
+	fs::remove_dir_all(&root).ok();
+}
+
+/// The checkpoint controller is branch-scoped: selecting an earlier entry must
+/// drop the open checkpoint from the abandoned path, and selecting the
+/// checkpoint entry again must restore it.
+#[test]
+fn rpc_branch_rehydrates_checkpoint_state_for_the_selected_branch() {
+	const TS: &str = "2026-10-29T00:00:00.000Z";
+	let root = checkpoint_root("branch");
+	let worktree = root.join("worktree");
+	let sessions = root.join("sessions");
+
+	let mut store = SessionStore::open(&checkpoint_session_options(
+		&worktree,
+		&sessions,
+		Some("branch-fixture"),
+	));
+	assert!(store.enabled(), "fixture store: {:?}", store.corrupt_reason());
+	let mut call = ContentPart {
+		kind: "toolCall".to_string(),
+		text: None,
+		data: None,
+		mime_type: None,
+		extra: serde_json::Map::new(),
+	};
+	call.extra.insert("id".to_string(), json!("call-cp"));
+	call.extra.insert("name".to_string(), json!("checkpoint"));
+	call.extra.insert("arguments".to_string(), json!({ "goal": "map it" }));
+	let assistant = SessionMessage::assistant(
+		MessageContent::Parts(vec![call]),
+		"api",
+		"local",
+		"mock-model",
+		None,
+		"toolUse",
+		2,
+	);
+	let mut result = SessionMessage::tool_result(
+		"call-cp",
+		"checkpoint",
+		MessageContent::Text(
+			"Checkpoint: map it\nFinish exploration and formulate findings.".to_string(),
+		),
+		false,
+		3,
+	);
+	result.extra.insert(
+		"details".to_string(),
+		json!({ "goal": "map it", "startedAt": TS }),
+	);
+	store
+		.append_messages(&[
+			MessageEntry::new(
+				"u1",
+				None,
+				TS,
+				SessionMessage::user(MessageContent::Text("root question".to_string()), 1),
+			),
+			MessageEntry::new("cp-asst", Some("u1".to_string()), TS, assistant),
+			MessageEntry::new("cp-result", Some("cp-asst".to_string()), TS, result),
+		])
+		.expect("append fixture turn");
+	drop(store);
+
+	let (port, requests) = spawn_tool_model(vec![
+		ToolScript { text: "BRANCH-OK".to_string(), tool: None },
+		ToolScript { text: "CHECKPOINT-OPEN".to_string(), tool: None },
+		ToolScript {
+			text: String::new(),
+			tool: Some(("rewind", json!({ "report": "BRANCH-FINDINGS" }))),
+		},
+		ToolScript { text: "FINAL-BRANCH".to_string(), tool: None },
+	]);
+	let harness = Harness::start(launch_checkpoint(
+		port,
+		&worktree,
+		&sessions,
+		Some("branch-fixture"),
+	));
+
+	// Branch to the root user message: the abandoned checkpoint must not keep
+	// the yield guard armed, so one provider request finishes the turn.
+	harness.send(json!({ "type": "branch", "id": "b1", "entryId": "u1" }));
+	let frames = harness.wait_for(|frames| frames.iter().any(|frame| frame["id"] == "b1"), timeout());
+	let branch = frames.iter().find(|frame| frame["id"] == "b1").expect("branch response");
+	assert_eq!(branch["success"], true, "branch response: {branch:#?}");
+	harness.send(json!({ "type": "prompt", "id": "p1", "message": "after branch" }));
+	harness.wait_frame("agent_end", timeout());
+
+	let after_root_branch = requests
+		.lock()
+		.unwrap_or_else(std::sync::PoisonError::into_inner)
+		.clone();
+	assert_eq!(
+		after_root_branch.len(),
+		1,
+		"stale checkpoint forced a continuation: {after_root_branch:#?}"
+	);
+	let root_request = after_root_branch[0].to_string();
+	assert!(!root_request.contains("You MUST call rewind"), "{root_request}");
+	assert!(!root_request.contains("Checkpoint: map it"), "{root_request}");
+
+	// Branch back to the checkpoint result: the open checkpoint returns and the
+	// guard continues the turn with the rewind warning.
+	harness.send(json!({ "type": "branch", "id": "b2", "entryId": "cp-result" }));
+	let frames = harness.wait_for(|frames| frames.iter().any(|frame| frame["id"] == "b2"), timeout());
+	let branch = frames.iter().find(|frame| frame["id"] == "b2").expect("branch response");
+	assert_eq!(branch["success"], true, "branch response: {branch:#?}");
+	harness.send(json!({ "type": "prompt", "id": "p2", "message": "with checkpoint" }));
+	harness.wait_for(
+		|frames| frames.iter().filter(|frame| frame["type"] == "agent_end").count() >= 2,
+		timeout(),
+	);
+
+	let all = requests
+		.lock()
+		.unwrap_or_else(std::sync::PoisonError::into_inner)
+		.clone();
+	assert_eq!(all.len(), 4, "branch requests: {all:#?}");
+	assert!(
+		all[2].to_string().contains("You MUST call rewind"),
+		"checkpoint state not restored after branching back: {}",
+		all[2]
+	);
+	// The restored checkpoint is cut by the scripted rewind, and the abandoned
+	// post-branch turn stays out of the final request.
+	let final_request = all[3].to_string();
+	assert!(final_request.contains("Branch-return summary"), "{final_request}");
+	assert!(final_request.contains("BRANCH-FINDINGS"), "{final_request}");
+	assert!(!final_request.contains("CHECKPOINT-OPEN"), "{final_request}");
+	drop(harness);
+	fs::remove_dir_all(&root).ok();
 }

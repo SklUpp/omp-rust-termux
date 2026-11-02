@@ -1187,6 +1187,10 @@ impl RpcSession {
 		self.store.branch_to(entry_id).map_err(|error| {
 			Prerequisite::new("branch_unavailable", format!("cannot branch to {entry_id}: {error}"))
 		})?;
+		// Checkpoint state is branch-scoped: an open checkpoint or completed
+		// rewind from the path just abandoned must not leak into the new branch.
+		self.checkpoint_host = CheckpointHost::new();
+		self.checkpoint_host.rehydrate(&self.store);
 		// The branch changed under the same log: rebuild the context the next
 		// request and the frame surface read from.
 		self.history = if self.store.has_branch_context() {
@@ -2079,28 +2083,109 @@ impl RpcSession {
 		}
 		let pending = prepared.turn_ack.take();
 		let turn_start = pending.as_ref().map_or(0, |(request, _)| request.turn_start);
-		if self.store.enabled() && !valid.is_empty() {
-			if let Err(err) = self.store.append_messages(&valid) {
-				eprintln!("warning: {err}");
+		// The loop blocks on this reply: a rewrite decided after persistence must
+		// travel in it, never be dropped in favour of a default ack.
+		let mut decision = pi_agent::TurnAckDecision::default();
+		let mut rewound = false;
+		if self.store.enabled() {
+			let captured = if valid.is_empty() {
+				false
+			} else {
+				if let Err(err) = self.store.append_messages(&valid) {
+					eprintln!("warning: {err}");
+				}
+				let captured =
+					self.checkpoint_host.note_persisted_tool_results(&self.store, &valid);
+				if let Err(err) = self.checkpoint_host.persist_active_reminder(&mut self.store) {
+					eprintln!("warning: {err}");
+				}
+				captured
+			};
+			if captured {
+				decision.warning = self.checkpoint_host.active_notice().map(str::to_string);
 			}
-			let _ = self.checkpoint_host.note_persisted_tool_results(&self.store, &valid);
-			if let Err(err) = self.checkpoint_host.persist_active_reminder(&mut self.store) {
-				eprintln!("warning: {err}");
+			// Same turn-end cut as the headless loop: the persisted branch moves,
+			// abandoned entries stay on disk, and the next provider request gets
+			// the rebuilt conversation instead of the exploratory tail.
+			match self.checkpoint_host.apply_pending_rewind(&mut self.store) {
+				Ok(Some(applied)) => {
+					// The checkpoint is no longer active; its notice would
+					// contradict the retained report.
+					decision.warning = None;
+					match CheckpointHost::context_messages(&self.store) {
+						Ok(messages) => {
+							decision.rewrite = Some(pi_agent::TurnRewrite::Replace(messages));
+						},
+						Err(err) => {
+							eprintln!("warning: {err}; falling back to branch history");
+							if let Ok(messages) = runtime::history_messages(&applied.history) {
+								decision.rewrite =
+									Some(pi_agent::TurnRewrite::Replace(messages));
+							}
+						},
+					}
+					self.history = applied.history;
+					self.history_messages = None;
+					self.todo_phases = self.store.latest_todo_phases();
+					self.last_assistant_text = self
+						.history
+						.last()
+						.map(|turn| turn.assistant.clone())
+						.filter(|text| !text.is_empty());
+					rewound = true;
+				},
+				Ok(None) => {},
+				Err(err) => eprintln!("warning: cannot apply rewind: {err}"),
 			}
-		} else if !self.store.enabled() {
-			let _ = self
+		} else {
+			let captured = self
 				.checkpoint_host
 				.note_unpersisted_tool_results(tool_results, &prepared.tool_names, turn_start);
+			if let Some(rewind) = self.checkpoint_host.apply_pending_rewind_in_memory() {
+				decision.rewrite = match self.in_memory_messages.as_mut() {
+					Some(messages) => {
+						// The mirror is the uncompacted branch; replay it wholesale
+						// so the run does not depend on the checkpoint result
+						// surviving compaction.
+						crate::session_checkpoint::apply_in_memory_rewind(messages, &rewind);
+						Some(pi_agent::TurnRewrite::Replace(messages.clone()))
+					},
+					None => Some(pi_agent::TurnRewrite::InMemory(rewind)),
+				};
+			} else if captured {
+				decision.warning = self.checkpoint_host.active_notice().map(str::to_string);
+			}
+		}
+		// Pre-yield guard parity: an open checkpoint whose turn produced no tool
+		// calls must continue with the rewind warning instead of ending.
+		if self.checkpoint_host.needs_rewind_before_yield() && message.tool_calls.is_empty() {
+			if let Some(warning) = self.checkpoint_host.yield_warning() {
+				decision.continue_turn = true;
+				decision.warning = Some(warning.to_string());
+			}
+		}
+		if !self.store.enabled()
+			&& let Some(warning) = decision.warning.as_deref().filter(|w| !w.is_empty())
+			&& let Some(messages) = self.in_memory_messages.as_mut()
+		{
+			messages.push(Message::system(warning));
 		}
 		for entry in &valid {
 			if let Ok(value) = serde_json::to_value(&entry.message) {
 				self.messages.push(value);
 			}
 		}
-		prepared.parent_id = Some(previous);
+		if rewound {
+			// The cut moved the leaf past the rewound turn's own entries; the
+			// mirror and the next parent must follow the retained branch.
+			self.messages = branch_wire_messages(&self.store);
+			prepared.parent_id = self.store.leaf_id().map(str::to_string);
+		} else {
+			prepared.parent_id = Some(previous);
+		}
 
 		if let Some((_, reply)) = pending {
-			let _ = reply.send(pi_agent::TurnAckDecision::default());
+			let _ = reply.send(decision);
 		}
 	}
 }

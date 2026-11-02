@@ -53,6 +53,7 @@ fn json_rows_and_yml_models_resolve_ts_precedence() {
 					"api": "ollama-chat",
 					"baseUrl": "http://127.0.0.1:11434",
 					"maxTokens": 8192,
+					"omitMaxOutputTokens": true,
 					"contextWindow": 131072,
 					"input": ["text", "image"],
 					"reasoning": true,
@@ -66,6 +67,7 @@ fn json_rows_and_yml_models_resolve_ts_precedence() {
 					"api": "anthropic-messages",
 					"baseUrl": "https://proxy.example/v1",
 					"maxTokens": 4096,
+					"omitMaxOutputTokens": true,
 					"contextWindow": 200000,
 					"input": ["text"],
 					"compat": {"keepAlive": true, "rowOnly": 7},
@@ -87,7 +89,7 @@ fn json_rows_and_yml_models_resolve_ts_precedence() {
 	let yml = dir.join("models.yml");
 	write(
 		&yml,
-		"providers:\n  ollama:\n    baseUrl: http://gateway.example:8080\n    api: openai-completions\n    compat:\n      keepAlive: false\n      supportsUsageInStreaming: false\n      nested:\n        b: 9\n        c: 3\n    models:\n      - id: qwen3\n        api: anthropic-messages\n        baseUrl: http://127.0.0.1:9000\n        maxTokens: 2048\n        thinking:\n          mode: budget\n          efforts:\n            - low\n            - medium\n          maxTokens: 1024\n        compat:\n          keepAlive: true\n          nested:\n            y: 2\n      - id: phi\n        reasoning: false\n        cost:\n          cacheRead: 0\n      - id: mistral\n        api: ollama-chat\n",
+		"providers:\n  ollama:\n    baseUrl: http://gateway.example:8080\n    api: openai-completions\n    compat:\n      keepAlive: false\n      supportsUsageInStreaming: false\n      nested:\n        b: 9\n        c: 3\n    models:\n      - id: qwen3\n        api: anthropic-messages\n        baseUrl: http://127.0.0.1:9000\n        maxTokens: 2048\n        omitMaxOutputTokens: false\n        thinking:\n          mode: budget\n          efforts:\n            - low\n            - medium\n          maxTokens: 1024\n        compat:\n          keepAlive: true\n          nested:\n            y: 2\n      - id: phi\n        reasoning: false\n        cost:\n          cacheRead: 0\n      - id: mistral\n        api: ollama-chat\n",
 	);
 	let catalog = Catalog::load_from(&[json], &yml).expect("catalog");
 
@@ -129,6 +131,9 @@ fn json_rows_and_yml_models_resolve_ts_precedence() {
 	let qwen3_cost = qwen3.cost.as_ref().expect("bundled cost");
 	assert_eq!(qwen3_cost["input"], serde_json::json!(1));
 	assert_eq!(qwen3_cost["output"], serde_json::json!(2));
+	// The bundled row sets the native omission flag; the authored `false` must
+	// override it while every other patched field above stays intact.
+	assert_eq!(catalog.omit_max_output_tokens("ollama", "qwen3"), Some(false));
 
 	// `phi` authored `reasoning: false` and an explicit zero rate: both beat
 	// the bundled values, while omitted name/cost rates keep the row's.
@@ -142,6 +147,8 @@ fn json_rows_and_yml_models_resolve_ts_precedence() {
 	// No authored dialect/endpoint: consumers fall back to the connection.
 	assert_eq!(catalog.model_api("ollama", "phi"), None);
 	assert_eq!(catalog.model_base_url("ollama", "phi"), None);
+	// Never declared: distinct from an authored `false`.
+	assert_eq!(catalog.omit_max_output_tokens("ollama", "phi"), None);
 
 	// `llama3`: no `models.yml` definition, so the provider block overrides the
 	// bundled endpoint and merges into the row compat without touching `api`.
@@ -162,11 +169,14 @@ fn json_rows_and_yml_models_resolve_ts_precedence() {
 	assert_eq!(catalog.supports_usage_in_streaming("ollama", "llama3"), Some(false));
 	assert_eq!(catalog.supports_usage_in_streaming("ollama", "qwen3"), Some(false));
 	assert_eq!(catalog.model_thinking("ollama", "llama3"), None);
+	// No same-id definition touches this row, so the bundled flag survives.
+	assert_eq!(catalog.omit_max_output_tokens("ollama", "llama3"), Some(true));
 
 	// `mistral`: a `models.yml`-only definition is appended, not dropped.
 	assert_eq!(catalog.provider_of("mistral"), Some("ollama"));
 	assert_eq!(catalog.model_api("ollama", "mistral"), Some("ollama-chat"));
 	assert_eq!(catalog.model_base_url("ollama", "mistral"), None);
+	assert_eq!(catalog.omit_max_output_tokens("ollama", "mistral"), None);
 	assert_eq!(
 		catalog.model_compat("ollama", "mistral"),
 		Some(&serde_json::json!({

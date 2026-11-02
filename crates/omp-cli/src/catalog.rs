@@ -38,6 +38,12 @@ pub struct ModelInfo {
 	pub name:            Option<String>,
 	/// `maxTokens` output cap when declared.
 	pub max_tokens:      Option<u64>,
+	/// TS `Model.omitMaxOutputTokens`: `Some(true)` suppresses the wire output
+	/// cap while `maxTokens` still budgets locally; `Some(false)` is an
+	/// authored re-enable and `None` means the definition never mentioned it
+	/// (`models.json`/`models.yml`). Kept tri-state so a patch can override a
+	/// bundled `true` with an explicit `false`.
+	pub omit_max_output_tokens: Option<bool>,
 	/// `reasoning` flag (defaults to false, as the catalog schema does).
 	pub reasoning:       bool,
 	/// Supported thinking efforts (`thinking.efforts`); `None` when the
@@ -87,6 +93,8 @@ struct ModelEntry {
 	name: Option<String>,
 	#[serde(default, rename = "maxTokens")]
 	max_tokens: Option<u64>,
+	#[serde(default, rename = "omitMaxOutputTokens")]
+	omit_max_output_tokens: Option<bool>,
 	#[serde(default)]
 	reasoning: bool,
 	#[serde(default)]
@@ -136,6 +144,9 @@ impl YamlModel {
 			input:           info.input.or(base.input),
 			name:            info.name.or(base.name),
 			max_tokens:      info.max_tokens.or(base.max_tokens),
+			omit_max_output_tokens: info
+				.omit_max_output_tokens
+				.or(base.omit_max_output_tokens),
 			reasoning:       reasoning.unwrap_or(base.reasoning),
 			efforts:         if thinking_declared { info.efforts } else { base.efforts },
 			cost:            patch_cost(base.cost.as_ref(), info.cost.as_ref()),
@@ -373,6 +384,7 @@ impl Catalog {
 						input: entry.input,
 						name: entry.name,
 						max_tokens: entry.max_tokens,
+						omit_max_output_tokens: entry.omit_max_output_tokens,
 						reasoning: entry.reasoning,
 						efforts: thinking_efforts(thinking.clone()),
 						cost: normalize_cost(entry.cost),
@@ -483,6 +495,9 @@ fn yml_sections(
 								cost: yml_cost(item),
 								api: item.get("api").and_then(yaml::Value::to_text),
 								base_url: item.get("baseUrl").and_then(yaml::Value::to_text),
+								omit_max_output_tokens: item
+									.get("omitMaxOutputTokens")
+									.and_then(yaml::Value::as_bool),
 								supports_usage_in_streaming: compat_bool(
 									compat.as_ref(),
 									"supportsUsageInStreaming",
@@ -646,6 +661,19 @@ impl Catalog {
 			.get(model)?
 			.thinking
 			.as_ref()
+	}
+
+	/// TS `Model.omitMaxOutputTokens` for this model: `Some(true)` means the
+	/// runtime must omit the wire output cap (Ollama `num_predict`), while
+	/// `Some(false)` is an authored re-enable and `None` means the catalog
+	/// never declared it, so the builder keeps its default.
+	#[must_use]
+	pub fn omit_max_output_tokens(&self, provider: &str, model: &str) -> Option<bool> {
+		self
+			.providers
+			.get(provider)?
+			.get(model)?
+			.omit_max_output_tokens
 	}
 
 	pub fn model_count(&self) -> usize {

@@ -23,6 +23,7 @@ use omp_cli::{
 	config::{Config, ProviderConfig},
 	output::OutputMode,
 	runtime::PiAgentRunner,
+	session::{SessionOptions, SessionStore},
 };
 
 const FAST_REJECTION: &str = r#"{"type":"error","error":{"type":"invalid_request_error","message":"speed is not supported for this model"}}"#;
@@ -228,4 +229,100 @@ fn rejected_priority_retries_without_fast_mode_and_reports_the_drop() {
 	let (_head, follow_body) = captured_rx.recv().expect("follow-up request");
 	assert_eq!(body_field(&follow_body, "speed"), None, "no priority, no speed");
 	server.join().expect("server");
+}
+
+fn tier_options(dir: std::path::PathBuf, id: &str) -> SessionOptions {
+	SessionOptions {
+		enabled: true,
+		cwd: PathBuf::from("/work"),
+		model: Some("anthropic/claude-priority".to_string()),
+		provider: Some("anthropic".to_string()),
+		dir: Some(dir),
+		id: Some(id.to_string()),
+		continue_latest: false,
+		parent_session: None,
+		no_title: true,
+	}
+}
+
+fn tiers(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+	pairs
+		.iter()
+		.map(|(family, tier)| ((*family).to_string(), (*tier).to_string()))
+		.collect()
+}
+
+/// TS `session-entries.ts:91-95` + `session-context.ts:263-264`: the entry is
+/// the string-valued family map (or `null`), the last entry on the branch wins,
+/// and an explicit reset is a recorded state — it must not fall back to config.
+#[test]
+fn service_tier_change_journals_strings_and_reset_survives_resume() {
+	let dir = std::env::temp_dir().join(format!(
+		"omp-anthropic-priority-{}-{}",
+		std::process::id(),
+		std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.expect("clock")
+			.as_nanos()
+	));
+	std::fs::create_dir_all(&dir).expect("temp dir");
+
+	let mut store = SessionStore::open(&tier_options(dir.clone(), "priority-tier"));
+	assert!(!store.has_service_tier_entry(), "a fresh session has no selection");
+	store
+		.append_service_tier_change(&tiers(&[("anthropic", "priority")]))
+		.expect("append selection");
+
+	let reopened = SessionStore::open(&tier_options(dir.clone(), "priority-tier"));
+	assert!(reopened.has_service_tier_entry());
+	assert_eq!(
+		reopened.service_tier_by_family(),
+		tiers(&[("anthropic", "priority")]),
+		"resume restores the recorded selection"
+	);
+
+	// Explicit reset: a recorded empty map, not a missing entry.
+	let mut reset = SessionStore::open(&tier_options(dir.clone(), "priority-tier"));
+	reset
+		.append_service_tier_change(&BTreeMap::new())
+		.expect("append reset");
+	let resumed = SessionStore::open(&tier_options(dir.clone(), "priority-tier"));
+	assert!(resumed.has_service_tier_entry(), "the reset is itself recorded");
+	assert!(
+		resumed.service_tier_by_family().is_empty(),
+		"the reset must not re-enable the configured priority"
+	);
+
+	// Explicit re-arm after the reset wins as the last branch entry.
+	let mut rearm = SessionStore::open(&tier_options(dir.clone(), "priority-tier"));
+	rearm
+		.append_service_tier_change(&tiers(&[("anthropic", "priority")]))
+		.expect("append re-arm");
+	assert_eq!(
+		SessionStore::open(&tier_options(dir.clone(), "priority-tier")).service_tier_by_family(),
+		tiers(&[("anthropic", "priority")]),
+		"an explicit re-arm restores priority"
+	);
+
+	let log = std::fs::read_dir(&dir)
+		.expect("session dir")
+		.flatten()
+		.map(|entry| entry.path())
+		.find(|path| path.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
+		.expect("session log");
+	let contents = std::fs::read_to_string(&log).expect("read log");
+	let entries: Vec<serde_json::Value> = contents
+		.lines()
+		.filter(|line| !line.trim().is_empty())
+		.map(|line| serde_json::from_str(line).expect("json entry"))
+		.collect();
+	let tiers_json: Vec<&serde_json::Value> = entries
+		.iter()
+		.filter(|entry| entry["type"] == "service_tier_change")
+		.map(|entry| &entry["serviceTier"])
+		.collect();
+	assert_eq!(tiers_json.len(), 3, "selection, reset, re-arm were all journaled");
+	assert_eq!(tiers_json[0]["anthropic"], "priority", "values are ServiceTier strings");
+	assert!(tiers_json[1].is_null(), "the reset is null, never false");
+	let _ = std::fs::remove_dir_all(&dir);
 }

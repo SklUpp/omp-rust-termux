@@ -617,8 +617,12 @@ fn unwrap_delimited_thinking(open: &str, close: &str, text: &str) -> String {
 			return text.to_string();
 		};
 		if level.cursor >= level.end {
-			let level = stack.pop().expect("level");
-			let joined = level.segments.join("\n");
+			let mut level = stack.pop().expect("level");
+			let joined = match level.segments.len() {
+				0 => String::new(),
+				1 => level.segments.pop().expect("segment"),
+				_ => level.segments.join("\n"),
+			};
 			match stack.last_mut() {
 				Some(parent) => parent.segments.push(joined),
 				None => return joined,
@@ -626,7 +630,18 @@ fn unwrap_delimited_thinking(open: &str, close: &str, text: &str) -> String {
 			continue;
 		}
 		if !text[level.cursor..].starts_with(open) {
-			return text.to_string();
+			// A plain body is a leaf: recursive TS unwrap returns it unchanged.
+			if stack.len() == 1 {
+				return text.to_string();
+			}
+			let level = stack.pop().expect("level");
+			let body = text[level.cursor..level.end].to_string();
+			stack
+				.last_mut()
+				.expect("parent")
+				.segments
+				.push(body);
+			continue;
 		}
 		let Some(&(_, close_at)) = pairs
 			.binary_search_by_key(&level.cursor, |(opened, _)| *opened)
@@ -659,28 +674,24 @@ fn delimiter_pairs(
 	start: usize,
 	end: usize,
 ) -> Vec<(usize, usize)> {
+	let bytes = text.as_bytes();
+	let open = open.as_bytes();
+	let close = close.as_bytes();
 	let mut pending = Vec::new();
 	let mut pairs = Vec::new();
 	let mut cursor = start;
 	while cursor < end {
-		let next_open = text[cursor..end].find(open).map(|index| cursor + index);
-		let next_close = text[cursor..end].find(close).map(|index| cursor + index);
-		match (next_open, next_close) {
-			(Some(open_at), Some(close_at)) if open_at < close_at => {
-				pending.push(open_at);
-				cursor = open_at + open.len();
-			},
-			(_, Some(close_at)) => {
-				if let Some(open_at) = pending.pop() {
-					pairs.push((open_at, close_at));
-				}
-				cursor = close_at + close.len();
-			},
-			(Some(open_at), None) => {
-				pending.push(open_at);
-				cursor = open_at + open.len();
-			},
-			(None, None) => break,
+		let rest = &bytes[cursor..end];
+		if rest.starts_with(open) {
+			pending.push(cursor);
+			cursor += open.len();
+		} else if rest.starts_with(close) {
+			if let Some(open_at) = pending.pop() {
+				pairs.push((open_at, cursor));
+			}
+			cursor += close.len();
+		} else {
+			cursor += 1;
 		}
 	}
 	pairs.sort_unstable();

@@ -6353,6 +6353,7 @@ mod tests {
 			)),
 			session_id: Some("session-1".to_string()),
 			cancel: Some(token),
+			service_tier_by_family: Default::default(),
 		};
 		let error = cancelled.target("childprov/model").err().expect("cancelled lookup");
 		assert!(error.contains("credential lookup failed for provider `childprov`"), "{error}");

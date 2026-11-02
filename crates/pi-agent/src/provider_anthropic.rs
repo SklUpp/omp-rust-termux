@@ -1823,6 +1823,11 @@ impl ModelProvider for AnthropicMessagesProvider {
 		// block or terminal stop) retries once without `speed` and the beta.
 		// Metadata-only chunks do not count as output.
 		let mut prelude: Vec<Result<StreamChunk, ProviderError>> = Vec::new();
+		// Metadata-only records are last-wins (usage deltas, stop reason): the
+		// provider controls how many precede output, so coalesce to a bounded
+		// newest tail instead of retaining every record while the idle deadline
+		// keeps refreshing.
+		const PRELUDE_LIMIT: usize = 64;
 		loop {
 			match stream.next().await {
 				Some(Ok(chunk)) => {
@@ -1844,6 +1849,10 @@ impl ModelProvider for AnthropicMessagesProvider {
 					prelude.push(Ok(chunk));
 					if observable {
 						break;
+					}
+					if prelude.len() > PRELUDE_LIMIT {
+						// Drop the oldest superseded metadata record.
+						prelude.remove(0);
 					}
 				},
 				Some(Err(error)) => {

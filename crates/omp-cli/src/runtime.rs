@@ -1441,7 +1441,7 @@ impl AgentRunner for PiAgentRunner {
 			.filter(|text| !text.trim().is_empty())
 		{
 			let mut message = pi_agent::Message::developer(context.to_string());
-			message.custom_type = Some("plan-mode".to_string());
+			message.custom_type = Some("plan-mode-reference".to_string());
 			messages.push(message);
 		}
 		if let Some(context) = &request.goal_context {

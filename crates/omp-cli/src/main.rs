@@ -1172,17 +1172,31 @@ fn run() -> std::result::Result<(), CliError> {
 	};
 	session.checkpoint_host.rehydrate(&store);
 	session.store = store;
+	// One authoritative live selection, resolved once at launch with the TS
+	// precedence (explicit flag, then the recorded entry including a reset,
+	// then configured family defaults, then the legacy single value).
+	let live_service_tiers = if session.service_tier_explicit {
+		crate::service_tier::for_single(session.config.service_tier.as_deref())
+	} else if session.store.has_service_tier_entry() {
+		session.store.service_tier_by_family()
+	} else {
+		let configured = session.config.configured_service_tiers();
+		if configured.is_empty() {
+			crate::service_tier::for_single(session.config.service_tier.as_deref())
+		} else {
+			configured
+		}
+	};
+	session.service_tier_by_family = live_service_tiers.clone();
+	session.service_tier_recorded = true;
 	if session.service_tier_explicit {
 		// TS `setServiceTierFamily`: an explicit launch flag is recorded, so a
 		// later resume restores the re-armed selection.
-		let tiers = crate::service_tier::for_single(session.config.service_tier.as_deref());
 		if session.store.enabled()
-			&& let Err(err) = session.store.append_service_tier_change(&tiers)
+			&& let Err(err) = session.store.append_service_tier_change(&live_service_tiers)
 		{
 			eprintln!("warning: cannot record service tier change: {err}");
 		}
-		session.service_tier_by_family = tiers;
-		session.service_tier_recorded = true;
 	}
 	// TS `sdk.ts:1505-1545`: an explicit `--model` wins; otherwise a restored
 	// session's recorded model/role decides the route, with the configured
@@ -1816,23 +1830,9 @@ impl Session<'_> {
 			runtime::latest_todo_phases_from_turns(&self.history)
 		};
 		let goal_context = self.goal_mode_context(&todo_phases);
-		// TS precedence: an explicit launch flag rearms; otherwise a recorded
-		// entry (including an empty reset) wins over configured defaults, and a
-		// configured default applies only when the session recorded nothing.
-		let service_tier_by_family = if self.service_tier_explicit {
-			crate::service_tier::for_single(self.config.service_tier.as_deref())
-		} else if self.store.has_service_tier_entry() {
-			self.store.service_tier_by_family()
-		} else if self.service_tier_recorded {
-			self.service_tier_by_family.clone()
-		} else {
-			let configured = self.config.configured_service_tiers();
-			if configured.is_empty() {
-				crate::service_tier::for_single(self.config.service_tier.as_deref())
-			} else {
-				configured
-			}
-		};
+		// The launch resolved the live selection once; later prompts read that
+		// single owner, so a downgrade or reset is never re-armed by the flag.
+		let service_tier_by_family = self.service_tier_by_family.clone();
 		Ok(RunRequest {
 			prompt,
 			parts,
@@ -2215,6 +2215,7 @@ impl Session<'_> {
 					asst_msg.attribution =
 						message.attribution.map(|value| value.as_str().to_string());
 					asst_msg.disabled_features = message.disabled_features.clone();
+					let mut priority_downgraded = false;
 					if message
 						.disabled_features
 						.as_deref()
@@ -2224,12 +2225,7 @@ impl Session<'_> {
 					{
 						self.service_tier_by_family.remove("anthropic");
 						self.service_tier_recorded = true;
-						if self.store.enabled()
-							&& let Err(err) =
-								self.store.append_service_tier_change(&self.service_tier_by_family)
-						{
-							eprintln!("warning: cannot record service tier change: {err}");
-						}
+						priority_downgraded = true;
 						eprintln!(
 							"warning: Priority/fast mode rejected for this model; retried without it. Fast mode is now off."
 						);
@@ -2282,7 +2278,15 @@ impl Session<'_> {
 						if let Err(err) = store.append_messages(&valid_turn_entries) {
 							eprintln!("warning: {err}");
 						}
-					}
+
+						// The downgrade entry must be the branch leaf: append it
+						// after the persisted turn, never as its sibling.
+						if priority_downgraded
+							&& let Err(err) =
+								self.store.append_service_tier_change(&self.service_tier_by_family)
+						{
+							eprintln!("warning: cannot record service tier change: {err}");
+						}					}
 					*parent = Some(prev_id);
 
 					if !store.enabled()

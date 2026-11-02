@@ -1536,8 +1536,6 @@ impl Session<'_> {
 			} else {
 				self.config.resolve_api_key(provider)
 			};
-			let changed = self.provider.as_deref() != Some(provider)
-				|| self.model.as_deref() != Some(id);
 			self.provider = Some(provider.to_string());
 			self.model = Some(id.to_string());
 			self.api_key = api_key;
@@ -1546,12 +1544,10 @@ impl Session<'_> {
 			{
 				self.thinking = Some(level);
 			}
-			if changed {
-				invalidate_inherited_cache_key(
-					&mut self.prompt_cache_key,
-					&mut self.prompt_cache_key_source,
-				);
-			}
+			// Restoration reconstructs the session's own route; it is not an
+			// explicit model switch. The header cache key was inherited for this
+			// session before this call and must survive unchanged.
+
 			self.root_base_url = runtime::effective_endpoint(
 				&self.catalog,
 				&self.config,

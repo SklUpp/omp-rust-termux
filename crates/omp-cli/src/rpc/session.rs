@@ -531,8 +531,6 @@ impl RpcSession {
 			} else {
 				self.config.resolve_api_key(provider)
 			};
-			let changed = self.provider.as_deref() != Some(provider)
-				|| self.model.as_deref() != Some(id);
 			self.provider = Some(provider.to_string());
 			self.model = Some(id.to_string());
 			self.api_key = api_key;
@@ -545,9 +543,6 @@ impl RpcSession {
 					runtime::CliThinking::Auto => None,
 					runtime::CliThinking::Effort(effort) => Some(effort.to_string()),
 				};
-			}
-			if changed {
-				self.prompt_cache_key_inherited = false;
 			}
 			self.refresh_root_endpoint();
 			return Some(candidate);

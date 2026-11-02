@@ -62,6 +62,29 @@ impl ToolRegistry {
 		self.tools.remove(name);
 	}
 
+	/// Tool schemas filtered to an active internal-name selection.
+	pub fn schemas_selected(&self, names: Option<&[String]>) -> Vec<Value> {
+		self
+			.tools
+			.values()
+			.filter(|tool| {
+				names.is_none_or(|names| {
+					names.iter().any(|name| name.as_str() == tool.name())
+				})
+			})
+			.map(|tool| {
+				serde_json::json!({
+					"type": "function",
+					"function": {
+						"name": tool.wire_name().unwrap_or_else(|| tool.name()),
+						"description": tool.description(),
+						"parameters": tool.schema()
+					}
+				})
+			})
+			.collect()
+	}
+
 	/// Mount the session's staged-preview policy on this registry.
 	pub fn set_policy(&mut self, policy: Arc<dyn crate::state::ToolPolicy>) {
 		self.policy = Some(policy);

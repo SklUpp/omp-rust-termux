@@ -344,6 +344,9 @@ pub struct RpcSession {
 	pub(crate) plan_yolo: Option<Arc<crate::plan_yolo::PlanYoloShared>>,
 	/// Planning tool selection to restore after approval or a failed arm.
 	pub(crate) plan_yolo_tools: Option<crate::plan_yolo::PlanYoloToolSelection>,
+	/// Failed approved switch surfaced to the turn owner instead of silently
+	/// ending the run.
+	pub(crate) plan_yolo_commit_error: Option<String>,
 }
 
 impl RpcSession {
@@ -498,8 +501,11 @@ impl RpcSession {
 			plan_mode_probe: None,
 			plan_yolo: None,
 			plan_yolo_tools: None,
+			plan_yolo_commit_error: None,
 		};
 		if let Some(arm) = plan_yolo {
+			// Explicit `--plan-yolo` is the grant: TS `armPlanYoloIfNeeded`
+			// publishes `enabled: true` independently of `plan.enabled`.
 			let gate =
 				Arc::new(std::sync::Mutex::new(crate::acp::plan::PlanGate::new(true)));
 			session.set_plan_yolo(Arc::new(crate::plan_yolo::PlanYoloShared::new(
@@ -1056,6 +1062,13 @@ impl RpcSession {
 	/// Install the live plan-mode probe the hidden `goal` tool consults.
 	pub fn set_plan_mode_probe(&mut self, probe: Option<crate::goal_tool::PlanModeProbe>) {
 		self.plan_mode_probe = probe;
+	}
+
+	/// Take a failed approved plan-yolo switch so the turn owner can fail the
+	/// run instead of reporting success after implementing nothing.
+	#[must_use]
+	pub fn take_plan_yolo_commit_error(&mut self) -> Option<String> {
+		self.plan_yolo_commit_error.take()
 	}
 
 	/// Persist the shared exclusive `mode_change` slot (`"plan"`, `"none"`, or
@@ -1773,6 +1786,14 @@ impl RpcSession {
 		if self.is_streaming {
 			return Err(Error::new("a turn is already streaming"));
 		}
+		self.plan_yolo_commit_error = None;
+		if !input.continuation
+			&& let Some(shared) = self.plan_yolo.as_ref()
+		{
+			// A new user decision supersedes an approval left behind by an
+			// aborted turn; a fresh proposal is still required.
+			shared.cancel_pending();
+		}
 		// A cut queued by the previous run must land before this prompt joins
 		// the mirror, or the abandoned tail would sit before the new turn.
 		self.flush_pending_wire();
@@ -2097,6 +2118,14 @@ impl RpcSession {
 	/// Persist and account for one finished turn.
 	pub fn finish_turn(&mut self, prepared: &mut PreparedTurn, outcome: &TurnOutcome) {
 		self.is_streaming = false;
+		if outcome.error.is_some()
+			|| outcome.aborted
+			|| self.plan_yolo_commit_error.is_some()
+		{
+			if let Some(shared) = self.plan_yolo.as_ref() {
+				shared.cancel_pending();
+			}
+		}
 		let mut record = std::mem::take(&mut prepared.builder).finish();
 		if outcome.error.is_some() {
 			let canon = session::canonical_stop_reason(&record.stop_reason);
@@ -2592,6 +2621,11 @@ impl RpcSession {
 			message.stop_reason,
 			Some(pi_agent::StopReason::Error | pi_agent::StopReason::Aborted)
 		);
+		if terminal
+			&& let Some(shared) = self.plan_yolo.as_ref()
+		{
+			shared.cancel_pending();
+		}
 		if !terminal
 			&& let Some(arm) = self.prewalk.target().cloned()
 		{
@@ -2797,6 +2831,7 @@ impl RpcSession {
 		}
 		if !terminal
 			&& let Some(shared) = self.plan_yolo.as_ref().cloned()
+			&& shared.has_pending()
 		{
 			let artifacts = self.plan_artifacts();
 			let catalog = Arc::clone(&self.catalog);
@@ -2896,6 +2931,8 @@ impl RpcSession {
 						commit.handoff,
 					));
 					decision.continue_turn = true;
+					decision.tool_selection =
+						self.plan_yolo_tools.as_ref().map(|tools| tools.restore());
 					eprintln!("{}", commit.notice);
 					self.provider = Some(target.provider);
 					self.model = Some(target.model);
@@ -2927,7 +2964,12 @@ impl RpcSession {
 					gate.queue_mode_persist(persisted.0, persisted.1);
 					gate.queue_config_refresh();
 				},
-				Err(err) => eprintln!("warning: plan-yolo switch failed — {err}"),
+				Err(err) => {
+					let message = format!("plan-yolo switch failed — {err}");
+					eprintln!("warning: {message}");
+					decision.warning = Some(message.clone());
+					self.plan_yolo_commit_error = Some(message);
+				},
 			}
 		}
 		// A cut queued by an earlier turn must not mix with this turn's tail.

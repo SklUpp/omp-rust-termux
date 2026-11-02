@@ -160,6 +160,10 @@ pub struct TurnAckDecision {
 	/// Context budget of the replacement model, when it differs from the one
 	/// the run started with.
 	pub context_limit: Option<usize>,
+	/// Replace the live tool selection before the next provider request.
+	/// `Some(None)` means the full registry; `Some(Some(names))` keeps only
+	/// those internal names. `None` leaves the selection unchanged.
+	pub tool_selection: Option<Option<Vec<String>>>,
 }
 
 impl Default for TurnAckDecision {
@@ -172,6 +176,7 @@ impl Default for TurnAckDecision {
 			scrub_custom_type: None,
 			provider: None,
 			context_limit: None,
+			tool_selection: None,
 		}
 	}
 }
@@ -186,6 +191,7 @@ impl std::fmt::Debug for TurnAckDecision {
 			.field("scrub_custom_type", &self.scrub_custom_type)
 			.field("provider", &self.provider.as_ref().map(|_| "<provider>"))
 			.field("context_limit", &self.context_limit)
+			.field("tool_selection", &self.tool_selection)
 			.finish()
 	}
 }
@@ -846,6 +852,15 @@ impl AgentLoop {
 		apply_turn_decision(messages, rewrite, warning)
 	}
 
+	/// Apply a typed tool-selection replacement at the turn boundary. It
+	/// changes both the schemas and execution immediately, before the next
+	/// provider request in this dialog.
+	fn apply_turn_tools(&self, selection: Option<Option<Vec<String>>>) {
+		if let Some(selection) = selection {
+			self.scheduler.set_selection(selection);
+		}
+	}
+
 	/// Run turns without emitting live events.
 	pub async fn run_dialog(
 		&self,
@@ -989,7 +1004,10 @@ impl AgentLoop {
 			if cancellation_token.is_cancelled() {
 				return Err(AgentError::Interrupted);
 			}
-			let schemas = self.registry.schemas();
+			let active_selection = self.scheduler.selection();
+			let schemas = self
+				.registry
+				.schemas_selected(active_selection.as_deref());
 			// A compliant turn pays zero tool_choice change; only the escalated
 			// turn forces a choice, and only for the single request below. The
 			// policy owns that choice: a staged preview names `write`, while the
@@ -1205,8 +1223,10 @@ impl AgentLoop {
 					scrub_custom_type,
 					provider,
 					context_limit: replacement_context_limit,
+					tool_selection: replacement_tools,
 				} = decision;
 				let _ = self.apply_turn_rewrite(&mut state.messages, rewrite, warning);
+				self.apply_turn_tools(replacement_tools);
 				apply_turn_boundary(
 					&mut state.messages,
 					&mut active_provider,
@@ -1263,8 +1283,10 @@ impl AgentLoop {
 					scrub_custom_type,
 					provider,
 					context_limit: replacement_context_limit,
+					tool_selection: replacement_tools,
 				} = decision;
 				let _ = self.apply_turn_rewrite(&mut state.messages, rewrite, warning);
+				self.apply_turn_tools(replacement_tools);
 				apply_turn_boundary(
 					&mut state.messages,
 					&mut active_provider,
@@ -1315,9 +1337,11 @@ impl AgentLoop {
 					scrub_custom_type,
 					provider,
 					context_limit: replacement_context_limit,
+					tool_selection: replacement_tools,
 				} = decision;
 				let mut continue_turn = continue_turn;
 				continue_turn |= self.apply_turn_rewrite(&mut state.messages, rewrite, warning);
+				self.apply_turn_tools(replacement_tools);
 				apply_turn_boundary(
 					&mut state.messages,
 					&mut active_provider,
@@ -1445,8 +1469,10 @@ impl AgentLoop {
 				scrub_custom_type,
 				provider,
 				context_limit: replacement_context_limit,
+				tool_selection: replacement_tools,
 			} = decision;
 			let _ = self.apply_turn_rewrite(&mut state.messages, rewrite, warning);
+			self.apply_turn_tools(replacement_tools);
 			apply_turn_boundary(
 				&mut state.messages,
 				&mut active_provider,

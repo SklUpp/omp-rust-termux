@@ -230,6 +230,21 @@ impl PlanYoloShared {
 			.is_some()
 	}
 
+	/// Validate that the armed plan generation still owns plan mode before a
+	/// proposal mutates its artifact.
+	fn ensure_current_generation(&self) -> Result<(), String> {
+		let gate = self
+			.gate
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner());
+		if !gate.state.as_ref().is_some_and(|state| state.enabled)
+			|| gate.generation != self.arm_generation.load(Ordering::Acquire)
+		{
+			return Err("plan-yolo plan mode changed before approval".to_string());
+		}
+		Ok(())
+	}
+
 	/// Publish plan mode before the first prompt. Returns the snapshot to pass
 	/// to [`Self::rollback_arm`] if the host's tool-set update fails.
 	///
@@ -556,6 +571,9 @@ impl pi_agent::state::ProposeHandler for PlanYoloProposalHandler {
 			.as_deref()
 			.map(plan::plan_file_url_for_slug)
 			.unwrap_or(state_path);
+		self.shared
+			.ensure_current_generation()
+			.map_err(ToolError::Rejected)?;
 		// `local://` is read-only for the model, so the one inline-content path
 		// goes through the same fd-contained artifact writer as plan mode.
 		if let Some(content) = &proposal.content {
@@ -606,17 +624,13 @@ impl pi_agent::state::ProposeHandler for PlanYoloProposalHandler {
 
 /// Contained `resolveApprovedPlan`: plan content is read through the artifact
 /// fd walk, never through the working tree.
-fn is_truncated_read(error: &str) -> bool {
-	error.contains("refusing to return a truncated read")
-}
-
 fn read_plan_candidate(root: &Path, url: &str) -> Result<Option<String>, String> {
 	let Some(relative) = pi_agent::tools::local_artifact_relative(url) else {
 		return Ok(None);
 	};
 	match pi_agent::tools::read_local_artifact(root, &relative) {
 		Ok(content) => Ok(Some(content)),
-		Err(error) if is_truncated_read(&error) => Err(error),
+		Err(error) if error.is_truncated() => Err(error.to_string()),
 		Err(_) => Ok(None),
 	}
 }
@@ -646,6 +660,9 @@ fn resolve_reviewed_plan(
 		},
 		&|| plan::list_local_plan_files(root),
 	);
+	if resolved.is_ok() {
+		return resolved.map_err(ToolError::Rejected);
+	}
 	if let Some(error) = read_error.into_inner() {
 		return Err(ToolError::Rejected(error));
 	}
@@ -773,6 +790,52 @@ mod tests {
 		let error = resolve_reviewed_plan(&proposal, "local://PLAN.md", &root)
 			.expect_err("oversized plan");
 		assert!(error.to_string().contains("full-text artifact limit"), "{error}");
+		let _ = std::fs::remove_dir_all(root);
+	}
+
+	#[test]
+	fn successful_resolution_ignores_an_unrelated_truncated_candidate() {
+		let root = temp_root("candidate-error");
+		std::fs::write(root.join("PLAN.md"), "# Plan\n\nDo it.\n").expect("valid plan");
+		File::create(root.join("A-plan.md"))
+			.expect("oversized candidate")
+			.set_len(pi_agent::tools::hashline::snapshot::SNAPSHOT_MAX_BYTES as u64 + 1)
+			.expect("candidate size");
+		let proposal = plan::PlanProposal {
+			title:   None,
+			slug:    None,
+			content: None,
+		};
+		let resolved = resolve_reviewed_plan(&proposal, "local://PLAN.md", &root)
+			.expect("the valid plan must win even if an earlier candidate was truncated");
+		assert_eq!(resolved.plan_file_path, "local://PLAN.md");
+		let _ = std::fs::remove_dir_all(root);
+	}
+
+	#[tokio::test]
+	async fn proposal_rejects_a_changed_generation_before_inline_write() {
+		let shared = shared();
+		let _arming = shared.arm().expect("arm");
+		let root = temp_root("stale-generation");
+		{
+			let gate = shared.gate();
+			let mut gate = gate.lock().unwrap();
+			gate.generation = gate.generation.wrapping_add(1);
+		}
+		let handler = PlanYoloProposalHandler {
+			shared:    Arc::clone(&shared),
+			artifacts: Some(root.clone()),
+		};
+		let ctx = AgentContext::new(root.clone());
+		let error = pi_agent::state::ProposeHandler::propose(
+			&handler,
+			r#"{"title":"Plan","content":"# Plan\n"}"#,
+			&ctx,
+		)
+		.await
+		.expect_err("a stale plan generation must reject before writing");
+		assert!(error.to_string().contains("plan mode changed"), "{error}");
+		assert!(!root.join("PLAN.md").exists(), "the inline artifact must not be written");
 		let _ = std::fs::remove_dir_all(root);
 	}
 

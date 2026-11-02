@@ -84,7 +84,7 @@ struct LaunchArgs {
 	plan: Option<String>,
 
 	/// Arm the one-way prewalk switch (wins over `prewalk.enabled`).
-	#[arg(long = "prewalk")]
+	#[arg(long = "prewalk", conflicts_with_all = ["plan_yolo", "plan_yolo_into"])]
 	prewalk: bool,
 
 	/// Disable prewalk even when the settings enable it.
@@ -92,7 +92,11 @@ struct LaunchArgs {
 	no_prewalk: bool,
 
 	/// Model or role to switch to at the first edit/write (default `@smol`).
-	#[arg(long = "prewalk-into", value_name = "MODEL")]
+	#[arg(
+		long = "prewalk-into",
+		value_name = "MODEL",
+		conflicts_with_all = ["plan_yolo", "plan_yolo_into"]
+	)]
 	prewalk_into: Option<String>,
 
 	/// Force read-only plan mode at start, auto-approve the model's plan, then

@@ -1433,15 +1433,16 @@ impl AgentRunner for PiAgentRunner {
 		// user message. This build carries no plan/vibe context, so the goal
 		// context is the last hidden message before the user turn.
 		// TS pre-LLM slot order: plan reference, plan mode, goal mode, then the
-		// user turn. The plan reference keeps the typed identity so later
-		// guidance scrub/replay does not treat it as a generic developer turn.
+		// user turn. This slot is the active `PlanGate::prompt_prefix` context,
+		// which TS types as `plan-mode-context`; the approved pointer's
+		// `plan-mode-reference` identity is applied where that pointer is built.
 		if let Some(context) = request
 			.plan_context
 			.as_deref()
 			.filter(|text| !text.trim().is_empty())
 		{
 			let mut message = pi_agent::Message::developer(context.to_string());
-			message.custom_type = Some("plan-mode-reference".to_string());
+			message.custom_type = Some("plan-mode-context".to_string());
 			messages.push(message);
 		}
 		if let Some(context) = &request.goal_context {

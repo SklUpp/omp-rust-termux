@@ -12,19 +12,43 @@ use crate::state::{AgentContext, ToolApprover, ToolCall, ToolResult};
 pub struct ToolScheduler {
 	registry: ToolRegistry,
 	approver: Option<Arc<dyn ToolApprover>>,
+	/// Session tool selection replaced at a turn boundary. `None` means the
+	/// whole registry; `Some(names)` rejects calls outside the active set.
+	selection: std::sync::Mutex<Option<Vec<String>>>,
 }
 
 impl ToolScheduler {
 	pub fn new(registry: ToolRegistry) -> Self {
-		Self { registry, approver: None }
+		Self { registry, approver: None, selection: std::sync::Mutex::new(None) }
 	}
 
 	pub fn with_approver(registry: ToolRegistry, approver: Arc<dyn ToolApprover>) -> Self {
-		Self { registry, approver: Some(approver) }
+		Self {
+			registry,
+			approver: Some(approver),
+			selection: std::sync::Mutex::new(None),
+		}
 	}
 
 	pub fn approver(&self) -> Option<&Arc<dyn ToolApprover>> {
 		self.approver.as_ref()
+	}
+
+	/// Replace the active selection before the next provider request.
+	pub fn set_selection(&self, selection: Option<Vec<String>>) {
+		*self
+			.selection
+			.lock()
+			.unwrap_or_else(std::sync::PoisonError::into_inner) = selection;
+	}
+
+	#[must_use]
+	pub fn selection(&self) -> Option<Vec<String>> {
+		self
+			.selection
+			.lock()
+			.unwrap_or_else(std::sync::PoisonError::into_inner)
+			.clone()
 	}
 	/// Execute a batch of tool calls:
 	/// - Non-exclusive tools (read, grep, glob) run concurrently.
@@ -58,6 +82,26 @@ impl ToolScheduler {
 	}
 
 	async fn run_single(&self, call: &ToolCall, ctx: &AgentContext) -> ToolResult {
+		let selected = self.selection();
+		let allowed = selected.as_ref().is_none_or(|selected| {
+			selected.iter().any(|name| name == &call.name)
+				|| self
+					.registry
+					.get(&call.name)
+					.is_some_and(|tool| selected.iter().any(|name| name == tool.name()))
+		});
+		if !allowed {
+			return ToolResult {
+				tool_call_id: call.id.clone(),
+				content: format!(
+					"Tool execution denied: {} is not in the active tool selection.",
+					call.name
+				),
+				is_error: true,
+				terminate: false,
+				details: None,
+			};
+		}
 		let Some(tool) = self.registry.get(&call.name) else {
 			// A known-but-excluded tool carries a machine-readable boundary marker
 			// in `details`; unknown names keep the empty diagnostic shape.
@@ -198,6 +242,23 @@ mod tests {
 		let mut registry = ToolRegistry::new();
 		registry.register(Arc::new(BashTool::new()));
 		ToolScheduler::with_approver(registry, approver)
+	}
+
+	#[tokio::test]
+	async fn active_selection_denies_a_removed_tool_before_execution() {
+		let dir = temp_dir("selection");
+		let marker = dir.join("ran");
+		let scheduler = ToolScheduler::new({
+			let mut registry = ToolRegistry::new();
+			registry.register(Arc::new(BashTool::new()));
+			registry
+		});
+		scheduler.set_selection(Some(Vec::new()));
+		let results = scheduler.execute_batch(&bash_call(&marker), &AgentContext::new(dir)).await;
+		assert_eq!(results.len(), 1);
+		assert!(results[0].is_error, "a removed tool must not run");
+		assert!(results[0].content.contains("not in the active tool selection"));
+		assert!(!marker.exists(), "the denied command must not execute");
 	}
 
 	#[tokio::test]

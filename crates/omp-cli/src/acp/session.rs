@@ -409,6 +409,7 @@ impl AcpRuntime {
 			token: token_slot,
 			plan,
 			plan_yolo: plan_yolo.clone(),
+			plan_yolo_armed_mode_sent: AtomicBool::new(false),
 			plan_yolo_mode_sent: AtomicBool::new(false),
 			plan_artifacts,
 			closed: Mutex::new(None),
@@ -424,21 +425,12 @@ impl AcpRuntime {
 			let plan = Arc::clone(&record.plan);
 			let probe_plan = Arc::clone(&plan);
 			let mut session = record.lock();
+			// Ordinary hooks are the standing guard for manual plan mode. The
+			// explicit plan-yolo arm overrides them for its planning turn, and
+			// the turn owner reinstalls them at the one-shot cutover.
+			session.set_plan_mode(record.ordinary_plan_hooks());
 			if let Some(shared) = record.plan_yolo.as_ref() {
 				session.set_plan_yolo(Arc::clone(shared));
-			} else {
-				session.set_plan_mode(crate::agent::PlanModeHooks {
-					guard:   Some(Arc::new(plan::PlanWriteGuard::new(
-						Arc::clone(&plan),
-						record.plan_artifacts.clone(),
-					))),
-					propose: Some(Arc::new(AcpPlanProposalHandler {
-						session: Arc::downgrade(&record),
-					})),
-					policy:  Some(Arc::new(plan::PlanReminderPolicy::new(
-						Arc::clone(&plan),
-					))),
-				});
 			}
 			session.set_plan_mode_probe(Some(Arc::new(move || {
 				probe_plan
@@ -498,6 +490,8 @@ pub struct AcpSession {
 	plan: Arc<Mutex<PlanGate>>,
 	/// Plan-yolo gate/pending shared with RpcSession; `None` when disabled.
 	plan_yolo: Option<Arc<crate::plan_yolo::PlanYoloShared>>,
+	/// One `current_mode_update` when plan-yolo arms the plan phase.
+	plan_yolo_armed_mode_sent: AtomicBool,
 	/// One `current_mode_update` after a plan-yolo switch.
 	plan_yolo_mode_sent: AtomicBool,
 	/// Session `local://` root cached at open: the approval tool runs under the
@@ -592,6 +586,7 @@ impl AcpSession {
 	/// already closed so no frame can leave.
 	pub fn shutdown(&self, reason: &str) {
 		*self.lock_closed() = Some(reason.to_string());
+		self.cancel_plan_pending();
 		self.signal_cancel();
 	}
 
@@ -607,9 +602,36 @@ impl AcpSession {
 		self.plan.lock().unwrap_or_else(PoisonError::into_inner)
 	}
 
+	/// The ordinary ACP plan hooks. They share this session's gate, so a
+	/// manual plan entry after a plan-yolo cutover is guarded by the same
+	/// state and proposes through the client dialog, never plan-yolo's
+	/// auto-approval.
+	fn ordinary_plan_hooks(self: &Arc<Self>) -> crate::agent::PlanModeHooks {
+		crate::agent::PlanModeHooks {
+			guard:   Some(Arc::new(plan::PlanWriteGuard::new(
+				Arc::clone(&self.plan),
+				self.plan_artifacts.clone(),
+			))),
+			propose: Some(Arc::new(AcpPlanProposalHandler {
+				session: Arc::downgrade(self),
+			})),
+			policy:  Some(Arc::new(plan::PlanReminderPolicy::new(Arc::clone(
+				&self.plan,
+			)))),
+		}
+	}
+
+	/// Drop a queued plan-yolo approval. The gate stays in plan mode, so a
+	/// later turn must propose again before any execution switch.
+	fn cancel_plan_pending(&self) {
+		if let Some(shared) = self.plan_yolo.as_ref() {
+			shared.cancel_pending();
+		}
+	}
+
 	/// Apply a mode id: the exclusive TS `mode_change` slot accepts `plan` only
 	/// while no Goal holds it, and every accepted change is persisted.
-	fn apply_mode(&self, mode_id: &str) -> Result<(), RequestError> {
+	fn apply_mode(self: &Arc<Self>, mode_id: &str) -> Result<(), RequestError> {
 		if mode_id == plan::ACP_PLAN_MODE_ID && self.lock().goal.has_goal() {
 			return Err(RequestError::new(
 				INTERNAL_ERROR,
@@ -627,6 +649,15 @@ impl AcpSession {
 			.lock()
 			.append_mode_change(persisted.0, persisted.1)
 			.map_err(|error| RequestError::new(INTERNAL_ERROR, error.to_string()))?;
+		// A plan-yolo turn leaves the session with no plan hooks after its
+		// cutover. A later manual `plan` entry must install the ordinary guard,
+		// proposal and policy again, sharing the same live gate.
+		if mode_id == plan::ACP_PLAN_MODE_ID
+			&& self.plan_yolo.as_ref().is_none_or(|shared| shared.is_completed())
+		{
+			let hooks = self.ordinary_plan_hooks();
+			self.lock().set_plan_mode(hooks);
+		}
 		self.emit_update(json!({
 			"sessionUpdate": "current_mode_update",
 			"currentModeId": self.lock_plan().current_mode_id(),
@@ -635,7 +666,7 @@ impl AcpSession {
 	}
 
 	/// `session/set_mode` and the `mode` config option.
-	pub fn set_mode(&self, mode_id: &str) -> Result<Value, RequestError> {
+	pub fn set_mode(self: &Arc<Self>, mode_id: &str) -> Result<Value, RequestError> {
 		self.apply_mode(mode_id)?;
 		let config = self.config_options();
 		self.emit_update(json!({
@@ -646,7 +677,11 @@ impl AcpSession {
 	}
 
 	/// `session/set_config_option`.
-	pub fn set_config_option(&self, config_id: &str, value: &Value) -> Result<Value, RequestError> {
+	pub fn set_config_option(
+		self: &Arc<Self>,
+		config_id: &str,
+		value: &Value,
+	) -> Result<Value, RequestError> {
 		if value.is_boolean() {
 			return Err(RequestError::new(
 				INTERNAL_ERROR,
@@ -798,7 +833,9 @@ impl AcpSession {
 		}
 		let (text, images) = convert_prompt_blocks(prompt)?;
 		let mut text = text;
-		if self.runtime.recipe.tools_enabled && self.plan_yolo.is_none() {
+		let ordinary_plan = self.runtime.recipe.tools_enabled
+			&& self.plan_yolo.as_ref().is_none_or(|shared| shared.is_completed());
+		if ordinary_plan {
 			// Approved-plan pointer: injected once on the first prompt after
 			// approval, and only when the file is actually readable. A failed
 			// resolution keeps the pointer for a later turn.
@@ -809,21 +846,22 @@ impl AcpSession {
 				text = format!("{}\n\n{text}", plan::plan_reference_message(&reference));
 				self.lock_plan().clear_plan_reference();
 			}
-			// A user prompt owns the next decision: counters and any queued
-			// continuation/required choice are dropped, while the reminder
-			// already persisted at settle stays in history (TS :5748-5756).
-			{
-				let mut gate = self.lock_plan();
-				gate.discard_queued_continuation();
-				plan::reset_reminders(&mut gate.settle);
-			}
-			if let Some(prefix) =
+		}
+		// A user prompt owns the next decision: counters and any queued
+		// continuation/required choice are dropped, while the reminder
+		// already persisted at settle stays in history (TS :5748-5756).
+		{
+			let mut gate = self.lock_plan();
+			gate.discard_queued_continuation();
+			plan::reset_reminders(&mut gate.settle);
+		}
+		if ordinary_plan
+			&& let Some(prefix) =
 				self
 					.lock_plan()
 					.prompt_prefix(self.caps.elicitation_form(), true, true)
-			{
-				text = format!("{prefix}\n\n{text}");
-			}
+		{
+			text = format!("{prefix}\n\n{text}");
 		}
 		let generation = self.gate.begin();
 		if let Err(error) = self.ensure_open() {
@@ -973,12 +1011,24 @@ impl AcpSession {
 					session.execute_turn(text, images)
 				})) {
 					Ok(done) => done,
-					Err(_) => TurnDone {
-						stop_reason: "end_turn".to_string(),
-						usage: None,
-						error: Some(
-							RequestError::internal_error().with_detail("ACP turn worker panicked"),
-						),
+					Err(_) => {
+						session.cancel_plan_pending();
+						if session
+							.plan_yolo
+							.as_ref()
+							.is_some_and(|shared| shared.is_completed())
+						{
+							let hooks = session.ordinary_plan_hooks();
+							session.lock().set_plan_mode(hooks);
+						}
+						TurnDone {
+							stop_reason: "end_turn".to_string(),
+							usage: None,
+							error: Some(
+								RequestError::internal_error()
+									.with_detail("ACP turn worker panicked"),
+							),
+						}
 					},
 				};
 				*session.token.lock().unwrap_or_else(PoisonError::into_inner) = None;
@@ -1038,16 +1088,16 @@ impl AcpSession {
 			});
 	}
 
-	fn execute_turn(&self, text: String, images: Vec<RpcImage>) -> TurnDone {
+	fn execute_turn(self: &Arc<Self>, text: String, images: Vec<RpcImage>) -> TurnDone {
 		self.execute_turn_input(TurnInput { text, images, continuation: false })
 	}
 
-	fn execute_continuation(&self) -> TurnDone {
+	fn execute_continuation(self: &Arc<Self>) -> TurnDone {
 		let reminder = self.lock_plan().take_reminder().unwrap_or_default();
 		self.execute_turn_input(TurnInput { text: reminder, images: Vec::new(), continuation: true })
 	}
 
-	fn execute_turn_input(&self, input: TurnInput) -> TurnDone {
+	fn execute_turn_input(self: &Arc<Self>, input: TurnInput) -> TurnDone {
 		let mut session = self.lock();
 		let (request, mut prepared) = match session.prepare_turn(&input) {
 			Ok(pair) => pair,
@@ -1059,6 +1109,17 @@ impl AcpSession {
 				};
 			},
 		};
+		if self
+			.plan_yolo
+			.as_ref()
+			.is_some_and(|shared| shared.is_armed())
+			&& !self.plan_yolo_armed_mode_sent.swap(true, Ordering::AcqRel)
+		{
+			self.emit_update(json!({
+				"sessionUpdate": "current_mode_update",
+				"currentModeId": self.lock_plan().current_mode_id(),
+			}));
+		}
 		let baseline = stats_tokens(&session.stats());
 		let token = prepared.token.clone();
 		*token_slot(&self.token) = Some(token.clone());
@@ -1126,6 +1187,18 @@ impl AcpSession {
 		let outcome =
 			TurnOutcome { error: stream_error.clone().filter(|_| !cancelled), aborted: cancelled };
 		session.finish_turn(&mut prepared, &outcome);
+		if self
+			.plan_yolo
+			.as_ref()
+			.is_some_and(|shared| shared.is_completed())
+		{
+			// The one-shot cutover cleared the plan hooks in `finish_turn`. Put
+			// the ordinary standing hooks back now, so any later manual plan
+			// entry shares this gate and is guarded without another mode call.
+			let hooks = self.ordinary_plan_hooks();
+			session.set_plan_mode(hooks);
+		}
+		let plan_yolo_error = session.take_plan_yolo_commit_error();
 		// An approval tool cannot append while this thread holds the session
 		// lock, so the queued `mode_change` lands here, before the turn reply.
 		let queued_mode = self.lock_plan().take_mode_persist();
@@ -1194,6 +1267,10 @@ impl AcpSession {
 			error: outcome
 				.error
 				.map(|message| RequestError::new(INTERNAL_ERROR, message))
+				.or_else(|| {
+					plan_yolo_error
+						.map(|message| RequestError::new(INTERNAL_ERROR, message))
+				})
 				.or(plan_error),
 		}
 	}
@@ -1284,6 +1361,7 @@ impl AcpSession {
 	/// Signal and run the close hook. Callers publish the closed marker before
 	/// the gate opens (`claim_close` does it inside its critical section).
 	fn finish_forced_close(&self, reason: &str) {
+		self.cancel_plan_pending();
 		self.signal_cancel();
 		if let Some(hook) = self
 			.on_close
@@ -1298,6 +1376,7 @@ impl AcpSession {
 	/// Close: cancel any prompt, wait the bounded cleanup barrier, mark closed.
 	pub fn close(&self, reason: &str) -> Result<(), RequestError> {
 		*self.lock_closed() = Some(reason.to_string());
+		self.cancel_plan_pending();
 		self.signal_cancel();
 		if !self.gate.wait_idle(CANCEL_CLEANUP_TIMEOUT) {
 			// The worker is still unwinding; release queued prompts so they

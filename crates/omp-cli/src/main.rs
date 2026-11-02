@@ -1988,6 +1988,13 @@ impl Session<'_> {
 				"cannot append to legacy v1 session log: read-only; use import_legacy_v1",
 			));
 		}
+		if hidden_custom_type.is_none()
+			&& let Some(shared) = self.plan_yolo.as_ref()
+		{
+			// A new user decision supersedes any approval left by an aborted
+			// turn; the gate still requires a fresh proposal.
+			shared.cancel_pending();
+		}
 		reporter.begin_turn()?;
 
 		let now_start = std::time::SystemTime::now();
@@ -2681,8 +2688,12 @@ impl Session<'_> {
 						}
 					}
 
-					if !terminal
-						&& let Some(shared) = plan_yolo_shared.clone()
+					if terminal {
+						if let Some(shared) = plan_yolo_shared.as_ref() {
+							shared.cancel_pending();
+						}
+					} else if let Some(shared) = plan_yolo_shared.clone()
+						&& shared.has_pending()
 					{
 						let committed = shared.commit_pending(
 							plan_yolo_artifacts.as_deref(),
@@ -2793,12 +2804,17 @@ impl Session<'_> {
 									),
 								);
 								decision.continue_turn = true;
+								decision.tool_selection = plan_yolo_tools_restore
+									.as_ref()
+									.map(|tools| tools.restore());
 								eprintln!("{}", commit.notice);
 								*plan_yolo_switch =
 									Some((target, switch_thinking, api_key));
 							},
 							Err(err) => {
-								eprintln!("warning: plan-yolo switch failed — {err}");
+								return Err(Error::new(format!(
+									"plan-yolo switch failed — {err}"
+								)));
 							},
 						}
 					}
@@ -2850,6 +2866,9 @@ impl Session<'_> {
 
 		if drive_result.is_err() {
 			cancel_token.cancel();
+			if let Some(shared) = self.plan_yolo.as_ref() {
+				shared.cancel_pending();
+			}
 			for event in stream {
 				if let Ok(event) = event {
 					builder.observe(&event);

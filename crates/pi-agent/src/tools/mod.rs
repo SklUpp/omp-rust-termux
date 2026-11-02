@@ -1339,6 +1339,38 @@ pub(crate) fn validate_artifact_relative(relative: &str) -> Result<(), String> {
 	Ok(())
 }
 
+/// Failure mode of [`read_local_artifact`]. Callers that must distinguish a
+/// deliberately rejected truncated read from a missing/invalid artifact use
+/// the variant instead of matching display text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArtifactReadError {
+	Truncated(String),
+	Invalid(String),
+}
+
+impl ArtifactReadError {
+	#[must_use]
+	pub fn is_truncated(&self) -> bool {
+		matches!(self, Self::Truncated(_))
+	}
+}
+
+impl std::fmt::Display for ArtifactReadError {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			Self::Truncated(message) | Self::Invalid(message) => f.write_str(message),
+		}
+	}
+}
+
+impl std::error::Error for ArtifactReadError {}
+
+impl From<ArtifactReadError> for String {
+	fn from(error: ArtifactReadError) -> Self {
+		error.to_string()
+	}
+}
+
 /// Contained UTF-8 read of one artifact, for hosts that resolve a `local:`
 /// URL outside the read tool.
 ///
@@ -1346,17 +1378,23 @@ pub(crate) fn validate_artifact_relative(relative: &str) -> Result<(), String> {
 /// [`hashline::snapshot::SNAPSHOT_MAX_BYTES`] plus one sentinel byte, so a
 /// truncated or ambiguous read is rejected before UTF-8 decoding. Approval
 /// consumers must never compare a capped prefix as if it were the artifact.
-pub fn read_local_artifact(root: &Path, relative: &str) -> Result<String, String> {
-	validate_artifact_relative(relative)?;
-	let (bytes, size) = internal_urls::read_contained(root, relative)?;
+pub fn read_local_artifact(
+	root: &Path,
+	relative: &str,
+) -> Result<String, ArtifactReadError> {
+	validate_artifact_relative(relative).map_err(ArtifactReadError::Invalid)?;
+	let (bytes, size) =
+		internal_urls::read_contained(root, relative).map_err(ArtifactReadError::Invalid)?;
 	let limit = hashline::snapshot::SNAPSHOT_MAX_BYTES as u64;
 	let read = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
 	if size > read || size > limit || read > limit {
-		return Err(format!(
+		return Err(ArtifactReadError::Truncated(format!(
 			"local://{relative} is {size} bytes and exceeds the {limit} byte full-text artifact limit; refusing to return a truncated read"
-		));
+		)));
 	}
-	String::from_utf8(bytes).map_err(|_| format!("local://{relative} is not UTF-8 text"))
+	String::from_utf8(bytes).map_err(|_| {
+		ArtifactReadError::Invalid(format!("local://{relative} is not UTF-8 text"))
+	})
 }
 
 /// Validated relative path of a `local://<path>` target. Traversal, empty
@@ -3925,7 +3963,8 @@ mod plan_mode_tool_tests {
 			.set_len(limit + 1)
 			.expect("capped size");
 		let error = read_local_artifact(&artifacts, "capped.md").expect_err("cap sentinel");
-		assert!(error.contains("refusing to return a truncated read"), "{error}");
+		assert!(error.is_truncated(), "{error}");
+		assert!(error.to_string().contains("refusing to return a truncated read"), "{error}");
 
 		// Original metadata size beyond the bytes returned (and beyond the cap):
 		// this is the actual truncated-prefix case.
@@ -3935,7 +3974,7 @@ mod plan_mode_tool_tests {
 			.set_len(limit + 2)
 			.expect("truncated size");
 		let error = read_local_artifact(&artifacts, "truncated.md").expect_err("truncated");
-		assert!(error.contains("refusing to return a truncated read"), "{error}");
+		assert!(error.is_truncated(), "{error}");
 		let _ = std::fs::remove_dir_all(cwd);
 	}
 

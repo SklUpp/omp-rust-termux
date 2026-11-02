@@ -57,6 +57,11 @@ class Provider:
         self.tool_result_text = "tool done"
         self.plan_yolo_root = False
         self.plan_yolo_target = False
+        # Plan-yolo abort fixture: after the proposal tool result, hold the
+        # next request until the client cancels and releases this event.
+        self.hang_after_proposal = False
+        self.proposal_waiting = threading.Event()
+        self.release_proposal = threading.Event()
         self.continuation_started = threading.Event()
         self.lock = threading.Lock()
         provider = self
@@ -118,6 +123,29 @@ class Provider:
             payload["choices"] = [{"index": 0, "delta": delta, "finish_reason": finish}]
             return "data: " + json.dumps(payload)
 
+        if "MANUAL_PLAN" in last_user and not tool_after_user:
+            yield chunk(
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "index": 0,
+                            "id": "call_manual_blocked",
+                            "type": "function",
+                            "function": {
+                                "name": "write",
+                                "arguments": json.dumps(
+                                    {"path": "manual-blocked.txt", "content": "must not land"}
+                                ),
+                            },
+                        }
+                    ],
+                }
+            )
+            yield chunk({}, "tool_calls")
+            yield "data: [DONE]"
+            return
+
         if self.plan_yolo_root and "PLAN_YOLO" in last_user:
             tool_results = 0
             for message in messages:
@@ -166,6 +194,13 @@ class Provider:
                     "write",
                     {"path": "xd://propose", "content": "Plan"},
                 )
+                return
+            if tool_results == 3 and self.hang_after_proposal:
+                self.proposal_waiting.set()
+                self.release_proposal.wait(PROMPT_TIMEOUT)
+                yield chunk({"role": "assistant", "content": "after aborted proposal"})
+                yield chunk({}, "stop")
+                yield "data: [DONE]"
                 return
 
         if self.plan_yolo_target and self.requests == 1:
@@ -856,9 +891,20 @@ def run_plan_yolo(binary: str) -> None:
                    for line in client.stderr), (
             f"missing plan-yolo notice; stderr={client.stderr[-10:]!r}"
         )
+        assert not any("plan-yolo switch failed" in line for line in client.stderr), (
+            f"a completed switch must not warn; stderr={client.stderr[-10:]!r}"
+        )
         updates = client.updates_since(mark, session_id)
-        assert any(update.get("sessionUpdate") == "current_mode_update" for update in updates), (
-            "plan-yolo mode change must be announced"
+        mode_updates = [
+            update
+            for update in updates
+            if update.get("sessionUpdate") == "current_mode_update"
+        ]
+        assert any(update.get("currentModeId") == "plan" for update in mode_updates), (
+            "the armed plan-yolo phase must be announced"
+        )
+        assert any(update.get("currentModeId") == "default" for update in mode_updates), (
+            "the cutover must publish the default mode"
         )
         chunks = [u for u in updates if u.get("sessionUpdate") == "agent_message_chunk"]
         assert "hello from target" in chunk_text(chunks), chunk_text(chunks)
@@ -871,6 +917,70 @@ def run_plan_yolo(binary: str) -> None:
         assert_eq(follow["stopReason"], "end_turn", "post-plan stop reason")
         assert_eq(target_provider.requests, 3, "target keeps serving the session")
         assert_eq(root_provider.requests, 3, "root provider stays at three requests")
+
+        # After the one-shot cutover, a client-selected manual plan must install
+        # the ordinary guard again: the working-tree write is denied.
+        client.request("session/set_mode", {"sessionId": session_id, "modeId": "plan"})
+        manual = client.request(
+            "session/prompt",
+            {"sessionId": session_id, "prompt": [{"type": "text", "text": "MANUAL_PLAN"}]},
+            PROMPT_TIMEOUT,
+        )
+        assert_eq(manual["stopReason"], "end_turn", "manual plan stop reason")
+        assert not (client.cwd / "manual-blocked.txt").exists(), (
+            "a post-cutover manual plan must be write-guarded"
+        )
+        assert_eq(target_provider.requests, 5, "manual plan ran on the target route")
+        assert_eq(root_provider.requests, 3, "root provider stays at three requests")
+
+        # Abort after a valid proposal: the pending approval must not survive
+        # into the next user prompt or auto-switch the session.
+        abort_session = client.request("session/new", {"cwd": cwd, "mcpServers": []})[
+            "sessionId"
+        ]
+        root_provider.hang_after_proposal = True
+        root_provider.proposal_waiting.clear()
+        root_provider.release_proposal.clear()
+        request_id = client.next_id
+        client.next_id += 1
+        client.send(
+            {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": "session/prompt",
+                "params": {
+                    "sessionId": abort_session,
+                    "prompt": [{"type": "text", "text": "PLAN_YOLO abort"}],
+                },
+            }
+        )
+        assert root_provider.proposal_waiting.wait(PROMPT_TIMEOUT), (
+            f"proposal never reached the provider; stderr={client.stderr[-8:]!r}"
+        )
+        client.notify("session/cancel", {"sessionId": abort_session})
+        root_provider.release_proposal.set()
+        cancelled = client.wait_frame(
+            lambda f: f.get("id") == request_id and ("result" in f or "error" in f),
+            PROMPT_TIMEOUT,
+        )
+        assert_eq(
+            cancelled.get("result", {}).get("stopReason"),
+            "cancelled",
+            "aborted plan-yolo proposal stop reason",
+        )
+        root_provider.hang_after_proposal = False
+        target_before = target_provider.requests
+        after_abort = client.request(
+            "session/prompt",
+            {"sessionId": abort_session, "prompt": [{"type": "text", "text": "NEXT"}]},
+            PROMPT_TIMEOUT,
+        )
+        assert_eq(after_abort["stopReason"], "end_turn", "post-abort prompt")
+        assert_eq(
+            target_provider.requests,
+            target_before,
+            "an aborted approval must not auto-switch on the next prompt",
+        )
 
         client.close_stdin()
         code = client.wait_exit(10.0)

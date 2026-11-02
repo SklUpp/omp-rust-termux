@@ -316,6 +316,11 @@ impl PlanGate {
 		if mode_id != ACP_PLAN_MODE_ID || !self.enabled {
 			return Err(format!("Unsupported ACP mode: {mode_id}"));
 		}
+		if self.state.as_ref().is_some_and(|state| state.enabled) {
+			// Re-asserting the advertised plan mode is a no-op: it must not
+			// rotate the generation under an already armed plan-yolo approval.
+			return Ok(());
+		}
 		self.state = Some(AcpPlanState::enter(self.state.as_ref()));
 		reset_reminders(&mut self.settle);
 		self.pending_reminder = None;
@@ -1208,6 +1213,17 @@ mod tests {
 		assert_eq!(parsed.slug.as_deref(), Some("auth"));
 		assert_eq!(parsed.content.as_deref(), Some("# Plan\n"));
 		assert_eq!(parse_plan_proposal("   "), PlanProposal::default());
+	}
+
+	#[test]
+	fn repeated_plan_mode_keeps_the_approval_generation() {
+		let mut gate = PlanGate::new(true);
+		gate.set_mode(ACP_PLAN_MODE_ID).expect("enter plan mode");
+		let generation = gate.generation;
+		gate.set_mode(ACP_PLAN_MODE_ID).expect("re-enter plan mode");
+		assert_eq!(gate.generation, generation, "plan entry must be idempotent");
+		gate.set_mode(ACP_DEFAULT_MODE_ID).expect("leave plan mode");
+		assert_ne!(gate.generation, generation, "leaving plan mode invalidates it");
 	}
 
 	#[test]

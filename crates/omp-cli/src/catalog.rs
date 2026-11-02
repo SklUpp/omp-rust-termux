@@ -47,6 +47,24 @@ pub struct ModelInfo {
 	/// (`input`/`output`/`cacheRead`/`cacheWrite`, missing ones `0`); extra
 	/// keys such as `longContext` are preserved for `--json`.
 	pub cost:            Option<serde_json::Value>,
+	/// Per-model wire dialect (`api`), as authored. `None` inherits the
+	/// connection's `api`; a provider-level `api` never masks a declared
+	/// per-model one (TS `modelDef.api ?? providerApi`).
+	pub api:             Option<String>,
+	/// Per-model `baseUrl`, as authored. `None` inherits the connection's
+	/// `baseUrl`; consumers resolve that fallback, the loader does not.
+	pub base_url:        Option<String>,
+	/// Sparse `compat` block resolved for this model: the provider-level
+	/// block is the base and the model's own keys win (`models.yml` models,
+	/// TS `mergeCompat(providerCompat, modelDef.compat)`). Bundled
+	/// `models.json` rows are materialized, so a `models.yml` provider block
+	/// overrides them key by key instead (TS `#loadBuiltInModels`). Kept as
+	/// `serde_json::Value` so dialect keys this binary does not model survive.
+	pub compat:          Option<serde_json::Value>,
+	/// Authored `thinking` block preserved verbatim (`mode`, `efforts`,
+	/// `maxTokens`, `effortMap`, ...); `efforts` above is its listing subset.
+	/// No provider-level fallback: TS inherits thinking from the model only.
+	pub thinking:        Option<serde_json::Value>,
 	/// TS `compat.supportsUsageInStreaming` override for this model
 	/// (`models.json`/`models.yml`). `None` means the model declares nothing,
 	/// so the provider-level default applies (`!isCerebras`, as
@@ -75,15 +93,67 @@ struct ModelEntry {
 	#[serde(default)]
 	cost: Option<serde_json::Value>,
 	#[serde(default)]
-	compat: Option<CompatEntry>,
+	api: Option<String>,
+	#[serde(default, rename = "baseUrl")]
+	base_url: Option<String>,
+	#[serde(default)]
+	compat: Option<serde_json::Value>,
 }
 
-/// Sparse TS `ModelSpec.compat` block; only the keys the runtime consumes are
-/// typed, everything else in the block is ignored.
-#[derive(Deserialize)]
-struct CompatEntry {
-	#[serde(default, rename = "supportsUsageInStreaming")]
-	supports_usage_in_streaming: Option<bool>,
+/// Boolean key from a sparse `compat` block; non-object or non-bool → `None`.
+fn compat_bool(compat: Option<&serde_json::Value>, key: &str) -> Option<bool> {
+	compat?.get(key)?.as_bool()
+}
+
+/// TS `mergeCompat`: objects merge key by key (recursively for nested
+/// records), the override wins everywhere else. A non-object block keeps only
+/// the override, matching the TS spread of a non-record base.
+fn merge_compat(
+	base: Option<&serde_json::Value>,
+	over: Option<&serde_json::Value>,
+) -> Option<serde_json::Value> {
+	match (base, over) {
+		(None, over) => over.cloned(),
+		(base, None) => base.cloned(),
+		(Some(base), Some(over)) => Some(merge_compat_value(base, over)),
+	}
+}
+
+fn merge_compat_value(base: &serde_json::Value, over: &serde_json::Value) -> serde_json::Value {
+	let (serde_json::Value::Object(base), serde_json::Value::Object(over)) = (base, over) else {
+		return over.clone();
+	};
+	let mut merged = base.clone();
+	for (key, value) in over {
+		let next = match merged.get(key) {
+			Some(existing) if existing.is_object() && value.is_object() => {
+				merge_compat_value(existing, value)
+			},
+			_ => value.clone(),
+		};
+		merged.insert(key.clone(), next);
+	}
+	serde_json::Value::Object(merged)
+}
+
+/// Bundled `models.json` rows are materialized, so a `models.yml` provider
+/// block acts as a user override: its keys win over the row's own compat
+/// (TS `#loadBuiltInModels` `mergeCompat(model.compatConfig,
+/// providerOverride.compat)`). Per-model `api`/`baseUrl` are untouched.
+fn apply_provider_compat(
+	providers: &mut BTreeMap<String, BTreeMap<String, ModelInfo>>,
+	provider_compat: &BTreeMap<String, serde_json::Value>,
+) {
+	for (provider_id, models) in providers {
+		let Some(over) = provider_compat.get(provider_id) else {
+			continue;
+		};
+		for info in models.values_mut() {
+			info.compat = merge_compat(info.compat.as_ref(), Some(over));
+			info.supports_usage_in_streaming =
+				compat_bool(info.compat.as_ref(), "supportsUsageInStreaming");
+		}
+	}
 }
 
 /// `thinking.efforts` from a catalog `thinking` block; `true`-only or absent
@@ -140,15 +210,18 @@ impl Catalog {
 	/// `models.json`, `models.yml` providers are the model source.
 	pub fn load_from(json_paths: &[PathBuf], yml_path: &Path) -> Result<Self> {
 		let mut connections = BTreeMap::new();
+		let mut provider_compat = BTreeMap::new();
 		let mut yml_providers = None;
 		if yml_path.is_file() {
-			let (providers, parsed) = yml_sections(yml_path)?;
+			let (providers, parsed, compat) = yml_sections(yml_path)?;
 			connections = parsed;
+			provider_compat = compat;
 			yml_providers = Some((providers, yml_path.to_path_buf()));
 		}
 		if let Some(path) = json_paths.iter().find(|path| path.is_file()) {
 			let mut catalog = Self::from_json(path)?;
 			catalog.connections = connections;
+			apply_provider_compat(&mut catalog.providers, &provider_compat);
 			if let Some((providers, _)) = yml_providers {
 				for (provider_id, models) in providers {
 					catalog.providers.entry(provider_id).or_insert(models);
@@ -183,6 +256,9 @@ impl Catalog {
 					.context_window
 					.and_then(|window| usize::try_from(window).ok())
 					.filter(|window| *window > 0);
+				let thinking = entry.thinking;
+				let supports_usage_in_streaming =
+					compat_bool(entry.compat.as_ref(), "supportsUsageInStreaming");
 				entries.insert(
 					id,
 					ModelInfo {
@@ -192,11 +268,13 @@ impl Catalog {
 						name: entry.name,
 						max_tokens: entry.max_tokens,
 						reasoning: entry.reasoning,
-						efforts: thinking_efforts(entry.thinking),
+						efforts: thinking_efforts(thinking.clone()),
 						cost: normalize_cost(entry.cost),
-						supports_usage_in_streaming: entry
-							.compat
-							.and_then(|compat| compat.supports_usage_in_streaming),
+						api: entry.api,
+						base_url: entry.base_url,
+						compat: entry.compat,
+						thinking,
+						supports_usage_in_streaming,
 					},
 				);
 			}
@@ -225,13 +303,18 @@ fn normalize_cost(cost: Option<serde_json::Value>) -> Option<serde_json::Value> 
 /// Parse `models.yml`: provider model lists plus connection blocks.
 fn yml_sections(
 	path: &Path,
-) -> Result<(BTreeMap<String, BTreeMap<String, ModelInfo>>, BTreeMap<String, ProviderConfig>)> {
+) -> Result<(
+	BTreeMap<String, BTreeMap<String, ModelInfo>>,
+	BTreeMap<String, ProviderConfig>,
+	BTreeMap<String, serde_json::Value>,
+)> {
 	let text = fs::read_to_string(path)
 		.map_err(|err| Error::with_source(format!("cannot read {}", path.display()), err))?;
 	let value =
 		yaml::parse(&text).map_err(|err| Error::new(format!("{}: {err}", path.display())))?;
 	let mut providers = BTreeMap::new();
 	let mut connections = BTreeMap::new();
+	let mut provider_compat_by_id = BTreeMap::new();
 	if let Some(section) = value.get("providers") {
 		let Some(pairs) = section.as_map() else {
 			return Err(Error::new(format!("{}: `providers` must be a mapping", path.display())));
@@ -239,11 +322,12 @@ fn yml_sections(
 		for (id, provider) in pairs {
 			connections.insert(id.clone(), config::parse_provider(provider, id, path)?);
 			// Provider-level `compat` is a default for every model below it;
-			// a model-level `compat` wins (TS `mergeCompat`).
-			let provider_usage_in_streaming = provider
-				.get("compat")
-				.and_then(|compat| compat.get("supportsUsageInStreaming"))
-				.and_then(yaml::Value::as_bool);
+			// a model-level key wins (TS `mergeCompat(providerCompat,
+			// modelDef.compat)`), and never masks a per-model `api`/`baseUrl`.
+			let provider_compat = provider.get("compat").map(yaml_json);
+			if let Some(compat) = &provider_compat {
+				provider_compat_by_id.insert(id.clone(), compat.clone());
+			}
 			let mut models = BTreeMap::new();
 			if let Some(list) = provider.get("models") {
 				let Some(items) = list.as_list() else {
@@ -267,15 +351,9 @@ fn yml_sections(
 									.filter_map(yaml::Value::to_text)
 									.collect()
 							});
-						let efforts = item
-							.get("thinking")
-							.and_then(|thinking| thinking.get("efforts"))
-							.and_then(yaml::Value::as_list)
-							.map(|list| {
-								list.iter()
-									.filter_map(yaml::Value::to_text)
-									.collect()
-							});
+						let thinking = item.get("thinking").map(yaml_json);
+						let model_compat = item.get("compat").map(yaml_json);
+						let compat = merge_compat(provider_compat.as_ref(), model_compat.as_ref());
 						models.insert(
 							model_id.to_string(),
 							ModelInfo {
@@ -291,13 +369,16 @@ fn yml_sections(
 									.get("reasoning")
 									.and_then(yaml::Value::as_bool)
 									.unwrap_or(false),
-								efforts,
+								efforts: thinking_efforts(thinking.clone()),
 								cost: yml_cost(item),
-								supports_usage_in_streaming: item
-									.get("compat")
-									.and_then(|compat| compat.get("supportsUsageInStreaming"))
-									.and_then(yaml::Value::as_bool)
-									.or(provider_usage_in_streaming),
+								api: item.get("api").and_then(yaml::Value::to_text),
+								base_url: item.get("baseUrl").and_then(yaml::Value::to_text),
+								supports_usage_in_streaming: compat_bool(
+									compat.as_ref(),
+									"supportsUsageInStreaming",
+								),
+								compat,
+								thinking,
 							},
 						);
 					}
@@ -306,7 +387,26 @@ fn yml_sections(
 			providers.insert(id.clone(), models);
 		}
 	}
-	Ok((providers, connections))
+	Ok((providers, connections, provider_compat_by_id))
+}
+
+/// `models.yml` value as JSON, so authored metadata shares one
+/// representation with the bundled `models.json` rows.
+fn yaml_json(value: &yaml::Value) -> serde_json::Value {
+	match value {
+		yaml::Value::Null => serde_json::Value::Null,
+		yaml::Value::Bool(value) => serde_json::Value::Bool(*value),
+		yaml::Value::Int(value) => serde_json::Value::from(*value),
+		yaml::Value::Float(value) => serde_json::Value::from(*value),
+		yaml::Value::Str(value) => serde_json::Value::String(value.clone()),
+		yaml::Value::List(items) => serde_json::Value::Array(items.iter().map(yaml_json).collect()),
+		yaml::Value::Map(pairs) => serde_json::Value::Object(
+			pairs
+				.iter()
+				.map(|(key, value)| (key.clone(), yaml_json(value)))
+				.collect(),
+		),
+	}
 }
 
 /// Numeric YAML scalar as `f64`.
@@ -399,6 +499,43 @@ impl Catalog {
 			.get(model)?
 			.supports_usage_in_streaming
 	}
+
+	/// Declared per-model wire dialect (`api`), without the connection
+	/// fallback: a provider-level `api` never masks a model that names one.
+	#[must_use]
+	pub fn model_api(&self, provider: &str, model: &str) -> Option<&str> {
+		self.providers.get(provider)?.get(model)?.api.as_deref()
+	}
+
+	/// Declared per-model `baseUrl`, without the connection fallback.
+	#[must_use]
+	pub fn model_base_url(&self, provider: &str, model: &str) -> Option<&str> {
+		self
+			.providers
+			.get(provider)?
+			.get(model)?
+			.base_url
+			.as_deref()
+	}
+
+	/// Sparse `compat` block resolved for this model, provider default and
+	/// model keys already merged (precedence in [`ModelInfo::compat`]).
+	#[must_use]
+	pub fn model_compat(&self, provider: &str, model: &str) -> Option<&serde_json::Value> {
+		self.providers.get(provider)?.get(model)?.compat.as_ref()
+	}
+
+	/// Authored `thinking` block, verbatim.
+	#[must_use]
+	pub fn model_thinking(&self, provider: &str, model: &str) -> Option<&serde_json::Value> {
+		self
+			.providers
+			.get(provider)?
+			.get(model)?
+			.thinking
+			.as_ref()
+	}
+
 	pub fn model_count(&self) -> usize {
 		self.providers.values().map(BTreeMap::len).sum()
 	}

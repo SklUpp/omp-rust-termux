@@ -621,7 +621,7 @@ fn setup_same_provider_two_endpoints(
 	fs::write(
 		agent_dir.join("models.yml"),
 		format!(
-			"providers:\n  mockA:\n    api: openai-completions\n    apiKey: target-key\n    models:\n      - id: model-a\n        contextWindow: 128000\n        baseUrl: \"http://127.0.0.1:{a_port}/v1\"\n      - id: model-b\n        contextWindow: 128000\n        baseUrl: \"http://127.0.0.1:{b_port}/v1\"\n        reasoning: true\n        thinking:\n          efforts: [\"low\", \"high\"]\n          defaultLevel: max\n"
+			"providers:\n  mockA:\n    api: openai-completions\n    apiKey: target-key\n    models:\n      - id: model-a\n        contextWindow: 128000\n        baseUrl: \"http://127.0.0.1:{a_port}/v1\"\n      - id: model-b\n        contextWindow: 128000\n        baseUrl: \"http://127.0.0.1:{b_port}/v1\"\n        reasoning: true\n        thinking:\n          efforts: [\"low\", \"high\"]\n          defaultLevel: max\n      - id: model-c\n        contextWindow: 128000\n        baseUrl: \"http://127.0.0.1:{b_port}/v1\"\n        reasoning: true\n        thinking:\n          efforts: [\"low\", \"high\"]\n          defaultLevel: auto\n"
 		),
 	)
 	.expect("models.yml");
@@ -1092,6 +1092,72 @@ fn prewalk_explicit_suffix_overrides_the_target_default_level() {
 	a.stop();
 	b.stop();
 	fs::remove_dir_all(base).ok();
+}
+
+/// `defaultLevel: auto` must enter the same auto state and produce the same
+/// request shape as an explicit `:auto` suffix (no fixed effort).
+#[test]
+fn prewalk_default_auto_matches_explicit_auto() {
+	let run_target = |target: &str| -> (serde_json::Value, String) {
+		let a = MockWireServer::start(vec![tool_sse(&[(
+			"call-write",
+			"write",
+			serde_json::json!({"path": ".", "content": "x"}),
+		)])]);
+		let b = MockWireServer::start(vec![text_sse("auto endpoint")]);
+		let base = temp_dir("prewalk-auto");
+		let (agent_dir, cwd, sessions) =
+			setup_same_provider_two_endpoints(&base, a.port, b.port);
+		let run_out = run(
+			omp(&agent_dir, &cwd, &sessions).args([
+				"--yolo",
+				"--tools",
+				"write,read",
+				"--prewalk-into",
+				target,
+				"--session-id",
+				"prewalk-auto",
+				"-p",
+				"write now",
+			]),
+		);
+		assert!(
+			run_out.status.success(),
+			"auto run failed for {target}: {}",
+			String::from_utf8_lossy(&run_out.stderr)
+		);
+		assert_eq!(b.request_count(), 1, "target request for {target}");
+		let body = b.request(0);
+		let stderr = String::from_utf8_lossy(&run_out.stderr).to_string();
+		a.stop();
+		b.stop();
+		fs::remove_dir_all(base).ok();
+		(body, stderr)
+	};
+
+	let (default_body, default_stderr) = run_target("mockA/model-c");
+	let (explicit_body, explicit_stderr) = run_target("mockA/model-c:auto");
+	assert!(
+		default_stderr.contains("Prewalk: switched"),
+		"{default_stderr}"
+	);
+	assert!(
+		explicit_stderr.contains("Prewalk: switched"),
+		"{explicit_stderr}"
+	);
+	assert_eq!(default_body["model"], explicit_body["model"]);
+	assert_eq!(
+		default_body["messages"], explicit_body["messages"],
+		"default auto and explicit auto must carry the same conversation"
+	);
+	assert!(
+		default_body.get("reasoning_effort").is_none(),
+		"auto is not a fixed effort: {default_body}"
+	);
+	assert!(
+		explicit_body.get("reasoning_effort").is_none(),
+		"explicit auto is not a fixed effort: {explicit_body}"
+	);
 }
 
 /// The action check keys on the tool, not its success flag. A write that fails

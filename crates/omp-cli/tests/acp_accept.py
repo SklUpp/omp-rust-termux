@@ -16,7 +16,9 @@ Covered: initialize + advertised capabilities, new/list/load/resume/fork/close,
 set_mode plan/default, set_config_option thinking, prompt block fallbacks,
 permission reverse request + `allow_always` persistence, cancel notification,
 detached plan continuation cancel (cooperative release only, not the 5s forced
-close), malformed-line recovery, unknown method, EOF cleanup.
+close), settings-derived prewalk switch after the first mutation (target route
+persists for the session scope), malformed-line recovery, unknown method, EOF
+cleanup.
 """
 
 from __future__ import annotations
@@ -133,6 +135,29 @@ class Provider:
             yield "data: [DONE]"
             return
 
+        if "PREWALK" in last_user:
+            yield chunk(
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "index": 0,
+                            "id": "call_prewalk_write",
+                            "type": "function",
+                            "function": {
+                                "name": "write",
+                                "arguments": json.dumps(
+                                    {"path": "probe.txt", "content": "switched"}
+                                ),
+                            },
+                        }
+                    ],
+                }
+            )
+            yield chunk({}, "tool_calls")
+            yield "data: [DONE]"
+            return
+
         if "PERMISSION" in last_user:
             yield chunk(
                 {
@@ -172,7 +197,13 @@ def text_of(content):
 
 
 class Client:
-    def __init__(self, binary: str, root: Path, provider: Provider) -> None:
+    def __init__(
+        self,
+        binary: str,
+        root: Path,
+        provider: Provider,
+        prewalk_target: Provider | None = None,
+    ) -> None:
         self.config = root / "config"
         self.data = root / "data"
         self.state = root / "state"
@@ -180,20 +211,15 @@ class Client:
         self.agent_dir = self.config / "agent"
         for path in (self.config, self.agent_dir, self.data, self.state, self.tmp):
             path.mkdir(parents=True, exist_ok=True)
-        (self.agent_dir / "config.yml").write_text(
+        config_text = (
             "defaultModel: mock/mock-model\n"
             "providers:\n"
             "  mock:\n"
             f"    baseUrl: \"{provider.base_url}\"\n"
             "    api: openai-completions\n"
-            "    apiKey: test-key\n",
-            encoding="utf-8",
+            "    apiKey: test-key\n"
         )
-        (self.agent_dir / "models.json").write_text(
-            '{"mock":{"mock-model":{"id":"mock-model","provider":"mock","contextWindow":128000}}}\n',
-            encoding="utf-8",
-        )
-        (self.agent_dir / "models.yml").write_text(
+        models_text = (
             "providers:\n"
             "  mock:\n"
             f"    baseUrl: \"{provider.base_url}\"\n"
@@ -201,9 +227,36 @@ class Client:
             "    apiKey: test-key\n"
             "    models:\n"
             "      - id: mock-model\n"
-            "        contextWindow: 128000\n",
+            "        contextWindow: 128000\n"
+        )
+        if prewalk_target is not None:
+            # A provider-level baseUrl would override the per-model endpoints;
+            # leave routing to models.yml so root and target stay separate.
+            config_text = config_text.replace(
+                f"    baseUrl: \"{provider.base_url}\"\n", ""
+            )
+            # Fresh ACP sessions carry the settings-derived prewalk arm; the
+            # restricted tool selection opens the gate before a todo call, and
+            # yolo avoids a permission round-trip for the write mutation.
+            config_text += (
+                "prewalk:\n"
+                "  enabled: true\n"
+                "modelRoles:\n"
+                "  smol: mock/model-b\n"
+                "tools: [write, read]\n"
+                "approvalMode: yolo\n"
+            )
+            models_text += (
+                "      - id: model-b\n"
+                "        contextWindow: 128000\n"
+                f"        baseUrl: \"{prewalk_target.base_url}\"\n"
+            )
+        (self.agent_dir / "config.yml").write_text(config_text, encoding="utf-8")
+        (self.agent_dir / "models.json").write_text(
+            '{"mock":{"mock-model":{"id":"mock-model","provider":"mock","contextWindow":128000}}}\n',
             encoding="utf-8",
         )
+        (self.agent_dir / "models.yml").write_text(models_text, encoding="utf-8")
         env = dict(os.environ)
         env.update(
             PI_CONFIG_DIR=str(self.config),
@@ -628,6 +681,57 @@ def run(binary: str) -> None:
         print(f"acp_accept artifacts retained at: {root}")
 
 
+def run_prewalk(binary: str) -> None:
+    """ACP + settings-derived prewalk: switch after the first mutation and keep
+    the new route for the session scope while the root provider is untouched."""
+    root = Path(tempfile.mkdtemp(prefix="acp-prewalk."))
+    root_provider = Provider()
+    target_provider = Provider()
+    root_provider.start()
+    target_provider.start()
+    client = Client(binary, root, root_provider, prewalk_target=target_provider)
+    try:
+        client.request("initialize", {"protocolVersion": 1, "clientCapabilities": {}})
+        cwd = str(client.cwd)
+        created = client.request("session/new", {"cwd": cwd, "mcpServers": []})
+        session_id = created["sessionId"]
+        mark = client.mark()
+        response = client.request(
+            "session/prompt",
+            {"sessionId": session_id, "prompt": [{"type": "text", "text": "PREWALK mutate"}]},
+            PROMPT_TIMEOUT,
+        )
+        assert_eq(response["stopReason"], "end_turn", "prewalk stop reason")
+        assert_eq(root_provider.requests, 1, "root provider request count")
+        assert_eq(target_provider.requests, 1, "target provider request count")
+        updates = client.updates_since(mark, session_id)
+        chunks = [u for u in updates if u.get("sessionUpdate") == "agent_message_chunk"]
+        assert_eq(chunk_text(chunks), "hello from mock", "target provider response")
+        assert any("Prewalk: switched to mock/model-b" in line for line in client.stderr), (
+            f"missing switch notice; stderr={client.stderr[-10:]!r}"
+        )
+
+        # The switch lives in the session scope: the next prompt keeps using the
+        # target endpoint, and the root provider is never contacted again.
+        follow = client.request(
+            "session/prompt",
+            {"sessionId": session_id, "prompt": [{"type": "text", "text": "follow up"}]},
+            PROMPT_TIMEOUT,
+        )
+        assert_eq(follow["stopReason"], "end_turn", "post-switch stop reason")
+        assert_eq(target_provider.requests, 2, "target keeps serving the session")
+        assert_eq(root_provider.requests, 1, "root provider stays at one request")
+
+        client.close_stdin()
+        code = client.wait_exit(10.0)
+        assert code is not None, f"ACP did not exit; stderr={client.stderr[-20:]!r}"
+    finally:
+        client.kill()
+        root_provider.stop()
+        target_provider.stop()
+        print(f"acp_prewalk artifacts retained at: {root}")
+
+
 def chunk_text(chunks):
     parts = []
     for update in chunks:
@@ -645,6 +749,7 @@ def main(argv=None):
     if not Path(binary).is_file():
         raise SystemExit(f"binary not found: {binary}")
     run(binary)
+    run_prewalk(binary)
     print("acp_accept: OK")
 
 

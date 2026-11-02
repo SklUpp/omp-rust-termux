@@ -3503,6 +3503,12 @@ pub fn model_default_thinking(
 	else {
 		return DefaultThinking::Unspecified;
 	};
+	// `auto` is a selector state, not a fixed effort: keep it so the host enters
+	// the same auto policy as an explicit `:auto`, instead of collapsing it to
+	// the resolver's `undefined`.
+	if level == CliThinking::Auto {
+		return DefaultThinking::Resolved(Some(CliThinking::Auto));
+	}
 	DefaultThinking::Resolved(
 		resolve_thinking_effort(catalog, provider, model, Some(level))
 			.and_then(|effort| parse_cli_thinking(&effort)),
@@ -8602,6 +8608,37 @@ mod process_scope_tests {
 				"latch finished before the published scoped teardown was joined"
 			);
 		});
+	}
+
+	#[test]
+	fn default_level_auto_is_the_same_selector_state_as_explicit_auto() {
+		let mut catalog = crate::catalog::Catalog::default();
+		let mut models = std::collections::BTreeMap::new();
+		models.insert(
+			"model-auto".to_string(),
+			crate::catalog::ModelInfo {
+				provider: "mock".to_string(),
+				reasoning: true,
+				efforts: Some(vec!["low".to_string(), "high".to_string()]),
+				thinking: Some(serde_json::json!({
+					"efforts": ["low", "high"],
+					"defaultLevel": "auto"
+				})),
+				..crate::catalog::ModelInfo::default()
+			},
+		);
+		catalog.providers.insert("mock".to_string(), models);
+		assert_eq!(
+			model_default_thinking(&catalog, "mock", "model-auto"),
+			DefaultThinking::Resolved(Some(CliThinking::Auto))
+		);
+		assert_eq!(parse_cli_thinking("auto"), Some(CliThinking::Auto));
+		// The fixed-level resolver intentionally reports undefined for auto; the
+		// host must preserve the auto selector before invoking it.
+		assert_eq!(
+			resolve_thinking_effort(&catalog, "mock", "model-auto", Some(CliThinking::Auto)),
+			None
+		);
 	}
 
 }

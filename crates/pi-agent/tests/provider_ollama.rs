@@ -14,16 +14,14 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use pi_agent::provider_ollama::{
-	DeepSeekInbandScanner, HealedToolCall, InbandScanEvent, KimiInbandScanner,
-	MarkupHealingEvent, MarkupHealer, OllamaProvider, StreamMarkupHealingPattern,
-	ThinkingInbandScanner, demote_thinking, extract_retry_hint,
+	DeepSeekInbandScanner, InbandScanEvent, KimiInbandScanner, MAX_SECTION_BYTES,
+	MAX_STREAM_HOLD_BYTES, MarkupHealer, MarkupHealingEvent, OllamaPayloadHook, OllamaProvider,
+	StreamMarkupHealingPattern, ThinkingInbandScanner, demote_thinking, extract_retry_hint,
 	get_stream_markup_healing_pattern, is_llama_cpp_parse_error, is_malformed_tool_call,
-	model_may_leak_dsml_tool_calls, model_may_leak_kimi_tool_calls,
-	normalize_kimi_function_name, preferred_dialect, resolve_env_timeout,
-	sanitize_malformed_tool_calls, should_retry_ollama_response,
-	NON_VISION_IMAGE_PLACEHOLDER,
+	normalize_kimi_function_name, preferred_dialect, sanitize_malformed_tool_calls,
+	should_retry_ollama_response, NON_VISION_IMAGE_PLACEHOLDER,
 };
-use pi_agent::state::{Attribution, Role, StopReason, TokenUsage};
+use pi_agent::state::{Attribution, Role, StopReason};
 use pi_agent::{
 	ChunkStream, ContentPart, Message, ModelProvider, ProviderError, StreamChunk, ToolCall,
 	ToolChoice,
@@ -907,10 +905,10 @@ async fn custom_provider_id_is_stamped_and_default_is_unchanged() {
 fn test_thinking_scanner_tag_handling_and_streaming_deltas() {
 	let mut scanner = ThinkingInbandScanner::default();
 	// Feed text with <think> tag split across chunks
-	let events1 = scanner.feed("Hello <th");
+	let events1 = scanner.feed("Hello <th").expect("feed");
 	assert_eq!(events1, vec![InbandScanEvent::Text("Hello ".to_string())]);
 
-	let events2 = scanner.feed("ink>my thought</think> World");
+	let events2 = scanner.feed("ink>my thought</think> World").expect("feed");
 	assert_eq!(
 		events2,
 		vec![
@@ -923,7 +921,9 @@ fn test_thinking_scanner_tag_handling_and_streaming_deltas() {
 
 	// Test Gemini fenced thinking
 	let mut fenced_scanner = ThinkingInbandScanner::default();
-	let fevents = fenced_scanner.feed("```thinking\ninternal reasoning\n```final answer");
+	let fevents = fenced_scanner
+		.feed("```thinking\ninternal reasoning\n```final answer")
+		.expect("feed");
 	assert_eq!(
 		fevents,
 		vec![
@@ -936,7 +936,9 @@ fn test_thinking_scanner_tag_handling_and_streaming_deltas() {
 
 	// Test Gemma reasoning channel
 	let mut gemma_scanner = ThinkingInbandScanner::default();
-	let gevents = gemma_scanner.feed("<|channel>thought\ngemma step<channel|>result");
+	let gevents = gemma_scanner
+		.feed("<|channel>thought\ngemma step<channel|>result")
+		.expect("feed");
 	assert_eq!(
 		gevents,
 		vec![
@@ -953,8 +955,8 @@ fn test_thinking_scanner_code_fence_guard() {
 	let mut scanner = ThinkingInbandScanner::default();
 	// Inside a fenced code block, <think> is literal text and must NOT be parsed as thinking
 	let code = "```python\n<think>not thinking</think>\n```\noutside";
-	let events = scanner.feed(code);
-	let flush_events = scanner.flush();
+	let events = scanner.feed(code).expect("feed");
+	let flush_events = scanner.flush().expect("flush");
 	let mut all_text = String::new();
 	for ev in events.into_iter().chain(flush_events.into_iter()) {
 		match ev {
@@ -969,7 +971,7 @@ fn test_thinking_scanner_code_fence_guard() {
 
 	// Inline code span
 	let mut inline_scanner = ThinkingInbandScanner::default();
-	let inline_events = inline_scanner.feed("Here is `<think>` inline");
+	let inline_events = inline_scanner.feed("Here is `<think>` inline").expect("feed");
 	let mut inline_text = String::new();
 	for ev in inline_events {
 		if let InbandScanEvent::Text(t) = ev {
@@ -992,7 +994,7 @@ fn test_kimi_scanner_tool_calls_and_name_normalization() {
 
 	let mut scanner = KimiInbandScanner::default();
 	let payload = "<|tool_calls_section_begin|><|tool_call_begin|>functions.web_search:0<|tool_call_argument_begin|>{\"q\":\"rust\"}<|tool_call_end|><|tool_calls_section_end|>visible text";
-	let events = scanner.feed(payload);
+	let events = scanner.feed(payload).expect("feed");
 	assert_eq!(events.len(), 2);
 	match &events[0] {
 		InbandScanEvent::ToolCall { name, arguments, .. } => {
@@ -1008,7 +1010,7 @@ fn test_kimi_scanner_tool_calls_and_name_normalization() {
 fn test_dsml_scanner_fullwidth_and_ascii() {
 	let mut fullwidth_scanner = DeepSeekInbandScanner::default();
 	let fw = "<｜DSML｜tool_calls><｜DSML｜invoke name=\"bash\"><｜DSML｜parameter name=\"cmd\" string=\"ls -la\"/></｜DSML｜invoke></｜DSML｜tool_calls>";
-	let events = fullwidth_scanner.feed(fw);
+	let events = fullwidth_scanner.feed(fw).expect("feed");
 	assert_eq!(events.len(), 1);
 	match &events[0] {
 		InbandScanEvent::ToolCall { name, arguments, .. } => {
@@ -1021,7 +1023,7 @@ fn test_dsml_scanner_fullwidth_and_ascii() {
 
 	let mut ascii_scanner = DeepSeekInbandScanner::default();
 	let ascii = "<|DSML|tool_calls><|DSML|invoke name=\"calc\"><|DSML|parameter name=\"expr\">{\"val\": 42}</|DSML|parameter></|DSML|invoke></|DSML|tool_calls>";
-	let a_events = ascii_scanner.feed(ascii);
+	let a_events = ascii_scanner.feed(ascii).expect("feed");
 	assert_eq!(a_events.len(), 1);
 	match &a_events[0] {
 		InbandScanEvent::ToolCall { name, arguments, .. } => {
@@ -1051,14 +1053,13 @@ fn test_markup_healer_pattern_and_native_tool_call_protection() {
 	// Verify feed_events_without_calls suppresses healed tool calls when native calls exist
 	let mut healer = MarkupHealer::new(StreamMarkupHealingPattern::Kimi);
 	let text_with_markup = "<|tool_calls_section_begin|><|tool_call_begin|>tool1<|tool_call_argument_begin|>{}<|tool_call_end|><|tool_calls_section_end|>extra text";
-	let events = healer.feed_events_without_calls(text_with_markup);
+	let events = healer.feed_events_without_calls(text_with_markup).expect("feed");
 	// ToolCall is suppressed, only clean text is emitted
 	assert_eq!(events, vec![MarkupHealingEvent::Text("extra text".to_string())]);
 }
 
 #[test]
 fn test_history_sanitize_malformed_tool_calls_and_pairing() {
-	// Malformed tool calls: empty id or name
 	let bad_call = ToolCall {
 		id: "  ".to_string(),
 		name: "bash".to_string(),
@@ -1073,38 +1074,19 @@ fn test_history_sanitize_malformed_tool_calls_and_pairing() {
 	};
 	assert!(!is_malformed_tool_call(&valid_call));
 
-	// Messages with bad tool call and matching tool result
+	// The malformed call lives in both projections; its result must follow it out.
+	let mut assistant = Message::assistant_with_tools("", vec![bad_call]);
+	assistant.parts = vec![ContentPart::ToolCall {
+		id: "  ".to_string(),
+		name: "bash".to_string(),
+		arguments: json!({}),
+	}];
 	let messages = vec![
-		Message {
-			role: Role::Assistant,
-			content: vec![ContentPart::ToolCall(bad_call)],
-			timestamp: None,
-			tool_call_id: None,
-			tool_name: None,
-			is_error: None,
-			api: None,
-			provider: None,
-			model: None,
-			attribution: None,
-			stop_reason: None,
-		},
-		Message {
-			role: Role::Tool,
-			content: vec![ContentPart::Text { text: "result".to_string() }],
-			timestamp: None,
-			tool_call_id: Some("  ".to_string()),
-			tool_name: Some("bash".to_string()),
-			is_error: None,
-			api: None,
-			provider: None,
-			model: None,
-			attribution: None,
-			stop_reason: None,
-		},
+		assistant,
+		Message::tool_with_status("  ", "bash", "result", false),
 		Message::user("follow up"),
 	];
 	let sanitized = sanitize_malformed_tool_calls(&messages);
-	// Both the empty tool call assistant message and its tool result are dropped
 	assert_eq!(sanitized.len(), 1);
 	assert_eq!(sanitized[0].role, Role::User);
 }
@@ -1187,7 +1169,7 @@ async fn test_empty_completion_retry_retries_and_succeeds() {
 		.complete(&[Message::user("ping")], &[], &ToolChoice::Auto)
 		.await
 		.expect("complete after retry");
-	assert_eq!(message.content_text(), "retry success");
+	assert_eq!(message.content, "retry success");
 }
 
 #[tokio::test]
@@ -1208,12 +1190,12 @@ async fn test_on_payload_hook_modifies_request_payload() {
 		let _ = socket.flush().await;
 	});
 
-	let hook = std::sync::Arc::new(|payload: &Value, _model: &str| {
+	let hook: OllamaPayloadHook = std::sync::Arc::new(|payload: &Value, _model: &str| {
 		let mut modified = payload.clone();
 		if let Some(map) = modified.as_object_mut() {
 			map.insert("custom_injected_option".to_string(), json!(true));
 		}
-		Box::pin(async move { Ok(Some(modified)) }) as pi_agent::provider_ollama::BoxFuture<Result<Option<Value>, ProviderError>>
+		Box::pin(async move { Ok(Some(modified)) })
 	});
 
 	let provider = make_provider(&format!("http://{addr}"), "test-model").with_on_payload(hook);
@@ -1227,42 +1209,78 @@ async fn test_on_payload_hook_modifies_request_payload() {
 }
 
 #[test]
-fn test_tool_schema_semantic_preservation() {
-	let tool_schema = json!({
-		"type": "function",
-		"function": {
-			"name": "search_database",
-			"description": "Searches records matching query",
-			"parameters": {
-				"type": "object",
-				"properties": {
-					"query": {
-						"type": "string",
-						"description": "SQL-like search term"
-					},
-					"limit": {
-						"type": "integer",
-						"minimum": 1,
-						"maximum": 100
-					},
-					"filter": {
-						"anyOf": [
-							{ "type": "string" },
-							{ "type": "array", "items": { "type": "string" } }
-						]
-					}
-				},
-				"required": ["query"]
+fn test_thinking_scanner_unicode_fragments_do_not_panic() {
+	// Every emitted offset must land on a char boundary: `é` is 2 bytes, the
+	// emoji 4, and fullwidth DSML tags 3 bytes per scalar.
+	let mut scanner = ThinkingInbandScanner::default();
+	let mut visible = String::new();
+	for fragment in ["héllo 😀 <thi", "nk>réason 🧠</thi", "nk> après"] {
+		for ev in scanner.feed(fragment).expect("feed") {
+			if let InbandScanEvent::Text(text) = ev {
+				visible.push_str(&text);
 			}
 		}
-	});
+	}
+	assert!(visible.contains("héllo 😀 "), "{visible}");
 
-	let provider = make_provider("http://127.0.0.1:11434", "test-model");
-	// Request conversion preserves parameters without mutating or dropping semantic fields
-	let req = provider.complete(&[Message::user("search")], &[tool_schema.clone()], &ToolChoice::Auto);
-	drop(req);
+	let mut dsml = DeepSeekInbandScanner::default();
+	for fragment in ["<｜DSML｜", "tool_calls>", "<｜DSML｜invoke name=\"x\">", "héllo 😀"] {
+		let _ = dsml.feed(fragment).expect("feed");
+	}
+}
 
-	assert_eq!(tool_schema["function"]["name"], "search_database");
-	assert_eq!(tool_schema["function"]["parameters"]["required"], json!(["query"]));
-	assert!(tool_schema["function"]["parameters"]["properties"]["filter"]["anyOf"].is_array());
+#[test]
+fn test_scanner_retains_bounded_when_fence_never_closes() {
+	// An unterminated fenced code line is held back for later fence detection;
+	// without a cap it would grow with every record.
+	let chunk = "a".repeat(64 * 1024);
+	let mut fenced = ThinkingInbandScanner::default();
+	fenced.feed("```python\n").expect("open fence");
+	let mut hold_err = None;
+	for _ in 0..(MAX_STREAM_HOLD_BYTES / chunk.len() + 2) {
+		if let Err(err) = fenced.feed(&chunk) {
+			hold_err = Some(err);
+			break;
+		}
+	}
+	assert!(hold_err.is_some(), "unterminated fence must stop retaining");
+}
+
+#[test]
+fn test_tool_section_aggregate_cap_across_many_partial_records() {
+	// Each record is a valid section prefix; only their accumulation is
+	// unbounded, so the per-record cap cannot protect this path.
+	let chunk = "a".repeat(64 * 1024);
+
+	let mut kimi = KimiInbandScanner::default();
+	kimi.feed("<|tool_calls_section_begin|><|tool_call_begin|>fn.x:0<|tool_call_argument_begin|>")
+		.expect("open section");
+	let mut kimi_err = None;
+	let mut fed = 0usize;
+	while fed < MAX_SECTION_BYTES + chunk.len() * 2 {
+		if let Err(err) = kimi.feed(&chunk) {
+			kimi_err = Some(err);
+			break;
+		}
+		fed += chunk.len();
+	}
+	assert!(kimi_err.is_some(), "unclosed Kimi section must be capped");
+	assert!(
+		fed <= MAX_SECTION_BYTES + chunk.len(),
+		"cap must fire near the limit, fed={fed}"
+	);
+
+	let mut dsml = DeepSeekInbandScanner::default();
+	dsml.feed("<|DSML|tool_calls><|DSML|invoke name=\"t\">")
+		.expect("open section");
+	let mut dsml_err = None;
+	let mut fed = 0usize;
+	while fed < MAX_SECTION_BYTES + chunk.len() * 2 {
+		if let Err(err) = dsml.feed(&chunk) {
+			dsml_err = Some(err);
+			break;
+		}
+		fed += chunk.len();
+	}
+	assert!(dsml_err.is_some(), "unclosed DSML section must be capped");
 }

@@ -962,7 +962,7 @@ mod tests {
 		});
 
 		let error = shared
-			.commit_pending(Some(&root), |_| Err("no key".to_string()))
+			.commit_pending(Some(&root), |_| Err::<(), _>("no key".to_string()))
 			.expect_err("build must fail");
 		assert!(error.contains("no key"));
 		assert!(shared.gate().lock().unwrap().state.as_ref().is_some_and(|state| state.enabled));

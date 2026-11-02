@@ -2793,18 +2793,19 @@ impl Session<'_> {
 								commit,
 								(provider, target, switch_thinking, api_key),
 							)) => {
-								if store.enabled()
-									&& let Err(err) = store.append_model_change(
+								if store.enabled() {
+									match store.append_model_change(
 										&format!(
 											"{}/{}",
 											target.provider, target.model
 										),
 										"fallback",
-									)
-								{
-									eprintln!(
-										"warning: cannot record plan-yolo model change: {err}"
-									);
+									) {
+										Ok(id) => *parent = Some(id),
+										Err(err) => eprintln!(
+											"warning: cannot record plan-yolo model change: {err}"
+										),
+									}
 								}
 								decision.provider = Some(provider);
 								decision.context_limit = Some(

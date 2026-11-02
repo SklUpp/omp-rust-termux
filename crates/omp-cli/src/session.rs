@@ -1502,6 +1502,7 @@ impl SessionStore {
 					store.is_v1 = is_v1;
 					store.title_slot = title_slot;
 					store.enabled = true;
+					store.ensure_artifacts_directory();
 					return store;
 				},
 				Err(err) => {
@@ -1581,6 +1582,7 @@ impl SessionStore {
 		store.title_slot = parse_title_slot(&title_slot_str);
 		store.is_v1 = false;
 		store.enabled = true;
+		store.ensure_artifacts_directory();
 		store
 	}
 
@@ -2783,6 +2785,23 @@ impl SessionStore {
 	}
 	fn warn(&mut self, message: String) {
 		self.warnings.push(message);
+	}
+
+	/// A persisted session owns the `local://` artifact directory, independent
+	/// of which tools are mounted. Plan writes fail at the root open otherwise.
+	fn ensure_artifacts_directory(&mut self) {
+		if !self.enabled {
+			return;
+		}
+		let Some(artifacts) = self.file().and_then(artifacts_directory_for) else {
+			return;
+		};
+		if let Err(err) = fs::create_dir_all(&artifacts) {
+			self.warn(format!(
+				"cannot create session artifacts directory {}: {err}",
+				artifacts.display()
+			));
+		}
 	}
 }
 #[cfg(test)]

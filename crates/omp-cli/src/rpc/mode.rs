@@ -1894,10 +1894,13 @@ fn run_turn(
 		let mut guard = session
 			.lock()
 			.unwrap_or_else(std::sync::PoisonError::into_inner);
-		guard.finish_turn(&mut prepared, &outcome);
 		if let Some(error) = guard.take_plan_yolo_commit_error() {
+			if let Some(id) = guard.record_plan_yolo_commit_failure(&error) {
+				prepared.parent_id = Some(id);
+			}
 			outcome.error.get_or_insert(error);
 		}
+		guard.finish_turn(&mut prepared, &outcome);
 		// Drain goal persistence and complete-exit after the turn settles, so a
 		// goal tool call cannot lose its `goal_updated`/terminal metric.
 		for frame in guard.finish_goal_turn() {

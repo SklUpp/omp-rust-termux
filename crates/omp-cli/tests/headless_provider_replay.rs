@@ -772,7 +772,8 @@ fn plan_yolo_guards_then_switches_and_resumes_on_default() {
 		text_sse("implemented"),
 	]);
 	let base = temp_dir("plan-yolo-switch");
-	let (agent_dir, cwd, sessions) = setup_two_providers(&base, a.port, b.port, "");
+	let (agent_dir, cwd, sessions) =
+		setup_two_providers(&base, a.port, b.port, "tools: [write, read]\n");
 	let first = run(
 		omp(&agent_dir, &cwd, &sessions).args([
 			"--yolo",

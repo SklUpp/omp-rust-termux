@@ -220,19 +220,23 @@ class Provider:
                     },
                 )
                 return
+            if tool_results == 2 and self.hang_after_proposal:
+                # The one-shot cutover commits at the proposal turn's end, so
+                # there is no fourth root request to hold. Pause this planning
+                # turn before the proposal is dispatched; cancellation must
+                # abandon the arm without switching models.
+                self.proposal_waiting.set()
+                self.release_proposal.wait(PROMPT_TIMEOUT)
+                yield chunk({"role": "assistant", "content": "planning aborted"})
+                yield chunk({}, "stop")
+                yield "data: [DONE]"
+                return
             if tool_results == 2:
                 yield from tool_call(
                     "call_plan_propose",
                     "write",
                     {"path": "xd://propose", "content": "Plan"},
                 )
-                return
-            if tool_results == 3 and self.hang_after_proposal:
-                self.proposal_waiting.set()
-                self.release_proposal.wait(PROMPT_TIMEOUT)
-                yield chunk({"role": "assistant", "content": "after aborted proposal"})
-                yield chunk({}, "stop")
-                yield "data: [DONE]"
                 return
 
         if self.plan_yolo_target and self.requests == 1:
@@ -965,8 +969,8 @@ def run_plan_yolo(binary: str) -> None:
         assert_eq(target_provider.requests, 5, "manual plan ran on the target route")
         assert_eq(root_provider.requests, 3, "root provider stays at three requests")
 
-        # Abort after a valid proposal: the pending approval must not survive
-        # into the next user prompt or auto-switch the session.
+        # Abort an armed planning turn before its proposal is dispatched: the
+        # incomplete arm must not survive into the next prompt or auto-switch.
         abort_session = client.request("session/new", {"cwd": cwd, "mcpServers": []})[
             "sessionId"
         ]

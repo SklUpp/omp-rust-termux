@@ -1090,6 +1090,23 @@ impl RpcSession {
 		self.plan_yolo_commit_error.take()
 	}
 
+	/// Journal the failed cutover so a resumed session sees the turn was not a
+	/// successful implementation; the live error frame is not durable.
+	pub fn record_plan_yolo_commit_failure(&mut self, error: &str) -> Option<String> {
+		if !self.store.enabled() {
+			return None;
+		}
+		self
+			.store
+			.append_custom_message(
+				"plan-yolo-switch-error",
+				error,
+				false,
+				json!({ "phase": "switch" }),
+			)
+			.ok()
+	}
+
 	/// Persist the shared exclusive `mode_change` slot (`"plan"`, `"none"`, or
 	/// the goal modes). Plan and Goal cannot hold it at once.
 	pub fn append_mode_change(&mut self, mode: &str, data: Option<Value>) -> Result<()> {
@@ -2942,13 +2959,16 @@ impl RpcSession {
 			});
 			match committed {
 				Ok((commit, (provider, target, switch_thinking, api_key))) => {
-					if self.store.enabled()
-						&& let Err(err) = self.store.append_model_change(
+					if self.store.enabled() {
+						match self.store.append_model_change(
 							&format!("{}/{}", target.provider, target.model),
 							"fallback",
-						)
-					{
-						eprintln!("warning: cannot record plan-yolo model change: {err}");
+						) {
+							Ok(id) => previous = id,
+							Err(err) => eprintln!(
+								"warning: cannot record plan-yolo model change: {err}"
+							),
+						}
 					}
 					decision.provider = Some(provider);
 					decision.context_limit = Some(

@@ -2109,6 +2109,37 @@ fn rpc_failed_plan_switch_surfaces_an_error_instead_of_success() {
 		"provider build fails before any implementation request"
 	);
 	assert!(!worktree.join("probe.txt").exists());
+	let log = session_log(&sessions);
+	let entries: Vec<Value> = fs::read_to_string(&log)
+		.expect("session log")
+		.lines()
+		.filter_map(|line| serde_json::from_str(line).ok())
+		.collect();
+	let failure = entries
+		.iter()
+		.find(|entry| {
+			entry["type"] == "custom_message"
+				&& entry["customType"] == "plan-yolo-switch-error"
+		})
+		.expect("failed cutover must leave a durable journal entry");
+	assert!(
+		failure["content"]
+			.as_str()
+			.is_some_and(|content| content.contains("plan-yolo switch failed")),
+		"failure entry must carry the consumer-visible error: {failure}"
+	);
+	let resumed = SessionStore::open(&checkpoint_session_options(
+		&worktree,
+		&sessions,
+		Some("plan-yolo-rpc-build-error"),
+	));
+	assert!(
+		resumed.branch_entries().iter().any(|entry| {
+			entry.kind == "custom_message"
+				&& entry.extra["customType"] == "plan-yolo-switch-error"
+		}),
+		"resuming must retain the failed cutover"
+	);
 	drop(harness);
 	fs::remove_dir_all(&root).ok();
 }

@@ -21,6 +21,7 @@ use std::{
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// Per-model cost block as authored in the catalog; unknown fields stay absent.
+#[derive(Clone)]
 pub struct OllamaPayloadCost {
 	pub input: f64,
 	pub output: f64,
@@ -32,6 +33,7 @@ pub struct OllamaPayloadCost {
 
 /// Materialized thinking ladder for the hook. No `Debug`/`Serialize`: this is
 /// configuration, not a wire payload.
+#[derive(Clone)]
 pub struct OllamaPayloadThinking {
 	/// Authored `mode`, else the TS default `"effort"`.
 	pub mode: String,
@@ -39,14 +41,25 @@ pub struct OllamaPayloadThinking {
 	pub efforts: Vec<String>,
 	/// Authored `defaultLevel`.
 	pub default_level: Option<String>,
-	/// Authored `effortMap`; omitted efforts map to themselves.
-	pub effort_map: Vec<(String, String)>,
+	/// Authored `effortMap`; `None` means the key was absent (identity implied).
+	pub effort_map: Option<Vec<(String, String)>>,
+	/// Adaptive thinking accepts the `display` field.
+	pub supports_display: Option<bool>,
+	/// Per-effort upstream wire-id routing (`"off"` allowed); `None` = absent.
+	pub effort_routing: Option<Vec<(String, String)>>,
+	/// Per-effort token budgets (`u64`, no narrowing); `None` = absent.
+	pub effort_budgets: Option<Vec<(String, u64)>>,
+	/// Thinking-off must be explicitly suppressed on the wire.
+	pub suppress_when_off: Option<bool>,
+	/// Reasoning is mandatory upstream.
+	pub requires_effort: Option<bool>,
 }
 
 /// Full resolved TS `Model<"ollama-chat">` context passed to `onPayload`
 /// (`ollama.ts:577`). Built once per provider by the runtime and handed over
 /// through [`OllamaProvider::with_payload_model`]. Deliberately carries no
 /// `Debug`/`Serialize`/`Deserialize`: it includes configuration headers.
+#[derive(Clone)]
 pub struct OllamaPayloadModel {
 	/// Configured route id (`be5dd`), defaulting to the adapter dialect label.
 	pub provider: String,
@@ -198,14 +211,6 @@ fn credential_values(api_key: Option<&str>) -> Vec<String> {
 		.filter(|value| !value.is_empty())
 		.map(|value| vec![value.to_string()])
 		.unwrap_or_default()
-}
-
-/// Header names whose values must never reach diagnostics or error bodies.
-fn is_credential_header(name: &str) -> bool {
-	matches!(
-		name.to_ascii_lowercase().as_str(),
-		"authorization" | "proxy-authorization" | "x-api-key" | "api-key"
-	)
 }
 
 fn redact_with(text: &str, secrets: &[String]) -> String {
@@ -427,7 +432,9 @@ pub struct OllamaProvider {
 	on_payload: Option<OllamaPayloadHook>,
 	/// Resolved full model context handed to `onPayload`; built once by the
 	/// runtime through [`Self::with_payload_model`].
-	payload_model: Option<OllamaPayloadModel>,
+	payload_model: Option<Arc<OllamaPayloadModel>>,
+	/// Caller/config request headers, kept outside the hook-visible model.
+	request_headers: Vec<(String, String)>,
 	/// Pre-response and first-event stream budget (`idle-iterator.ts:24`).
 	first_event_timeout: StreamTimeout,
 	/// Idle gap budget between streamed stream chunks (`idle-iterator.ts:14`).
@@ -600,6 +607,11 @@ impl OllamaProvider {
 		validate_base_url(&base_url)?;
 		let http = reqwest::Client::builder()
 			.connect_timeout(CONNECT_TIMEOUT)
+			// Safety boundary: a redirect could forward `Authorization` and
+			// configured credential headers to another origin. Never follow
+			// redirects by default; callers that truly need them pass their own
+			// client via `with_client` and own that policy.
+			.redirect(reqwest::redirect::Policy::none())
 			.build()
 			.map_err(network_error)?;
 		Ok(Self::with_client(http, base_url, api_key, model))
@@ -636,6 +648,7 @@ impl OllamaProvider {
 			provider_id: None,
 			on_payload: None,
 			payload_model: None,
+			request_headers: Vec::new(),
 			first_event_timeout: resolve_env_timeout_setting(
 				&[
 					"PI_OPENAI_STREAM_FIRST_EVENT_TIMEOUT_MS",
@@ -670,9 +683,9 @@ impl OllamaProvider {
 	pub fn with_provider_id(mut self, provider_id: Option<String>) -> Self {
 		self.provider_id = provider_id.filter(|value| !value.trim().is_empty());
 		if let Some(provider_id) = &self.provider_id
-			&& let Some(model) = &mut self.payload_model
+			&& let Some(model) = self.payload_model.as_mut()
 		{
-			model.provider.clone_from(provider_id);
+			Arc::make_mut(model).provider.clone_from(provider_id);
 		}
 		self
 	}
@@ -737,7 +750,14 @@ impl OllamaProvider {
 	/// this once per provider (root turn or child).
 	pub fn with_payload_model(mut self, model: OllamaPayloadModel) -> Self {
 		self.provider_id = Some(model.provider.clone());
-		self.payload_model = Some(model);
+		self.payload_model = Some(Arc::new(model));
+		self
+	}
+
+	/// Caller/config request headers, merged after model headers and before
+	/// `Authorization`/`Content-Type`; never visible to the payload hook.
+	pub fn with_request_headers(mut self, headers: Vec<(String, String)>) -> Self {
+		self.request_headers = headers;
 		self
 	}
 
@@ -773,11 +793,16 @@ impl OllamaProvider {
 	/// so diagnostics redact all of them.
 	fn request_secrets(&self) -> Vec<String> {
 		let mut secrets = credential_values(self.api_key.as_deref());
-		if let Some(model) = &self.payload_model {
-			for (name, value) in &model.headers {
-				if is_credential_header(name) && !value.trim().is_empty() {
-					secrets.push(value.clone());
-				}
+		let headers = self
+			.payload_model
+			.iter()
+			.flat_map(|model| model.headers.iter())
+			.chain(self.request_headers.iter());
+		for (_, value) in headers {
+			// Every configured header value is treated as sensitive by default:
+			// gateways routinely put tokens in custom names (`X-Api-Key`, cookies).
+			if !value.trim().is_empty() {
+				secrets.push(value.clone());
 			}
 		}
 		secrets
@@ -788,20 +813,23 @@ impl OllamaProvider {
 	/// owns `Authorization` and `Content-Type` last.
 	fn config_headers(&self) -> Vec<(&str, &str)> {
 		let mut merged: Vec<(&str, &str)> = Vec::new();
-		if let Some(model) = &self.payload_model {
-			for (name, value) in &model.headers {
-				if name.eq_ignore_ascii_case("authorization")
-					|| name.eq_ignore_ascii_case("content-type")
-				{
-					continue;
-				}
-				match merged
-					.iter_mut()
-					.find(|(existing, _)| existing.eq_ignore_ascii_case(name))
-				{
-					Some(slot) => *slot = (name.as_str(), value.as_str()),
-					None => merged.push((name.as_str(), value.as_str())),
-				}
+		let headers = self
+			.payload_model
+			.iter()
+			.flat_map(|model| model.headers.iter())
+			.chain(self.request_headers.iter());
+		for (name, value) in headers {
+			if name.eq_ignore_ascii_case("authorization")
+				|| name.eq_ignore_ascii_case("content-type")
+			{
+				continue;
+			}
+			match merged
+				.iter_mut()
+				.find(|(existing, _)| existing.eq_ignore_ascii_case(name))
+			{
+				Some(slot) => *slot = (name.as_str(), value.as_str()),
+				None => merged.push((name.as_str(), value.as_str())),
 			}
 		}
 		merged
@@ -1345,7 +1373,7 @@ impl OllamaProvider {
 				.then(|| self.direct_payload_model());
 			let context = self
 				.payload_model
-				.as_ref()
+				.as_deref()
 				.or(fallback.as_ref())
 				.expect("payload context");
 			if let Some(replaced) = hook(&payload, context).await? {

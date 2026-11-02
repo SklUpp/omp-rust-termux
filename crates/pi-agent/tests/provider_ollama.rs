@@ -1344,16 +1344,15 @@ async fn payload_model_context_carries_full_catalog_fields_and_pre_auth_headers(
 			mode: "effort".to_string(),
 			efforts: vec!["low".to_string(), "high".to_string()],
 			default_level: Some("low".to_string()),
-			effort_map: vec![("low".to_string(), "low".to_string())],
+			effort_map: Some(vec![("low".to_string(), "low".to_string())]),
+			supports_display: Some(true),
+			effort_routing: None,
+			effort_budgets: Some(vec![("high".to_string(), 8192)]),
+			suppress_when_off: Some(false),
+			requires_effort: None,
 		}),
 		effort: Some("high".to_string()),
-		headers: vec![
-			("X-Model".to_string(), "model".to_string()),
-			("X-Model".to_string(), "config-wins".to_string()),
-			("X-Config".to_string(), "caller".to_string()),
-			("Authorization".to_string(), "evil".to_string()),
-			("Content-Type".to_string(), "text/plain".to_string()),
-		],
+		headers: vec![("X-Model".to_string(), "model".to_string())],
 	};
 	let hook: OllamaPayloadHook = std::sync::Arc::new(
 		move |_payload: &Value, model: &OllamaPayloadModel| {
@@ -1374,12 +1373,35 @@ async fn payload_model_context_carries_full_catalog_fields_and_pre_auth_headers(
 			assert_eq!(thinking.mode, "effort");
 			assert_eq!(thinking.efforts, vec!["low", "high"]);
 			assert_eq!(thinking.default_level.as_deref(), Some("low"));
+			assert_eq!(
+				thinking.effort_map.as_deref(),
+				Some(&[("low".to_string(), "low".to_string())][..])
+			);
+			assert_eq!(thinking.supports_display, Some(true));
+			assert!(thinking.effort_routing.is_none());
+			assert_eq!(
+				thinking.effort_budgets.as_deref(),
+				Some(&[("high".to_string(), 8_192u64)][..])
+			);
+			assert_eq!(thinking.suppress_when_off, Some(false));
+			assert!(thinking.requires_effort.is_none());
 			assert_eq!(model.effort.as_deref(), Some("high"));
+			// Hook sees model-level headers only, never caller/config ones.
+			assert_eq!(
+				model.headers,
+				vec![("X-Model".to_string(), "model".to_string())]
+			);
 			Box::pin(async move { Ok(None) })
 		},
 	);
 	let provider = make_provider(&base, "row")
 		.with_payload_model(context)
+		.with_request_headers(vec![
+			("X-Model".to_string(), "config-wins".to_string()),
+			("X-Config".to_string(), "caller".to_string()),
+			("Authorization".to_string(), "evil".to_string()),
+			("Content-Type".to_string(), "text/plain".to_string()),
+		])
 		.with_on_payload(hook);
 	provider
 		.complete(&[Message::user("hi")], &[], &ToolChoice::Auto)
@@ -1397,6 +1419,66 @@ async fn payload_model_context_carries_full_catalog_fields_and_pre_auth_headers(
 	assert!(!lower.contains("evil"), "{raw}");
 	assert!(lower.contains("content-type: application/json"), "{raw}");
 	assert!(!lower.contains("content-type: text/plain"), "{raw}");
+}
+
+#[tokio::test]
+async fn default_client_rejects_redirects_without_contacting_second_origin() {
+	let attacker = TcpListener::bind("127.0.0.1:0").await.expect("attacker bind");
+	let attacker_addr = attacker.local_addr().expect("attacker addr");
+	let first = TcpListener::bind("127.0.0.1:0").await.expect("first bind");
+	let first_addr = first.local_addr().expect("first addr");
+	let (head_tx, head_rx) = tokio::sync::oneshot::channel();
+	tokio::spawn(async move {
+		let (mut socket, _) = first.accept().await.expect("accept");
+		if let Some((head, _)) = read_request(&mut socket).await {
+			let _ = head_tx.send(head);
+		}
+		let redirect = format!(
+			"HTTP/1.1 302 Found\r\nLocation: http://{attacker_addr}/steal\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+		);
+		let _ = socket.write_all(redirect.as_bytes()).await;
+	});
+	let provider = make_provider(&format!("http://{first_addr}"), "m");
+	let err = provider
+		.stream(&[Message::user("hi")], &[], &ToolChoice::Auto)
+		.await
+		.err()
+		.expect("redirect status");
+	let head = head_rx.await.expect("first origin request");
+	assert!(head.to_ascii_lowercase().contains("authorization: bearer"));
+	match err {
+		ProviderError::HttpStatus(status, _) => assert_eq!(status, 302),
+		other => panic!("Expected HttpStatus(302), got {other:?}"),
+	}
+	assert!(
+		tokio::time::timeout(Duration::from_millis(150), attacker.accept())
+			.await
+			.is_err(),
+		"redirect target must never be contacted"
+	);
+}
+
+#[tokio::test]
+async fn diagnostic_redaction_covers_every_configuration_header_value() {
+	let cookie = "session-token-abc";
+	let custom = "gateway-token-xyz";
+	let body = format!("denied cookie={cookie} custom={custom}");
+	let (base, _request_rx) = serve_once(response("400 Bad Request", "text/plain", &body)).await;
+	let provider = make_provider(&base, "m").with_request_headers(vec![
+		("Cookie".to_string(), cookie.to_string()),
+		("X-Gateway-Token".to_string(), custom.to_string()),
+	]);
+	let err = provider
+		.stream(&[Message::user("hi")], &[], &ToolChoice::Auto)
+		.await
+		.err()
+		.expect("HTTP failure");
+	let ProviderError::HttpStatus(_, text) = err else {
+		panic!("Expected HttpStatus, got {err:?}");
+	};
+	assert!(text.contains("[redacted]"), "{text}");
+	assert!(!text.contains(cookie), "{text}");
+	assert!(!text.contains(custom), "{text}");
 }
 
 #[test]

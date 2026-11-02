@@ -5851,7 +5851,7 @@ mod tests {
 			session_id: Some("session-1".to_string()),
 			cancel: Some(token),
 		};
-		let error = cancelled.target("childprov/model").expect_err("cancelled lookup");
+		let error = cancelled.target("childprov/model").err().expect("cancelled lookup");
 		assert!(error.contains("credential lookup failed for provider `childprov`"), "{error}");
 	}
 

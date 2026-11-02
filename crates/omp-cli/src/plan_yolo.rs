@@ -8,10 +8,11 @@
 //! switch is guaranteed.
 
 use std::{
+	cell::RefCell,
 	path::{Path, PathBuf},
 	sync::{
 		Arc, Mutex,
-		atomic::{AtomicBool, Ordering},
+		atomic::{AtomicBool, AtomicU64, Ordering},
 	},
 };
 
@@ -84,6 +85,12 @@ pub fn resolve_arm(
 		}
 		return Ok(None);
 	}
+	if cli.no_tools {
+		return Err(
+			"--plan-yolo requires tools; --no-tools cannot arm an unapprovable plan"
+				.to_string(),
+		);
+	}
 	let requested = cli.plan_yolo_into.as_deref().unwrap_or(DEFAULT_TARGET);
 	let target = runtime::resolve_model_switch(catalog, config, requested, None)
 		.map_err(|error| format!("plan-yolo target: {error}"))?;
@@ -125,6 +132,9 @@ pub struct PlanYoloShared {
 	pending: Mutex<Option<PlanYoloPending>>,
 	armed: AtomicBool,
 	completed: AtomicBool,
+	/// Gate generation published by [`PlanYoloShared::arm`]. A manual plan
+	/// entry after arm/commit changes it, so the stale handler cannot approve.
+	arm_generation: AtomicU64,
 }
 
 /// A validated plan whose execution switch has not been applied yet. Review
@@ -181,6 +191,7 @@ impl PlanYoloShared {
 			pending: Mutex::new(None),
 			armed: AtomicBool::new(false),
 			completed: AtomicBool::new(false),
+			arm_generation: AtomicU64::new(0),
 		}
 	}
 
@@ -191,7 +202,11 @@ impl PlanYoloShared {
 
 	#[must_use]
 	pub fn is_armed(&self) -> bool {
-		self.armed.load(Ordering::Acquire)
+		self.armed.load(Ordering::Acquire) && !self.completed.load(Ordering::Acquire)
+	}
+
+	fn approval_active(&self) -> bool {
+		self.is_armed()
 	}
 
 	#[must_use]
@@ -232,19 +247,23 @@ impl PlanYoloShared {
 		gate.settle = plan::PlanSettleState::default();
 		gate.discard_queued_continuation();
 		gate.generation = gate.generation.wrapping_add(1);
+		self.arm_generation.store(gate.generation, Ordering::Release);
 		Some(PlanYoloArming { previous })
 	}
 
 	/// Restore the pre-arm gate state after a failed tool-set publication.
 	pub fn rollback_arm(&self, arming: PlanYoloArming) {
-		*self
-			.gate
-			.lock()
-			.unwrap_or_else(|poison| poison.into_inner()) = arming.previous;
+		// Same pending -> gate order as approval/commit, so a failed arm cannot
+		// deadlock a concurrent proposal that already holds the pending slot.
 		self.pending
 			.lock()
 			.unwrap_or_else(|poison| poison.into_inner())
 			.take();
+		*self
+			.gate
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner()) = arming.previous;
+		self.arm_generation.store(0, Ordering::Release);
 		self.armed.store(false, Ordering::Release);
 	}
 
@@ -264,6 +283,10 @@ impl PlanYoloShared {
 	/// intact. The artifact is re-read through the contained reader and must
 	/// byte-match the reviewed version. The caller must not independently exit
 	/// the gate; this is the only transition to execution.
+	///
+	/// `build` runs synchronously with the pending and gate locks held; it must
+	/// not call back into this [`PlanYoloShared`]. This is what makes the
+	/// build/exit sequence atomic without a speculative intermediate state.
 	pub fn commit_pending<T>(
 		&self,
 		artifacts: Option<&Path>,
@@ -276,6 +299,10 @@ impl PlanYoloShared {
 		let Some(pending) = pending_slot.as_ref() else {
 			return Err("plan-yolo has no approved plan pending a switch".to_string());
 		};
+		if !self.approval_active() {
+			*pending_slot = None;
+			return Err("plan-yolo is no longer armed for this session".to_string());
+		}
 		if let Err(error) =
 			ensure_plan_fully_read(&pending.plan_file_path, &pending.reviewed_content)
 		{
@@ -286,9 +313,11 @@ impl PlanYoloShared {
 			.gate
 			.lock()
 			.unwrap_or_else(|poison| poison.into_inner());
-		if !gate.state.as_ref().is_some_and(|state| state.enabled) {
+		if !gate.state.as_ref().is_some_and(|state| state.enabled)
+			|| gate.generation != self.arm_generation.load(Ordering::Acquire)
+		{
 			*pending_slot = None;
-			return Err("plan-yolo plan mode is no longer active".to_string());
+			return Err("plan-yolo plan mode changed before the execution switch".to_string());
 		}
 		let root = artifacts.ok_or_else(|| {
 			"plan-yolo cannot switch: the session has no artifact directory".to_string()
@@ -354,12 +383,17 @@ impl PlanYoloShared {
 				"plan-yolo approval is already pending the execution switch".to_string(),
 			);
 		}
+		if !self.approval_active() {
+			return Err("plan-yolo is no longer armed for this session".to_string());
+		}
 		let gate = self
 			.gate
 			.lock()
 			.unwrap_or_else(|poison| poison.into_inner());
-		if !gate.state.as_ref().is_some_and(|state| state.enabled) {
-			return Err("plan mode is not active".to_string());
+		if !gate.state.as_ref().is_some_and(|state| state.enabled)
+			|| gate.generation != self.arm_generation.load(Ordering::Acquire)
+		{
+			return Err("plan-yolo plan mode changed before approval".to_string());
 		}
 		*pending = Some(PlanYoloPending {
 			target: self.arm.target.clone(),
@@ -393,6 +427,33 @@ pub fn plan_hooks(
 	}
 }
 
+/// Tool plan for the planning turn plus the selection the host must restore
+/// after approval or arm failure. Keeping both in one value prevents a host
+/// from losing the pre-plan selection when it only calls [`augment_tools`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanYoloToolSelection {
+	selected: Option<Vec<String>>,
+	previous: Option<Vec<String>>,
+}
+
+impl PlanYoloToolSelection {
+	#[must_use]
+	pub fn selected(&self) -> Option<&[String]> {
+		self.selected.as_deref()
+	}
+
+	#[must_use]
+	pub fn previous(&self) -> Option<&[String]> {
+		self.previous.as_deref()
+	}
+
+	/// Selection to publish again after the plan turn or a failed arm.
+	#[must_use]
+	pub fn restore(&self) -> Option<Vec<String>> {
+		self.previous.clone()
+	}
+}
+
 /// Add `write` to a restricted selection only when tools are enabled and the
 /// builtin is actually absent. `None` means "all builtins", which already
 /// includes `write`; `--no-tools` never gains a transport tool.
@@ -407,6 +468,26 @@ pub fn augment_tools(
 	}
 	tools.push("write".to_string());
 	Some(tools)
+}
+
+/// Host-facing planning-tool handle. Rejects `--no-tools` instead of arming a
+/// plan the model cannot write or approve; the caller applies
+/// [`PlanYoloToolSelection::selected`] and later restores
+/// [`PlanYoloToolSelection::restore`].
+pub fn plan_tools(
+	tools_enabled: bool,
+	selected: Option<&[String]>,
+) -> Result<PlanYoloToolSelection, String> {
+	if !tools_enabled {
+		return Err(
+			"plan-yolo requires tools; --no-tools cannot arm an unapprovable plan"
+				.to_string(),
+		);
+	}
+	Ok(PlanYoloToolSelection {
+		selected: augment_tools(tools_enabled, selected),
+		previous: selected.map(|tools| tools.to_vec()),
+	})
 }
 
 /// Auto-approving proposal handler. It validates and queues, but deliberately
@@ -424,6 +505,12 @@ impl pi_agent::state::ProposeHandler for PlanYoloProposalHandler {
 		body: &str,
 		ctx: &AgentContext,
 	) -> Result<ToolResult, ToolError> {
+		if !self.shared.approval_active() {
+			return Err(ToolError::Rejected(
+				"Plan-yolo is no longer armed for this session; xd://propose has no auto-approval here."
+					.to_string(),
+			));
+		}
 		if self.shared.has_pending() {
 			return Err(ToolError::Rejected(
 				"Plan approval is already pending the execution switch.".to_string(),
@@ -506,21 +593,50 @@ impl pi_agent::state::ProposeHandler for PlanYoloProposalHandler {
 
 /// Contained `resolveApprovedPlan`: plan content is read through the artifact
 /// fd walk, never through the working tree.
+fn is_truncated_read(error: &str) -> bool {
+	error.contains("refusing to return a truncated read")
+}
+
+fn read_plan_candidate(root: &Path, url: &str) -> Result<Option<String>, String> {
+	let Some(relative) = pi_agent::tools::local_artifact_relative(url) else {
+		return Ok(None);
+	};
+	match pi_agent::tools::read_local_artifact(root, &relative) {
+		Ok(content) => Ok(Some(content)),
+		Err(error) if is_truncated_read(&error) => Err(error),
+		Err(_) => Ok(None),
+	}
+}
+
 fn resolve_reviewed_plan(
 	proposal: &plan::PlanProposal,
 	target_url: &str,
 	root: &Path,
 ) -> Result<plan::ResolvedPlan, ToolError> {
-	plan::resolve_approved_plan(
+	// Surface an oversized target as its actionable size error instead of
+	// converting it to the resolver's generic "Plan file not found".
+	if let Err(error) = read_plan_candidate(root, target_url) {
+		return Err(ToolError::Rejected(error));
+	}
+	let read_error = RefCell::new(None::<String>);
+	let resolved = plan::resolve_approved_plan(
 		proposal.title.as_deref(),
 		target_url,
-		&|url| {
-			let relative = pi_agent::tools::local_artifact_relative(url)?;
-			pi_agent::tools::read_local_artifact(root, &relative).ok()
+		&|url| match read_plan_candidate(root, url) {
+			Ok(content) => content,
+			Err(error) => {
+				if read_error.borrow().is_none() {
+					*read_error.borrow_mut() = Some(error);
+				}
+				None
+			},
 		},
 		&|| plan::list_local_plan_files(root),
-	)
-	.map_err(ToolError::Rejected)
+	);
+	if let Some(error) = read_error.into_inner() {
+		return Err(ToolError::Rejected(error));
+	}
+	resolved.map_err(ToolError::Rejected)
 }
 
 fn render_handoff(plan_file_path: &str, title: &str) -> String {
@@ -531,6 +647,8 @@ fn render_handoff(plan_file_path: &str, title: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+	use std::{fs::File, io::Write};
+
 	use super::*;
 
 	fn target() -> ModelSwitch {
@@ -611,6 +729,79 @@ mod tests {
 		assert!(ensure_inline_plan_size(&over).is_err());
 		let exact = "x".repeat(MAX_INLINE_PLAN_BYTES);
 		assert!(ensure_inline_plan_size(&exact).is_ok());
+	}
+
+	#[test]
+	fn plan_tools_keep_the_previous_selection_for_restore() {
+		let read = vec!["read".to_string()];
+		let tools = plan_tools(true, Some(&read)).expect("tools enabled");
+		assert_eq!(
+			tools.selected().map(|selected| selected.to_vec()),
+			Some(vec!["read".to_string(), "write".to_string()])
+		);
+		assert_eq!(tools.previous().map(|previous| previous.to_vec()), Some(read.clone()));
+		assert_eq!(tools.restore(), Some(read));
+		assert!(plan_tools(false, None).is_err(), "--no-tools must not arm");
+	}
+
+	#[test]
+	fn oversized_plan_surfaces_the_reader_error() {
+		let root = temp_root("oversize-resolve");
+		let path = root.join("PLAN.md");
+		File::create(&path)
+			.expect("plan")
+			.set_len(pi_agent::tools::hashline::snapshot::SNAPSHOT_MAX_BYTES as u64 + 1)
+			.expect("plan size");
+		let proposal = plan::PlanProposal {
+			title:   Some("Plan".to_string()),
+			slug:    None,
+			content: None,
+		};
+		let error = resolve_reviewed_plan(&proposal, "local://PLAN.md", &root)
+			.expect_err("oversized plan");
+		assert!(error.to_string().contains("full-text artifact limit"), "{error}");
+		let _ = std::fs::remove_dir_all(root);
+	}
+
+	#[tokio::test]
+	async fn stale_handler_refuses_autoapproval_after_commit() {
+		let shared = shared();
+		let _arming = shared.arm().expect("arm");
+		let root = temp_root("stale-handler");
+		let content = "# Plan\n\nDo it.\n";
+		File::create(root.join("PLAN.md"))
+			.expect("plan")
+			.write_all(content.as_bytes())
+			.expect("plan body");
+		*shared.pending.lock().unwrap() = Some(PlanYoloPending {
+			target: target(),
+			thinking: None,
+			plan_file_path: "local://PLAN.md".to_string(),
+			title: "Plan".to_string(),
+			reviewed_content: content.to_string(),
+		});
+		shared
+			.commit_pending(Some(&root), |_| Ok(()))
+			.expect("initial approval");
+
+		// A later manual plan entry keeps the handler installed. It must not
+		// inherit plan-yolo's auto-approval.
+		{
+			let gate = shared.gate();
+			let mut gate = gate.lock().unwrap();
+			gate.enabled = true;
+			gate.set_mode(plan::ACP_PLAN_MODE_ID).expect("manual plan");
+		}
+		let handler = PlanYoloProposalHandler {
+			shared:    Arc::clone(&shared),
+			artifacts: Some(root.clone()),
+		};
+		let ctx = AgentContext::new(root.clone());
+		let error = pi_agent::state::ProposeHandler::propose(&handler, "Plan", &ctx)
+			.await
+			.expect_err("stale handler must reject");
+		assert!(error.to_string().contains("no longer armed"), "{error}");
+		let _ = std::fs::remove_dir_all(root);
 	}
 
 	#[test]

@@ -577,6 +577,14 @@ pub struct Config {
 	pub external_thinking:    bool,
 	/// Ephemeral `--service-tier` (OpenAI wire; `none`/empty omit).
 	pub service_tier:         Option<String>,
+	/// Ephemeral `--add-dir` workspace roots, before `cwd` normalization.
+	pub add_dirs:             Vec<PathBuf>,
+	/// Ephemeral `--no-rules`.
+	pub no_rules:             bool,
+	/// Ephemeral `--no-pty`.
+	pub no_pty:               bool,
+	/// Ephemeral `--models` scope patterns; `None` when the flag is absent.
+	pub model_scope:          Option<Vec<String>>,
 	/// Paths that contributed, base first.
 	pub sources:              Vec<PathBuf>,
 }
@@ -985,12 +993,40 @@ impl Config {
 		if cli.no_lsp {
 			self.lsp.enabled = Some(false);
 		}
+		if !cli.add_dir.is_empty() {
+			self.add_dirs.extend(cli.add_dir.iter().cloned());
+		}
+		if cli.no_rules {
+			self.no_rules = true;
+		}
+		if cli.no_pty {
+			self.no_pty = true;
+		}
+		if let Some(models) = &cli.models {
+			self.model_scope = Some(models.clone());
+		}
 		if cli.external_thinking {
 			self.external_thinking = true;
 		}
 		if let Some(tier) = &cli.service_tier {
 			self.service_tier = Some(tier.clone());
 		}
+	}
+
+	/// Normalize `--add-dir` roots against the effective `cwd` like TS
+	/// `normalizeSessionWorkspace`: `~` expansion, `path.resolve` lexical
+	/// normalization, `cwd` excluded, first occurrence wins, supplied order
+	/// preserved. These roots are workspace inputs for discovery, never a
+	/// sandbox boundary.
+	pub fn normalize_workspace_roots(&mut self, cwd: &Path) {
+		let mut roots: Vec<PathBuf> = Vec::new();
+		for dir in std::mem::take(&mut self.add_dirs) {
+			let normalized = normalize_lexically(&resolve_layer_path(cwd, &dir));
+			if normalized != cwd && !roots.contains(&normalized) {
+				roots.push(normalized);
+			}
+		}
+		self.add_dirs = roots;
 	}
 }
 
@@ -2821,6 +2857,41 @@ mod tests {
 		assert_eq!(config.append_system_prompt.as_deref(), Some("cli-append"));
 		// A flag does not overwrite unrelated file fields.
 		assert_eq!(config.default_model.as_deref(), Some("file/model"));
+	}
+
+	#[test]
+	fn workspace_and_policy_flags_reach_runtime_config() {
+		use clap::Parser;
+		let cli = crate::args::Cli::try_parse_from([
+			"omp",
+			"--add-dir",
+			"extra",
+			"--add-dir",
+			"extra",
+			"--add-dir",
+			".",
+			"--no-pty",
+			"--no-rules",
+			"--models",
+			"mock/a, mock/b",
+		])
+		.expect("cli");
+		let mut config = Config::default();
+		config.apply_runtime(&cli);
+		assert_eq!(
+			config.add_dirs,
+			[PathBuf::from("extra"), PathBuf::from("extra"), PathBuf::from(".")]
+		);
+		assert!(config.no_pty);
+		assert!(config.no_rules);
+		assert_eq!(
+			config.model_scope.as_deref(),
+			Some(["mock/a".to_string(), "mock/b".to_string()].as_slice())
+		);
+
+		// Roots resolve against cwd, dedupe in supplied order, and drop cwd.
+		config.normalize_workspace_roots(Path::new("/work"));
+		assert_eq!(config.add_dirs, [PathBuf::from("/work/extra")]);
 	}
 
 	#[test]

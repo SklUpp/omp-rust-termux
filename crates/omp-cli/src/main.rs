@@ -12,7 +12,7 @@ use omp_cli::{
 	agent::{self, AgentRunner, ExtraTool, RunRequest},
 	agents,
 	approve::{ApprovalMode, Approvals},
-	args::{Command, normalize_continue_session_args, parse_cli, refused_verb_message},
+	args::{Cli, Command, normalize_continue_session_args, parse_cli, refused_verb_message},
 	catalog::Catalog,
 	completions,
 	config::Config,
@@ -144,6 +144,15 @@ fn run() -> std::result::Result<(), CliError> {
 	let mut cli = parse_cli(bootstrap.argv.clone());
 	// `--continue <uuid>` names a session (TS parity), not prompt text.
 	normalize_continue_session_args(&mut cli, &bootstrap.argv);
+	// TS `main.ts` sets `PI_NO_PTY=1` for the process; tool children inherit it
+	// through `AgentContext.env`, so their bash never selects an interactive
+	// user-shell PTY. The Rust foreground bash tool has no PTY path, making the
+	// environment the portable half of the contract.
+	if cli.no_pty {
+		// SAFETY: startup is single-threaded here; the runner and every worker
+		// thread are created later.
+		unsafe { std::env::set_var("PI_NO_PTY", "1") };
+	}
 	if let Some(alias_name) = &bootstrap.alias {
 		let result = profile::install_alias(alias_name, profile.as_deref())?;
 		print!(
@@ -163,6 +172,7 @@ fn run() -> std::result::Result<(), CliError> {
 	// positional operand is the output path (`parsedArgs.messages[0]` in TS).
 	// A parsed subcommand owns its own surface (`omp export ...`), so it wins.
 	if let (Some(session), None) = (cli.export.as_deref(), &cli.command) {
+		maybe_auto_chdir(&cli);
 		let base = match &cli.cwd {
 			Some(cwd) => dirs::absolute(&std::env::current_dir()?, cwd),
 			None => std::env::current_dir()?,
@@ -468,12 +478,16 @@ fn run() -> std::result::Result<(), CliError> {
 		return Err(CliError::fail(agent::MISSING_RUNTIME));
 	};
 
+	// TS `applyStartupCwd`: an explicit `--cwd` owns the launch directory;
+	// otherwise a launch from `$HOME` moves to a temp dir unless `--allow-home`.
+	maybe_auto_chdir(&cli);
 	// Project discovery (and relative overlays) use the effective run directory:
 	// an explicit `--cwd` first, else the base config `cwd`, else the process cwd.
 	let mut config = Config::load_run(&cli.config, cli.cwd.as_deref())?;
 	// Dedicated flags are the runtime override layer: they win over every file.
 	config.apply_runtime(&cli);
 	let cwd = resolve_cwd(cli.cwd.clone(), config.cwd.clone())?;
+	config.normalize_workspace_roots(&cwd);
 	let processed_cli_files = if !cli.file_args.is_empty() {
 		process_cli_file_args(&cli.file_args, &cwd)?
 	} else {
@@ -523,8 +537,25 @@ fn run() -> std::result::Result<(), CliError> {
 	}
 
 	let prompt_inputs = (config.system_prompt.clone(), config.append_system_prompt.clone());
-	let loaded_prompts =
+	let mut loaded_prompts =
 		prompts::resolve(prompt_inputs.0.as_deref(), prompt_inputs.1.as_deref(), &cwd)?;
+	// TS `system-prompt.ts` discovers project context files for every additional
+	// workspace root beyond `cwd`; root order follows `--add-dir`, duplicates by
+	// path collapse onto the first copy.
+	for root in &config.add_dirs {
+		for file in prompts::resolve(None, None, root)?.files {
+			if !loaded_prompts.files.iter().any(|existing| existing.path == file.path) {
+				loaded_prompts.files.push(file);
+			}
+		}
+	}
+	// TS `--no-rules` passes `options.rules = []`, disabling rules discovery;
+	// this build's rule surface is the `RULES.md` context file.
+	if config.no_rules {
+		loaded_prompts
+			.files
+			.retain(|file| file.path.file_name().and_then(|name| name.to_str()) != Some("RULES.md"));
+	}
 	let skills_filter = (cli.no_skills, cli.skills.clone());
 	let loaded_skills = skills::load(&cwd, skills_filter.0, &skills_filter.1)?;
 	let catalog = Arc::new(Catalog::load(&cwd)?);
@@ -533,16 +564,44 @@ fn run() -> std::result::Result<(), CliError> {
 		config.allow.iter().cloned(),
 	);
 	let default_model = config.default_model.clone();
-	let requested_model = cli.model.clone();
+	// TS findInitialModel: an explicit `--model` wins, then the first model in
+	// the `--models` scope for a fresh session. A resumed session keeps its own
+	// model, so the scope does not override it here. An explicitly supplied
+	// scope that matches nothing is a hard error instead of a fallback to the
+	// configured default (a CLI `--models` scope never silently widens).
+	let restoring_session =
+		cli.continue_session || cli.resume.is_some() || cli.fork.is_some() || foreign_source.is_some();
+	let (requested_model, scoped_thinking) = match &cli.model {
+		Some(model) => (Some(model.clone()), None),
+		None if !restoring_session => match &config.model_scope {
+			// An all-empty `--models ""` has no patterns to resolve, so it
+			// imposes no scope (TS `resolveModelScope` skips empty entries).
+			Some(patterns) if !patterns.is_empty() => match first_scoped_model(patterns, &catalog) {
+				Some((model, thinking)) => (Some(model), thinking),
+				None => {
+					return Err(CliError::usage(format!(
+						"no models match --models {}",
+						patterns.join(",")
+					)));
+				},
+			},
+			_ => (None, None),
+		},
+		None => (None, None),
+	};
 	let requested_provider = cli.provider.clone();
 	let requested_api_key = cli.api_key.clone();
-	let thinking = cli.thinking.as_deref().and_then(|raw| {
-		let parsed = runtime::parse_cli_thinking(raw);
-		if parsed.is_none() {
-			eprintln!("{}", runtime::cli_thinking_warning(raw));
-		}
-		parsed
-	});
+	let thinking = cli
+		.thinking
+		.as_deref()
+		.and_then(|raw| {
+			let parsed = runtime::parse_cli_thinking(raw);
+			if parsed.is_none() {
+				eprintln!("{}", runtime::cli_thinking_warning(raw));
+			}
+			parsed
+		})
+		.or_else(|| scope_thinking.as_deref().and_then(runtime::parse_cli_thinking));
 	let session_dir = cli
 		.session_dir
 		.as_ref()
@@ -2038,6 +2097,125 @@ impl Session<'_> {
 		}
 		Ok(())
 	}
+}
+
+/// TS `maybeAutoChdir`: a launch from `$HOME` moves to the first existing
+/// candidate (`$HOME/tmp`, `/tmp`, `/var/tmp`, else the OS temp dir). An
+/// explicit `--cwd` or `--allow-home` opts out. This changes the process cwd
+/// only; it grants no permission and does not confine any path.
+fn maybe_auto_chdir(cli: &Cli) {
+	if cli.allow_home || cli.cwd.is_some() {
+		return;
+	}
+	let Some(home) = dirs::home_dir() else {
+		return;
+	};
+	let Ok(cwd) = std::env::current_dir() else {
+		return;
+	};
+	let comparable = |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+	if comparable(&cwd) != comparable(&home) {
+		return;
+	}
+	for candidate in [home.join("tmp"), PathBuf::from("/tmp"), PathBuf::from("/var/tmp")] {
+		if candidate.is_dir() && std::env::set_current_dir(&candidate).is_ok() {
+			return;
+		}
+	}
+	let fallback = std::env::temp_dir();
+	if comparable(&fallback) != comparable(&cwd) && fallback.is_dir() {
+		let _ = std::env::set_current_dir(fallback);
+	}
+}
+
+/// Thinking levels accepted as a `--models` suffix (TS `parseThinkingSuffix`
+/// plus the `auto` sentinel coerced by the scope resolver).
+const MODEL_THINKING_SUFFIXES: [&str; 8] =
+	["off", "minimal", "low", "medium", "high", "xhigh", "max", "auto"];
+
+fn split_model_thinking_suffix(pattern: &str) -> (&str, Option<&str>) {
+	match pattern.rsplit_once(':') {
+		Some((base, level)) if MODEL_THINKING_SUFFIXES.contains(&level) => (base, Some(level)),
+		_ => (pattern, None),
+	}
+}
+
+/// First concrete model matched by an explicit `--models` scope, in pattern
+/// order and then catalog order (TS `resolveModelScope`). Glob patterns match
+/// `provider/id` or the bare id case-insensitively; non-glob patterns match
+/// exactly, then by case-insensitive substring (TS fuzzy selector). The
+/// returned thinking level is the `:level` suffix carried by the winning
+/// pattern (TS scoped-model thinking, `main.ts` initialThinking).
+fn first_scoped_model(
+	patterns: &[String],
+	catalog: &Catalog,
+) -> Option<(String, Option<String>)> {
+	for pattern in patterns {
+		let raw = pattern.trim();
+		if raw.is_empty() {
+			continue;
+		}
+		let (stripped, suffix) = split_model_thinking_suffix(raw);
+		let suffix = suffix.map(str::to_string);
+		if raw.contains('*') || raw.contains('?') || raw.contains('[') {
+			let Ok(glob) = globset::GlobBuilder::new(stripped)
+				.case_insensitive(true)
+				.literal_separator(true)
+				.build()
+			else {
+				continue;
+			};
+			let matcher = glob.compile_matcher();
+			if let Some(model) = find_in_catalog(catalog, |full, id| {
+				matcher.is_match(full) || matcher.is_match(id)
+			}) {
+				return Some((model, suffix));
+			}
+			continue;
+		}
+		// A literal id ending in `:level` keeps priority over suffix parsing.
+		if let Some(model) = find_in_catalog(catalog, |full, id| {
+			full.eq_ignore_ascii_case(raw) || id.eq_ignore_ascii_case(raw)
+		}) {
+			return Some((model, None));
+		}
+		if stripped == raw {
+			let needle = raw.to_lowercase();
+			if let Some(model) =
+				find_in_catalog(catalog, |_, id| id.to_lowercase().contains(&needle))
+			{
+				return Some((model, None));
+			}
+			continue;
+		}
+		if let Some(model) = find_in_catalog(catalog, |full, id| {
+			full.eq_ignore_ascii_case(stripped) || id.eq_ignore_ascii_case(stripped)
+		}) {
+			return Some((model, suffix));
+		}
+		let needle = stripped.to_lowercase();
+		if let Some(model) =
+			find_in_catalog(catalog, |_, id| id.to_lowercase().contains(&needle))
+		{
+			return Some((model, suffix));
+		}
+	}
+	None
+}
+
+fn find_in_catalog(
+	catalog: &Catalog,
+	mut matches: impl FnMut(&str, &str) -> bool,
+) -> Option<String> {
+	for (provider, models) in &catalog.providers {
+		for id in models.keys() {
+			let full = format!("{provider}/{id}");
+			if matches(&full, id) {
+				return Some(full);
+			}
+		}
+	}
+	None
 }
 
 fn resolve_cwd(cli_cwd: Option<PathBuf>, config_cwd: Option<PathBuf>) -> Result<PathBuf> {

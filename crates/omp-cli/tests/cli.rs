@@ -632,3 +632,69 @@ fn root_export_flag_matches_the_export_subcommand_and_fails_before_stdout() {
 
 	std::fs::remove_dir_all(&root).ok();
 }
+
+#[test]
+fn allow_home_controls_the_startup_home_auto_chdir() {
+	let root = std::env::temp_dir().join(format!("omp-cli-allow-home-{}", std::process::id()));
+	let home = root.join("home");
+	let home_tmp = home.join("tmp");
+	std::fs::create_dir_all(&home_tmp).expect("home tmp dir");
+	std::fs::create_dir_all(root.join("config/agent")).expect("agent dir");
+	let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v3_session.jsonl");
+	std::fs::copy(&fixture, home.join("home-only.jsonl")).expect("copy home session");
+	std::fs::copy(&fixture, home_tmp.join("session.jsonl")).expect("copy tmp session");
+
+	let run = |args: &[&std::ffi::OsStr]| {
+		omp()
+			.args(args)
+			.current_dir(&home)
+			.env("HOME", &home)
+			.env("PI_CONFIG_DIR", root.join("config"))
+			.env("PI_CODING_AGENT_DIR", root.join("config/agent"))
+			.env("OMP_SHARE_DIR", root.join("share"))
+			.stdin(Stdio::null())
+			.output()
+			.expect("run omp")
+	};
+	let os = std::ffi::OsStr::new;
+
+	// `--allow-home` keeps the launch directory, so the relative session and
+	// output path resolve under `$HOME`.
+	let allowed = run(&[
+		os("--allow-home"),
+		os("--export"),
+		os("home-only.jsonl"),
+		os("allowed.html"),
+	]);
+	assert_eq!(
+		allowed.status.code(),
+		Some(i32::from(EXIT_SUCCESS)),
+		"stderr: {}",
+		String::from_utf8_lossy(&allowed.stderr)
+	);
+	assert!(home.join("allowed.html").is_file(), "--allow-home must stay in $HOME");
+
+	// Without the flag a launch from `$HOME` switches to `$HOME/tmp` before the
+	// export path resolves; the copy under `$HOME` is not visible there.
+	let moved = run(&[os("--export"), os("home-only.jsonl"), os("moved.html")]);
+	assert_eq!(
+		moved.status.code(),
+		Some(i32::from(EXIT_FAILURE)),
+		"stderr: {}",
+		String::from_utf8_lossy(&moved.stderr)
+	);
+	assert!(!home.join("moved.html").exists());
+	assert!(!home_tmp.join("moved.html").exists());
+
+	// The auto-chdir target is `$HOME/tmp`, where the second copy resolves.
+	let tmp = run(&[os("--export"), os("session.jsonl"), os("from-tmp.html")]);
+	assert_eq!(
+		tmp.status.code(),
+		Some(i32::from(EXIT_SUCCESS)),
+		"stderr: {}",
+		String::from_utf8_lossy(&tmp.stderr)
+	);
+	assert!(home_tmp.join("from-tmp.html").is_file(), "auto-chdir must select $HOME/tmp");
+
+	std::fs::remove_dir_all(&root).ok();
+}

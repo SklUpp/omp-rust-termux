@@ -284,3 +284,74 @@ fn no_lsp_flag_disables_explicit_lsp_tool() {
 		"expected the disabled-lsp error, got: {stderr}"
 	);
 }
+
+/// `--models` picks the first concrete model in pattern order and errors when
+/// an explicit scope matches nothing instead of widening to the default.
+#[test]
+fn models_flag_scopes_the_initial_model() {
+	let server = MockWireServer::start();
+	let base = temp_dir("models");
+	let (agent_dir, cwd) = setup(server.port, &base);
+
+	run_omp_ok(&agent_dir, &cwd, &[], &["--models", "mock/other,mock/cli-fast"]);
+	assert_eq!(server.body(0)["model"], "other", "pattern order wins over catalog order");
+
+	run_omp_ok(&agent_dir, &cwd, &[], &["--models", "mock/cli-*"]);
+	assert_eq!(server.body(1)["model"], "cli-fast", "glob scope picks the first catalog match");
+
+	let collapsed = run_omp(&agent_dir, &cwd, &[], &["--models", "mock/absent*"]);
+	assert!(!collapsed.status.success(), "an empty --models scope must fail");
+	let stderr = String::from_utf8_lossy(&collapsed.stderr);
+	assert!(stderr.contains("no models match --models"), "stderr: {stderr}");
+	assert!(collapsed.stdout.is_empty(), "a rejected scope must not reach the wire");
+	server.stop();
+}
+
+/// `--no-rules` drops the `RULES.md` rule surface but keeps `AGENTS.md`.
+#[test]
+fn no_rules_flag_drops_rules_context_only() {
+	let server = MockWireServer::start();
+	let base = temp_dir("no-rules");
+	let (agent_dir, cwd) = setup(server.port, &base);
+	let project = cwd.join(".omp");
+	fs::create_dir_all(&project).expect("project config dir");
+	fs::write(project.join("RULES.md"), "RULES CONTEXT MARKER").expect("write rules");
+	fs::write(project.join("AGENTS.md"), "AGENTS CONTEXT MARKER").expect("write agents");
+
+	run_omp_ok(&agent_dir, &cwd, &[], &[]);
+	let with_rules = server.body(0).to_string();
+	assert!(with_rules.contains("RULES CONTEXT MARKER"), "rules must load by default");
+	assert!(with_rules.contains("AGENTS CONTEXT MARKER"), "agents context must load");
+
+	run_omp_ok(&agent_dir, &cwd, &[], &["--no-rules"]);
+	let without_rules = server.body(1).to_string();
+	assert!(!without_rules.contains("RULES CONTEXT MARKER"), "--no-rules must drop RULES.md");
+	assert!(without_rules.contains("AGENTS CONTEXT MARKER"), "--no-rules must keep AGENTS.md");
+	server.stop();
+}
+
+/// `--add-dir` adds workspace roots: project context discovery includes each
+/// root, and the same root supplied twice still contributes once.
+#[test]
+fn add_dir_flag_contributes_workspace_root_context() {
+	let server = MockWireServer::start();
+	let base = temp_dir("add-dir");
+	let (agent_dir, cwd) = setup(server.port, &base);
+	let shared = base.join("shared");
+	fs::create_dir_all(shared.join(".omp")).expect("shared project dir");
+	fs::write(shared.join(".omp/AGENTS.md"), "SHARED ROOT MARKER").expect("write shared agents");
+	let shared_arg = shared.to_str().expect("utf8 shared path");
+
+	run_omp_ok(&agent_dir, &cwd, &[], &[]);
+	assert!(!server.body(0).to_string().contains("SHARED ROOT MARKER"));
+
+	run_omp_ok(&agent_dir, &cwd, &[], &["--add-dir", shared_arg, "--add-dir", shared_arg]);
+	let body = server.body(1).to_string();
+	assert!(body.contains("SHARED ROOT MARKER"), "--add-dir must load root context");
+	assert_eq!(
+		body.matches("SHARED ROOT MARKER").count(),
+		1,
+		"a repeated root must contribute once"
+	);
+	server.stop();
+}

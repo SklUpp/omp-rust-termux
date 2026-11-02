@@ -42,6 +42,14 @@ struct LaunchArgs {
 	#[arg(long, value_name = "DIR")]
 	cwd: Option<PathBuf>,
 
+	/// Additional workspace roots beyond the working directory (repeatable).
+	#[arg(long = "add-dir", value_name = "DIR")]
+	add_dir: Vec<PathBuf>,
+
+	/// Stay in the home directory instead of switching to a temp dir at startup.
+	#[arg(long = "allow-home")]
+	allow_home: bool,
+
 	/// Isolated profile for auth, sessions, settings, and caches.
 	#[arg(long, value_name = "NAME")]
 	profile: Option<String>,
@@ -58,6 +66,10 @@ struct LaunchArgs {
 	/// Model id (`provider/model` or bare id).
 	#[arg(long)]
 	model: Option<String>,
+
+	/// Comma-separated model patterns defining the session's model scope.
+	#[arg(long, value_name = "MODELS")]
+	models: Option<String>,
 
 	/// Smol/fast model for lightweight tasks (or `PI_SMOL_MODEL`).
 	#[arg(long, value_name = "MODEL")]
@@ -107,6 +119,10 @@ struct LaunchArgs {
 	/// Disable LSP tools, formatting, and diagnostics.
 	#[arg(long = "no-lsp")]
 	no_lsp: bool,
+
+	/// Disable PTY-based interactive bash execution.
+	#[arg(long = "no-pty")]
+	no_pty: bool,
 
 	/// Only enable these tools (comma-separated or repeatable).
 	#[arg(long, value_delimiter = ',', value_name = "TOOLS")]
@@ -187,6 +203,10 @@ struct LaunchArgs {
 	#[arg(long = "no-skills")]
 	no_skills: bool,
 
+	/// Disable rules discovery and loading.
+	#[arg(long = "no-rules")]
+	no_rules: bool,
+
 	/// Only load skills matching this glob (comma-separated or repeatable).
 	#[arg(long, value_delimiter = ',', value_name = "GLOB")]
 	skills: Vec<String>,
@@ -242,6 +262,12 @@ pub struct Cli {
 	/// Working directory for the session.
 	pub cwd: Option<PathBuf>,
 
+	/// Additional workspace roots beyond the working directory.
+	pub add_dir: Vec<PathBuf>,
+
+	/// Stay in the home directory instead of switching to a temp dir at startup.
+	pub allow_home: bool,
+
 	/// Isolated profile for auth, sessions, settings, and caches.
 	pub profile: Option<String>,
 
@@ -253,6 +279,9 @@ pub struct Cli {
 
 	/// Model id (`provider/model` or bare id).
 	pub model: Option<String>,
+
+	/// Model patterns defining the session's model scope.
+	pub models: Option<Vec<String>>,
 
 	/// Smol/fast model for lightweight tasks (or `PI_SMOL_MODEL`).
 	pub smol: Option<String>,
@@ -290,6 +319,9 @@ pub struct Cli {
 
 	/// Disable LSP tools, formatting, and diagnostics.
 	pub no_lsp: bool,
+
+	/// Disable PTY-based interactive bash execution.
+	pub no_pty: bool,
 
 	/// Only enable these tools (comma-separated or repeatable).
 	pub tools: Option<Vec<String>>,
@@ -344,6 +376,9 @@ pub struct Cli {
 
 	/// Discover no skills.
 	pub no_skills: bool,
+
+	/// Disable rules discovery and loading.
+	pub no_rules: bool,
 
 	/// Only load skills matching this glob (comma-separated or repeatable).
 	pub skills: Vec<String>,
@@ -437,6 +472,17 @@ impl Cli {
 		// Everything after `--` remains a prompt message, even if starting with `@`.
 		prompt.extend(raw.trailing);
 
+		// TS `--models` setter splits on commas and trims; a repeated flag
+		// replaces the earlier scope instead of appending to it.
+		let models: Option<Vec<String>> = raw.models.as_deref().map(|value| {
+			value
+				.split(',')
+				.map(str::trim)
+				.filter(|pattern| !pattern.is_empty())
+				.map(str::to_string)
+				.collect()
+		});
+
 		Self {
 			prompt,
 			file_args,
@@ -444,10 +490,13 @@ impl Cli {
 			mode: raw.mode,
 			print_thoughts: raw.print_thoughts,
 			cwd: raw.cwd,
+			add_dir: raw.add_dir,
+			allow_home: raw.allow_home,
 			profile: raw.profile,
 			alias: raw.alias,
 			export: raw.export,
 			model: raw.model,
+			models,
 			smol: raw.smol,
 			slow: raw.slow,
 			plan: raw.plan,
@@ -460,6 +509,7 @@ impl Cli {
 			max_time: raw.max_time,
 			no_tools: raw.no_tools,
 			no_lsp: raw.no_lsp,
+			no_pty: raw.no_pty,
 			tools: raw.tools,
 			approval_mode: raw.approval_mode,
 			yolo: raw.yolo,
@@ -478,6 +528,7 @@ impl Cli {
 			session_id: raw.session_id,
 			no_session: raw.no_session,
 			no_skills: raw.no_skills,
+			no_rules: raw.no_rules,
 			skills: raw.skills,
 			command,
 		}
@@ -1453,6 +1504,46 @@ mod tests {
 		assert_eq!(cli.config, [PathBuf::from("a.yml"), PathBuf::from("b.yml")]);
 		assert!(cli.no_skills);
 		assert_eq!(cli.prompt, ["hello"]);
+	}
+
+	#[test]
+	fn workspace_and_policy_flags_parse() {
+		let cli = parse(&[
+			"omp",
+			"--add-dir",
+			"one",
+			"--add-dir",
+			"/two",
+			"--allow-home",
+			"--no-pty",
+			"--no-rules",
+			"--models",
+			" a, b ,c",
+			"hello",
+		]);
+		assert_eq!(cli.add_dir, [PathBuf::from("one"), PathBuf::from("/two")]);
+		assert!(cli.allow_home);
+		assert!(cli.no_pty);
+		assert!(cli.no_rules);
+		assert_eq!(
+			cli.models.as_deref(),
+			Some(["a".to_string(), "b".to_string(), "c".to_string()].as_slice())
+		);
+		assert_eq!(cli.prompt, ["hello"]);
+
+		let bare = parse(&["omp"]);
+		assert!(bare.add_dir.is_empty());
+		assert!(!bare.allow_home);
+		assert!(!bare.no_pty);
+		assert!(!bare.no_rules);
+		assert!(bare.models.is_none());
+
+		// A repeated `--models` replaces the earlier scope (TS setter).
+		let replaced = parse(&["omp", "--models", "first", "--models", "second,third"]);
+		assert_eq!(
+			replaced.models.as_deref(),
+			Some(["second".to_string(), "third".to_string()].as_slice())
+		);
 	}
 
 	#[test]

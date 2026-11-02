@@ -691,11 +691,16 @@ fn ttsr_builtin_defaults_are_embedded_from_ts_assets() {
 fn terminal_escaping_neutralizes_control_sequences() {
 	let raw = "safe\n\u{1b}]52;c;base64\u{7}\u{9b}31m";
 	let escaped = escape_terminal_text(raw, false);
-	assert!(escaped.contains("\\u{1b}"), "{escaped}");
-	assert!(escaped.contains("\\n"), "{escaped}");
-	assert!(escaped.contains("\\u{7}"), "{escaped}");
-	assert!(escaped.contains("\\u{9b}"), "{escaped}");
+	assert!(!escaped.contains('\u{1b}'), "{escaped}");
+	assert!(!escaped.contains('\u{7}'), "{escaped}");
+	assert!(!escaped.contains('\u{9b}'), "{escaped}");
+	assert!(!escaped.contains('\n'), "{escaped}");
 	assert!(!escaped.chars().any(char::is_control), "{escaped}");
+
+	let kept = escape_terminal_text("a\nb\tc\u{1b}", true);
+	assert!(kept.contains('\n'), "newlines preserved: {kept}");
+	assert!(kept.contains('\t'), "tabs preserved: {kept}");
+	assert!(!kept.contains('\u{1b}'), "other controls still escaped: {kept}");
 
 	let detail = json!({
 		"name": "rule\u{1b}[31m",
@@ -707,7 +712,7 @@ fn terminal_escaping_neutralizes_control_sequences() {
 	render_rule_detail(&mut out, &detail, false).expect("detail");
 	let text = String::from_utf8(out).expect("utf8");
 	assert!(!text.contains('\u{1b}'), "{text}");
-	assert!(text.contains("\\u{1b}"), "{text}");
+	assert!(text.contains("trigger"), "{text}");
 }
 
 #[test]
@@ -828,7 +833,7 @@ fn gc_agent_dir_text_escapes_controls() {
 	let result = json!({ "agentDir": "/tmp/\u{1b}]0;x", "apply": false, "lockPath": "/tmp/x" });
 	let text = gc_text(&result);
 	assert!(!text.contains('\u{1b}'), "{text}");
-	assert!(text.contains("\\u{1b}"), "{text}");
+	assert!(text.contains("GC dry-run"), "{text}");
 }
 
 #[test]

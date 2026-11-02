@@ -166,7 +166,10 @@ pub async fn run(
 									.for_provider(provider),
 							);
 						}
-						return Ok(CodeExchange { code, state: state.unwrap_or_default(), redirect_uri });
+						// `callback-server.ts:222-227` discards the callback state and
+						// passes the generated `state` to `exchangeToken`, so a bare
+						// pasted code still exchanges with the state this flow minted.
+						return Ok(CodeExchange { code, state: expected_state.to_string(), redirect_uri });
 					},
 					Ok(Err(err)) => return Err(err.for_provider(provider)),
 					Err(TryRecvError::Disconnected) => return Err(AuthError::cancelled(provider)),
@@ -395,7 +398,8 @@ mod tests {
 		.await
 		.expect("a bare pasted code is accepted");
 		assert_eq!(exchange.code, "pasted-code");
-		assert_eq!(exchange.state, "");
+		// The exchange must still carry the generated state, not an empty string.
+		assert_eq!(exchange.state, TEST_STATE);
 	}
 
 	#[tokio::test]

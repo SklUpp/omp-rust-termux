@@ -11,7 +11,7 @@ use std::{
 	future::Future,
 	pin::Pin,
 	sync::{
-		Arc, OnceLock,
+		Arc,
 		atomic::{AtomicU64, Ordering},
 	},
 	time::Duration,
@@ -3138,9 +3138,8 @@ struct RetryBodyPatterns {
 	try_again: regex::Regex,
 }
 
-fn retry_body_patterns() -> &'static RetryBodyPatterns {
-	static PATTERNS: OnceLock<RetryBodyPatterns> = OnceLock::new();
-	PATTERNS.get_or_init(|| RetryBodyPatterns {
+static RETRY_BODY_PATTERNS: std::sync::LazyLock<RetryBodyPatterns> =
+	std::sync::LazyLock::new(|| RetryBodyPatterns {
 		quota: regex::Regex::new(r"(?i)reset after (?:(\d+)h)?(?:(\d+)m)?(\d+(?:\.\d+)?)s")
 			.expect("quota reset pattern"),
 		will_reset: regex::Regex::new(
@@ -3155,7 +3154,10 @@ fn retry_body_patterns() -> &'static RetryBodyPatterns {
 			r"(?i)try again in\s+~?\s*([0-9.]+)\s*(ms|sec|s|minutes?|mins?|m|hours?|hrs?|h)\b",
 		)
 		.expect("try again pattern"),
-	})
+	});
+
+fn retry_body_patterns() -> &'static RetryBodyPatterns {
+	&RETRY_BODY_PATTERNS
 }
 
 fn retry_unit_to_ms(unit: &str) -> Option<u64> {

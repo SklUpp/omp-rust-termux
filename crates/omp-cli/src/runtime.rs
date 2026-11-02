@@ -2220,9 +2220,15 @@ fn wire_base_url(
 		WireDialect::OpenAiCompletions => configured.ok_or_else(|| {
 			format!("provider `{provider}` has no baseUrl in config.yml or models.yml")
 		}),
-		// The Ollama adapter normalizes a bare host and defaults to the cloud
-		// endpoint, so an absent base URL is legal for this dialect.
-		WireDialect::OllamaChat => Ok(configured.unwrap_or_else(|| "https://ollama.com".to_string())),
+		// The adapter normalizes a bare host; the default is the local daemon
+		// unless the provider is the cloud one (its rows all use the cloud URL).
+		WireDialect::OllamaChat => Ok(configured.unwrap_or_else(|| {
+			if provider == "ollama-cloud" {
+				"https://ollama.com".to_string()
+			} else {
+				"http://127.0.0.1:11434".to_string()
+			}
+		})),
 		WireDialect::AnthropicMessages => anthropic_base_url(provider, configured)
 			.ok_or_else(|| format!("provider `{provider}` has no baseUrl for `anthropic-messages`")),
 	}
@@ -4897,14 +4903,20 @@ fn replayable_entries(
 		if dropped.is_empty() {
 			continue;
 		}
-		for scan in (index..kept.len()).rev() {
+		// Only the batch that immediately follows the removed turn can belong to
+		// it: stop at the first non-result so a later turn that reuses an id keeps
+		// its own result. The block end is fixed before any removal.
+		let mut end = index;
+		while end < kept.len() && kept[end].message.role == "toolResult" {
+			end += 1;
+		}
+		for scan in (index..end).rev() {
 			let paired = {
 				let candidate = &kept[scan].message;
-				candidate.role == "toolResult"
-					&& candidate
-						.tool_call_id
-						.as_deref()
-						.is_some_and(|id| dropped.contains(id))
+				candidate
+					.tool_call_id
+					.as_deref()
+					.is_some_and(|id| dropped.contains(id))
 			};
 			if paired {
 				kept.remove(scan);
@@ -7803,8 +7815,17 @@ mod tests {
 			entry("m7", SessionMessage::user(MessageContent::Text("third".to_string()), 7)),
 		];
 		let history = history_messages_from_entries(&entries).expect("history");
-		let roles: Vec<&str> = history.iter().map(|message| message.role.as_str()).collect();
-		assert_eq!(roles, vec!["user", "user", "assistant", "user"], "{roles:?}");
+		let roles: Vec<pi_agent::Role> = history.iter().map(|message| message.role).collect();
+		assert_eq!(
+			roles,
+			vec![
+				pi_agent::Role::User,
+				pi_agent::Role::User,
+				pi_agent::Role::Assistant,
+				pi_agent::Role::User,
+			],
+			"{roles:?}"
+		);
 		assert_eq!(history[0].content, "first");
 		assert_eq!(history[1].content, "second");
 		assert_eq!(history[2].parts[0].thinking_signature(), Some("sig-live"));
@@ -7903,6 +7924,109 @@ mod tests {
 		assert_eq!(
 			resolve(&reasoning(&["low"], false), None, Some(thinking(&["low"], None)), "low"),
 			Ok(None)
+		);
+	}
+
+	/// Only the cloud provider defaults to the hosted endpoint; a local Ollama
+	/// provider without a configured route talks to the daemon.
+	#[test]
+	fn ollama_defaults_differ_between_local_and_cloud() {
+		let catalog_without_route = catalog_with_model("ollama", "qwen3", ModelInfo {
+			provider: "ollama".to_string(),
+			api: Some("ollama-chat".to_string()),
+			..ModelInfo::default()
+		}, None);
+		assert_eq!(
+			wire_base_url(&catalog_without_route, "ollama", "qwen3", None, WireDialect::OllamaChat),
+			Ok("http://127.0.0.1:11434".to_string())
+		);
+		let cloud = catalog_with_model("ollama-cloud", "gpt-oss", ModelInfo {
+			provider: "ollama-cloud".to_string(),
+			api: Some("ollama-chat".to_string()),
+			..ModelInfo::default()
+		}, None);
+		assert_eq!(
+			wire_base_url(&cloud, "ollama-cloud", "gpt-oss", None, WireDialect::OllamaChat),
+			Ok("https://ollama.com".to_string())
+		);
+	}
+
+	/// The paired-result cleanup is bounded to the batch that follows the removed
+	/// turn: a later turn that reuses the same tool-call id keeps its result.
+	#[test]
+	fn entry_history_keeps_later_result_that_reuses_a_failed_call_id() {
+		use crate::session::{
+			ContentPart as SessionPart, MessageContent, MessageEntry, SessionMessage,
+		};
+
+		let entry = |id: &str, message: SessionMessage| {
+			MessageEntry::new(id, None, "2026-01-01T00:00:00Z", message)
+		};
+		let call = |id: &str, name: &str| {
+			SessionMessage::assistant(
+				MessageContent::Parts(vec![
+					SessionPart::tool_call(id, name, serde_json::json!({"path": "a"})),
+				]),
+				"ollama-chat",
+				"ollama",
+				"qwen3",
+				None,
+				"aborted",
+				2,
+			)
+		};
+		let entries = vec![
+			entry("m1", SessionMessage::user(MessageContent::Text("first".to_string()), 1)),
+			entry("m2", call("call_0", "read")),
+			entry("m3", SessionMessage::tool_result(
+				"call_0",
+				"read",
+				MessageContent::Text("failed batch".to_string()),
+				true,
+				3,
+			)),
+			entry("m4", SessionMessage::user(MessageContent::Text("second".to_string()), 4)),
+			entry("m5", SessionMessage::assistant(
+				MessageContent::Parts(vec![
+					SessionPart::tool_call("call_0", "read", serde_json::json!({"path": "b"})),
+				]),
+				"ollama-chat",
+				"ollama",
+				"qwen3",
+				None,
+				"toolUse",
+				5,
+			)),
+			entry("m6", SessionMessage::tool_result(
+				"call_0",
+				"read",
+				MessageContent::Text("valid result".to_string()),
+				false,
+				6,
+			)),
+		];
+		let history = history_messages_from_entries(&entries).expect("history");
+		let roles: Vec<pi_agent::Role> = history.iter().map(|message| message.role).collect();
+		assert_eq!(
+			roles,
+			vec![
+				pi_agent::Role::User,
+				pi_agent::Role::User,
+				pi_agent::Role::Assistant,
+				pi_agent::Role::Tool,
+			],
+			"{roles:?}"
+		);
+		assert!(
+			history.iter().all(|message| message.content != "failed batch"),
+			"the failed batch must not replay"
+		);
+		assert_eq!(history[2].tool_calls[0].id, "call_0");
+		assert_eq!(history[3].content, "valid result");
+		assert_eq!(
+			history[3].tool_call_id.as_deref(),
+			Some("call_0"),
+			"the later turn keeps its own result even though the id repeats"
 		);
 	}
 

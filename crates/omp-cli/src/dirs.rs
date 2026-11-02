@@ -97,6 +97,7 @@ fn is_profile_derived(dir: &Path, base: &Path) -> bool {
 pub enum AgentDirCategory {
 	Data,
 	State,
+	Cache,
 }
 
 impl AgentDirCategory {
@@ -104,8 +105,16 @@ impl AgentDirCategory {
 		match self {
 			Self::Data => "XDG_DATA_HOME",
 			Self::State => "XDG_STATE_HOME",
+			Self::Cache => "XDG_CACHE_HOME",
 		}
 	}
+}
+
+/// `rootSubdir(name, category)` (`dirs.ts`): a sibling of `agent/` under the
+/// config root, or flat under `$XDG_*_HOME/omp` when the XDG pin applies.
+#[must_use]
+pub fn root_subdir(name: &str, category: AgentDirCategory) -> PathBuf {
+	xdg_agent_root(category).unwrap_or_else(config_root).join(name)
 }
 
 /// Agent subdirectory honoring the DirResolver XDG redirect. Mirrors

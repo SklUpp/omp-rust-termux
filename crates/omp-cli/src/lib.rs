@@ -24,6 +24,7 @@ pub mod file_mentions;
 pub mod foreign_session;
 pub mod goal;
 pub mod goal_tool;
+pub mod local_cmd;
 pub mod local_models;
 pub mod output;
 pub mod process_cli;

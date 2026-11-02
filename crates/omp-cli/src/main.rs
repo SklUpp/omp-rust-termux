@@ -24,6 +24,7 @@ use omp_cli::{
 	foreign_session::{self, ForeignSessionSource, ForeignSessionStore},
 	goal::{self, GoalMode, GoalModeState, GoalPersist, GoalRuntime, RestorePlan, TokenCounters},
 	goal_tool::{GOAL_TOOL_NAME, GoalTool},
+	local_cmd,
 	local_models,
 	output::{self, OutputMode, Reporter, session_id},
 	process_cli,
@@ -65,6 +66,23 @@ impl CliError {
 	/// Non-zero exit whose explanation was already printed on stdout.
 	fn silent(code: u8) -> Self {
 		Self { message: String::new(), code }
+	}
+}
+
+fn base_dir(cli: &Cli) -> Result<PathBuf> {
+	match &cli.cwd {
+		Some(cwd) => Ok(dirs::absolute(&std::env::current_dir()?, cwd)),
+		None => Ok(std::env::current_dir()?),
+	}
+}
+
+/// Map a handler's explicit exit code to the CLI result: zero succeeds, any
+/// other code is silent because the handler already rendered its output.
+fn local_exit(code: u8) -> std::result::Result<(), CliError> {
+	if code == omp_cli::EXIT_SUCCESS {
+		Ok(())
+	} else {
+		Err(CliError::silent(code))
 	}
 }
 
@@ -454,6 +472,106 @@ fn run() -> std::result::Result<(), CliError> {
 			};
 			run_commit_command(message.as_deref(), &base)?;
 			return Ok(());
+		},
+		Some(Command::Ttsr {
+			action,
+			snippet,
+			file,
+			rule,
+			source,
+			tool,
+			path,
+			verbose,
+			json,
+			no_gitignore,
+			max_bytes,
+		}) => {
+			let base = base_dir(&cli)?;
+			let opts = local_cmd::TtsrOptions {
+				action: action.clone(),
+				snippet: snippet.clone(),
+				file: file.clone(),
+				rule: rule.clone(),
+				source: source.clone(),
+				tool: tool.clone(),
+				path: path.clone(),
+				verbose: *verbose,
+				json: *json,
+				no_gitignore: *no_gitignore,
+				max_bytes: *max_bytes,
+			};
+			let stdout = io::stdout();
+			let stderr = io::stderr();
+			let mut out = io::BufWriter::new(stdout.lock());
+			let mut err = io::BufWriter::new(stderr.lock());
+			let code = local_cmd::run_ttsr(&opts, &base, &mut out, &mut err)?;
+			out.flush()?;
+			err.flush()?;
+			return local_exit(code);
+		},
+		Some(Command::Gallery { tool, state, width, expanded, plain }) => {
+			let opts = local_cmd::GalleryOptions {
+				tool: tool.clone(),
+				states: state.clone(),
+				width: *width,
+				expanded: *expanded,
+				plain: *plain,
+			};
+			let stdout = io::stdout();
+			let mut out = io::BufWriter::new(stdout.lock());
+			let code = local_cmd::run_gallery(&opts, &mut out)?;
+			out.flush()?;
+			return local_exit(code);
+		},
+		Some(Command::Grievances { action: _, limit, tool, json }) => {
+			let opts = local_cmd::GrievancesOptions { limit: *limit, tool: tool.clone(), json: *json };
+			let stdout = io::stdout();
+			let mut out = io::BufWriter::new(stdout.lock());
+			let code = local_cmd::run_grievances(&opts, &mut out)?;
+			out.flush()?;
+			return local_exit(code);
+		},
+		Some(Command::Gc {
+			json,
+			agent_dir,
+			blobs,
+			archive,
+			wal,
+			cold_archive_after_days,
+			retain_newest_global,
+			retain_newest_per_cwd,
+		}) => {
+			let base = base_dir(&cli)?;
+			let opts = local_cmd::GcOptions {
+				json: *json,
+				agent_dir: agent_dir.clone(),
+				blobs: *blobs,
+				archive: *archive,
+				wal: *wal,
+				cold_archive_after_days: *cold_archive_after_days,
+				retain_newest_global: *retain_newest_global,
+				retain_newest_per_cwd: *retain_newest_per_cwd,
+			};
+			let stdout = io::stdout();
+			let stderr = io::stderr();
+			let mut out = io::BufWriter::new(stdout.lock());
+			let mut err = io::BufWriter::new(stderr.lock());
+			let code = local_cmd::run_gc(&opts, &base, &mut out, &mut err)?;
+			out.flush()?;
+			err.flush()?;
+			return local_exit(code);
+		},
+		Some(Command::Setup { component, check, json }) => {
+			let base = base_dir(&cli)?;
+			let opts = local_cmd::SetupOptions { component: component.clone(), check: *check, json: *json };
+			let stdout = io::stdout();
+			let stderr = io::stderr();
+			let mut out = io::BufWriter::new(stdout.lock());
+			let mut err = io::BufWriter::new(stderr.lock());
+			let code = local_cmd::run_setup(&opts, &base, &mut out, &mut err)?;
+			out.flush()?;
+			err.flush()?;
+			return local_exit(code);
 		},
 		Some(Command::Completions { shell }) => {
 			return completions::run(shell.as_deref()).map_err(|message| CliError::fail(message));

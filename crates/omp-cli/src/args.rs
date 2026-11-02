@@ -591,27 +591,22 @@ const EXCLUDED_VERBS: [(&str, &str); 6] = [
 
 /// Known upstream verbs this binary does not implement yet, including the
 /// upstream registry alias `img`.
-const MISSING_VERBS: [&str; 20] = [
+const MISSING_VERBS: [&str; 15] = [
 	"auth-broker",
 	"auth-gateway",
 	"bench",
 	"browser-relay",
 	"compress",
 	"dry-balance",
-	"gc",
-	"gallery",
-	"grievances",
 	"images",
 	"img",
 	"if-bench",
 	"say",
 	"share",
-	"setup",
 	"ssh",
 	"usage",
 	"tiny-models",
 	"token",
-	"ttsr",
 ];
 
 /// The two Rust surfaces that are not TypeScript registry verbs. Every other
@@ -1203,6 +1198,133 @@ pub enum Command {
 		/// Commit message (default: `omp commit`).
 		#[arg(short = 'm', long = "message", value_name = "MSG")]
 		message: Option<String>,
+	},
+
+	/// Inspect and test Time-Traveling Stream Rules (TTSR).
+	///
+	/// Loads the embedded `builtin-defaults` set plus on-disk native/agent rule
+	/// providers. Plugin-marketplace rules are an explicit unsupported source in
+	/// this native runtime, matching the plugin-execution boundary.
+	Ttsr {
+		/// Action: `list` (default), `test`, or `scan`.
+		#[arg(value_name = "ACTION", value_parser = ["list", "test", "scan"])]
+		action:       Option<String>,
+		/// Inline snippet (test) or directory (scan).
+		#[arg(value_name = "SNIPPET")]
+		snippet:      Option<String>,
+		/// Snippet file path, or `-` for stdin (test).
+		#[arg(short = 'f', long, value_name = "PATH")]
+		file:         Option<String>,
+		/// Rule markdown file to test in isolation (skips project rule loading).
+		#[arg(short = 'r', long, value_name = "PATH")]
+		rule:         Option<PathBuf>,
+		/// Match source: `text`, `thinking`, or `tool`.
+		#[arg(long, value_name = "SOURCE")]
+		source:       Option<String>,
+		/// Tool name when source is tool (defaults to edit).
+		#[arg(long, value_name = "TOOL")]
+		tool:         Option<String>,
+		/// Candidate file path for scope/glob matching and AST inference.
+		#[arg(short = 'p', long, value_name = "PATH")]
+		path:         Option<String>,
+		/// Show every evaluated rule, not just triggered ones.
+		#[arg(short = 'v', long)]
+		verbose:      bool,
+		/// Output JSON.
+		#[arg(long)]
+		json:         bool,
+		/// Include files excluded by `.gitignore` (scan).
+		#[arg(long = "no-gitignore")]
+		no_gitignore: bool,
+		/// Maximum file size to scan in bytes; 0 disables the limit (scan).
+		#[arg(long = "max-bytes", value_name = "N")]
+		max_bytes:    Option<u64>,
+	},
+
+	/// Render a headless tool-lifecycle preview to stdout (ANSI/plain).
+	///
+	/// This is a deterministic preview of the native tool catalog's call/result
+	/// states, not a byte-for-byte TypeScript `ToolExecutionComponent` render.
+	Gallery {
+		/// Render a single tool by name.
+		#[arg(short = 't', long, value_name = "TOOL")]
+		tool:     Option<String>,
+		/// Render only the given lifecycle state(s).
+		#[arg(short = 's', long = "state", value_name = "STATE")]
+		state:    Vec<String>,
+		/// Render width in columns (clamped to 40..=200).
+		#[arg(short = 'w', long, value_name = "N")]
+		width:    Option<usize>,
+		/// Render the expanded variant of each renderer.
+		#[arg(short = 'e', long)]
+		expanded: bool,
+		/// Strip ANSI styling from the output.
+		#[arg(long)]
+		plain:    bool,
+	},
+
+	/// View reported tool issues from automated QA.
+	Grievances {
+		/// Action: `list` (default). Destructive actions are not in this build.
+		#[arg(value_name = "ACTION", value_parser = ["list"])]
+		action: Option<String>,
+		/// Number of recent issues to show.
+		#[arg(short = 'n', long, default_value_t = 20, value_name = "N")]
+		limit:  u32,
+		/// Filter by tool name.
+		#[arg(short = 't', long, value_name = "TOOL")]
+		tool:   Option<String>,
+		/// Output as JSON.
+		#[arg(short = 'j', long)]
+		json:   bool,
+	},
+
+	/// On-disk storage maintenance (dry-run only in this build).
+	Gc {
+		/// Output JSON.
+		#[arg(long)]
+		json:                  bool,
+		/// Agent directory to maintain.
+		#[arg(long = "agent-dir", value_name = "DIR")]
+		agent_dir:             Option<PathBuf>,
+		/// Sweep unreferenced blobs.
+		#[arg(long)]
+		blobs:                 bool,
+		/// Archive cold sessions.
+		#[arg(long)]
+		archive:               bool,
+		/// Report history/model database WAL files.
+		#[arg(long)]
+		wal:                   bool,
+		/// Minimum session age before archiving.
+		#[arg(long = "cold-archive-after-days", value_name = "N")]
+		cold_archive_after_days: Option<u32>,
+		/// Always keep this many newest sessions active.
+		#[arg(long = "retain-newest-global", value_name = "N")]
+		retain_newest_global:  Option<u32>,
+		/// Always keep this many newest sessions per cwd active.
+		#[arg(long = "retain-newest-per-cwd", value_name = "N")]
+		retain_newest_per_cwd: Option<u32>,
+	},
+
+	/// Run onboarding setup or check optional dependencies.
+	///
+	/// `setup python` executes the configured/discovered interpreter for the
+	/// availability probe. That interpreter runs with the user's permissions and
+	/// may execute startup hooks from the project; run it only in trusted
+	/// projects. The CLI itself does not install, download, or mutate files.
+	/// `setup speech` reports cache presence separately from `ready`; readiness
+	/// requires a verified execution backend and is false when none exists.
+	Setup {
+		/// Component: `python` or `speech`.
+		#[arg(value_name = "COMPONENT")]
+		component: Option<String>,
+		/// Check whether dependencies are installed without installing.
+		#[arg(short = 'c', long)]
+		check:     bool,
+		/// Output status as JSON.
+		#[arg(long)]
+		json:      bool,
 	},
 }
 
@@ -1992,5 +2114,185 @@ mod tests {
 		assert!(refusal(&["--export", "log.jsonl", "git"]).is_some());
 		assert_eq!(refusal(&["--export", "log.jsonl", "repl"]), None);
 		assert_eq!(refusal(&["--export", "share"]), None);
+	}
+
+	#[test]
+	fn ttsr_subcommand_parses_flags() {
+		assert_eq!(
+			parse(&["omp", "ttsr"]).command,
+			Some(Command::Ttsr {
+				action:       None,
+				snippet:      None,
+				file:         None,
+				rule:         None,
+				source:       None,
+				tool:         None,
+				path:         None,
+				verbose:      false,
+				json:         false,
+				no_gitignore: false,
+				max_bytes:    None,
+			})
+		);
+		assert_eq!(
+			parse(&[
+				"omp", "ttsr", "test", "regex", "--file", "-", "--rule", "r.md", "--source", "tool", "--tool",
+				"edit", "--path", "a.ts", "-v", "--json",
+			])
+			.command,
+			Some(Command::Ttsr {
+				action:       Some("test".to_string()),
+				snippet:      Some("regex".to_string()),
+				file:         Some("-".to_string()),
+				rule:         Some(PathBuf::from("r.md")),
+				source:       Some("tool".to_string()),
+				tool:         Some("edit".to_string()),
+				path:         Some("a.ts".to_string()),
+				verbose:      true,
+				json:         true,
+				no_gitignore: false,
+				max_bytes:    None,
+			})
+		);
+		assert_eq!(
+			parse(&["omp", "ttsr", "scan", "src", "--no-gitignore", "--max-bytes", "1024"]).command,
+			Some(Command::Ttsr {
+				action:       Some("scan".to_string()),
+				snippet:      Some("src".to_string()),
+				file:         None,
+				rule:         None,
+				source:       None,
+				tool:         None,
+				path:         None,
+				verbose:      false,
+				json:         false,
+				no_gitignore: true,
+				max_bytes:    Some(1024),
+			})
+		);
+		assert!(Cli::try_parse_from(["omp", "ttsr", "bogus"]).is_err());
+	}
+
+	#[test]
+	fn gallery_subcommand_parses_repeatable_states() {
+		assert_eq!(
+			parse(&["omp", "gallery"]).command,
+			Some(Command::Gallery {
+				tool:     None,
+				state:    Vec::new(),
+				width:    None,
+				expanded: false,
+				plain:    false,
+			})
+		);
+		assert_eq!(
+			parse(&["omp", "gallery", "-t", "read", "-s", "done", "--state", "failed", "-w", "80", "-e", "--plain"])
+				.command,
+			Some(Command::Gallery {
+				tool:     Some("read".to_string()),
+				state:    vec!["done".to_string(), "failed".to_string()],
+				width:    Some(80),
+				expanded: true,
+				plain:    true,
+			})
+		);
+	}
+
+	#[test]
+	fn grievances_subcommand_parses_list_flags() {
+		assert_eq!(
+			parse(&["omp", "grievances"]).command,
+			Some(Command::Grievances {
+				action: None,
+				limit:  20,
+				tool:   None,
+				json:   false,
+			})
+		);
+		assert_eq!(
+			parse(&["omp", "grievances", "list", "-n", "5", "-t", "bash", "-j"]).command,
+			Some(Command::Grievances {
+				action: Some("list".to_string()),
+				limit:  5,
+				tool:   Some("bash".to_string()),
+				json:   true,
+			})
+		);
+		// Destructive sub-actions are not exposed in this slice; clap rejects them.
+		assert!(Cli::try_parse_from(["omp", "grievances", "clean"]).is_err());
+	}
+
+	#[test]
+	fn gc_subcommand_parses_dry_run_flags() {
+		assert_eq!(
+			parse(&["omp", "gc"]).command,
+			Some(Command::Gc {
+				json:                    false,
+				agent_dir:               None,
+				blobs:                   false,
+				archive:                 false,
+				wal:                     false,
+				cold_archive_after_days: None,
+				retain_newest_global:    None,
+				retain_newest_per_cwd:   None,
+			})
+		);
+		assert_eq!(
+			parse(&[
+				"omp",
+				"gc",
+				"--json",
+				"--agent-dir",
+				"/tmp/agent",
+				"--blobs",
+				"--cold-archive-after-days",
+				"7",
+				"--retain-newest-global",
+				"3",
+				"--retain-newest-per-cwd",
+				"1",
+			])
+			.command,
+			Some(Command::Gc {
+				json:                    true,
+				agent_dir:               Some(PathBuf::from("/tmp/agent")),
+				blobs:                   true,
+				archive:                 false,
+				wal:                     false,
+				cold_archive_after_days: Some(7),
+				retain_newest_global:    Some(3),
+				retain_newest_per_cwd:   Some(1),
+			})
+		);
+		// Destructive apply is deliberately absent.
+		assert!(Cli::try_parse_from(["omp", "gc", "--apply"]).is_err());
+	}
+
+	#[test]
+	fn setup_subcommand_parses_component_probes() {
+		assert_eq!(
+			parse(&["omp", "setup"]).command,
+			Some(Command::Setup {
+				component: None,
+				check:     false,
+				json:      false,
+			})
+		);
+		assert_eq!(
+			parse(&["omp", "setup", "python", "--check"]).command,
+			Some(Command::Setup {
+				component: Some("python".to_string()),
+				check:     true,
+				json:      false,
+			})
+		);
+		assert_eq!(
+			parse(&["omp", "setup", "speech", "--json"]).command,
+			Some(Command::Setup {
+				component: Some("speech".to_string()),
+				check:     false,
+				json:      true,
+			})
+		);
 	}
 }

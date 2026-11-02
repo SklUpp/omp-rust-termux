@@ -50,7 +50,7 @@ const OPTIONAL_VALUE_FLAGS: [&str; 3] = ["--resume", "-r", "--session"];
 /// variant; `subcommand_gate_stops_extraction_for_every_clap_subcommand`
 /// enforces that through the extraction boundary, and `args` checks its upstream
 /// verb refusal tables against this list.
-pub(crate) const SUBCOMMANDS: [&str; 19] = [
+pub(crate) const SUBCOMMANDS: [&str; 24] = [
 	"acp",
 	"repl",
 	"completions",
@@ -70,6 +70,11 @@ pub(crate) const SUBCOMMANDS: [&str; 19] = [
 	"render",
 	"cleanse",
 	"commit",
+	"ttsr",
+	"gallery",
+	"grievances",
+	"gc",
+	"setup",
 ];
 
 /// Internal marker inserted when stripping `--profile`/`--alias` would let the

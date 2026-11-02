@@ -327,11 +327,62 @@ pub fn build_matcher(
 		.map_err(|_| format!("Regex error: {message}"))
 }
 
+/// Compile `pattern` without the literal fallback.
+///
+/// Unlike [`build_matcher`], an invalid pattern returns `Err` instead of being
+/// matched literally. Callers that treat a bad pattern as unusable (TTSR rule
+/// conditions) use this so they can skip it exactly like the JS `RegExp`
+/// constructor does.
+pub fn compile_strict(
+	pattern: &str,
+	ignore_case: bool,
+	multiline: bool,
+) -> std::result::Result<CompiledMatcher, String> {
+	let sanitized = sanitize_braces(pattern);
+	match build_regex_matcher(sanitized.as_ref(), ignore_case, multiline) {
+		Ok(matcher) => Ok(CompiledMatcher::Rust(matcher)),
+		Err(err) => build_pcre_matcher(sanitized.as_ref(), ignore_case, multiline)
+			.map(CompiledMatcher::Pcre)
+			.map_err(|_| err.to_string()),
+	}
+}
+
+/// True when `pattern` compiles and matches anywhere in `haystack`.
+///
+/// Invalid patterns return `false` (unusable conditions are skipped, never
+/// treated as literals).
+#[must_use]
+pub fn pattern_matches(pattern: &str, haystack: &str, ignore_case: bool, multiline: bool) -> bool {
+	match compile_strict(pattern, ignore_case, multiline) {
+		Ok(matcher) => Matcher::is_match(&matcher, haystack.as_bytes()).unwrap_or(false),
+		Err(_) => false,
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use grep_matcher::Matcher;
 
-	use super::{escape_unescaped_parentheses, sanitize_braces};
+	use super::{compile_strict, escape_unescaped_parentheses, pattern_matches, sanitize_braces};
+
+	#[test]
+	fn strict_compile_rejects_invalid_patterns() {
+		assert!(compile_strict("(?i)any", false, false).is_ok());
+		assert!(compile_strict("(unclosed", false, false).is_err());
+		// No literal fallback: an invalid pattern never silently matches text.
+		assert!(!pattern_matches("(unclosed", "(unclosed", false, false));
+	}
+
+	#[test]
+	fn strict_pattern_matching_respects_flags() {
+		assert!(pattern_matches("any", "let value: any = 1;", false, false));
+		assert!(!pattern_matches("ANY", "let value: any = 1;", false, false));
+		assert!(pattern_matches("ANY", "let value: any = 1;", true, false));
+		assert!(pattern_matches(r"\bany\b", "an any value", false, false));
+		assert!(!pattern_matches(r"\bany\b", "anything", false, false));
+		assert!(!pattern_matches("^two$", "one\ntwo", false, false));
+		assert!(pattern_matches("^two$", "one\ntwo", false, true));
+	}
 
 	#[test]
 	fn preserves_unicode_property_escapes() {

@@ -603,8 +603,10 @@ pub struct Config {
 	/// Ephemeral `--service-tier` (OpenAI wire; `none`/empty omit).
 	pub service_tier:         Option<String>,
 	/// `tier.openai` / `tier.anthropic` / `tier.google` settings (TS
-	/// `buildServiceTierByFamily`). `"none"` and values the family cannot
-	/// realize are dropped at parse time.
+	/// `buildServiceTierByFamily`). Values the family cannot realize are dropped
+	/// at parse time; explicit `"none"` / `null` is retained as a sentinel so
+	/// higher layers can clear a lower layer's configured tier, and dropped
+	/// when resolving the effective map in [`Config::configured_service_tiers`].
 	pub tier_openai:          Option<String>,
 	pub tier_anthropic:       Option<String>,
 	pub tier_google:          Option<String>,
@@ -718,6 +720,15 @@ impl Config {
 		}
 		if overlay.service_tier.is_some() {
 			self.service_tier = overlay.service_tier;
+		}
+		if overlay.tier_openai.is_some() {
+			self.tier_openai = overlay.tier_openai;
+		}
+		if overlay.tier_anthropic.is_some() {
+			self.tier_anthropic = overlay.tier_anthropic;
+		}
+		if overlay.tier_google.is_some() {
+			self.tier_google = overlay.tier_google;
 		}
 		if !overlay.allow.is_empty() {
 			self.allow = overlay.allow;
@@ -1084,10 +1095,22 @@ impl Config {
 fn apply_nested_settings(config: &mut Config, value: &Value, path: &Path) -> Result<()> {
 	if let Some(tier) = value.get("tier").and_then(Value::as_map) {
 		for (family, item) in tier {
-			let Some(value) = expect_text(item, &format!("tier.{family}"), path)? else {
+			if !matches!(family.as_str(), "openai" | "anthropic" | "google") {
 				continue;
+			}
+			// TS `settings.ts:2650 deepMerge`: an explicit "none" or null in a
+			// higher layer must clear a lower layer's configured tier. We store
+			// "none" as a sentinel; `configured_service_tiers()` ignores it because
+			// `family_value` returns None.
+			let parsed = match item {
+				Value::Null => Some("none"),
+				_ => match expect_text(item, &format!("tier.{family}"), path)? {
+					Some(value) if value == "none" => Some("none"),
+					Some(value) => crate::service_tier::family_value(family, &value),
+					None => None,
+				},
 			};
-			let Some(tier) = crate::service_tier::family_value(family, &value) else {
+			let Some(tier) = parsed else {
 				continue;
 			};
 			match family.as_str() {
@@ -2305,6 +2328,49 @@ pub fn discover_mcp_servers(cwd: &Path) -> Result<Vec<DiscoveredMcpServer>> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn config_merge_copies_tier_family_selections() {
+		let mut base = Config::default();
+		let mut overlay = Config::default();
+		overlay.tier_anthropic = Some("priority".to_string());
+		overlay.tier_openai = Some("flex".to_string());
+		base.merge(overlay);
+		assert_eq!(base.tier_anthropic.as_deref(), Some("priority"));
+		assert_eq!(base.tier_openai.as_deref(), Some("flex"));
+		assert_eq!(base.tier_google, None);
+	}
+
+	#[test]
+	fn config_merge_clears_lower_tier_with_explicit_none_or_null() {
+		let mut base = Config::default();
+		base.tier_anthropic = Some("priority".to_string());
+		base.tier_openai = Some("flex".to_string());
+
+		let mut overlay = Config::default();
+		overlay.tier_anthropic = Some("none".to_string());
+		base.merge(overlay);
+		assert_eq!(base.tier_anthropic.as_deref(), Some("none"));
+		assert_eq!(base.tier_openai.as_deref(), Some("flex"));
+		// configured_service_tiers() drops "none" so the family is omitted
+		let live = base.configured_service_tiers();
+		assert_eq!(live.get("anthropic"), None);
+		assert_eq!(live.get("openai").map(String::as_str), Some("flex"));
+	}
+
+	#[test]
+	fn apply_nested_settings_preserves_none_and_null_clears() {
+		let yaml_val: Value =
+			yaml::parse("tier:
+  anthropic: none
+  openai: null
+").expect("yaml");
+		let mut config = Config::default();
+		apply_nested_settings(&mut config, &yaml_val, Path::new("settings.json")).expect("parse");
+		assert_eq!(config.tier_anthropic.as_deref(), Some("none"));
+		assert_eq!(config.tier_openai.as_deref(), Some("none"));
+		assert!(config.configured_service_tiers().is_empty());
+	}
 
 	fn parse_config(text: &str) -> Result<Config> {
 		Config::from_value(&yaml::parse(text).expect("yaml"), Path::new("test.yml"))

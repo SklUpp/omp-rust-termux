@@ -719,6 +719,15 @@ impl Config {
 		if overlay.service_tier.is_some() {
 			self.service_tier = overlay.service_tier;
 		}
+		if overlay.tier_openai.is_some() {
+			self.tier_openai = overlay.tier_openai;
+		}
+		if overlay.tier_anthropic.is_some() {
+			self.tier_anthropic = overlay.tier_anthropic;
+		}
+		if overlay.tier_google.is_some() {
+			self.tier_google = overlay.tier_google;
+		}
 		if !overlay.allow.is_empty() {
 			self.allow = overlay.allow;
 		}
@@ -2305,6 +2314,18 @@ pub fn discover_mcp_servers(cwd: &Path) -> Result<Vec<DiscoveredMcpServer>> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn config_merge_copies_tier_family_selections() {
+		let mut base = Config::default();
+		let mut overlay = Config::default();
+		overlay.tier_anthropic = Some("priority".to_string());
+		overlay.tier_openai = Some("flex".to_string());
+		base.merge(overlay);
+		assert_eq!(base.tier_anthropic.as_deref(), Some("priority"));
+		assert_eq!(base.tier_openai.as_deref(), Some("flex"));
+		assert_eq!(base.tier_google, None);
+	}
 
 	fn parse_config(text: &str) -> Result<Config> {
 		Config::from_value(&yaml::parse(text).expect("yaml"), Path::new("test.yml"))

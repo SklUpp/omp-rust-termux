@@ -1098,11 +1098,11 @@ fn prewalk_explicit_suffix_overrides_the_target_default_level() {
 /// request shape as an explicit `:auto` suffix (no fixed effort).
 #[test]
 fn prewalk_default_auto_matches_explicit_auto() {
-	let run_target = |target: &str| -> (serde_json::Value, String) {
+	let run_target = |target: &str| -> (serde_json::Value, String, String) {
 		let a = MockWireServer::start(vec![tool_sse(&[(
 			"call-write",
 			"write",
-			serde_json::json!({"path": ".", "content": "x"}),
+			serde_json::json!({"path": "probe.txt", "content": "x"}),
 		)])]);
 		let b = MockWireServer::start(vec![text_sse("auto endpoint")]);
 		let base = temp_dir("prewalk-auto");
@@ -1129,14 +1129,16 @@ fn prewalk_default_auto_matches_explicit_auto() {
 		assert_eq!(b.request_count(), 1, "target request for {target}");
 		let body = b.request(0);
 		let stderr = String::from_utf8_lossy(&run_out.stderr).to_string();
+		let root = base.to_string_lossy().to_string();
 		a.stop();
 		b.stop();
 		fs::remove_dir_all(base).ok();
-		(body, stderr)
+		(body, stderr, root)
 	};
 
-	let (default_body, default_stderr) = run_target("mockA/model-c");
-	let (explicit_body, explicit_stderr) = run_target("mockA/model-c:auto");
+	let (default_body, default_stderr, default_root) = run_target("mockA/model-c");
+	let (explicit_body, explicit_stderr, explicit_root) =
+		run_target("mockA/model-c:auto");
 	assert!(
 		default_stderr.contains("Prewalk: switched"),
 		"{default_stderr}"
@@ -1146,8 +1148,16 @@ fn prewalk_default_auto_matches_explicit_auto() {
 		"{explicit_stderr}"
 	);
 	assert_eq!(default_body["model"], explicit_body["model"]);
+	// Success tool results still name their absolute target; normalize only the
+	// fixture's own known temp root, then compare the full wire conversation.
+	let default_messages = default_body["messages"]
+		.to_string()
+		.replace(&default_root, "<FIXTURE_ROOT>");
+	let explicit_messages = explicit_body["messages"]
+		.to_string()
+		.replace(&explicit_root, "<FIXTURE_ROOT>");
 	assert_eq!(
-		default_body["messages"], explicit_body["messages"],
+		default_messages, explicit_messages,
 		"default auto and explicit auto must carry the same conversation"
 	);
 	assert!(

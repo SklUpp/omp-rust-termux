@@ -1389,7 +1389,35 @@ pub fn to_openai_messages(messages: &[Message]) -> Result<Vec<OpenAiMessage>, Pr
 		// ToolCall blocks are rendered from `m.tool_calls`; reasoning never
 		// reaches this wire, so neither forces the structured-content form.
 		let has_parts = m.parts.iter().any(crate::state::ContentPart::is_replayable_content);
-		let content = if m.has_image() || has_parts {
+		let content = if m.role == Role::Assistant {
+			// TS `openai-completions.ts:2052-2065`: assistant content is always
+			// a plain string. Some OpenAI-compatible backends mirror an array
+			// of text blocks back to the model literally, which would recurse
+			// into nested content on the next turn. Concatenate visible text
+			// blocks in order with no separator; fall back to the projection
+			// when no block carries text. Reasoning/redacted blocks stay
+			// print/persist only and never reach this wire.
+			let text = {
+				let mut text = String::new();
+				for part in &m.parts {
+					if let crate::state::ContentPart::Text { text: visible } = part
+						&& !visible.trim().is_empty()
+					{
+						text.push_str(visible);
+					}
+				}
+				if text.is_empty() {
+					m.content.clone()
+				} else {
+					text
+				}
+			};
+			if text.is_empty() && tool_calls.is_some() {
+				None
+			} else {
+				Some(OpenAiContent::Text(text))
+			}
+		} else if m.has_image() || has_parts {
 			let mut parts = Vec::new();
 			for part in &m.parts {
 				match part {

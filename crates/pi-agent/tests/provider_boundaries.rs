@@ -13,8 +13,8 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use pi_agent::{
-	Message, ModelProvider, OpenAiCompatibleProvider, ProviderError, StopReason, StreamAssembler,
-	StreamChunk, ToolCallDelta, ToolChoice, parse_sse_line, sse_stream,
+	ContentPart, Message, ModelProvider, OpenAiCompatibleProvider, ProviderError, StopReason,
+	StreamAssembler, StreamChunk, ToolCall, ToolCallDelta, ToolChoice, parse_sse_line, sse_stream,
 };
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -596,6 +596,57 @@ async fn forced_tool_choice_serializes_openai_function_shape_on_the_wire() {
 	assert!(
 		headers.to_ascii_lowercase().contains("authorization: bearer sk-wire"),
 		"key must travel in the request header only: {headers}"
+	);
+}
+
+#[tokio::test]
+async fn assistant_history_is_a_plain_string_on_the_openai_wire() {
+	let (url, captured) =
+		serve_capturing(response("200 OK", "text/event-stream", "data: [DONE]\n\n")).await;
+	let provider = OpenAiCompatibleProvider::new(url, "sk-wire", "model").expect("provider");
+
+	let mut with_tools = Message::assistant_with_tools(
+		"projection is ignored when text blocks exist",
+		vec![ToolCall {
+			id: "call_read".to_string(),
+			name: "read".to_string(),
+			arguments: json!({ "path": "a.txt" }),
+		}],
+	);
+	with_tools.parts = vec![
+		ContentPart::thinking("secret reasoning"),
+		ContentPart::text("first"),
+		ContentPart::text("second"),
+	];
+	let mut fallback = Message::assistant("fallback text");
+	fallback.parts = vec![ContentPart::thinking("hidden reasoning")];
+
+	let mut stream = provider
+		.stream(
+			&[Message::user("hi"), with_tools, fallback],
+			&[],
+			&ToolChoice::Auto,
+		)
+		.await
+		.expect("stream");
+	while let Some(item) = stream.next().await {
+		item.expect("chunk");
+	}
+
+	let (_headers, body) = captured.await.expect("captured request");
+	let messages = body["messages"].as_array().expect("messages array");
+	let assistant = &messages[1];
+	assert!(assistant["content"].is_string(), "assistant content must be a string");
+	assert_eq!(assistant["content"], json!("firstsecond"), "text blocks join with no separator");
+	assert_eq!(assistant["tool_calls"][0]["id"], json!("call_read"));
+	assert!(assistant.get("reasoning").is_none(), "public reasoning never leaks");
+	assert!(assistant.get("reasoning_content").is_none(), "public reasoning never leaks");
+
+	let fallback = &messages[2];
+	assert_eq!(fallback["content"], json!("fallback text"), "m.content is the fallback");
+	assert!(
+		fallback.get("tool_calls").is_none(),
+		"a text-only assistant turn sends no tool_calls field"
 	);
 }
 

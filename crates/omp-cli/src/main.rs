@@ -2833,9 +2833,16 @@ impl Session<'_> {
 									Some((target, switch_thinking, api_key));
 							},
 							Err(err) => {
-								return Err(Error::new(format!(
-									"plan-yolo switch failed — {err}"
-								)));
+								let message = format!("plan-yolo switch failed — {err}");
+								if store.enabled()
+									&& let Err(append) =
+										store.append_plan_yolo_switch_failure(&message)
+								{
+									eprintln!(
+										"warning: cannot record plan-yolo switch failure: {append}"
+									);
+								}
+								return Err(Error::new(message));
 							},
 						}
 					}

@@ -1096,15 +1096,13 @@ impl RpcSession {
 		if !self.store.enabled() {
 			return None;
 		}
-		self
-			.store
-			.append_custom_message(
-				"plan-yolo-switch-error",
-				error,
-				false,
-				json!({ "phase": "switch" }),
-			)
-			.ok()
+		match self.store.append_plan_yolo_switch_failure(error) {
+			Ok(id) => Some(id),
+			Err(err) => {
+				eprintln!("warning: cannot record plan-yolo switch failure: {err}");
+				None
+			},
+		}
 	}
 
 	/// Persist the shared exclusive `mode_change` slot (`"plan"`, `"none"`, or
@@ -3017,9 +3015,12 @@ impl RpcSession {
 					gate.queue_config_refresh();
 				},
 				Err(err) => {
+					// A failed cutover ends this turn with the live error; a
+					// warning would set `continue_turn` and re-run the same
+					// failing commit up to the turn budget.
 					let message = format!("plan-yolo switch failed — {err}");
 					eprintln!("warning: {message}");
-					decision.warning = Some(message.clone());
+					decision.continue_turn = false;
 					self.plan_yolo_commit_error = Some(message);
 				},
 			}

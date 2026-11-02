@@ -57,6 +57,8 @@ class Provider:
         self.tool_result_text = "tool done"
         self.plan_yolo_root = False
         self.plan_yolo_target = False
+        self.mounted_plan_target = False
+        self.bodies: list[dict] = []
         # Plan-yolo abort fixture: after the proposal tool result, hold the
         # next request until the client cancels and releases this event.
         self.hang_after_proposal = False
@@ -80,6 +82,7 @@ class Provider:
                 body = json.loads(self.rfile.read(length) or b"{}")
                 with provider.lock:
                     provider.requests += 1
+                    provider.bodies.append(body)
                 self.send_response(200)
                 self.send_header("content-type", "text/event-stream")
                 self.send_header("cache-control", "no-cache")
@@ -239,6 +242,46 @@ class Provider:
                 )
                 return
 
+        if self.mounted_plan_target:
+            def emit_tool(call_id, name, arguments):
+                yield chunk(
+                    {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": call_id,
+                                "type": "function",
+                                "function": {
+                                    "name": name,
+                                    "arguments": json.dumps(arguments),
+                                },
+                            }
+                        ],
+                    }
+                )
+                yield chunk({}, "tool_calls")
+                yield "data: [DONE]"
+
+            if self.requests == 1:
+                # The plan-phase `write` must be hidden on the target schema
+                # and at execution; this malicious call proves both.
+                yield from emit_tool(
+                    "call_hidden_write",
+                    "write",
+                    {"path": "mounted-blocked.txt", "content": "must not land"},
+                )
+                return
+            if self.requests == 2:
+                yield from emit_tool(
+                    "call_probe_echo", "mcp__probe_echo", {"text": "hello"}
+                )
+                return
+            yield chunk({"role": "assistant", "content": "mounted done"})
+            yield chunk({}, "stop")
+            yield "data: [DONE]"
+            return
+
         if self.plan_yolo_target and self.requests == 1:
             yield chunk(
                 {
@@ -352,6 +395,7 @@ class Client:
         provider: Provider,
         prewalk_target: Provider | None = None,
         plan_yolo_target: Provider | None = None,
+        plan_yolo_tools: str = "write, read",
     ) -> None:
         self.config = root / "config"
         self.data = root / "data"
@@ -398,7 +442,7 @@ class Client:
                 # The explicit plan-yolo flag is on the launch argv; yolo only
                 # avoids a permission round-trip for the implementation write.
                 config_text += "approvalMode: yolo\n"
-            config_text += "tools: [write, read]\n"
+            config_text += f"tools: [{plan_yolo_tools}]\n"
             models_text += (
                 "      - id: model-b\n"
                 "        contextWindow: 128000\n"
@@ -1029,6 +1073,7 @@ def run_plan_yolo(binary: str) -> None:
         # the ordinary client-approved proposal path, never plan-yolo.
         client.request("session/set_mode", {"sessionId": abort_session, "modeId": "default"})
         client.request("session/set_mode", {"sessionId": abort_session, "modeId": "plan"})
+        ordinary_mark = client.mark()
         ordinary, permissions = client.prompt_answering_permission(
             abort_session, "ORDINARY_PROPOSE", "allow_once"
         )
@@ -1036,6 +1081,12 @@ def run_plan_yolo(binary: str) -> None:
         assert permissions and permissions[0].get("method") == "elicitation/create", (
             "manual plan must propose through the client approval dialog"
         )
+        ordinary_updates = client.updates_since(ordinary_mark, abort_session)
+        assert any(
+            update.get("sessionUpdate") == "current_mode_update"
+            and update.get("currentModeId") == "default"
+            for update in ordinary_updates
+        ), "approved ordinary plan must publish the default mode"
         assert_eq(
             target_provider.requests,
             target_before,
@@ -1063,6 +1114,127 @@ def run_plan_yolo(binary: str) -> None:
         print(f"acp_plan_yolo artifacts retained at: {root}")
 
 
+def run_plan_yolo_mounted_tool(binary: str) -> None:
+    """Plan-yolo hides only the plan-added builtin while a mounted MCP tool
+    survives the cutover schema and executes."""
+    root = Path(tempfile.mkdtemp(prefix="acp-plan-yolo-mcp."))
+    root_provider = Provider()
+    root_provider.plan_yolo_root = True
+    target_provider = Provider()
+    target_provider.model = "model-b"
+    target_provider.mounted_plan_target = True
+    script = root / "probe_mcp.py"
+    script.write_text(
+        """import sys, json
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    mid = msg.get("id")
+    method = msg.get("method")
+    if method == "initialize":
+        result = {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "probe", "version": "1.0.0"},
+        }
+    elif method == "tools/list":
+        result = {
+            "tools": [{
+                "name": "echo",
+                "description": "Echo result",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"text": {"type": "string"}},
+                },
+            }],
+        }
+    elif method == "tools/call":
+        result = {
+            "content": [{"type": "text", "text": "echo result"}],
+            "isError": False,
+        }
+    else:
+        result = {}
+    if mid is not None:
+        sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": mid, "result": result}) + "\n")
+        sys.stdout.flush()
+""",
+        encoding="utf-8",
+    )
+    mcp_servers = [
+        {"name": "probe", "command": "python3", "args": [str(script)]}
+    ]
+    root_provider.start()
+    target_provider.start()
+    client = Client(
+        binary,
+        root,
+        root_provider,
+        plan_yolo_target=target_provider,
+        plan_yolo_tools="read, mcp__probe_echo",
+    )
+    try:
+        client.request(
+            "initialize",
+            {
+                "protocolVersion": 1,
+                "clientCapabilities": {"elicitation": {"form": {}}},
+            },
+        )
+        cwd = str(client.cwd)
+        session_id = client.request(
+            "session/new", {"cwd": cwd, "mcpServers": mcp_servers}
+        )["sessionId"]
+        response = client.request(
+            "session/prompt",
+            {"sessionId": session_id, "prompt": [{"type": "text", "text": "PLAN_YOLO mounted"}]},
+            PROMPT_TIMEOUT,
+        )
+        assert_eq(response["stopReason"], "end_turn", "mounted plan stop reason")
+        assert_eq(root_provider.requests, 3, "mounted root request count")
+        assert_eq(target_provider.requests, 3, "hidden write, echo, final")
+
+        def tool_names(body):
+            names = set()
+            for tool in body.get("tools") or []:
+                function = tool.get("function") or {}
+                name = function.get("name") or tool.get("name")
+                if name:
+                    names.add(name)
+            return names
+
+        assert "write" in tool_names(root_provider.bodies[0]), (
+            "plan phase must receive the added write tool"
+        )
+        target_tools = tool_names(target_provider.bodies[0])
+        assert "write" not in target_tools, f"hidden write leaked to schema: {target_tools}"
+        assert "mcp__probe_echo" in target_tools, (
+            f"mounted tool disappeared from schema: {target_tools}"
+        )
+        assert not (client.cwd / "blocked.txt").exists(), "plan guard must deny writes"
+        assert not (client.cwd / "mounted-blocked.txt").exists(), (
+            "hidden write must not execute after cutover"
+        )
+        target_wire = [json.dumps(body) for body in target_provider.bodies]
+        assert any("not available in the active tool selection" in body for body in target_wire[1:]), (
+            f"hidden write denial missing: {target_wire[-2:]!r}"
+        )
+        assert any("echo result" in body for body in target_wire[1:]), (
+            f"mounted echo result missing: {target_wire[-2:]!r}"
+        )
+        assert any(
+            "Plan mode: the working tree is read-only" in json.dumps(body)
+            for body in root_provider.bodies
+        ), "plan-phase write guard must stay active"
+    finally:
+        client.kill()
+        root_provider.stop()
+        target_provider.stop()
+        print(f"acp_plan_yolo_mounted artifacts retained at: {root}")
+
+
 def chunk_text(chunks):
     parts = []
     for update in chunks:
@@ -1082,6 +1254,7 @@ def main(argv=None):
     run(binary)
     run_prewalk(binary)
     run_plan_yolo(binary)
+    run_plan_yolo_mounted_tool(binary)
     print("acp_accept: OK")
 
 

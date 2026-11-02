@@ -2221,6 +2221,17 @@ impl SessionStore {
 		Ok(id)
 	}
 
+	/// Durable failed plan-yolo cutover record. The live error frame is not
+	/// recoverable after reconnect, so the audit trail must carry it.
+	pub fn append_plan_yolo_switch_failure(&mut self, error: &str) -> Result<String, String> {
+		self.append_custom_message(
+			"plan-yolo-switch-error",
+			error,
+			false,
+			serde_json::json!({ "phase": "switch" }),
+		)
+	}
+
 	/// TS `SessionManager.appendCustomMessageEntry` for the checkpoint lane:
 	/// persisted `custom_message` with `display` control and details.
 	pub fn append_custom_message(

@@ -360,6 +360,11 @@ impl RpcSession {
 		observer: Arc<dyn SubagentObserver>,
 		resolver: Arc<dyn crate::rpc::auth::CredentialResolver>,
 	) -> Result<Self> {
+		if launch.prewalk.is_some() && launch.plan_yolo.is_some() {
+			return Err(Error::new(
+				"--plan-yolo cannot be combined with an effective prewalk arm; choose one startup switch",
+			));
+		}
 		let RpcLaunch {
 			runner,
 			config,

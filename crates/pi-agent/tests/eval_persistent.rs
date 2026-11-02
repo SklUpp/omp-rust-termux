@@ -729,7 +729,7 @@ async fn assert_local_symlink_contract(language: EvalLanguage, code: &str) {
 async fn python_local_symlinks_allow_internal_and_block_escapes() {
 	assert_local_symlink_contract(
 		EvalLanguage::Py,
-		r#"
+		r##"
 def attempt(label, fn):
     try:
         fn()
@@ -750,7 +750,7 @@ print('special-link:' + read('local://special-link.txt'))
 print('percent-link:' + read('local://percent-link.txt'))
 print('literal-percent:' + read('local://literal%20name.txt'))
 print('bad-percent:' + read('local://draft%zz.md'))
-"#,
+"##,
 	)
 	.await;
 }
@@ -760,7 +760,7 @@ print('bad-percent:' + read('local://draft%zz.md'))
 async fn ruby_local_symlinks_allow_internal_and_block_escapes() {
 	assert_local_symlink_contract(
 		EvalLanguage::Rb,
-		r#"
+		r##"
 def attempt(label)
   yield
   puts "#{label}:ok"
@@ -781,7 +781,7 @@ puts 'special-link:' + read('local://special-link.txt')
 puts 'percent-link:' + read('local://percent-link.txt')
 puts 'literal-percent:' + read('local://literal%20name.txt')
 puts 'bad-percent:' + read('local://draft%zz.md')
-"#,
+"##,
 	)
 	.await;
 }
@@ -791,7 +791,7 @@ puts 'bad-percent:' + read('local://draft%zz.md')
 async fn julia_local_symlinks_allow_internal_and_block_escapes() {
 	assert_local_symlink_contract(
 		EvalLanguage::Jl,
-		r#"
+		r##"
 function attempt(label, f)
     try
         f()
@@ -814,7 +814,7 @@ println("special-link:" * read("local://special-link.txt"))
 println("percent-link:" * read("local://percent-link.txt"))
 println("literal-percent:" * read("local://literal%20name.txt"))
 println("bad-percent:" * read("local://draft%zz.md"))
-"#,
+"##,
 	)
 	.await;
 }
@@ -847,7 +847,7 @@ async fn javascript_local_symlinks_validate_before_bridging() {
 		.execute(
 			&json!({
 				"language": "js",
-				"code": r#"
+				"code": r##"
 const outcomes = [];
 for (const [label, fn] of [
   ["ext-read", () => read("local://ext.txt")],
@@ -873,7 +873,7 @@ await read("local://literal%20name.txt");
 await read("local://draft%zz.md");
 print(outcomes.join("\n"));
 print("internal-done");
-"#,
+"##,
 				"timeout": 120
 			}),
 			&ctx,

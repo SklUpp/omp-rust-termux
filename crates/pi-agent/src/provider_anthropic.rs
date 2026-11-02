@@ -1821,12 +1821,14 @@ impl ModelProvider for AnthropicMessagesProvider {
 		// TS `firstTokenTime === undefined`: a fast-mode failure before any
 		// observable output (text, reasoning, tool delta, redacted/signature
 		// block or terminal stop) retries once without `speed` and the beta.
-		// Metadata-only chunks do not count as output.
-		let mut prelude: Vec<Result<StreamChunk, ProviderError>> = Vec::new();
+		// Metadata-only records are coalesced into one aggregate chunk instead
+		// of being buffered one by one.
+		let mut metadata: Option<StreamChunk> = None;
+		let mut observable: Option<StreamChunk> = None;
 		loop {
 			match stream.next().await {
 				Some(Ok(chunk)) => {
-					let observable = chunk
+					let is_observable = chunk
 						.content
 						.as_deref()
 						.is_some_and(|text| !text.is_empty())
@@ -1841,9 +1843,13 @@ impl ModelProvider for AnthropicMessagesProvider {
 							.is_some_and(|data| !data.is_empty())
 						|| chunk.signature.is_some()
 						|| chunk.is_done;
-					prelude.push(Ok(chunk));
-					if observable {
+					if is_observable {
+						observable = Some(chunk);
 						break;
+					}
+					match &mut metadata {
+						Some(aggregate) => merge_metadata(aggregate, chunk),
+						None => metadata = Some(chunk),
 					}
 				},
 				Some(Err(error)) => {
@@ -1883,13 +1889,20 @@ impl ModelProvider for AnthropicMessagesProvider {
 							Some(vec!["priority".to_string()]),
 						));
 					}
-					prelude.push(Err(error));
-					break;
+					return Ok(Box::pin(
+						futures::stream::iter(metadata.map(Ok))
+							.chain(futures::stream::iter([Err(error)]))
+							.chain(stream),
+					));
 				},
 				None => break,
 			}
 		}
-		Ok(Box::pin(futures::stream::iter(prelude).chain(stream)))
+		Ok(Box::pin(
+			futures::stream::iter(metadata.map(Ok))
+				.chain(futures::stream::iter(observable.map(Ok)))
+				.chain(stream),
+		))
 	}
 }
 
@@ -2674,18 +2687,33 @@ fn with_disabled_features(
 	}))
 }
 
-/// Fast-mode classification for a failure surfaced by the SSE stream rather
-/// than the HTTP status (`firstTokenTime === undefined` in TS).
+/// Metadata-only pre-output records are coalesced into one chunk: usage
+/// snapshots are cumulative, so the newest one wins whole; the remaining
+/// fields keep their latest present value. No record is dropped silently.
+fn merge_metadata(into: &mut StreamChunk, chunk: StreamChunk) {
+	if chunk.content_index.is_some() {
+		into.content_index = chunk.content_index;
+	}
+	if chunk.usage.is_some() {
+		into.usage = chunk.usage;
+	}
+	if chunk.stop_reason.is_some() {
+		into.stop_reason = chunk.stop_reason;
+	}
+	if chunk.error_message.is_some() {
+		into.error_message = chunk.error_message;
+	}
+	if chunk.disabled_features.is_some() {
+		into.disabled_features = chunk.disabled_features;
+	}
+}
+
+/// TS `matchesFastModeUnsupported` requires a concrete 400/429 status. An SSE
+/// `error` event carries no status, so it is surfaced, never retried.
 fn stream_error_is_fast_mode_unsupported(error: &ProviderError) -> bool {
 	match error {
 		ProviderError::HttpStatus(status, text) => is_fast_mode_unsupported(*status, text),
-		other => {
-			let text = other.to_string().to_ascii_lowercase();
-			(text.contains("invalid_request_error")
-				&& contains_word(&text, "speed")
-				&& text.contains("not support"))
-				|| (text.contains("rate_limit_error") && text.contains("fast mode"))
-		},
+		_ => false,
 	}
 }
 

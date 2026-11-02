@@ -926,7 +926,8 @@ fn run() -> std::result::Result<(), CliError> {
 		prompt_inputs,
 		skills_filter,
 		store: SessionStore::default(),
-		service_tier_by_family: store.service_tier_by_family(),
+		// Resolved once below, after the session store is opened.
+		service_tier_by_family: std::collections::BTreeMap::new(),
 		service_tier_explicit: cli.service_tier.is_some(),
 		service_tier_recorded: false,
 		history: Vec::new(),
@@ -1186,17 +1187,35 @@ fn run() -> std::result::Result<(), CliError> {
 	};
 	session.checkpoint_host.rehydrate(&store);
 	session.store = store;
+	// One authoritative live selection, resolved once at launch with the TS
+	// precedence (explicit flag, then the recorded entry including a reset,
+	// then configured family defaults, then the legacy single value).
+	let base_service_tiers = if session.store.has_service_tier_entry() {
+		session.store.service_tier_by_family()
+	} else {
+		session.config.configured_service_tiers()
+	};
+	// `--service-tier` is the TS OpenAI-only override (`cli/args.ts:48` ->
+	// `sdk.ts:3408`): it layers onto the recorded/configured map and never
+	// touches the anthropic or google families.
+	let live_service_tiers = omp_cli::service_tier::overlay_openai(
+		if session.service_tier_explicit {
+			session.config.service_tier.as_deref()
+		} else {
+			None
+		},
+		&base_service_tiers,
+	);
+	session.service_tier_by_family = live_service_tiers.clone();
+	session.service_tier_recorded = true;
 	if session.service_tier_explicit {
 		// TS `setServiceTierFamily`: an explicit launch flag is recorded, so a
 		// later resume restores the re-armed selection.
-		let tiers = crate::service_tier::for_single(session.config.service_tier.as_deref());
 		if session.store.enabled()
-			&& let Err(err) = session.store.append_service_tier_change(&tiers)
+			&& let Err(err) = session.store.append_service_tier_change(&live_service_tiers)
 		{
 			eprintln!("warning: cannot record service tier change: {err}");
 		}
-		session.service_tier_by_family = tiers;
-		session.service_tier_recorded = true;
 	}
 	// TS `sdk.ts:1505-1545`: an explicit `--model` wins; otherwise a restored
 	// session's recorded model/role decides the route, with the configured
@@ -1890,23 +1909,9 @@ impl Session<'_> {
 			runtime::latest_todo_phases_from_turns(&self.history)
 		};
 		let goal_context = self.goal_mode_context(&todo_phases);
-		// TS precedence: an explicit launch flag rearms; otherwise a recorded
-		// entry (including an empty reset) wins over configured defaults, and a
-		// configured default applies only when the session recorded nothing.
-		let service_tier_by_family = if self.service_tier_explicit {
-			crate::service_tier::for_single(self.config.service_tier.as_deref())
-		} else if self.store.has_service_tier_entry() {
-			self.store.service_tier_by_family()
-		} else if self.service_tier_recorded {
-			self.service_tier_by_family.clone()
-		} else {
-			let configured = self.config.configured_service_tiers();
-			if configured.is_empty() {
-				crate::service_tier::for_single(self.config.service_tier.as_deref())
-			} else {
-				configured
-			}
-		};
+		// The launch resolved the live selection once; later prompts read that
+		// single owner, so a downgrade or reset is never re-armed by the flag.
+		let service_tier_by_family = self.service_tier_by_family.clone();
 		Ok(RunRequest {
 			prompt,
 			parts,
@@ -2175,6 +2180,8 @@ impl Session<'_> {
 			self.prompt_cache_key_source == Some(PromptCacheKeySource::Inherited);
 		let prewalk_todo_available =
 			prewalk::todo_available(self.tools_enabled, self.config.tools.as_deref());
+		// The downgrade effects touch `self`; the event closure only records it.
+		let mut priority_downgraded = false;
 		let plan_yolo_shared = self.plan_yolo.clone();
 		let plan_yolo_tools_restore = self.plan_yolo_tools.clone();
 		let plan_yolo_artifacts = self.plan_artifacts();
@@ -2194,7 +2201,8 @@ impl Session<'_> {
 		                        model_fallback: Option<&str>,
 		                        provider_fallback: Option<&str>,
 		                        prewalk_state: &mut prewalk::PrewalkState,
-		                        prewalk_switch: &mut Option<prewalk::AppliedSwitch>| -> Result<()> {
+		                        prewalk_switch: &mut Option<prewalk::AppliedSwitch>,
+		                        priority_downgraded: &mut bool| -> Result<()> {
 			match event {
 				agent::Event::ToolStart { id, tool, .. } => {
 					tools.insert(id.clone(), tool.clone());
@@ -2300,21 +2308,9 @@ impl Session<'_> {
 					if message
 						.disabled_features
 						.as_deref()
-						.is_some_and(|features| features.contains("priority"))
-						&& self.service_tier_by_family.get("anthropic").map(String::as_str)
-							== Some("priority")
+						.is_some_and(|features| features.iter().any(|feature| feature == "priority"))
 					{
-						self.service_tier_by_family.remove("anthropic");
-						self.service_tier_recorded = true;
-						if self.store.enabled()
-							&& let Err(err) =
-								self.store.append_service_tier_change(&self.service_tier_by_family)
-						{
-							eprintln!("warning: cannot record service tier change: {err}");
-						}
-						eprintln!(
-							"warning: Priority/fast mode rejected for this model; retried without it. Fast mode is now off."
-						);
+						*priority_downgraded = true;
 					}
 					let asst_entry = MessageEntry::new(
 						asst_id.clone(),
@@ -2364,8 +2360,17 @@ impl Session<'_> {
 						if let Err(err) = store.append_messages(&valid_turn_entries) {
 							eprintln!("warning: {err}");
 						}
+
 					}
-					*parent = Some(prev_id);
+					// The journal leaf (a downgrade metadata entry included) is the
+					// ancestry for the next assistant turn, so a tool continuation
+					// cannot orphan the recorded reset; the non-persistent path keeps
+					// the in-memory id chain.
+					*parent = if store.enabled() {
+						store.leaf_id().map(str::to_string).or(Some(prev_id))
+					} else {
+						Some(prev_id)
+					};
 
 					if !store.enabled()
 						&& let Some(messages) = in_memory.as_mut()
@@ -2809,7 +2814,6 @@ impl Session<'_> {
 
 		let model_opt = self.model.clone();
 		let provider_opt = self.provider.clone();
-
 		let mut rewind_history: Option<Vec<TurnRecord>> = None;
 		let drive_result = deadline::drive(
 			&mut stream,
@@ -2830,6 +2834,7 @@ impl Session<'_> {
 					provider_opt.as_deref(),
 					&mut prewalk_state,
 					&mut prewalk_switch,
+					&mut priority_downgraded,
 				)?;
 				// A goal tool transition queued during this event lands before the
 				// turn-end entries, like TS `appendModeChange` during execution.
@@ -2841,6 +2846,7 @@ impl Session<'_> {
 				Ok(())
 			},
 		);
+
 
 		if drive_result.is_err() {
 			cancel_token.cancel();
@@ -2860,6 +2866,7 @@ impl Session<'_> {
 						provider_opt.as_deref(),
 						&mut prewalk_state,
 						&mut prewalk_switch,
+					&mut priority_downgraded,
 					);
 					if !reporter_failed {
 						let _ = reporter.event(&event);
@@ -2868,6 +2875,25 @@ impl Session<'_> {
 			}
 		}
 		drop(handle_event);
+		if priority_downgraded
+			&& self.service_tier_by_family.get("anthropic").map(String::as_str)
+				== Some("priority")
+		{
+			// One authoritative update after the turn: the journal entry appended
+			// here becomes the branch leaf, so the next assistant (tool
+			// continuation or resume) stays downgraded.
+			self.service_tier_by_family.remove("anthropic");
+			self.service_tier_recorded = true;
+			if self.store.enabled()
+				&& let Err(err) =
+					self.store.append_service_tier_change(&self.service_tier_by_family)
+			{
+				eprintln!("warning: cannot record service tier change: {err}");
+			}
+			eprintln!(
+				"warning: Priority/fast mode rejected for this model; retried without it. Fast mode is now off."
+			);
+		}
 		self.prewalk = prewalk_state;
 		// A switch applied mid-turn reaches later prompts through the session
 		// fields; the journal already carries the ephemeral `fallback` role.

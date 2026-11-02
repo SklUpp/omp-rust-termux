@@ -64,6 +64,43 @@ use super::{
 	transport::Transport,
 };
 
+/// `FrameSink` handed to the RPC session inside ACP mode. RPC frames stay raw
+/// on the RPC transport, but ACP speaks JSON-RPC only: a `notice` frame from
+/// `HostToolBridge` becomes the same `session/update` notification the driver
+/// emits for user-visible text, never a bare frame on the wire.
+struct AcpNoticeSink {
+	transport:  Transport,
+	session_id: Arc<Mutex<String>>,
+}
+
+impl FrameSink for AcpNoticeSink {
+	fn send(&self, frame: Value) {
+		if frame.get("type").and_then(Value::as_str) != Some("notice") {
+			self.transport.send(frame);
+			return;
+		}
+		let Some(message) = frame.get("message").and_then(Value::as_str) else {
+			return;
+		};
+		let session_id = self
+			.session_id
+			.lock()
+			.unwrap_or_else(PoisonError::into_inner)
+			.clone();
+		if session_id.is_empty() {
+			return;
+		}
+		let params = json!({
+			"sessionId": session_id,
+			"update": {
+				"sessionUpdate": "agent_message_chunk",
+				"content": { "type": "text", "text": message },
+			},
+		});
+		let _ = self.transport.notify("session/update", Some(&params));
+	}
+}
+
 /// TS `ACP_CANCEL_CLEANUP_TIMEOUT_MS`.
 pub const CANCEL_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 /// TS `ACP_BOOTSTRAP_RACE_GUARD_MS`.
@@ -282,16 +319,18 @@ impl AcpRuntime {
 			store_options,
 			steer: None,
 		};
-		let sink: Arc<dyn FrameSink> = Arc::new(self.transport.clone());
+		let token_slot = Arc::new(Mutex::new(None));
+		let session_id_slot = Arc::new(Mutex::new(id.clone().unwrap_or_default()));
+		let sink: Arc<dyn FrameSink> = Arc::new(AcpNoticeSink {
+			transport: self.transport.clone(),
+			session_id: Arc::clone(&session_id_slot),
+		});
 		let host_tools = Arc::new(HostToolBridge::new(Arc::clone(&sink)));
 		let host_uris = Arc::new(HostUriBridge::new(Arc::clone(&sink)));
 		let internal_urls = Arc::new(pi_agent::tools::internal_urls::InternalUrlRouter::new());
 		host_uris.bind(Arc::clone(&internal_urls));
 		let registry = Arc::new(SubagentRegistry::new());
 		let observer = registry.observer(Arc::clone(&sink));
-
-		let token_slot = Arc::new(Mutex::new(None));
-		let session_id_slot = Arc::new(Mutex::new(id.clone().unwrap_or_default()));
 		let mut approvals =
 			Approvals::new(self.recipe.approval_mode, self.recipe.allow.iter().cloned());
 		let permission = Arc::new(AcpPermissionBroker {
@@ -323,6 +362,7 @@ impl AcpRuntime {
 		)
 		.map_err(|error| RequestError::new(INTERNAL_ERROR, error.to_string()))?;
 		let id = session.session_id();
+		*session_id_slot.lock().unwrap_or_else(PoisonError::into_inner) = id.clone();
 		// Native `read`/`write`/`bash` calls route through the client only for
 		// the capabilities this session advertised; the bridge is copied into
 		// every `RunRequest` and onto the root/child tool instances.
@@ -3708,5 +3748,45 @@ mod tests {
 		assert!(gate.claim_close(owner, || {}), "watchdog closes its owner");
 		assert!(!gate.is_active());
 		assert!(!gate.release(owner), "finalizer after the close is a no-op");
+	}
+	#[test]
+	fn acp_notice_frames_become_one_session_update_notification() {
+		use crate::acp::transport::test_support::{RecordingWriter, transport_with};
+		use crate::rpc::host_tools::HostToolBridge;
+		use serde_json::json;
+
+		let writer = RecordingWriter::default();
+		let (transport, _recorder) = transport_with(&writer);
+		// The real producer path: the host-tool bridge emits a notice into the
+		// sink ACP installs, never a bare frame.
+		let sink: Arc<dyn crate::rpc::session::FrameSink> = Arc::new(super::AcpNoticeSink {
+			transport: transport.clone(),
+			session_id: Arc::new(std::sync::Mutex::new("sess-1".to_string())),
+		});
+		HostToolBridge::new(Arc::clone(&sink))
+			.send_notice("warning", "Priority/fast mode rejected");
+		let frames = writer.wait_frames(1, |frame| frame["method"] == json!("session/update"));
+		assert_eq!(frames.len(), 1, "exactly one warning notification");
+		assert_eq!(frames[0]["jsonrpc"], "2.0");
+		assert!(frames[0].get("id").is_none(), "notifications carry no id");
+		assert_eq!(frames[0]["params"]["sessionId"], "sess-1");
+		assert_eq!(frames[0]["params"]["update"]["sessionUpdate"], "agent_message_chunk");
+		assert_eq!(
+			frames[0]["params"]["update"]["content"]["text"],
+			"Priority/fast mode rejected"
+		);
+
+		// RPC keeps its raw frame shape for everything that is not a notice.
+		sink.send(json!({ "type": "host_tool_cancel", "id": "cancel-1" }));
+		let frames = writer.wait_frames(2, |_| true);
+		assert_eq!(
+			frames
+				.iter()
+				.filter(|frame| frame["method"] == json!("session/update"))
+				.count(),
+			1,
+			"translating a notice must not emit a second update or a provider request"
+		);
+		assert!(frames.iter().any(|frame| frame["type"] == json!("host_tool_cancel")));
 	}
 }

@@ -648,6 +648,7 @@ fn launch(port: u16, model: &str, provider: &str) -> RpcLaunch {
 		skills: Vec::new(),
 		catalog: Arc::new(Catalog::default()),
 		agent_db: agent_db_path(),
+		service_tier_explicit: false,
 		approval_mode: ApprovalMode::Yolo,
 		allow: Vec::new(),
 		model: Some(model.to_string()),
@@ -2237,4 +2238,158 @@ fn rpc_thinking_change_keeps_explicit_cache_key() {
 	assert_eq!(bodies[0]["prompt_cache_key"], "explicit-cache-1");
 	assert_eq!(bodies[0]["reasoning_effort"], "low");
 	drop(harness);
+}
+
+/// Anthropic fast-mode rejection body (`matchesFastModeUnsupported` matches a
+/// 400 mentioning `invalid_request_error`, the `speed` parameter and `not
+/// support`).
+const FAST_REJECTION: &str = r#"{"type":"error","error":{"type":"invalid_request_error","message":"speed is not supported for this model"}}"#;
+
+const ANTHROPIC_TURN: &str = concat!(
+	"event: message_start\n",
+	"data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{\"input_tokens\":3,\"output_tokens\":0}}}\n\n",
+	"event: content_block_start\n",
+	"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+	"event: content_block_delta\n",
+	"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n",
+	"event: content_block_stop\n",
+	"data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+	"event: message_delta\n",
+	"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}\n\n",
+	"event: message_stop\n",
+	"data: {\"type\":\"message_stop\"}\n\n"
+);
+
+/// Serve two Anthropic turns. Each turn starts with a fast-mode 400 followed by
+/// the downgraded 200 retry, so the even requests carry `speed: "fast"`.
+fn spawn_anthropic_fast_rejection(requests: Arc<Mutex<Vec<Vec<u8>>>>) -> u16 {
+	let listener = TcpListener::bind("127.0.0.1:0").expect("bind anthropic");
+	let port = listener.local_addr().expect("addr").port();
+	thread::spawn(move || {
+		for index in 0..4 {
+			let (mut socket, _) = listener.accept().expect("accept anthropic");
+			let request = read_request(&mut socket).expect("anthropic request");
+			requests
+				.lock()
+				.unwrap_or_else(std::sync::PoisonError::into_inner)
+				.push(request);
+			if index % 2 == 0 {
+				let _ = write!(
+					socket,
+					"HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+					FAST_REJECTION.len(),
+					FAST_REJECTION
+				);
+			} else {
+				let _ = write!(
+					socket,
+					"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+					ANTHROPIC_TURN.len(),
+					ANTHROPIC_TURN
+				);
+			}
+			let _ = socket.flush();
+		}
+	});
+	port
+}
+
+fn anthropic_launch(port: u16) -> RpcLaunch {
+	let mut launch = launch(port, "claude-priority", "anthropic");
+	launch.config.providers.insert(
+		"anthropic".to_string(),
+		ProviderConfig {
+			base_url: Some(format!("http://127.0.0.1:{port}/v1")),
+			api_key:  Some("sk-test".to_string()),
+			api:      Some("anthropic-messages".to_string()),
+			..Default::default()
+		},
+	);
+	let mut models = std::collections::BTreeMap::new();
+	models.insert("claude-priority".to_string(), ModelInfo {
+		provider: "anthropic".to_string(),
+		api: Some("anthropic-messages".to_string()),
+		max_tokens: Some(4096),
+		..ModelInfo::default()
+	});
+	let mut catalog = Catalog::default();
+	catalog.providers.insert("anthropic".to_string(), models);
+	launch.catalog = Arc::new(catalog);
+	launch
+}
+
+#[test]
+fn fast_mode_toggle_rearms_priority_after_an_anthropic_downgrade() {
+	let requests = Arc::new(Mutex::new(Vec::new()));
+	let port = spawn_anthropic_fast_rejection(Arc::clone(&requests));
+	let harness = Harness::start(anthropic_launch(port));
+
+	// The real `/fast on` path (TS `setFastMode`), not a settings file.
+	harness.send(json!({ "type": "set_fast_mode", "id": "f1", "enabled": true }));
+	let frames = harness.wait_for(
+		|frames| frames.iter().any(|frame| frame["id"] == "f1"),
+		timeout(),
+	);
+	let enabled = frames.iter().find(|frame| frame["id"] == "f1").expect("fast on");
+	assert_eq!(enabled["data"]["enabled"], true, "tier selected before the turn");
+
+	harness.send(json!({ "type": "prompt", "id": "p1", "message": "first" }));
+	let frames = harness.wait_for(
+		|frames| frames.iter().any(|frame| frame["type"] == "agent_end"),
+		timeout(),
+	);
+	assert!(
+		frames.iter().any(|frame| frame["type"] == "notice"
+			&& frame["level"] == "warning"
+			&& frame["message"].as_str().is_some_and(|text| text.contains("Priority/fast mode rejected"))),
+		"the downgrade is announced on the protocol notice frame"
+	);
+
+	// Re-arm through the same toggle: fresh provider instance plus the restored
+	// priority selection means the next request carries `speed: "fast"` again.
+	harness.send(json!({ "type": "set_fast_mode", "id": "f2", "enabled": true }));
+	let frames = harness.wait_for(
+		|frames| frames.iter().any(|frame| frame["id"] == "f2"),
+		timeout(),
+	);
+	let rearmed = frames.iter().find(|frame| frame["id"] == "f2").expect("fast rearm");
+	assert_eq!(rearmed["data"]["enabled"], true, "toggle restores priority");
+
+	harness.send(json!({ "type": "prompt", "id": "p2", "message": "second" }));
+	let frames = harness.wait_for(
+		|frames| {
+			frames
+				.iter()
+				.filter(|frame| frame["type"] == "agent_end")
+				.count()
+				>= 2
+		},
+		timeout(),
+	);
+	assert!(frames.iter().any(|frame| frame["type"] == "agent_end"));
+
+	let bodies = requests
+		.lock()
+		.unwrap_or_else(std::sync::PoisonError::into_inner)
+		.clone();
+	assert_eq!(bodies.len(), 4, "one rejected and one retried request per turn");
+	let body = |raw: &[u8]| -> Value {
+		let start = raw
+			.windows(4)
+			.position(|window| window == b"\r\n\r\n")
+			.map_or(raw.len(), |head| head + 4);
+		serde_json::from_slice(&raw[start..]).expect("anthropic json body")
+	};
+	assert_eq!(body(&bodies[0])["speed"].as_str(), Some("fast"), "first attempt requests fast mode");
+	assert_eq!(body(&bodies[1])["speed"].as_str(), None, "the downgraded retry does not");
+	assert_eq!(
+		body(&bodies[2])["speed"].as_str(),
+		Some("fast"),
+		"an explicit toggle rearms fast mode after the downgrade"
+	);
+	assert_eq!(
+		body(&bodies[3])["speed"].as_str(),
+		None,
+		"rejected again, retried without fast mode"
+	);
 }

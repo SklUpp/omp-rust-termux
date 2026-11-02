@@ -35,7 +35,7 @@ pub mod prompts;
 pub mod repl;
 pub mod rpc;
 pub mod runtime;
-pub(crate) mod service_tier;
+pub mod service_tier;
 pub mod session;
 pub mod session_checkpoint;
 pub mod skills;

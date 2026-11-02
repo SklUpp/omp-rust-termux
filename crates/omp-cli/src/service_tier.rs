@@ -123,20 +123,25 @@ pub(crate) fn resolve<'a>(
 		.filter(|tier| !tier.is_empty())
 }
 
-/// TS `serviceTierForAllFamilies`: broadcast one chosen tier across families,
-/// clamped to what each family realizes (Anthropic only `priority`, Google
-/// only `flex`/`priority`). `none`/empty/`inherit` yield no selection.
-pub(crate) fn for_single(tier: Option<&str>) -> BTreeMap<String, String> {
-	let Some(tier) = tier.filter(|tier| !matches!(*tier, "" | "none" | "inherit")) else {
-		return BTreeMap::new();
-	};
-	let mut out = BTreeMap::new();
-	out.insert("openai".to_string(), tier.to_string());
-	if tier == "priority" {
-		out.insert("anthropic".to_string(), "priority".to_string());
-	}
-	if matches!(tier, "flex" | "priority") {
-		out.insert("google".to_string(), tier.to_string());
+/// TS `--service-tier` override (`cli/args.ts:48` -> `sdk.ts:3408`): it only
+/// mutates the `openai` family entry of the effective map, preserving the
+/// other families. `none`/empty removes only that entry.
+pub fn overlay_openai(
+	explicit: Option<&str>,
+	base: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+	let mut out = base.clone();
+	let value = explicit.filter(|value| !matches!(*value, "" | "inherit"));
+	match value {
+		Some("none") => {
+			out.remove("openai");
+		},
+		Some(value) => {
+			if family_value("openai", value).is_some() {
+				out.insert("openai".to_string(), value.to_string());
+			}
+		},
+		None => {},
 	}
 	out
 }
@@ -151,4 +156,28 @@ pub(crate) fn family_value(family: &str, value: &str) -> Option<&'static str> {
 		_ => return None,
 	};
 	values.iter().copied().find(|tier| *tier == value)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn explicit_override_only_mutates_the_openai_family() {
+		let base = BTreeMap::from([
+			("anthropic".to_string(), "priority".to_string()),
+			("openai".to_string(), "flex".to_string()),
+		]);
+		let kept = overlay_openai(Some("none"), &base);
+		assert_eq!(kept.get("openai"), None);
+		assert_eq!(kept.get("anthropic").map(String::as_str), Some("priority"));
+		let replaced = overlay_openai(Some("scale"), &base);
+		assert_eq!(replaced.get("openai").map(String::as_str), Some("scale"));
+		assert_eq!(replaced.get("anthropic").map(String::as_str), Some("priority"));
+		let inherited = overlay_openai(Some("inherit"), &base);
+		assert_eq!(inherited, base);
+		assert!(overlay_openai(Some("priority"), &BTreeMap::new())
+			.get("anthropic")
+			.is_none());
+	}
 }

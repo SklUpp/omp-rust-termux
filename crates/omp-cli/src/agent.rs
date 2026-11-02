@@ -324,8 +324,6 @@ impl RunRequest {
 	pub fn has_image(&self) -> bool {
 		self.parts.iter().any(crate::session::ContentPart::is_image)
 	}
-	plan_context: None,
-	service_tier_by_family: std::collections::BTreeMap::new(),
 }
 
 pub trait AgentRunner: Send + Sync {

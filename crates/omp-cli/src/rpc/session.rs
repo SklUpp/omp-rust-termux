@@ -309,7 +309,9 @@ pub struct RpcSession {
 	pub(crate) todo_phases: Vec<TodoPhase>,
 	pub(crate) session_name: Option<String>,
 	/// Per-provider-family priority selection (TS `ServiceTierByFamily`).
-	pub(crate) priority_families: std::collections::BTreeMap<String, bool>,
+	/// Authoritative effective selection (TS `ServiceTierByFamily`, string
+	/// values). Fast mode is a derived view, never a second map.
+	pub(crate) service_tiers: std::collections::BTreeMap<String, String>,
 	pub(crate) last_assistant_text: Option<String>,
 	pub(crate) tokens_per_second: Option<f64>,
 	pub(crate) steer: Option<SteerFn>,
@@ -387,24 +389,26 @@ impl RpcSession {
 		for warning in store.take_warnings() {
 			eprintln!("warning: {warning}");
 		}
-		let live_service_tiers = if service_tier_explicit {
-			crate::service_tier::for_single(config.service_tier.as_deref())
-		} else if store.has_service_tier_entry() {
+		let base_service_tiers = if store.has_service_tier_entry() {
 			store.service_tier_by_family()
 		} else {
 			config.configured_service_tiers()
 		};
+		// `--service-tier` is the OpenAI-only override; other families survive.
+		let live_service_tiers = crate::service_tier::overlay_openai(
+			if service_tier_explicit {
+				config.service_tier.as_deref()
+			} else {
+				None
+			},
+			&base_service_tiers,
+		);
 		if service_tier_explicit
 			&& store.enabled()
 			&& let Err(err) = store.append_service_tier_change(&live_service_tiers)
 		{
 			eprintln!("warning: cannot record service tier change: {err}");
 		}
-		let priority_families: std::collections::BTreeMap<String, bool> = live_service_tiers
-			.iter()
-			.filter(|(_, tier)| tier.as_str() == "priority")
-			.map(|(family, _)| (family.clone(), true))
-			.collect();
 		if store.is_v1() {
 			return Err(Error::new(
 				"cannot run RPC on a legacy v1 session log: read-only; use import_legacy_v1",
@@ -459,7 +463,6 @@ impl RpcSession {
 			thinking_level,
 			prompt_cache_key,
 			prompt_cache_key_inherited,
-			service_tier_explicit,
 			prewalk: crate::prewalk::PrewalkState::new(prewalk),
 			provider_session_id,
 			max_time,
@@ -478,7 +481,7 @@ impl RpcSession {
 			queued: VecDeque::new(),
 			todo_phases,
 			session_name,
-			priority_families,
+			service_tiers: live_service_tiers,
 			last_assistant_text,
 			tokens_per_second: None,
 			steer,
@@ -941,11 +944,7 @@ impl RpcSession {
 	/// TS `ServiceTierByFamily` view of the RPC owner's boolean selection:
 	/// `true` becomes `"priority"`, absent families stay absent.
 	pub(crate) fn service_tier_by_family(&self) -> std::collections::BTreeMap<String, String> {
-		self.priority_families
-			.iter()
-			.filter(|(_, enabled)| **enabled)
-			.map(|(family, _)| (family.clone(), "priority".to_string()))
-			.collect()
+		self.service_tiers.clone()
 	}
 
 	/// Whether the user selected priority for the active model's family
@@ -954,7 +953,9 @@ impl RpcSession {
 	pub fn fast_mode_enabled(&self) -> bool {
 		self
 			.service_tier_family()
-			.is_some_and(|family| self.priority_families.get(family).copied().unwrap_or(false))
+			.is_some_and(|family| {
+				self.service_tiers.get(family).map(String::as_str) == Some("priority")
+			})
 	}
 
 	/// Whether priority will actually be realized on the wire for the active
@@ -976,9 +977,17 @@ impl RpcSession {
 			return false;
 		};
 		if enabled {
-			self.priority_families.insert(family.to_string(), true);
+			self.service_tiers
+				.insert(family.to_string(), "priority".to_string());
 		} else {
-			self.priority_families.remove(family);
+			self.service_tiers.remove(family);
+		}
+		// TS `setServiceTierFamily` journals the whole effective map, so an
+		// explicit toggle survives resume and fork.
+		if self.store.enabled()
+			&& let Err(err) = self.store.append_service_tier_change(&self.service_tiers)
+		{
+			eprintln!("warning: cannot record service tier change: {err}");
 		}
 		true
 	}
@@ -1244,6 +1253,7 @@ impl RpcSession {
 		// `parent_session` is persisted in `SessionHeader` at creation, so the
 		// lineage survives a reload of the new log.
 		self.store = store;
+		self.restore_service_tiers();
 		self.history.clear();
 		self.history_messages = None;
 		self.messages.clear();
@@ -1255,6 +1265,7 @@ impl RpcSession {
 		self.tokens_per_second = None;
 		self.checkpoint_host = CheckpointHost::new();
 		self.checkpoint_host.rehydrate(&self.store);
+		self.restore_service_tiers();
 		let target = self.session_scope_identity();
 		self.runner
 			.reopen_session(target.0.as_deref(), target.1.as_deref());
@@ -1323,8 +1334,10 @@ impl RpcSession {
 			.map(|turn| turn.assistant.clone())
 			.filter(|text| !text.is_empty());
 		self.store = store;
+		self.restore_service_tiers();
 		self.checkpoint_host = CheckpointHost::new();
 		self.checkpoint_host.rehydrate(&self.store);
+		self.restore_service_tiers();
 		let target = self.session_scope_identity();
 		self.runner
 			.reopen_session(target.0.as_deref(), target.1.as_deref());
@@ -1433,6 +1446,7 @@ impl RpcSession {
 		// rewind from the path just abandoned must not leak into the new branch.
 		self.checkpoint_host = CheckpointHost::new();
 		self.checkpoint_host.rehydrate(&self.store);
+		self.restore_service_tiers();
 		// The branch changed under the same log: rebuild the context the next
 		// request and the frame surface read from.
 		self.history = if self.store.has_branch_context() {
@@ -1460,6 +1474,20 @@ impl RpcSession {
 	}
 
 	// ---------------------------------------------------------------- todos --
+
+	/// TS `loadSession`/`branch`: the effective selection follows the active
+	/// session/branch, so switching cannot leak the previous tiers.
+	fn restore_service_tiers(&mut self) {
+		self.service_tiers = if self.store.has_service_tier_entry() {
+			self.store.service_tier_by_family()
+		} else {
+			// The legacy single `serviceTier` is the OpenAI-only override.
+			crate::service_tier::overlay_openai(
+				self.config.service_tier.as_deref(),
+				&self.config.configured_service_tiers(),
+			)
+		};
+	}
 
 	pub fn set_todos(&mut self, phases: Vec<TodoPhase>) {
 		self.todo_phases = phases;
@@ -2359,21 +2387,18 @@ impl RpcSession {
 		asst_msg.attribution = message.attribution.map(|value| value.as_str().to_string());
 		asst_msg.disabled_features = message.disabled_features.clone();
 		let mut priority_notice: Option<String> = None;
+		let mut priority_downgraded = false;
 		if message
 			.disabled_features
 			.as_deref()
-			.is_some_and(|features| features.contains("priority"))
-			&& self.priority_families.get("anthropic").copied().unwrap_or(false)
+			.is_some_and(|features| features.iter().any(|feature| feature == "priority"))
+			&& self.service_tiers.get("anthropic").map(String::as_str) == Some("priority")
 		{
 			// TS `agent-session.ts:2880-2889`: the server rejected priority, so
 			// the family selection drops, the journal records the new state and
 			// the user is told once.
-			self.priority_families.remove("anthropic");
-			if self.store.enabled()
-				&& let Err(err) = self.store.append_service_tier_change(&self.service_tier_by_family())
-			{
-				eprintln!("warning: cannot record service tier change: {err}");
-			}
+			self.service_tiers.remove("anthropic");
+			priority_downgraded = true;
 			priority_notice = Some(
 				"Priority/fast mode rejected for this model; retried without it. Fast mode is now off."
 					.to_string(),
@@ -2447,6 +2472,14 @@ impl RpcSession {
 			} else {
 				if let Err(err) = self.store.append_messages(&valid) {
 					eprintln!("warning: {err}");
+				}
+				// The downgrade entry must be the branch leaf: append it after
+				// the persisted turn, never as a sibling of the assistant.
+				if priority_downgraded
+					&& let Err(err) =
+						self.store.append_service_tier_change(&self.service_tiers)
+				{
+					eprintln!("warning: cannot record service tier change: {err}");
 				}
 				let captured =
 					self.checkpoint_host.note_persisted_tool_results(&self.store, &valid);
@@ -2548,7 +2581,10 @@ impl RpcSession {
 			messages.push(Message::system(warning));
 		}
 
-		merge_turn_warning(&mut decision, priority_notice.take());
+		if let Some(notice) = priority_notice.take() {
+			// Live host notice on the protocol transport; never model guidance.
+			self.host_tools.send_notice("warning", &notice);
+		}
 		// Prewalk: advance the one-way switch at this settled boundary. A
 		// terminal provider turn never starts another request, so it neither
 		// swaps the provider nor injects guidance.
@@ -2923,19 +2959,6 @@ impl RpcSession {
 			let _ = reply.send(decision);
 		}
 	}
-}
-
-/// The RPC/ACP consumer receives the turn-ack warning, so the downgrade notice
-/// rides that existing protocol field instead of a host-only log line. A
-/// checkpoint warning decided at the same boundary is preserved after it.
-fn merge_turn_warning(decision: &mut pi_agent::TurnAckDecision, notice: Option<String>) {
-	let Some(notice) = notice else {
-		return;
-	};
-	decision.warning = Some(match decision.warning.take() {
-		Some(existing) => format!("{notice}\n{existing}"),
-		None => notice,
-	});
 }
 
 fn clean_title(name: &str) -> String {
@@ -3421,28 +3444,6 @@ mod tests {
 
 	/// `--no-session` session: every turn lives in the in-memory mirror only.
 	fn no_session() -> RpcSession {
-	#[test]
-	fn priority_notice_rides_the_turn_ack_warning_and_keeps_the_checkpoint_one() {
-		const NOTICE: &str =
-			"Priority/fast mode rejected for this model; retried without it. Fast mode is now off.";
-		let mut decision = pi_agent::TurnAckDecision::default();
-		merge_turn_warning(&mut decision, Some(NOTICE.to_string()));
-		assert_eq!(decision.warning.as_deref(), Some(NOTICE));
-		decision.warning = Some("checkpoint".to_string());
-		merge_turn_warning(&mut decision, Some(NOTICE.to_string()));
-		assert_eq!(
-			decision.warning.as_deref(),
-			Some("Priority/fast mode rejected for this model; retried without it. Fast mode is now off.\ncheckpoint")
-		);
-		merge_turn_warning(&mut decision, None);
-		assert!(
-			decision
-				.warning
-				.as_deref()
-				.is_some_and(|warning| warning.contains("checkpoint")),
-			"no notice leaves the existing warning untouched"
-		);
-	}
 
 		let sink: Arc<dyn FrameSink> = Arc::new(NullSink);
 		let mut config = Config::default();

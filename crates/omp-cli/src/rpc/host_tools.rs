@@ -91,6 +91,15 @@ pub fn normalize_definitions(
 }
 
 impl HostToolBridge {
+	/// Live host notice on the existing frame transport (see `rpc/frame.rs`).
+	pub(crate) fn send_notice(&self, level: &str, message: &str) {
+		self.sink.send(json!({
+			"type": "notice",
+			"level": level,
+			"message": message,
+		}));
+	}
+
 	#[must_use]
 	pub fn new(sink: Arc<dyn FrameSink>) -> Self {
 		Self {

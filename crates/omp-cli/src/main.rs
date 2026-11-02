@@ -2642,25 +2642,6 @@ impl Session<'_> {
 			},
 		);
 
-		if priority_downgraded
-			&& self.service_tier_by_family.get("anthropic").map(String::as_str)
-				== Some("priority")
-		{
-			// One authoritative update after the turn: the journal entry appended
-			// here becomes the branch leaf, so the next assistant (tool
-			// continuation or resume) stays downgraded.
-			self.service_tier_by_family.remove("anthropic");
-			self.service_tier_recorded = true;
-			if self.store.enabled()
-				&& let Err(err) =
-					self.store.append_service_tier_change(&self.service_tier_by_family)
-			{
-				eprintln!("warning: cannot record service tier change: {err}");
-			}
-			eprintln!(
-				"warning: Priority/fast mode rejected for this model; retried without it. Fast mode is now off."
-			);
-		}
 
 		if drive_result.is_err() {
 			cancel_token.cancel();
@@ -2689,6 +2670,25 @@ impl Session<'_> {
 			}
 		}
 		drop(handle_event);
+		if priority_downgraded
+			&& self.service_tier_by_family.get("anthropic").map(String::as_str)
+				== Some("priority")
+		{
+			// One authoritative update after the turn: the journal entry appended
+			// here becomes the branch leaf, so the next assistant (tool
+			// continuation or resume) stays downgraded.
+			self.service_tier_by_family.remove("anthropic");
+			self.service_tier_recorded = true;
+			if self.store.enabled()
+				&& let Err(err) =
+					self.store.append_service_tier_change(&self.service_tier_by_family)
+			{
+				eprintln!("warning: cannot record service tier change: {err}");
+			}
+			eprintln!(
+				"warning: Priority/fast mode rejected for this model; retried without it. Fast mode is now off."
+			);
+		}
 		self.prewalk = prewalk_state;
 		// A switch applied mid-turn reaches later prompts through the session
 		// fields; the journal already carries the ephemeral `fallback` role.

@@ -180,6 +180,11 @@ async fn request_body_matches_ollama_history_and_forced_tool_selection() {
 		name: "read".into(),
 		arguments: json!({"path": "a"}),
 	}];
+	// Same provider/API/model as the target so native thinking replays; the
+	// cross-model demotion contract has its own fixture below.
+	assistant.provider = Some("ollama".into());
+	assistant.api = Some("ollama-chat".into());
+	assistant.model = Some("llama3.2".into());
 
 	let mut image_user = Message::user_with_parts(vec![
 		ContentPart::text("look"),
@@ -259,6 +264,48 @@ async fn request_body_matches_ollama_history_and_forced_tool_selection() {
 }
 
 #[tokio::test]
+async fn foreign_history_thinking_demotes_to_target_dialect_text() {
+	let (base, request_rx) = serve_once(response(
+		"200 OK",
+		"application/x-ndjson",
+		"{\"message\":{\"content\":\"ok\"},\"done\":true}\n",
+	))
+	.await;
+
+	let mut assistant = Message::assistant("");
+	assistant.parts = vec![
+		ContentPart::thinking("plan"),
+		ContentPart::text("answer"),
+	];
+	assistant.provider = Some("anthropic".into());
+	assistant.api = Some("anthropic-messages".into());
+	assistant.model = Some("claude-3".into());
+
+	let provider = make_provider(&base, "llama3.2");
+	provider
+		.complete(
+			&[Message::user("hi"), assistant],
+			&[],
+			&ToolChoice::Auto,
+		)
+		.await
+		.expect("complete");
+
+	let (_, body) = request_rx.await.expect("request");
+	let wire = body["messages"].as_array().expect("messages");
+	let history = &wire[1];
+	assert_eq!(history["role"], "assistant");
+	assert!(
+		history.get("thinking").is_none(),
+		"foreign thinking must not replay natively: {history}"
+	);
+	assert_eq!(
+		history["content"], "<thinking>\nplan\n</thinking>\nanswer",
+		"demoted reasoning is consumer-visible content"
+	);
+}
+
+#[tokio::test]
 async fn cloud_dialect_caps_tokens_strips_history_thinking_and_demotes_system() {
 	let (base, request_rx) = serve_once(response(
 		"200 OK",
@@ -299,7 +346,7 @@ async fn omit_max_output_tokens_and_disable_reasoning_omit_wire_fields() {
 	let (base, request_rx) = serve_once(response(
 		"200 OK",
 		"application/x-ndjson",
-		"{\"done\":true}\n",
+		"{\"message\":{\"content\":\"ok\"},\"done\":true,\"eval_count\":1}\n",
 	))
 	.await;
 	let provider = make_provider(&base, "m")
@@ -487,6 +534,20 @@ async fn stream_flushes_an_eof_record_without_a_trailing_newline() {
 	assert_eq!(chunks[1].stop_reason, Some(StopReason::Stop));
 	assert_eq!(chunks[1].error_message, None);
 	assert!(chunks[1].usage.is_none());
+}
+
+#[tokio::test]
+async fn held_partial_tail_is_visible_so_length_stays_length() {
+	let body = "{\"message\":{\"content\":\"partial <\"},\"done\":false}\n{\"done\":true,\"done_reason\":\"length\",\"eval_count\":1}\n";
+	let (base, _request_rx) =
+		serve_once(response("200 OK", "application/x-ndjson", body)).await;
+	let provider = make_provider(&base, "m");
+	let message = provider
+		.complete(&[Message::user("hi")], &[], &ToolChoice::Auto)
+		.await
+		.expect("complete");
+	assert_eq!(message.stop_reason, Some(StopReason::Length));
+	assert_eq!(message.content, "partial <");
 }
 
 #[tokio::test]
@@ -724,7 +785,9 @@ async fn http_error_body_is_bounded_and_redacts_the_effective_bearer_token() {
 	// survive as a prefix of the cut token.
 	oversized.push_str(&"a".repeat(70 * 1024));
 	oversized.push_str(key);
-	let (base, request_rx) = serve_once(response("500 Internal Server Error", "text/plain", &oversized)).await;
+	// Non-retryable: retry behaviour is covered by its own fixture; this test
+	// isolates bounded body reading and credential redaction.
+	let (base, request_rx) = serve_once(response("400 Bad Request", "text/plain", &oversized)).await;
 	let provider = OllamaProvider::new(base.as_str(), key, "m").expect("provider");
 	let err = provider
 		.stream(&[Message::user("hi")], &[], &ToolChoice::Auto)
@@ -735,7 +798,7 @@ async fn http_error_body_is_bounded_and_redacts_the_effective_bearer_token() {
 	assert_eq!(body["model"], "m");
 	match &err {
 		ProviderError::HttpStatus(status, body) => {
-			assert_eq!(*status, 500);
+			assert_eq!(*status, 400);
 			assert!(body.len() < 70 * 1024, "error body must be bounded: {}", body.len());
 			assert!(body.contains("[redacted]"), "{body}");
 			assert!(body.contains("[truncated]"), "{body}");
@@ -1010,8 +1073,11 @@ fn test_kimi_scanner_tool_calls_and_name_normalization() {
 #[test]
 fn test_dsml_scanner_fullwidth_and_ascii() {
 	let mut fullwidth_scanner = DeepSeekInbandScanner::default();
-	let fw = "<｜DSML｜tool_calls><｜DSML｜invoke name=\"bash\"><｜DSML｜parameter name=\"cmd\" string=\"ls -la\"/></｜DSML｜invoke></｜DSML｜tool_calls>";
-	let events = fullwidth_scanner.feed(fw).expect("feed");
+	let fw = format!(
+		"<{p}DSML{p}tool_calls><{p}DSML{p}invoke name=\"bash\"><{p}DSML{p}parameter name=\"cmd\" string=\"true\">ls -la</{p}DSML{p}parameter></{p}DSML{p}invoke></{p}DSML{p}tool_calls>",
+		p = "\u{FF5C}"
+	);
+	let events = fullwidth_scanner.feed(&fw).expect("feed");
 	assert_eq!(events.len(), 1);
 	match &events[0] {
 		InbandScanEvent::ToolCall { name, arguments, .. } => {
@@ -1023,7 +1089,7 @@ fn test_dsml_scanner_fullwidth_and_ascii() {
 	}
 
 	let mut ascii_scanner = DeepSeekInbandScanner::default();
-	let ascii = "<|DSML|tool_calls><|DSML|invoke name=\"calc\"><|DSML|parameter name=\"expr\">{\"val\": 42}</|DSML|parameter></|DSML|invoke></|DSML|tool_calls>";
+	let ascii = "<|DSML|tool_calls><|DSML|invoke name=\"calc\"><|DSML|parameter name=\"expr\" string=\"false\">{\"val\": 42}</|DSML|parameter></|DSML|invoke></|DSML|tool_calls>";
 	let a_events = ascii_scanner.feed(ascii).expect("feed");
 	assert_eq!(a_events.len(), 1);
 	match &a_events[0] {
@@ -1110,7 +1176,7 @@ fn test_history_thinking_demotion_target_dialects() {
 	);
 	assert_eq!(
 		demote_thinking("random-model", "step 1"),
-		"<thinking>step 1</thinking>"
+		"<thinking>\nstep 1\n</thinking>"
 	);
 }
 
@@ -1163,6 +1229,9 @@ async fn test_empty_completion_retry_retries_and_succeeds() {
 		let _ = socket1.write_all(headers.as_bytes()).await;
 		let _ = socket1.write_all(empty_chunk.as_bytes()).await;
 		let _ = socket1.flush().await;
+		// EOF terminates attempt 1 (TS waits for the final NDJSON `done` then
+		// the server close), so the retry accept must not race an open socket.
+		drop(socket1);
 
 		// Attempt 2: successful completion
 		let (mut socket2, _) = listener.accept().await.expect("accept 2");

@@ -915,8 +915,19 @@ impl OllamaProvider {
 					continue;
 				}
 				let id = msg.tool_call_id.clone().unwrap_or_default();
-				// The call survives elsewhere in history, so this result is a
-				// duplicate/stale note rather than an orphan to replay.
+				// Normal case: this result answers an open call window. Keep the
+				// real body/id/error; never replace it with a synthetic note.
+				if let Some(pos) = pending.iter().position(|(pending_id, _)| pending_id == &id) {
+					pending.remove(pos);
+					consumed[index] = true;
+					output.push(msg);
+					continue;
+				}
+				// Unmatched inside an open window is noise (TS drops it).
+				if !pending.is_empty() {
+					continue;
+				}
+				// The call survives elsewhere in history, so this is a duplicate.
 				if valid_calls.iter().any(|call_id| call_id == &id) {
 					continue;
 				}
@@ -2749,10 +2760,13 @@ impl MarkupHealer {
 struct RecordHealer {
 	healer: MarkupHealer,
 	next_block: usize,
-	/// Raw parser text block -> allocated content block.
-	text_blocks: HashMap<usize, usize>,
-	/// Raw parser thinking block -> allocated content block.
-	thinking_blocks: HashMap<usize, usize>,
+	/// Active healed text/thinking block for a raw parser block. A thinking or
+	/// tool deltas end the active text block, so later text gets a new block
+	/// instead of appending before the intervening thinking (TS endActiveTextBlock).
+	text_block: Option<usize>,
+	thinking_block: Option<usize>,
+	text_raw: Option<usize>,
+	thinking_raw: Option<usize>,
 	/// Raw parser tool slot -> allocated content block.
 	tool_blocks: HashMap<usize, usize>,
 	saw_native_thinking: bool,
@@ -2766,8 +2780,10 @@ impl RecordHealer {
 		Self {
 			healer: MarkupHealer::new(pattern),
 			next_block: 0,
-			text_blocks: HashMap::new(),
-			thinking_blocks: HashMap::new(),
+			text_block: None,
+			thinking_block: None,
+			text_raw: None,
+			thinking_raw: None,
 			tool_blocks: HashMap::new(),
 			saw_native_thinking: false,
 			saw_healed_tool_calls: false,
@@ -2782,21 +2798,39 @@ impl RecordHealer {
 	}
 
 	fn ensure_text(&mut self, raw_block: usize) -> usize {
-		if let Some(block) = self.text_blocks.get(&raw_block) {
-			return *block;
+		if self.text_raw == Some(raw_block)
+			&& let Some(block) = self.text_block
+		{
+			return block;
 		}
 		let block = self.alloc_block();
-		self.text_blocks.insert(raw_block, block);
+		self.text_block = Some(block);
+		self.text_raw = Some(raw_block);
+		// Starting text ends any active thinking block.
+		self.thinking_block = None;
+		self.thinking_raw = None;
 		block
 	}
 
 	fn ensure_thinking(&mut self, raw_block: usize) -> usize {
-		if let Some(block) = self.thinking_blocks.get(&raw_block) {
-			return *block;
+		if self.thinking_raw == Some(raw_block)
+			&& let Some(block) = self.thinking_block
+		{
+			return block;
 		}
 		let block = self.alloc_block();
-		self.thinking_blocks.insert(raw_block, block);
+		self.thinking_block = Some(block);
+		self.thinking_raw = Some(raw_block);
+		// Thinking ends any active text block (TS endActiveTextBlock), so text
+		// after reasoning cannot append before it.
+		self.text_block = None;
+		self.text_raw = None;
 		block
+	}
+
+	fn end_active_text(&mut self) {
+		self.text_block = None;
+		self.text_raw = None;
 	}
 
 	fn ensure_tool_block(&mut self, raw_index: usize) -> usize {
@@ -2835,6 +2869,9 @@ impl RecordHealer {
 				MarkupHealingEvent::ToolCall(call) => {
 					self.saw_healed_tool_calls = true;
 					self.visible = true;
+					self.end_active_text();
+					self.thinking_block = None;
+					self.thinking_raw = None;
 					let block = self.alloc_block();
 					out.push(delta_chunk(
 						None,
@@ -2884,6 +2921,9 @@ impl RecordHealer {
 				out.push(delta_chunk(None, Some(reasoning), Vec::new(), block));
 			}
 			if !chunk.tool_call_deltas.is_empty() {
+				self.end_active_text();
+				self.thinking_block = None;
+				self.thinking_raw = None;
 				for mut delta in chunk.tool_call_deltas {
 					let block = self.ensure_tool_block(delta.index);
 					delta.index = block;
@@ -2893,6 +2933,15 @@ impl RecordHealer {
 				}
 			}
 		}
+		Ok(out)
+	}
+
+	/// Flush held markup without deciding the terminal stop; the caller must
+	/// recompute `visible` afterwards so a held tail counts as visible.
+	fn flush_held(&mut self) -> Result<Vec<StreamChunk>, ProviderError> {
+		let mut out = Vec::new();
+		let events = self.healer.flush_events()?;
+		self.push_events(events, usize::MAX, &mut out);
 		Ok(out)
 	}
 
@@ -3645,13 +3694,25 @@ where
 						}
 					}
 					if !fatal {
+						// Flush first: a held partial tail that becomes text or a
+						// tool call is visible and must not turn `length` into an
+						// empty-completion error.
+						if let Err(err) = state.healer.flush_held().map(|chunks| {
+							state.queue.extend(chunks.into_iter().map(Ok));
+						}) {
+							state.queue.push_back(Ok(error_chunk(err.to_string())));
+							fatal = true;
+						}
+					}
+					if !fatal {
 						let (usage, raw_stop) = state
 							.parse
 							.terminal
 							.take()
 							.unwrap_or((None, StopReason::Stop));
 						let visible = state.healer.visible;
-						let saw_tool_calls = state.parse.saw_tool_calls;
+						let saw_tool_calls =
+							state.parse.saw_tool_calls || state.healer.saw_healed_tool_calls;
 						let (stop, error_message) =
 							finalize_stop(raw_stop, visible, saw_tool_calls);
 						match state.healer.finish(usage, stop, error_message) {
@@ -3884,6 +3945,72 @@ mod tests {
 				.iter()
 				.all(|msg| !msg.content.contains("stale-tool-result")
 					&& msg.content != "No result provided")
+		);
+	}
+
+	#[test]
+	fn in_record_text_around_thinking_gets_ordered_blocks() {
+		let mut healer = RecordHealer::new(StreamMarkupHealingPattern::Thinking);
+		let mut out = Vec::new();
+		healer
+			.push_events(
+				vec![
+					MarkupHealingEvent::Text("a".to_string()),
+					MarkupHealingEvent::Thinking("b".to_string()),
+					MarkupHealingEvent::Text("c".to_string()),
+				],
+				0,
+				&mut out,
+			)
+			.expect("push events");
+		let parts: Vec<(String, usize, String)> = out
+			.iter()
+			.filter_map(|chunk| match (&chunk.content, &chunk.reasoning, chunk.content_index) {
+				(Some(text), _, Some(index)) => Some(("text".to_string(), index, text.clone())),
+				(_, Some(reason), Some(index)) => {
+					Some(("thinking".to_string(), index, reason.clone()))
+				},
+				_ => None,
+			})
+			.collect();
+		assert_eq!(
+			parts,
+			vec![
+				("text".to_string(), 0, "a".to_string()),
+				("thinking".to_string(), 1, "b".to_string()),
+				("text".to_string(), 2, "c".to_string()),
+			]
+		);
+	}
+
+	#[test]
+	fn adjacent_real_tool_result_keeps_body_id_and_error() {
+		let provider = OllamaProvider::new("http://127.0.0.1:9", "", "m").expect("provider");
+		let mut assistant = Message::assistant_with_tools(
+			"",
+			vec![ToolCall {
+				id: "c1".to_string(),
+				name: "t".to_string(),
+				arguments: serde_json::json!({}),
+			}],
+		);
+		assistant.parts = vec![ContentPart::tool_call("c1", "t", serde_json::json!({}))];
+		assistant.stop_reason = Some(StopReason::ToolUse);
+		let messages = vec![
+			assistant,
+			Message::tool_with_status("c1", "t", "REAL", true),
+		];
+		let transformed = provider.transform_messages(&messages);
+		assert_eq!(transformed.len(), 2, "{transformed:?}");
+		let tool = &transformed[1];
+		assert_eq!(tool.role, Role::Tool);
+		assert_eq!(tool.tool_call_id.as_deref(), Some("c1"));
+		assert_eq!(tool.content, "REAL");
+		assert!(tool.is_error);
+		assert!(
+			!transformed
+				.iter()
+				.any(|msg| msg.content.contains("No result provided"))
 		);
 	}
 

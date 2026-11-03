@@ -83,6 +83,8 @@ class MockModel:
                     has_tool_result = any(
                         message.get("role") == "tool" for message in messages
                     )
+                    status = 200
+                    content_type = "text/event-stream"
                     if child and mock.child_gate:
                         mock.child_gate_seen.set()
                         if mock.child_gate_release.wait(timeout=10):
@@ -155,10 +157,15 @@ class MockModel:
                             + "data: [DONE]\n\n"
                         )
                     elif child and mock.child_error:
-                        chunk = (
-                            'data: {"error":{"type":"server_error",'
-                            '"message":"child provider failed"}}\n\n'
-                            "data: [DONE]\n\n"
+                        status = 500
+                        content_type = "application/json"
+                        chunk = json.dumps(
+                            {
+                                "error": {
+                                    "type": "server_error",
+                                    "message": "child provider failed",
+                                }
+                            }
                         )
                     elif child:
                         chunk = (
@@ -209,8 +216,8 @@ class MockModel:
                 if delay:
                     time.sleep(delay)
                 encoded = chunk.encode()
-                self.send_response(200)
-                self.send_header("content-type", "text/event-stream")
+                self.send_response(status)
+                self.send_header("content-type", content_type)
                 self.send_header("content-length", str(len(encoded)))
                 self.send_header("connection", "close")
                 self.end_headers()
@@ -977,15 +984,41 @@ def phase_child_failure(binary: str, mock: MockModel, base: Path) -> None:
         for request in requests
     ):
         fail("child failure phase never reached the child provider")
-    if "child advice marker" in out.stdout:
-        fail("failed child advisor fabricated a card")
+    failure_logs = [
+        path for path in session_logs(sessions)
+        if "subagents" not in path.parts and "__advisor" not in path.name
+    ]
+    if len(failure_logs) != 1:
+        fail(f"expected one child-failure root log, got {failure_logs}")
+    root_log = failure_logs[0].read_text()
+    failed_results = []
+    for line in root_log.splitlines():
+        entry = json.loads(line)
+        message = entry.get("message") or {}
+        if message.get("role") != "toolResult":
+            continue
+        envelope = json.loads(message["content"])
+        failed_results.extend(envelope.get("results") or [])
+    if not failed_results:
+        fail("child-failure root log has no task result")
+    if all(result.get("exitCode", 0) == 0 for result in failed_results):
+        fail("real child provider error is reported as a successful task result")
+    if all(
+        not result.get("error") and not result.get("stderr")
+        for result in failed_results
+    ):
+        fail("failed child task result carries no error or stderr")
+    if "19191" in root_log:
+        fail("child advisor usage leaked into the parent session log")
+    if root_log.count("child advice marker") > 1:
+        fail("failed child emitted duplicate advice cards")
     root_advisors = [
         path for path in sessions.rglob("__advisor*.jsonl")
         if "subagents" not in path.parts
     ]
     if root_advisors:
         fail(f"root advisor ran despite --advisor being off: {root_advisors}")
-    print("PASS child provider failure contained")
+    print("PASS child provider failure visible; optional advice contained")
 
 
 def phase_child_cancel(binary: str, mock: MockModel, base: Path) -> None:

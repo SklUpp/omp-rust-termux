@@ -194,8 +194,9 @@ fn respond(request: &serde_json::Value) -> String {
 			"call-task",
 			"task",
 			&serde_json::json!({
-				"items": [{ "name": "child", "agent": "child", "task": "inspect the repo" }],
-				"async": false,
+				"name": "child",
+				"agent": "child",
+				"task": "inspect the repo",
 			}),
 		)
 	} else {
@@ -246,6 +247,42 @@ fn message_text(message: &serde_json::Value) -> String {
 			.join("\n"),
 		_ => String::new(),
 	}
+}
+
+fn system_text(request: &serde_json::Value) -> String {
+	request
+		.get("messages")
+		.and_then(serde_json::Value::as_array)
+		.map(|messages| {
+			messages
+				.iter()
+				.filter(|message| {
+					matches!(
+						message.get("role").and_then(serde_json::Value::as_str),
+						Some("system" | "developer")
+					)
+				})
+				.map(message_text)
+				.collect::<Vec<_>>()
+				.join("\n")
+		})
+		.unwrap_or_default()
+}
+
+fn request_diagnostics(requests: &[serde_json::Value], stderr: &str) -> String {
+	let mut out = format!("stderr:\n{stderr}\nrequests: {}\n", requests.len());
+	for (index, request) in requests.iter().enumerate() {
+		out.push_str(&format!("request {index}: {:?}\n", tool_names(request)));
+		if let Some(messages) = request.get("messages").and_then(serde_json::Value::as_array) {
+			for message in messages {
+				let role = message.get("role").and_then(serde_json::Value::as_str).unwrap_or("?");
+				let text = message_text(message);
+				let excerpt: String = text.chars().take(240).collect();
+				out.push_str(&format!("  {role}: {excerpt}\n"));
+			}
+		}
+	}
+	out
 }
 
 fn find_file(root: &Path, name: &str) -> Option<PathBuf> {
@@ -484,17 +521,16 @@ fn autoload_skills_reach_the_child_conversation_once() {
 	);
 
 	let requests = server.requests.lock().expect("requests").clone();
+	let stderr = String::from_utf8_lossy(&output.stderr);
 	let child_request = requests
 		.iter()
-		.find(|request| {
-			request
-				.get("messages")
-				.and_then(serde_json::Value::as_array)
-				.and_then(|messages| messages.first())
-				.map(message_text)
-				.is_some_and(|system| system.contains("Child marker instructions."))
-		})
-		.expect("child request reached the provider");
+		.find(|request| system_text(request).contains("Child marker instructions."))
+		.unwrap_or_else(|| {
+			panic!(
+				"child request reached the provider; {}",
+				request_diagnostics(&requests, &stderr)
+			)
+		});
 	let child_tools = tool_names(child_request);
 	assert!(
 		!child_tools.iter().any(|name| name == "learn" || name == "manage_skill"),
@@ -697,17 +733,18 @@ fn disabled_extensions_remove_a_skill_from_every_surface() {
 	);
 	let requests = server.requests.lock().expect("requests").clone();
 	assert!(!requests.is_empty(), "provider was reached");
-	let system = requests[0]
-		.get("messages")
-		.and_then(serde_json::Value::as_array)
-		.and_then(|messages| messages.first())
-		.map(message_text)
-		.unwrap_or_default();
+	let system = system_text(&requests[0]);
+	assert!(!system.is_empty(), "prompt listing/system prompt was not observed");
 	assert!(!system.contains("blocked"), "prompt listing must omit it: {system}");
 	let user = requests[0]
 		.get("messages")
 		.and_then(serde_json::Value::as_array)
-		.and_then(|messages| messages.last())
+		.and_then(|messages| {
+			messages
+				.iter()
+				.rev()
+				.find(|message| message.get("role").and_then(serde_json::Value::as_str) == Some("user"))
+		})
 		.map(message_text)
 		.unwrap_or_default();
 	assert_eq!(user, "/skill:blocked now", "disabled slash command stays literal");
@@ -718,5 +755,13 @@ fn disabled_extensions_remove_a_skill_from_every_surface() {
 				.expect("request json")
 				.contains("BLOCKED BODY MARKER")),
 		"disabled skill body must never reach the provider"
+	);
+	assert!(
+		!requests
+			.iter()
+			.any(|request| serde_json::to_string(request)
+				.expect("request json")
+				.contains("skill://blocked")),
+		"disabled skill URI must stay unavailable"
 	);
 }

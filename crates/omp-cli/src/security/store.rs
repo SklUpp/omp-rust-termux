@@ -24,6 +24,7 @@ use std::{
 
 use super::{
 	ids::{encode_security_project_key, sha256_hex},
+	preflight::{NativeSecurityGitAdapter, SecurityGitAdapter as _},
 	sarif::export_security_bundle_to_sarif,
 	types::{
 		self, SecurityDisposition, SecurityEvidence, SecurityFinding, SecurityScan, SecurityScanBundle,
@@ -115,10 +116,26 @@ pub struct SecurityStore {
 	project_directory: PathBuf,
 }
 
+/// `openForCwd` root resolution: the enclosing git worktree root when `cwd` is
+/// inside one, else `cwd` itself, canonicalized.
+///
+/// Resolution lives here rather than at the call site so no caller can pass a
+/// subdirectory and silently split a repository into two project stores.
+fn resolve_repository_root(cwd: &Path) -> PathBuf {
+	let resolved = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+	match NativeSecurityGitAdapter.root(&resolved).ok().flatten() {
+		Some(root) => fs::canonicalize(&root).unwrap_or(root),
+		None => resolved,
+	}
+}
+
 impl SecurityStore {
-	/// Open (or create) the store for a canonical repository root.
+	/// Open (or create) the project store for `repository_root` or, when it is a
+	/// directory inside a worktree, for that worktree's root (TS `openForCwd`).
+	/// A non-repository path keeps its own store; preflight is what later
+	/// requires a Git repository.
 	pub fn open(repository_root: &Path, state_root: Option<&Path>) -> crate::Result<Self> {
-		let canonical = fs::canonicalize(repository_root).unwrap_or_else(|_| repository_root.to_path_buf());
+		let canonical = resolve_repository_root(repository_root);
 		let canonical_text = canonical.to_string_lossy().to_string();
 		let project_key = encode_security_project_key(&canonical_text);
 		let project_directory = match state_root {
@@ -136,8 +153,9 @@ impl SecurityStore {
 		Ok(store)
 	}
 
-	/// `openForCwd`: the git repo root when `cwd` is inside one, else `cwd`.
-	/// The caller supplies the resolved root when it already has a git adapter.
+	/// Alias kept for callers that already speak in terms of a cwd. It performs
+	/// the exact same root resolution as [`Self::open`]; there is no bypass for
+	/// an "already resolved" path.
 	pub fn open_for_root(cwd: &Path, state_root: Option<&Path>) -> crate::Result<Self> {
 		Self::open(cwd, state_root)
 	}
@@ -635,7 +653,9 @@ mod tests {
 		let repo = root.join("repo");
 		fs::create_dir_all(&repo).expect("repo");
 		let store = SecurityStore::open(&repo, Some(&root.join("state"))).expect("store");
-		assert!(store.project_key().ends_with(&sha256_hex(repo.to_string_lossy().as_bytes())[..12]));
+		assert!(store
+			.project_key()
+			.ends_with(&sha256_hex(store.repository_root().as_bytes())[..12]));
 		assert!(store.index_path().is_file());
 		#[cfg(unix)]
 		{

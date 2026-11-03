@@ -204,13 +204,8 @@ impl SecurityScanTool {
 				let finding_id = required_str(params, "finding_id")?;
 				let status = required_str(params, "validation_status")?;
 				let summary = required_str(params, "validation_summary")?;
-				let store = super::store::SecurityStore::open(
-					&self.host.cwd(),
-					self.host.state_root().as_deref(),
-				)?;
-				if store.get_scan(&scan_id)?.is_none() {
-					return Err(crate::Error::new(format!("Unknown security scan: {scan_id}")));
-				}
+				// `getFinding` semantics: an unknown scan surfaces as an unknown
+				// finding, exactly like the TS tool.
 				let evidence: Vec<SecurityEvidence> = params
 					.get("validation_evidence")
 					.and_then(Value::as_array)

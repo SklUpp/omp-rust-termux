@@ -698,7 +698,10 @@ fn gc_live_breaker_without_main_lock_blocks_acquisition() {
 		format!("{}\n2026-01-01T00:00:00.000Z\n", std::process::id()),
 	)
 	.expect("live breaker");
-	let error = acquire_gc_lock(&agent).expect_err("live breaker without main lock");
+	let error = match acquire_gc_lock(&agent) {
+		Err(error) => error,
+		Ok(_) => panic!("live breaker without main lock must block acquisition"),
+	};
 	assert!(error.contains("GC already running"), "{error}");
 	assert!(
 		!agent.join("gc.lock").exists(),
@@ -936,7 +939,10 @@ fn gc_guard_lock_contends_and_persists_without_blocking_after_release() {
 	fs::create_dir_all(&agent).expect("agent dir");
 	let lock_path = agent.join("gc.lock");
 	let guard = open_gc_guard(&lock_path).expect("first guard");
-	let error = acquire_gc_lock(&agent).expect_err("contended guard");
+	let error = match acquire_gc_lock(&agent) {
+		Err(error) => error,
+		Ok(_) => panic!("contended guard must block acquisition"),
+	};
 	assert!(error.contains("GC already running"), "{error}");
 	assert!(!lock_path.exists(), "contention must not create gc.lock");
 	drop(guard);

@@ -20,7 +20,7 @@ use std::time::SystemTime;
 use pi_agent::{Message, Role};
 
 use crate::catalog::Catalog;
-use crate::session::{Cost, MessageContent, MessageEntry, SessionMessage, Usage};
+use crate::session::{ContentPart, Cost, MessageContent, MessageEntry, SessionMessage, Usage};
 
 pub const ADVISOR_TRANSCRIPT_STEM: &str = "__advisor";
 pub const ADVISOR_TRANSCRIPT_FILENAME: &str = "__advisor.jsonl";
@@ -156,8 +156,29 @@ impl AdvisorTranscript {
 			},
 			Role::Assistant => {
 				let usage = priced_usage(message, catalog, provider, model);
+				let mut parts: Vec<ContentPart> = message
+					.parts
+					.iter()
+					.filter_map(ContentPart::from_agent_part)
+					.collect();
+				if !message.tool_calls.is_empty()
+					&& !parts.iter().any(|part| part.kind == "toolCall")
+				{
+					parts.extend(message.tool_calls.iter().map(|call| {
+						ContentPart::tool_call(
+							call.id.clone(),
+							call.name.clone(),
+							call.arguments.clone(),
+						)
+					}));
+				}
+				let content = if parts.is_empty() {
+					MessageContent::Text(message.content.clone())
+				} else {
+					MessageContent::Parts(parts)
+				};
 				SessionMessage::assistant(
-					MessageContent::Text(message.content.clone()),
+					content,
 					message.api.clone().unwrap_or_default(),
 					message.provider.clone().unwrap_or_else(|| provider.to_string()),
 					message.model.clone().unwrap_or_else(|| model.to_string()),

@@ -305,6 +305,15 @@ class AcpClient:
                     raise AssertionError(f"prompt {text!r} failed: {current['error']}")
                 return current.get("result", {})
 
+    def barrier(self, session_id: str) -> None:
+        """Round-trip a session command after a terminal prompt.
+
+        Capture runs inside the turn worker before the prompt response, so a
+        completed session round-trip proves the actor and its capture work have
+        drained. Never use a sleep as absence evidence.
+        """
+        self.request("session/set_mode", {"sessionId": session_id, "modeId": "default"})
+
     def cancel_prompt(self, session_id: str, text: str, timeout=PROMPT_TIMEOUT) -> dict:
         request_id = self.next_id
         self.next_id += 1
@@ -602,7 +611,7 @@ def main(argv=None) -> int:
 
         cancelled = client.cancel_prompt(session_id, "CANCEL TURN")
         assert cancelled.get("stopReason") == "cancelled", cancelled
-        time.sleep(0.3)
+        client.barrier(session_id)
         assert not capture_requests(provider, "CANCEL TURN"), "cancelled turn must not capture"
 
         client.request("session/set_mode", {"sessionId": session_id, "modeId": "plan"})

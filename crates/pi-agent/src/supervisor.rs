@@ -272,6 +272,9 @@ pub struct ChildRecord {
 	/// readable `agent://` pointer and must not be exposed to consumers.
 	#[serde(skip)]
 	pub output_published: bool,
+	/// Whether this child was expected to persist a revival contract.
+	#[serde(skip)]
+	pub contract_expected: bool,
 	/// Real child transcript log (`<session artifacts>/<child_id>.jsonl`) the
 	/// task executor writes. `None` when no session root was installed.
 	#[serde(skip_serializing_if = "Option::is_none")]
@@ -1752,6 +1755,7 @@ impl Supervisor {
 				abort_reason: None,
 				output_id: Some(output_id),
 				output_published: false,
+				contract_expected: false,
 				session_file,
 				agent_source: spawn.agent_source.to_string(),
 				parent_tool_call_id: spawn.parent_tool_call_id.map(str::to_string),
@@ -1892,6 +1896,25 @@ impl Supervisor {
 	/// Mark an id owned after losing a first-publication race.
 	pub fn mark_output_id_taken(&self, output_id: &str) {
 		self.output_ids.reserve(output_id);
+	}
+
+	/// Record that this child is expected to have a revival contract.
+	pub fn mark_contract_expected(&self, id: &str) {
+		let mut state = self.state.lock().unwrap();
+		if let Some(record) = state.records.get_mut(id) {
+			record.contract_expected = true;
+		}
+	}
+
+	/// Actual contract intent, set only when persistence was attempted.
+	#[must_use]
+	pub fn child_contract_expected(&self, id: &str) -> bool {
+		let state = self.state.lock().unwrap();
+		state
+			.records
+			.get(id)
+			.map(|record| record.contract_expected)
+			.unwrap_or(false)
 	}
 
 	/// Confirm that this child's allocated output id is now readable.

@@ -8,7 +8,7 @@ use pi_agent::{
 	AgentConfig, AgentContext, AgentLoop, AgentState,
 	ChildStatus, DelegationLimits, HubTool, OpenAiCompatibleProvider,
 	Role, Supervisor, TaskTool, Tool, ToolRegistry,
-	tools::{InternalUrlRouter, UrlScope},
+	tools::{InternalUrlRouter, UrlScope, task_catalog::{AgentCatalog, AgentDefinition, AgentSource, Spawns}},
 };
 use pi_agent::tools::hub::HubToolDetails;
 use pi_agent::tools::task::TaskToolDetails;
@@ -241,7 +241,7 @@ fn route_response(latest: &str) -> Value {
 	if latest.contains("NESTED_PARENT") {
 		return tool_call_response(
 			"task",
-			&json!({ "name": "NestedChild", "task": "NESTED_CHILD" }),
+			&json!({ "name": "NestedChild", "agent": "scout", "task": "NESTED_CHILD" }),
 		);
 	}
 
@@ -480,6 +480,26 @@ async fn test_t1_happy_delegation() {
 	assert!(children[0].duration_ms.is_some());
 }
 
+fn test_catalog_agent(name: &str) -> AgentDefinition {
+	AgentDefinition {
+		name: name.to_string(),
+		description: format!("{name} test agent"),
+		tools: None,
+		spawns: Some(Spawns::All),
+		model: Vec::new(),
+		output: None,
+		thinking_level: None,
+		blocking: false,
+		read_summarize: None,
+		prewalk: None,
+		advisor: None,
+		autoload_skills: Vec::new(),
+		system_prompt: String::new(),
+		source: AgentSource::Bundled,
+		file_path: format!("embedded:{name}.md"),
+	}
+}
+
 fn saved_output_root(label: &str) -> PathBuf {
 	let nanos = SystemTime::now()
 		.duration_since(UNIX_EPOCH)
@@ -623,6 +643,10 @@ async fn nested_spawn_writes_dotted_outputs_in_the_producer_root() {
 		None,
 		DelegationLimits::default(),
 	);
+	supervisor.set_agent_catalog(Arc::new(AgentCatalog::new(
+		vec![test_catalog_agent("task"), test_catalog_agent("scout")],
+		None,
+	)));
 	supervisor.set_child_session_root(Some(subagents.clone()));
 	let mut scope = UrlScope::default();
 	scope.session_file = Some(root.join("main.jsonl"));

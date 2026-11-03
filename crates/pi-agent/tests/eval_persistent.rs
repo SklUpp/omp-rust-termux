@@ -1233,6 +1233,123 @@ async fn js_agent_handle_without_output_id_keeps_lifecycle_id_and_agent() {
 }
 
 #[tokio::test]
+async fn py_agent_handle_without_output_id_keeps_lifecycle_id_and_agent() {
+	if python_path().is_none() {
+		eprintln!("skipping Python regression: python is not installed");
+		return;
+	}
+	let host = Arc::new(TestHost::default());
+	*host
+		.omit_output_id
+		.lock()
+		.unwrap_or_else(|poison| poison.into_inner()) = true;
+	let Some((tool, runtime, ctx, cwd)) = harness_with(
+		one_language(EvalLanguage::Py),
+		Interpreters::default(),
+		test_session(),
+		Arc::clone(&host),
+		|settings| settings,
+	)
+	.await
+	else {
+		return;
+	};
+	let result = tool
+		.execute(
+			&json!({
+				"language": "py",
+				"code": "import json\nnode = agent('x', handle=True)\nprint(json.dumps(node))"
+			}),
+			&ctx,
+		)
+		.await
+		.expect("py agent handle fallback cell");
+	assert!(!result.is_error, "{}", result.content);
+	assert!(result.content.contains("\"handle\": null"), "{}", result.content);
+	assert!(result.content.contains("\"id\": \"task-1\""), "{}", result.content);
+	assert!(result.content.contains("\"agent\": \"task\""), "{}", result.content);
+	teardown(&runtime, cwd).await;
+}
+
+#[tokio::test]
+async fn rb_agent_handle_without_output_id_keeps_lifecycle_id_and_agent() {
+	if ruby_path().is_none() {
+		eprintln!("skipping Ruby regression: ruby is not installed");
+		return;
+	}
+	let host = Arc::new(TestHost::default());
+	*host
+		.omit_output_id
+		.lock()
+		.unwrap_or_else(|poison| poison.into_inner()) = true;
+	let Some((tool, runtime, ctx, cwd)) = harness_with(
+		one_language(EvalLanguage::Rb),
+		Interpreters::default(),
+		test_session(),
+		Arc::clone(&host),
+		|settings| settings,
+	)
+	.await
+	else {
+		return;
+	};
+	let result = tool
+		.execute(
+			&json!({
+				"language": "rb",
+				"code": "require 'json'\nnode = agent('x', handle: true)\nputs JSON.generate(node)"
+			}),
+			&ctx,
+		)
+		.await
+		.expect("ruby agent handle fallback cell");
+	assert!(!result.is_error, "{}", result.content);
+	assert!(result.content.contains("\"handle\":null"), "{}", result.content);
+	assert!(result.content.contains("\"id\":\"task-1\""), "{}", result.content);
+	assert!(result.content.contains("\"agent\":\"task\""), "{}", result.content);
+	teardown(&runtime, cwd).await;
+}
+
+#[tokio::test]
+async fn jl_agent_handle_without_output_id_keeps_lifecycle_id_and_agent() {
+	if julia_path().is_none() {
+		eprintln!("skipping Julia regression: julia is an external prerequisite (not installed)");
+		return;
+	}
+	let host = Arc::new(TestHost::default());
+	*host
+		.omit_output_id
+		.lock()
+		.unwrap_or_else(|poison| poison.into_inner()) = true;
+	let Some((tool, runtime, ctx, cwd)) = harness_with(
+		one_language(EvalLanguage::Jl),
+		Interpreters::default(),
+		test_session(),
+		Arc::clone(&host),
+		|settings| settings,
+	)
+	.await
+	else {
+		return;
+	};
+	let result = tool
+		.execute(
+			&json!({
+				"language": "jl",
+				"code": "node = agent(\"x\"; handle=true)\nprintln(Main.json_serialize(node))"
+			}),
+			&ctx,
+		)
+		.await
+		.expect("julia agent handle fallback cell");
+	assert!(!result.is_error, "{}", result.content);
+	assert!(result.content.contains("\"handle\":null"), "{}", result.content);
+	assert!(result.content.contains("\"id\":\"task-1\""), "{}", result.content);
+	assert!(result.content.contains("\"agent\":\"task\""), "{}", result.content);
+	teardown(&runtime, cwd).await;
+}
+
+#[tokio::test]
 async fn js_agent_handle_uses_output_id_not_lifecycle_id() {
 	if js_path().is_none() {
 		eprintln!("skipping JS regression: bun is not installed");

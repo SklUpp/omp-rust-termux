@@ -1119,12 +1119,7 @@ impl TaskTool {
 			let published = self
 				.supervisor
 				.save_agent_output(&outstanding_id, &item.name, &body);
-			let expected = contract_expected(
-				&self.supervisor,
-				&outstanding_id,
-				invocation_task,
-				result.isolation.is_some(),
-			);
+			let expected = contract_expected(&self.supervisor, &outstanding_id);
 			let persisted = persist_child_output_id(
 				&self.supervisor,
 				&outstanding_id,
@@ -1184,6 +1179,13 @@ impl TaskTool {
 					}
 				},
 			}
+		}
+		if invocation_task && !metadata_confirmed {
+			let reason = result
+				.error
+				.as_deref()
+				.unwrap_or("saved output metadata unavailable");
+			tombstone_aborted_child(&self.supervisor, &outstanding_id, reason);
 		}
 		self.supervisor.unregister_active_child(&outstanding_id);
 		guard.defuse();
@@ -1895,19 +1897,15 @@ fn settle_background_result(
 			supervisor.append_child_transcript(&id, &journaled_refs);
 			let (base, aborted, reason) = summarize_turns(&turns);
 			let finalized = finalize_output(&item, &turns, &base, aborted);
-			let has_output = !collect_yields(&turns).is_empty()
-				|| turns
-					.iter()
-					.any(|turn| !turn.message.content.trim().is_empty());
 			let artifact = if aborted {
 				aborted_output(reason.as_deref())
-			} else if cancelled && !has_output {
+			} else if cancelled && finalized.output.trim().is_empty() {
 				salvage.cancelled_output()
 			} else {
 				finalized.output.clone()
 			};
 			let output_id = supervisor.save_agent_output(&id, &item.name, &artifact);
-			let expected = contract_expected(&supervisor, &id, true, isolation.is_some());
+			let expected = contract_expected(&supervisor, &id);
 			let persisted = persist_child_output_id(
 				&supervisor,
 				&id,
@@ -1998,7 +1996,12 @@ fn settle_background_result(
 			let output_id =
 				supervisor.save_agent_output(&id, &item.name, &salvage.cancelled_output());
 			if let Err(error) =
-				persist_child_output_id(&supervisor, &id, output_id.as_deref(), false)
+				persist_child_output_id(
+					&supervisor,
+					&id,
+					output_id.as_deref(),
+					contract_expected(&supervisor, &id),
+				)
 			{
 				let message = format!("saved output metadata unavailable: {error}");
 				let (output, _) = cap_result_text(&message);
@@ -2028,7 +2031,12 @@ fn settle_background_result(
 			let output_id =
 				supervisor.save_agent_output(&id, &item.name, &salvage.raw_output());
 			if let Err(error) =
-				persist_child_output_id(&supervisor, &id, output_id.as_deref(), false)
+				persist_child_output_id(
+					&supervisor,
+					&id,
+					output_id.as_deref(),
+					contract_expected(&supervisor, &id),
+				)
 			{
 				let message = format!("saved output metadata unavailable: {error}");
 				let (output, _) = cap_result_text(&message);
@@ -2462,6 +2470,7 @@ fn persist_child_contract(
 	else {
 		return;
 	};
+	supervisor.mark_contract_expected(child_id);
 	let parent_id = supervisor.child_parent_id(child_id);
 	let tools = registry.names();
 	let spawns = item.agent.spawns.as_ref().map(Spawns::error_text);
@@ -2511,16 +2520,8 @@ fn persist_child_contract(
 /// A missing contract or write failure is returned to the caller: the task
 /// must surface the durable-metadata failure and must not be adopted without
 /// confirmed authority. A previously published file is never deleted here.
-fn contract_expected(
-	supervisor: &Arc<Supervisor>,
-	child_id: &str,
-	invocation_task: bool,
-	isolated: bool,
-) -> bool {
-	invocation_task
-		&& !isolated
-		&& crate::subagent_lifecycle::lookup(supervisor).is_some()
-		&& supervisor.child_session_file(child_id).is_some()
+fn contract_expected(supervisor: &Arc<Supervisor>, child_id: &str) -> bool {
+	supervisor.child_contract_expected(child_id)
 }
 
 fn persist_child_output_id(
@@ -3866,6 +3867,7 @@ mod tests {
 			})
 			.expect("reserve");
 		supervisor.append_child_transcript(&id, &[&Message::user("work")]);
+		supervisor.mark_contract_expected(&id);
 		settle_background_result(
 			Arc::clone(&supervisor),
 			id.clone(),

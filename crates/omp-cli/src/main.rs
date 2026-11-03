@@ -1282,6 +1282,15 @@ fn run() -> std::result::Result<(), CliError> {
 		&& cli.file_args.is_empty()
 		&& piped_stdin.is_none()
 		&& !cli.print;
+	if std::env::var_os("OMP_ADVISOR_DIAGNOSTIC").is_some() {
+		eprintln!(
+			"[advisor-diag] cli flow repl={} prompts={} print={} command={}",
+			repl_mode,
+			cli.prompt.len(),
+			cli.print,
+			cli.command.is_some()
+		);
+	}
 	if repl_mode {
 		let result = run_repl(&mut session, mode, &mut reporter).map_err(CliError::from);
 		// Post-shutdown child accounting reaches the log before it closes.
@@ -1332,6 +1341,7 @@ fn run() -> std::result::Result<(), CliError> {
 		prompts_to_run.push((None, prompt, Vec::new()));
 	}
 
+	let prompt_count = prompts_to_run.len();
 	for (ctx, prompt, parts) in prompts_to_run {
 		if let Err(error) = session.turn(ctx, prompt, parts, mode, &mut reporter) {
 			// A failed turn still settles the roster, but bounded short: never
@@ -1353,6 +1363,9 @@ fn run() -> std::result::Result<(), CliError> {
 	// Every primary prompt has settled: preserve late advice, wait bounded for
 	// the roster, persist/render it, then stop advisor work (TS
 	// `prepareForHeadlessAdvisorDrain` -> `waitForAdvisorCatchup(10min)`).
+	if std::env::var_os("OMP_ADVISOR_DIAGNOSTIC").is_some() {
+		eprintln!("[advisor-diag] cli loop done prompts={prompt_count}");
+	}
 	session.advisor_headless_drain(&mut reporter, Duration::from_secs(600))?;
 	// Last chance for a child that settled after the final turn boundary.
 	session.finish(&native_runner);
@@ -1831,6 +1844,15 @@ impl Session<'_> {
 		timeout: Duration,
 	) -> Result<()> {
 		let (id, file) = advisor_scope_for(&self.store);
+		if std::env::var_os("OMP_ADVISOR_DIAGNOSTIC").is_some() {
+			eprintln!(
+				"[advisor-diag] cli drain enter store={} session={} file={} timeout={:?}",
+				self.store.enabled(),
+				id.as_deref().unwrap_or("-"),
+				file.is_some(),
+				timeout
+			);
+		}
 		self
 			.runner
 			.advisor_prepare_headless_drain(id.as_deref(), file.as_deref());

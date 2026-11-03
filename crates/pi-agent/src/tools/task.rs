@@ -1895,9 +1895,13 @@ fn settle_background_result(
 			supervisor.append_child_transcript(&id, &journaled_refs);
 			let (base, aborted, reason) = summarize_turns(&turns);
 			let finalized = finalize_output(&item, &turns, &base, aborted);
+			let has_output = !collect_yields(&turns).is_empty()
+				|| turns
+					.iter()
+					.any(|turn| !turn.message.content.trim().is_empty());
 			let artifact = if aborted {
 				aborted_output(reason.as_deref())
-			} else if cancelled {
+			} else if cancelled && !has_output {
 				salvage.cancelled_output()
 			} else {
 				finalized.output.clone()

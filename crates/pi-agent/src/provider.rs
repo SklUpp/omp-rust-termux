@@ -1131,6 +1131,16 @@ pub struct OpenAiStreamChunk {
 	pub choices: Vec<OpenAiStreamChoice>,
 	#[serde(default)]
 	pub usage: Option<OpenAiUsage>,
+	#[serde(default)]
+	pub error: Option<OpenAiStreamError>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenAiStreamError {
+	#[serde(default, alias = "type")]
+	pub kind: String,
+	#[serde(default)]
+	pub message: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1575,6 +1585,18 @@ pub fn parse_sse_line(line: &str) -> Option<Result<StreamChunk, ProviderError>> 
 
 	match serde_json::from_str::<OpenAiStreamChunk>(data) {
 		Ok(chunk) => {
+			if let Some(error) = chunk.error {
+				let message = if error.message.is_empty() {
+					"provider stream error".to_string()
+				} else {
+					error.message
+				};
+				return Some(Err(ProviderError::Protocol(if error.kind.is_empty() {
+					message
+				} else {
+					format!("{}: {message}", error.kind)
+				})));
+			}
 			let mut content = None;
 			let mut reasoning = None;
 			let mut stop_reason = None;

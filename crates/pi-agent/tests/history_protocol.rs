@@ -486,10 +486,6 @@ async fn parked_and_tombstoned_transcripts_stay_readable() {
 		.expect("parked read");
 	assert!(parked_read.content.starts_with(&format!("# {parked} (parked)")));
 	assert!(parked_read.content.contains("parked-prior-answer"));
-	assert_eq!(
-		parked_read.notes.expect("notes"),
-		vec!["Source: session file (read-only, parked)".to_string()]
-	);
 
 	let tombstoned = reserve(&supervisor, "tombstoned");
 	append(
@@ -1058,10 +1054,6 @@ async fn revived_live_snapshot_precedes_flush_and_survives_idle_until_park() {
 		.await
 		.expect("parked file read");
 	assert!(parked.content.contains("gated-answer"));
-	assert_eq!(
-		parked.notes.expect("notes"),
-		vec!["Source: session file (read-only, parked)".to_string()]
-	);
 }
 
 

@@ -3,15 +3,18 @@
 #
 # Requires a built `omp` binary. Runs the real CLI against a localhost
 # OpenAI-compatible mock under an isolated $HOME:
-#   1. root spawns a child, reads `history://` and `history://task-1` while the
-#      child is live (before/around the JSONL flush), then settles it by waiting
-#      for completion.
-#   2. a fresh CLI process resumes the session, reads the parked transcript,
-#      cold-revives the same id with `hub send`, and reads its history again.
+#   1. root spawns an ASYNC child. The child's first provider call answers
+#      "live-child-answer", its second blocks on the root's history read. The
+#      root must see that in-turn answer in `history://task-1` BEFORE releasing
+#      the child; a file-only view never contains it and the harness fails.
+#      After release the child settles, is adopted, and history falls back to
+#      the journaled transcript.
+#   2. a fresh CLI process resumes the session, reads the parked row, cold-
+#      revives the same id with `hub send`, and reads its history again.
 #   3. a second, independent session spawns its own `task-1` and must read only
 #      its own transcript (same id, different session artifacts).
 #
-# Nothing is written outside $HOME. This is a hand-run recipe, not a cargo test.
+# Nothing is written outside $HOME. Hand-run recipe, not a cargo test.
 
 set -euo pipefail
 
@@ -37,9 +40,11 @@ trap cleanup EXIT
 python3 - "$PORT_FILE" >"$SERVER_LOG" 2>&1 <<'PY' &
 import json
 import sys
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 port_file = sys.argv[1]
+release_child = threading.Event()
 
 
 def sse(chunks):
@@ -86,7 +91,7 @@ def last_user(messages):
 
 
 def last_tool_call(messages):
-    """(name, arguments) of the assistant call answered by the last tool result."""
+    """(name, arguments) answered by the last tool result; None when not a tool turn."""
     call_id = None
     for message in reversed(messages):
         if message.get("role") == "tool":
@@ -107,19 +112,22 @@ def last_tool_call(messages):
     return None, {}
 
 
-def hub_op_count(messages, op):
+def count_tool_calls(messages, name, op=None, path=None):
     count = 0
     for message in messages:
         for call in message.get("tool_calls") or []:
             function = call.get("function") or {}
-            if function.get("name") != "hub":
+            if function.get("name") != name:
                 continue
             try:
                 arguments = json.loads(function.get("arguments") or "{}")
             except json.JSONDecodeError:
                 continue
-            if arguments.get("op") == op:
-                count += 1
+            if op is not None and arguments.get("op") != op:
+                continue
+            if path is not None and arguments.get("path") != path:
+                continue
+            count += 1
     return count
 
 
@@ -129,19 +137,27 @@ def root_reply(messages):
         return None
     name, arguments = last_tool_call(messages)
     content = message_text(last)
+    waits = count_tool_calls(messages, "hub", op="wait")
+    reads = count_tool_calls(messages, "read", path="history://task-1")
 
     if name == "task":
-        # First read is the bare index, then the live id before its flush.
         return tool_call("read", {"path": "history://"})
     if name == "read" and "# Agents" in content:
         return tool_call("read", {"path": "history://task-1"})
-    if name == "read" and "child-body-A" in content and "revived-body-B" not in content:
-        if hub_op_count(messages, "wait") == 0:
-            # Settle: the adopted row parks after this wait.
-            return tool_call("hub", {"op": "wait", "ids": ["task-1"], "timeoutMs": 5000})
-        return text("PHASE1_OK:" + content)
+    if name == "read" and waits == 0:
+        if "live-child-answer" in content:
+            # Live proof established: only now may the gated child finish.
+            release_child.set()
+            return tool_call("hub", {"op": "wait", "ids": ["task-1"], "timeoutMs": 10000})
+        if reads < 8:
+            return tool_call("read", {"path": "history://task-1"})
+        return text("PHASE1_FAIL_NO_LIVE")
     if name == "hub" and arguments.get("op") == "wait":
         return tool_call("read", {"path": "history://task-1"})
+    if name == "read" and waits >= 1:
+        if "live-child-answer" in content:
+            return text("PHASE1_OK:" + content)
+        return text("PHASE1_FAIL_AFTER_SETTLE")
     return text("DONE")
 
 
@@ -152,10 +168,10 @@ def resume_reply(messages):
     name, arguments = last_tool_call(messages)
     content = message_text(last)
 
-    if name == "read" and "revived-body-B" in content and "resume-body-C" not in content:
+    if name == "read" and "resume-body-C" not in content:
         return tool_call("hub", {"op": "send", "to": "task-1", "message": "REVIVE_RESUME"})
     if name == "hub" and arguments.get("op") == "send":
-        return tool_call("hub", {"op": "wait", "ids": ["task-1"], "timeoutMs": 5000})
+        return tool_call("hub", {"op": "wait", "ids": ["task-1"], "timeoutMs": 10000})
     if name == "hub" and arguments.get("op") == "wait":
         return tool_call("read", {"path": "history://task-1"})
     if name == "read" and "resume-body-C" in content:
@@ -171,24 +187,23 @@ def isolated_reply(messages):
     content = message_text(last)
 
     if name == "task":
-        return tool_call("hub", {"op": "wait", "ids": ["task-1"], "timeoutMs": 5000})
+        return tool_call("hub", {"op": "wait", "ids": ["task-1"], "timeoutMs": 10000})
     if name == "hub" and arguments.get("op") == "wait":
         return tool_call("read", {"path": "history://task-1"})
     if name == "read":
-        return text("PHASE3_OK:" + content)
+        if "iso-body-D" in content:
+            return text("PHASE3_OK:" + content)
+        return text("PHASE3_FAIL")
     return text("DONE")
 
 
-def child_reply(user):
-    if "REVIVE_RESUME" in user:
-        return tool_call("yield", {"result": {"data": "resume-body-C"}})
-    if "REVIVE_WORK" in user:
-        return tool_call("yield", {"result": {"data": "revived-body-B"}})
-    if "CHILD_WORK_ISOLATED" in user:
-        return tool_call("yield", {"result": {"data": "iso-body-D"}})
-    if "CHILD_WORK" in user:
-        return tool_call("yield", {"result": {"data": "child-body-A"}})
-    return text("DONE")
+def child_live_reply(messages):
+    """First call answers in-turn, second waits for the root's live read."""
+    assistant_turns = sum(1 for message in messages if message.get("role") == "assistant")
+    if assistant_turns == 0:
+        return text("live-child-answer")
+    release_child.wait(timeout=20)
+    return tool_call("yield", {"result": {"data": "child-body-A"}})
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -210,20 +225,17 @@ class Handler(BaseHTTPRequestHandler):
             payload = resume_reply(messages)
         elif "ROOT_TASK" in user:
             payload = root_reply(messages)
-        elif "REVIVE_RESUME" in user:
-            payload = tool_call("yield", {"result": {"data": "resume-body-C"}})
-        elif "REVIVE_WORK" in user:
-            payload = tool_call("yield", {"result": {"data": "revived-body-B"}})
         elif "CHILD_WORK_ISOLATED" in user:
-            payload = tool_call("yield", {"result": {"data": "iso-body-D"}})
+            payload = text("iso-body-D")
+        elif "REVIVE_RESUME" in user:
+            payload = text("resume-body-C")
+        elif "REVIVE_WORK" in user:
+            payload = text("revived-body-B")
         elif "CHILD_WORK" in user:
-            payload = tool_call("yield", {"result": {"data": "child-body-A"}})
+            payload = child_live_reply(messages)
 
         if payload is None:
-            if messages and messages[-1].get("role") == "tool":
-                payload = text("DONE")
-            else:
-                payload = child_reply(user)
+            payload = text("DONE")
 
         data = payload.encode()
         self.send_response(200)
@@ -280,22 +292,29 @@ run_cli() {
 		"$OMP_BIN" --cwd "$PROJECT" --session-dir "$SESSIONS" --yolo "$@"
 }
 
-# Phase 1: spawn -> live index/id -> settle -> hub revive -> history again.
+# Phase 1: async spawn -> gated in-turn answer visible live -> settle/adopt.
 run_cli -p ROOT_TASK >"$ROOT/first.out" 2>"$ROOT/first.err"
 grep -q "PHASE1_OK" "$ROOT/first.out" || {
-	echo "phase 1 history read failed" >&2
+	echo "phase 1 live history read failed" >&2
 	cat "$ROOT/first.out" "$ROOT/first.err" >&2
 	exit 1
 }
-grep -q "child-body-A" "$ROOT/first.out" || { echo "phase 1 missing pre-park body" >&2; exit 1; }
+grep -q "live-child-answer" "$ROOT/first.out" || {
+	echo "phase 1 did not observe the in-turn live answer" >&2
+	exit 1
+}
 
 SESSION_FILE="$(find "$SESSIONS" -name '*.jsonl' -type f -not -path '*/subagents/*' | sort | tail -n 1)"
 [[ -n "$SESSION_FILE" ]] || { echo "no session file" >&2; exit 1; }
 ARTIFACTS="${SESSION_FILE%.jsonl}"
 [[ -f "$ARTIFACTS/subagents/task-1.jsonl" ]] || { echo "child transcript missing" >&2; exit 1; }
 [[ -f "$ARTIFACTS/subagents/task-1.init.json" ]] || { echo "child contract missing" >&2; exit 1; }
+grep -q "live-child-answer" "$ARTIFACTS/subagents/task-1.jsonl" || {
+	echo "in-turn answer was not journaled after settle" >&2
+	exit 1
+}
 
-# Phase 2: fresh process -> restored parked row -> cold revive -> history.
+# Phase 2: fresh process -> parked read -> cold revive -> history again.
 SESSION_ID="$(basename "$SESSION_FILE" .jsonl)"
 SESSION_ID="${SESSION_ID##*_}"
 run_cli --resume "$SESSION_ID" -p READ_HISTORY_AFTER_TASK >"$ROOT/resume.out" 2>"$ROOT/resume.err"
@@ -304,8 +323,7 @@ grep -q "PHASE2_OK" "$ROOT/resume.out" || {
 	cat "$ROOT/resume.out" "$ROOT/resume.err" >&2
 	exit 1
 }
-grep -q "child-body-A" "$ROOT/resume.out" || { echo "resume lost pre-park body" >&2; exit 1; }
-grep -q "revived-body-B" "$ROOT/resume.out" || { echo "resume lost revived body" >&2; exit 1; }
+grep -q "live-child-answer" "$ROOT/resume.out" || { echo "resume lost live answer" >&2; exit 1; }
 grep -q "resume-body-C" "$ROOT/resume.out" || { echo "resume missing cold-revive body" >&2; exit 1; }
 
 # Phase 3: different session, same task-1 id, isolated artifacts.
@@ -316,7 +334,7 @@ grep -q "PHASE3_OK" "$ROOT/isolated.out" || {
 	exit 1
 }
 grep -q "iso-body-D" "$ROOT/isolated.out" || { echo "isolated session lost its body" >&2; exit 1; }
-! grep -q "child-body-A" "$ROOT/isolated.out" || { echo "isolated session read phase 1 transcript" >&2; exit 1; }
-! grep -q "revived-body-B" "$ROOT/isolated.out" || { echo "isolated session read revived phase 1 transcript" >&2; exit 1; }
+! grep -q "live-child-answer" "$ROOT/isolated.out" || { echo "isolated session read phase 1 transcript" >&2; exit 1; }
+! grep -q "resume-body-C" "$ROOT/isolated.out" || { echo "isolated session read phase 2 transcript" >&2; exit 1; }
 
 echo "HARNESS_OK root=$ROOT session=$SESSION_FILE"

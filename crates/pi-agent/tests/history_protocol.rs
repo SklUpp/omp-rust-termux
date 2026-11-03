@@ -29,6 +29,7 @@ use pi_agent::{
 		internal_urls::{InternalUrlRouter, UrlScope},
 		registry::ToolRegistry,
 		read::ReadTool,
+		task::{TaskTool, TaskToolDetails},
 		Tool,
 	},
 };
@@ -166,6 +167,21 @@ fn gated_manager(supervisor: &Arc<Supervisor>, provider: Arc<GatedProvider>) -> 
 
 fn supervisor(root: &TempRoot) -> Arc<Supervisor> {
 	let provider: Arc<dyn ModelProvider> = Arc::new(NoopProvider);
+	let supervisor = Supervisor::new(
+		ToolRegistry::with_builtins(),
+		provider,
+		None,
+		DelegationLimits::default(),
+	);
+	supervisor.set_child_session_root(Some(root.subagents()));
+	supervisor
+}
+
+fn supervisor_with(
+	root: &TempRoot,
+	provider: Arc<GatedProvider>,
+) -> Arc<Supervisor> {
+	let provider: Arc<dyn ModelProvider> = provider;
 	let supervisor = Supervisor::new(
 		ToolRegistry::with_builtins(),
 		provider,
@@ -960,6 +976,283 @@ async fn revived_live_snapshot_precedes_flush_and_survives_idle_until_park() {
 		parked.notes.expect("notes"),
 		vec!["Source: session file (read-only, parked)".to_string()]
 	);
+}
+
+
+#[tokio::test]
+async fn task_tool_live_snapshot_precedes_flush_then_adopts_to_disk() {
+	let root = TempRoot::new("producer");
+	let provider = gated_provider("child-live-answer");
+	let supervisor = supervisor_with(&root, Arc::clone(&provider));
+	let manager = gated_manager(&supervisor, Arc::clone(&provider));
+	let router = router(&manager);
+	let _sink = supervisor.owner_results_sink(None);
+	let tool = TaskTool::new(Arc::clone(&supervisor), 0);
+	let ctx = AgentContext::new(root.path.clone());
+	let result = tool
+		.execute(
+			&json!({ "name": "Live", "task": "LIVE_PROMPT" }),
+			&ctx,
+		)
+		.await
+		.expect("task start");
+	let details: TaskToolDetails =
+		serde_json::from_str(&result.content).expect("task details");
+	let job = details.async_state.expect("background task");
+	assert_eq!(job.state, "running");
+	tokio::time::timeout(Duration::from_secs(5), provider.entered.notified())
+		.await
+		.expect("child provider entered");
+	let id = manager
+		.child_records()
+		.first()
+		.expect("live child record")
+		.id
+		.clone();
+	let transcript = transcript_path(&root.subagents(), &id);
+	assert!(
+		!fs::read_to_string(&transcript)
+			.unwrap_or_default()
+			.contains("child-live-answer"),
+		"the child answer has not been journaled yet"
+	);
+
+	let live = read(&router, &root, &format!("history://{id}"))
+		.await
+		.expect("live history read");
+	assert!(live.content.contains("LIVE_PROMPT"), "{}", live.content);
+	assert_eq!(
+		live.notes.expect("notes"),
+		vec!["Source: live session (read-only, running)".to_string()]
+	);
+
+	provider.gate.add_permits(1);
+	let mut delivered = false;
+	for _ in 0..500 {
+		if !supervisor.take_results_for(None).is_empty() {
+			delivered = true;
+			break;
+		}
+		tokio::time::sleep(Duration::from_millis(10)).await;
+	}
+	assert!(delivered, "background task must deliver its result");
+	let mut settled = false;
+	for _ in 0..500 {
+		if manager.status(&id) == Some(LifecycleStatus::Idle)
+			&& manager.live_messages(&id).is_none()
+		{
+			settled = true;
+			break;
+		}
+		tokio::time::sleep(Duration::from_millis(10)).await;
+	}
+	assert!(settled, "adopt must settle the live row onto disk");
+	let mut journaled = false;
+	let mut transcript_body = String::new();
+	for _ in 0..500 {
+		transcript_body = fs::read_to_string(&transcript).unwrap_or_default();
+		if transcript_body.contains("child-live-answer") {
+			journaled = true;
+			break;
+		}
+		tokio::time::sleep(Duration::from_millis(10)).await;
+	}
+	assert!(journaled, "final answer must be journaled: {transcript_body}");
+
+	let disk = read(&router, &root, &format!("history://{id}"))
+		.await
+		.expect("disk fallback read");
+	assert!(disk.content.contains("child-live-answer"), "{}", disk.content);
+	assert_eq!(
+		disk.notes.expect("notes"),
+		vec!["Source: transcript file (read-only, idle)".to_string()]
+	);
+}
+
+#[tokio::test]
+async fn explicit_roots_without_session_file_deny_foreign_manager() {
+	let root_a = TempRoot::new("explicit-a");
+	let root_b = TempRoot::new("explicit-b");
+	let supervisor_a = supervisor(&root_a);
+	let supervisor_b = supervisor(&root_b);
+	let manager_b = manager(&supervisor_b);
+	let id_a = reserve(&supervisor_a, "a");
+	let _first_b = reserve(&supervisor_b, "first-b");
+	let id_b = reserve(&supervisor_b, "b");
+	append(&supervisor_a, &id_a, &[Message::user("alpha-body")]);
+	append(&supervisor_b, &id_b, &[Message::user("beta-body")]);
+	manager_b.seed_live(&id_b, Message::user("beta-live-secret"));
+	let shared = router(&manager_b);
+	let mut scope = UrlScope::default();
+	scope
+		.local_roots
+		.insert("local".to_string(), root_a.artifacts());
+	let context = scope.resolve_context(&root_a.path, &CancellationToken::new());
+
+	let own = shared
+		.resolve(&format!("history://{id_a}"), &context)
+		.await
+		.expect("caller A disk read");
+	assert!(own.content.contains("alpha-body"));
+	assert!(!own.content.contains("beta-body"));
+
+	let foreign = shared
+		.resolve(&format!("history://{id_b}"), &context)
+		.await
+		.expect_err("foreign manager denied");
+	assert!(foreign.starts_with(&format!("Unknown agent: {id_b}")), "{foreign}");
+	assert!(!foreign.contains("beta-live-secret"));
+}
+
+#[tokio::test]
+async fn empty_scope_denies_manager_rows_and_live_snapshots() {
+	let root = TempRoot::new("empty-scope");
+	let supervisor = supervisor(&root);
+	let manager = manager(&supervisor);
+	let id = reserve(&supervisor, "empty");
+	append(&supervisor, &id, &[Message::user("file-secret")]);
+	manager.seed_live(&id, Message::user("live-secret"));
+	let router = router(&manager);
+	let context = UrlScope::default().resolve_context(&root.path, &CancellationToken::new());
+
+	let index = router
+		.resolve("history://", &context)
+		.await
+		.expect("empty index");
+	assert!(index.content.contains("No agents registered."));
+	assert!(!index.content.contains(&id));
+
+	let error = router
+		.resolve(&format!("history://{id}"), &context)
+		.await
+		.expect_err("empty scope denial");
+	assert!(error.starts_with(&format!("Unknown agent: {id}")), "{error}");
+	assert!(!error.contains("live-secret"));
+}
+
+#[cfg(unix)]
+mod symlink_scope {
+	use std::os::unix::fs::symlink;
+
+	use super::*;
+
+	#[tokio::test]
+	async fn root_symlink_denies_live_and_disk_before_visibility() {
+		let root = TempRoot::new("root-link");
+		let outside = root.path.join("outside");
+		fs::create_dir_all(&outside).expect("outside");
+		append_messages(
+			&outside.join("task-1.jsonl"),
+			&[&Message::user("outside-secret")],
+		);
+		let subagents = root.subagents();
+		fs::remove_dir_all(&subagents).expect("remove subagents");
+		symlink(&outside, &subagents).expect("root symlink");
+
+		let supervisor = supervisor(&root);
+		let manager = manager(&supervisor);
+		manager.seed_live("task-1", Message::user("live-secret"));
+		let router = router(&manager);
+		let index = read(&router, &root, "history://").await.expect("index");
+		assert!(!index.content.contains("task-1"), "{}", index.content);
+		let error = read(&router, &root, "history://task-1")
+			.await
+			.expect_err("root symlink denied");
+		assert!(error.starts_with("Unknown agent: task-1"), "{error}");
+		assert!(!error.contains("outside-secret"));
+		assert!(!error.contains("live-secret"));
+	}
+
+	#[tokio::test]
+	async fn ancestor_symlink_denies_manager_before_live_visibility() {
+		let root = TempRoot::new("ancestor-link");
+		let real = root.path.join("real").join("session").join("subagents");
+		fs::create_dir_all(&real).expect("real subagents");
+		append_messages(
+			&real.join("task-1.jsonl"),
+			&[&Message::user("real-body")],
+		);
+		let linked = root.path.join("linked");
+		symlink(root.path.join("real"), &linked).expect("ancestor symlink");
+
+		let provider: Arc<dyn ModelProvider> = Arc::new(NoopProvider);
+		let supervisor = Supervisor::new(
+			ToolRegistry::with_builtins(),
+			provider,
+			None,
+			DelegationLimits::default(),
+		);
+		supervisor.set_child_session_root(Some(real.clone()));
+		let manager = manager(&supervisor);
+		manager.seed_live("task-1", Message::user("live-secret"));
+		let router = router(&manager);
+		let mut scope = UrlScope::default();
+		scope.session_file = Some(linked.join("session.jsonl"));
+		scope
+			.local_roots
+			.insert("local".to_string(), linked.join("session"));
+		let context = scope.resolve_context(&root.path, &CancellationToken::new());
+		let error = router
+			.resolve("history://task-1", &context)
+			.await
+			.expect_err("ancestor symlink denied");
+		assert!(error.starts_with("Unknown agent: task-1"), "{error}");
+		assert!(!error.contains("real-body"));
+		assert!(!error.contains("live-secret"));
+	}
+
+	#[tokio::test]
+	async fn nested_and_leaf_symlinks_are_never_read() {
+		let root = TempRoot::new("nested-leaf-links");
+		let supervisor = supervisor(&root);
+		let manager = manager(&supervisor);
+		let router = router(&manager);
+
+		let outside_dir = root.path.join("outside-dir");
+		fs::create_dir_all(&outside_dir).expect("outside dir");
+		append_messages(
+			&outside_dir.join("Parent.Child.jsonl"),
+			&[&Message::user("nested-secret")],
+		);
+		let parent_link = root.subagents().join("Parent");
+		symlink(&outside_dir, &parent_link).expect("nested dir symlink");
+
+		let outside_leaf = root.path.join("outside-leaf.jsonl");
+		append_messages(&outside_leaf, &[&Message::user("leaf-secret")]);
+		let leaf_link = root.subagents().join("task-1.jsonl");
+		symlink(&outside_leaf, &leaf_link).expect("leaf symlink");
+
+		let index = read(&router, &root, "history://").await.expect("index");
+		assert!(!index.content.contains("Parent.Child"), "{}", index.content);
+		assert!(!index.content.contains("task-1"), "{}", index.content);
+		for id in ["Parent.Child", "task-1"] {
+			let error = read(&router, &root, &format!("history://{id}"))
+				.await
+				.expect_err("symlink denied");
+			assert!(error.starts_with(&format!("Unknown agent: {id}")), "{error}");
+			assert!(!error.contains("nested-secret"));
+			assert!(!error.contains("leaf-secret"));
+		}
+	}
+
+	#[tokio::test]
+	async fn manager_row_leaf_symlink_is_denied_at_open() {
+		let root = TempRoot::new("manager-leaf-link");
+		let supervisor = supervisor(&root);
+		let manager = manager(&supervisor);
+		let id = reserve(&supervisor, "linked");
+		let transcript = transcript_path(&root.subagents(), &id);
+		fs::remove_file(&transcript).expect("remove transcript");
+		let outside = root.path.join("outside-manager.jsonl");
+		append_messages(&outside, &[&Message::user("manager-secret")]);
+		symlink(&outside, &transcript).expect("manager leaf symlink");
+		let router = router(&manager);
+		let error = read(&router, &root, &format!("history://{id}"))
+			.await
+			.expect_err("leaf symlink denied");
+		assert!(error.contains("cannot read transcript"), "{error}");
+		assert!(!error.contains("manager-secret"));
+	}
 }
 
 /// The caller isolation test must not accidentally pass because the two

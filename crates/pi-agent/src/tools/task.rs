@@ -877,6 +877,7 @@ impl TaskTool {
 
 		let mut terminal_mark = None;
 		let mut artifact_body: Option<String> = None;
+		let mut metadata_confirmed = true;
 		let mut result = match outcome {
 			Ok(turn_results) => {
 				// Journal the whole turn tail (assistant + tool results): a
@@ -1118,8 +1119,20 @@ impl TaskTool {
 			let published = self
 				.supervisor
 				.save_agent_output(&outstanding_id, &item.name, &body);
-			persist_child_output_id(&self.supervisor, &outstanding_id, published.as_deref());
+			let persisted = if invocation_task && result.isolation.is_none() {
+				persist_child_output_id(&self.supervisor, &outstanding_id, published.as_deref())
+			} else {
+				Ok(())
+			};
 			result.output_id = published;
+			if let Err(error) = persisted {
+				metadata_confirmed = false;
+				let message = format!("saved output metadata unavailable: {error}");
+				result.exit_code = 1;
+				result.stderr = message.clone();
+				result.error = Some(message.clone());
+				terminal_mark = Some(TerminalMark::Failed(message));
+			}
 		}
 		if let Some(mark) = terminal_mark {
 			match mark {
@@ -1127,7 +1140,7 @@ impl TaskTool {
 					self
 						.supervisor
 						.mark_completed(&outstanding_id, duration_ms, &output);
-					if invocation_task {
+					if invocation_task && metadata_confirmed {
 						adopt_keep_alive_child(
 							&self.supervisor,
 							&outstanding_id,
@@ -1139,7 +1152,7 @@ impl TaskTool {
 					self
 						.supervisor
 						.mark_failed(&outstanding_id, duration_ms, &message);
-					if invocation_task {
+					if invocation_task && metadata_confirmed {
 						adopt_keep_alive_child(
 							&self.supervisor,
 							&outstanding_id,
@@ -1878,7 +1891,29 @@ fn settle_background_result(
 				finalized.output.clone()
 			};
 			let output_id = supervisor.save_agent_output(&id, &item.name, &artifact);
-			persist_child_output_id(&supervisor, &id, output_id.as_deref());
+			let persisted = if isolation.is_none() {
+				persist_child_output_id(&supervisor, &id, output_id.as_deref())
+			} else {
+				Ok(())
+			};
+			if let Err(error) = persisted {
+				let message = format!("saved output metadata unavailable: {error}");
+				let usage = child_usage(&turns);
+				let (output, _) = cap_result_text(&message);
+				let envelope = task_result_envelope(
+					&id,
+					&agent,
+					output_id.as_deref(),
+					"failed (durable metadata)",
+					duration_ms,
+					&output,
+					None,
+					usage.as_ref(),
+				);
+				supervisor.mark_failed_with_usage(&id, duration_ms, &envelope, usage);
+				supervisor.enqueue_delivery(&id, envelope);
+				return;
+			}
 			if cancelled {
 				supervisor.mark_aborted(&id, "cancelled during isolation finalize");
 				tombstone_aborted_child(&supervisor, &id, "cancelled during isolation finalize");
@@ -2412,23 +2447,26 @@ fn persist_child_contract(
 /// Persist the confirmed published output id before adoption. `None` clears
 /// replacement authority after a failed publication, so a later revive cannot
 /// overwrite a file this child never wrote.
-fn persist_child_output_id(supervisor: &Arc<Supervisor>, child_id: &str, output_id: Option<&str>) {
-	let Some(root) = supervisor
+///
+/// A missing contract or write failure is returned to the caller: the task
+/// must surface the durable-metadata failure and must not be adopted without
+/// confirmed authority. A previously published file is never deleted here.
+fn persist_child_output_id(
+	supervisor: &Arc<Supervisor>,
+	child_id: &str,
+	output_id: Option<&str>,
+) -> Result<(), String> {
+	let root = supervisor
 		.child_session_file(child_id)
 		.and_then(|path| path.parent().map(std::path::Path::to_path_buf))
-	else {
-		return;
-	};
-	let Some(mut contract) = PersistedChildSession::load(&root, child_id) else {
-		return;
-	};
+		.ok_or_else(|| format!("no child session directory for {child_id}"))?;
+	let mut contract = PersistedChildSession::load(&root, child_id)
+		.ok_or_else(|| format!("missing child contract for {child_id}"))?;
 	contract.output_id = output_id.map(str::to_string);
 	contract.output_published = output_id.is_some();
-	if let Err(error) = contract.write(&root) {
-		eprintln!(
-			"warning: cannot persist published output id for {child_id}: {error}"
-		);
-	}
+	contract
+		.write(&root)
+		.map_err(|error| format!("cannot persist child contract for {child_id}: {error}"))
 }
 
 /// Hand a finished, non-isolated child to the lifecycle manager (`idle`), so
@@ -3564,8 +3602,9 @@ mod tests {
 			.save_agent_output(&id, "Saved", "mine")
 			.expect("published output");
 		assert_eq!(published, "Saved-2");
-		persist_child_output_id(&supervisor, &id, Some(&published));
-		let contract = PersistedChildSession::load(&subagents, &id).expect("reloaded contract");
+		persist_child_output_id(&supervisor, &id, Some(&published)).expect("persist authority");
+		let mut contract =
+			PersistedChildSession::load(&subagents, &id).expect("reloaded contract");
 		assert_eq!(contract.published_output_id(), Some("Saved-2"));
 		assert_eq!(std::fs::read_to_string(&foreign).expect("foreign"), "foreign");
 
@@ -3606,11 +3645,20 @@ mod tests {
 		contract.output_published = false;
 		contract.write(&subagents).expect("stale contract");
 		assert_eq!(contract.published_output_id(), None);
-		persist_child_output_id(&supervisor, &id, None);
+		persist_child_output_id(&supervisor, &id, None).expect("clear authority");
 		let contract = PersistedChildSession::load(&subagents, &id).expect("cleared contract");
 		assert_eq!(contract.published_output_id(), None);
 		assert_eq!(contract.output_id, None);
 		assert_eq!(std::fs::read_to_string(&foreign).expect("foreign"), "foreign");
+
+		// Deterministic failure seam: publication succeeded, but the contract
+		// disappeared. The helper must report it and leave the published file.
+		std::fs::remove_file(crate::task_persisted_revive::init_path(&subagents, &id))
+			.expect("remove contract");
+		let error = persist_child_output_id(&supervisor, &id, Some("Saved-2"))
+			.expect_err("missing contract must fail");
+		assert!(error.contains("missing child contract"), "{error}");
+		assert!(root.join("Saved-2.md").is_file(), "published file must survive");
 		std::fs::remove_dir_all(&root).ok();
 	}
 

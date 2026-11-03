@@ -260,9 +260,9 @@ fn resolve_in_roots(
 	signal: &crate::CancellationToken,
 ) -> Result<ScanResult, String> {
 	let nested_id = target.nested_id();
-	let candidate_ids: Vec<String> = match nested_id {
-		Some(nested) => vec![nested, target.output_id.clone()],
-		None => vec![target.output_id.clone()],
+	let candidate_ids: Vec<&str> = match nested_id.as_deref() {
+		Some(nested) => vec![nested, target.output_id.as_str()],
+		None => vec![target.output_id.as_str()],
 	};
 
 	let mut by_id: Vec<(String, PathBuf)> = Vec::new();
@@ -305,9 +305,9 @@ fn resolve_in_roots(
 
 	let found = candidate_ids
 		.iter()
-		.find_map(|candidate| by_id.iter().find(|(id, _)| id == candidate));
+		.find_map(|candidate| by_id.iter().find(|(id, _)| id.as_str() == *candidate));
 	let Some((matched_id, path)) = found else {
-		let target_id = nested_id.unwrap_or_else(|| target.output_id.clone());
+		let target_id = nested_id.as_deref().unwrap_or(target.output_id.as_str());
 		let list = if available.is_empty() {
 			"none".to_string()
 		} else {

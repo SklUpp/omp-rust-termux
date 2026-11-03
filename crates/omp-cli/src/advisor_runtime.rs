@@ -1716,6 +1716,52 @@ mod tests {
 		assert!(quarantine_turn_text("read src/lib.rs", "", &["rename".to_string()]).is_some());
 	}
 
+	struct GatedExecutor {
+		started: tokio::sync::Notify,
+		release: tokio::sync::Notify,
+	}
+
+	#[async_trait::async_trait]
+	impl AdvisorExecutor for GatedExecutor {
+		async fn execute(&self, _spec: AdvisorCallSpec) -> AdvisorCallResult {
+			self.started.notify_one();
+			self.release.notified().await;
+			let mut history = Vec::new();
+			history.push(Message::user("stale update"));
+			history.push(Message::assistant("stale answer"));
+			AdvisorCallResult { history, assistant_messages: Vec::new(), error: None }
+		}
+	}
+
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn reset_drops_a_settled_result_from_the_old_epoch() {
+		let executor = Arc::new(GatedExecutor {
+			started: tokio::sync::Notify::new(),
+			release: tokio::sync::Notify::new(),
+		});
+		let manager = manager(executor.clone());
+		manager.begin_primary_run(&[]);
+		manager.push_user(&Message::user("fix it"));
+		manager.push_turn(&Message::assistant("done"), &[]);
+		tokio::time::timeout(Duration::from_secs(1), executor.started.notified())
+			.await
+			.expect("advisor call started");
+		manager.reset("branch switched");
+		executor.release.notify_one();
+		tokio::time::sleep(Duration::from_millis(100)).await;
+		let state = manager.slots[0]
+			.state
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner());
+		assert!(
+			!state.history.iter().any(|message| message.content.contains("stale")),
+			"old-epoch history must not survive reset"
+		);
+		assert_eq!(state.backlog, 0, "stale batch must not be requeued");
+		drop(state);
+		manager.dispose();
+	}
+
 	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 	async fn quota_error_latches_and_reset_clears_it() {
 		let executor = Arc::new(FakeExecutor {

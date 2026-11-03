@@ -989,24 +989,29 @@ impl Drop for AbandonLaunch {
 				// A stop/restart replaced this generation; its owner decides.
 				return;
 			}
-			if state.snapshot.persist || state.snapshot.detached {
-				// Cross-exit launches survive the caller by contract.
-				return;
-			}
 			let spawned = state.snapshot.pid.is_some()
 				|| state.killer.is_some()
 				|| state.pinned.is_some()
 				|| state.group_id.is_some();
 			if !spawned {
-				// Aborted while awaiting the lifecycle gate of a fresh record:
+				// Aborted before (or at) the lifecycle gate of a fresh record:
 				// no generation ran, so settle the reservation synchronously
 				// instead of leaving a non-terminal record that blocks the name.
+				// This runs before the cross-exit return: nothing spawned means
+				// nothing for persist/detached to preserve.
+				if let Some(task) = state.restart_task.take() {
+					task.abort();
+				}
 				state.snapshot.state = ProcessState::Exited;
 				state.snapshot.exited_at = Some(now_ms());
 				state.snapshot.ready_pending = None;
 				state.snapshot.exit_reason = Some("launch cancelled".to_string());
 				drop(state);
 				self.record.notify_change();
+				return;
+			}
+			if state.snapshot.persist || state.snapshot.detached {
+				// Cross-exit launches survive the caller by contract.
 				return;
 			}
 			state.stop_requested = true;

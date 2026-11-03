@@ -1945,10 +1945,13 @@ fn forward_child_events(
 					.capture_message(message, status);
 			}
 			// Advisor trigger parity: one settled turn, after its tool results,
-			// never an aborted one (TS `setOnTurnEnd` skips an aborted signal,
-			// `session-advisors.ts:337`). The hook schedules its own work.
+			// never an aborted or failed turn. Provider failure produces an
+			// empty assistant turn; reviewing it would fabricate advice.
 			if let AgentEvent::TurnEnd { message, tool_results, status } = &event
-				&& !matches!(status, crate::TurnStatus::Aborted)
+				&& !matches!(
+					status,
+					crate::TurnStatus::Aborted | crate::TurnStatus::Error(_)
+				)
 				&& let Some(hook) = supervisor.child_advisor_hook()
 			{
 				let session_file = supervisor.child_session_file(&child_id);

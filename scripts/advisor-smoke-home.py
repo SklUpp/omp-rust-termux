@@ -293,6 +293,91 @@ def fail(message: str) -> None:
     raise SystemExit(f"FAIL: {message}")
 
 
+ENV_ARTIFACT_KEYS = (
+    "HOME",
+    "PI_CODING_AGENT_DIR",
+    "OMP_AGENT_DIR",
+    "PI_PROFILE",
+    "OMP_PROFILE",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+    "XDG_CACHE_HOME",
+)
+
+
+def dump_env(base: Path, agent_dir: Path, cwd: Path, sessions: Path, binary: str) -> None:
+    """Record which profile/agent dir the fixture process really selected."""
+    env = omp_env(agent_dir)
+    artifact = {
+        "binary": binary,
+        "agent_dir": str(agent_dir),
+        "cwd": str(cwd),
+        "sessions": str(sessions),
+        "env": {key: env.get(key) for key in ENV_ARTIFACT_KEYS},
+    }
+    (base / "fixture-env.json").write_text(json.dumps(artifact, indent=2) + "\n")
+
+
+def diagnose_cli_failure(
+    binary: str,
+    agent_dir: Path,
+    cwd: Path,
+    sessions: Path,
+    base: Path,
+) -> None:
+    """Read-only RPC status on the same env/config; never prompts the model."""
+    report: dict = {"error": None, "ready": False, "status": None, "frames": []}
+    proc = None
+    try:
+        proc, lines = spawn_with_reader(
+            binary,
+            [
+                binary,
+                "--cwd", str(cwd),
+                "--session-dir", str(sessions),
+                "--no-tools",
+                "--no-title",
+                "--advisor",
+                "--mode", "rpc",
+            ],
+            omp_env(agent_dir),
+        )
+        ready = read_lines(proc, lines, 20, lambda frame: frame.get("type") == "ready")
+        report["frames"].extend(ready)
+        report["ready"] = any(frame.get("type") == "ready" for frame in ready)
+        if report["ready"]:
+            send(proc, {"id": "diag-1", "type": "get_advisor_status"})
+            status = read_lines(
+                proc,
+                lines,
+                30,
+                lambda frame: frame.get("type") == "response"
+                and frame.get("command") == "get_advisor_status",
+            )
+            report["frames"].extend(status)
+            report["status"] = next(
+                (
+                    frame
+                    for frame in status
+                    if frame.get("type") == "response"
+                    and frame.get("command") == "get_advisor_status"
+                ),
+                None,
+            )
+    except (OSError, subprocess.SubprocessError, AssertionError) as error:
+        report["error"] = f"{type(error).__name__}: {error}"
+    finally:
+        if proc is not None:
+            try:
+                report["exit"] = close_stdin(proc, timeout=20)
+            except (subprocess.SubprocessError, AssertionError) as error:
+                report["exit_error"] = f"{type(error).__name__}: {error}"
+        (base / "cli-text-rpc-status.json").write_text(
+            json.dumps(report, indent=2, default=str) + "\n"
+        )
+
+
 def read_lines(proc: subprocess.Popen[str], lines: queue.Queue, timeout: float, until) -> list[dict]:
     """Collect decoded frames until `until(frame)` is true (or timeout)."""
     seen: list[dict] = []
@@ -364,17 +449,20 @@ def close_stdin(proc: subprocess.Popen[str], timeout: float = TIMEOUT) -> int:
 
 def phase_cli_text(binary: str, mock: MockModel, base: Path) -> Path:
     agent_dir, cwd, sessions, _ = write_config(base, mock.port)
+    dump_env(base, agent_dir, cwd, sessions, binary)
     out = cli_run(binary, agent_dir, cwd, sessions)
     (base / "cli-text.stdout").write_text(out.stdout)
     (base / "cli-text.stderr").write_text(out.stderr)
     mock.dump(base / "mock-requests.json")
     if out.returncode != 0:
+        diagnose_cli_failure(binary, agent_dir, cwd, sessions, base)
         fail(f"CLI text exited {out.returncode}: {out.stderr}")
     if "advisor:" not in out.stderr or "write target deleted" not in out.stderr:
         systems = [
             json.dumps(request.get("messages", [])[:1])[:200]
             for request in mock.requests
         ]
+        diagnose_cli_failure(binary, agent_dir, cwd, sessions, base)
         fail(
             f"CLI text must show the card on stderr: {out.stderr!r}; "
             f"provider requests={len(systems)} {systems}"

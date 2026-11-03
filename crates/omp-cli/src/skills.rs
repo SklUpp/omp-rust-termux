@@ -1159,7 +1159,8 @@ mod tests {
 			&skill("loud", "visible", "loud body"),
 		);
 		let result = load_with(&isolated_options(&dir)).expect("skills");
-		let visible: Vec<&str> = result.prompt_skills().iter().map(|skill| skill.name.as_str()).collect();
+		let skills = result.prompt_skills();
+		let visible: Vec<&str> = skills.iter().map(|skill| skill.name.as_str()).collect();
 		assert_eq!(visible, ["loud"]);
 		assert!(result.find("quiet").is_some());
 		assert!(result.find("quiet").expect("quiet").hide);

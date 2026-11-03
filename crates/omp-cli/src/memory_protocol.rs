@@ -177,7 +177,8 @@ mod tests {
 		std::fs::create_dir_all(&cwd).expect("cwd");
 		let root = local_memory::memory_root(&agent_dir, &cwd);
 		std::fs::create_dir_all(&root).expect("memory root");
-		(cwd, agent_dir, MemoryUrlHandler::new(agent_dir, MemoryBackend::Local))
+		let handler = MemoryUrlHandler::new(agent_dir.clone(), MemoryBackend::Local);
+		(cwd, agent_dir, handler)
 	}
 
 	async fn resolve(

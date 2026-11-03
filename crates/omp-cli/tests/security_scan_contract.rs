@@ -384,7 +384,7 @@ async fn disabled_gate_blocks_tool_and_preflight() {
 	let root = TempRoot::new("disabled-gate");
 	let repo = git_fixture(root.path());
 	let host = TestHost::disabled(&repo, root.path());
-	let (coordinator, tool) = tool(Arc::clone(&host));
+	let (coordinator, tool) = tool(host.clone());
 
 	let error = call(
 		&tool,
@@ -525,7 +525,7 @@ async fn preflight_pins_exact_oauth_row_and_is_deterministic() {
 	let repo = git_fixture(root.path());
 	let credential_id = seed_oauth(&root.path().join("agent.db"), 7);
 	let host = TestHost::new(&repo, root.path(), Some(model()), Behavior::Partial);
-	let (coordinator, _tool) = tool(Arc::clone(&host));
+	let (coordinator, _tool) = tool(host.clone());
 	let output = root.path().join("security-output");
 
 	let first = coordinator
@@ -605,7 +605,7 @@ async fn publish_scan_completes_store_output_sarif_and_redacts_identity() {
 		Behavior::Publish(publish_params()),
 	);
 	let state_root = host.state_root().expect("state root");
-	let (coordinator, tool) = tool(Arc::clone(&host));
+	let (coordinator, tool) = tool(host.clone());
 	let output = root.path().join("security-output");
 
 	let plan = coordinator
@@ -749,7 +749,7 @@ async fn session_without_publish_is_partial() {
 	let repo = git_fixture(root.path());
 	let host = TestHost::new(&repo, root.path(), Some(model()), Behavior::Partial);
 	let state_root = host.state_root().expect("state root");
-	let (coordinator, tool) = tool(Arc::clone(&host));
+	let (coordinator, tool) = tool(host.clone());
 	let output = root.path().join("security-output");
 
 	let plan = coordinator
@@ -845,7 +845,7 @@ async fn restart_marks_running_scan_failed_and_keeps_marker_order() {
 		Behavior::Publish(publish_params()),
 	);
 	let state_root = host.state_root().expect("state root");
-	let (coordinator, _tool) = tool(Arc::clone(&host));
+	let (coordinator, _tool) = tool(host.clone());
 	let output = root.path().join("security-output");
 
 	let plan = coordinator
@@ -867,7 +867,7 @@ async fn restart_marks_running_scan_failed_and_keeps_marker_order() {
 
 	// A fresh coordinator has no in-memory operation record: restart recovery
 	// must mark the persisted running scan failed.
-	let restarted = SecurityCoordinator::new(Arc::clone(&host));
+	let restarted = SecurityCoordinator::new(host.clone());
 	let recovered = restarted
 		.status(&operation.operation_id)
 		.expect("status")
@@ -1027,7 +1027,7 @@ async fn repository_subdirectory_shares_one_security_store() {
 		Behavior::Publish(publish_params()),
 	);
 	let state_root = host.state_root().expect("state root");
-	let (coordinator, _tool) = tool(Arc::clone(&host));
+	let (coordinator, _tool) = tool(host.clone());
 	let output = root.path().join("security-output");
 
 	let plan = coordinator
@@ -1113,7 +1113,7 @@ async fn start_from_subdirectory_uses_the_repository_root() {
 		Behavior::Publish(publish_params()),
 	);
 	let output = root.path().join("security-output");
-	let (coordinator, _tool) = tool(Arc::clone(&host));
+	let (coordinator, _tool) = tool(host.clone());
 
 	let plan = coordinator
 		.preflight(preflight_input(&output))
@@ -1161,7 +1161,7 @@ async fn security_url_lists_scans_and_respects_disabled_gate() {
 		Behavior::Publish(publish_params()),
 	);
 	let state_root = host.state_root().expect("state root");
-	let (coordinator, _tool) = tool(Arc::clone(&host));
+	let (coordinator, _tool) = tool(host.clone());
 	let output = root.path().join("security-output");
 
 	let plan = coordinator

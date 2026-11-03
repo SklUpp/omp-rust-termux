@@ -117,9 +117,29 @@ class MockModel:
                             }
                         )
                         chunk = (
-                            'data: {"choices":[{"delta":{"tool_calls":[{"index":0,'
-                            '"id":"call-adv","type":"function","function":{"name":"advise",'
-                            f'"arguments":{json.dumps(args)}}}}}]}}]}}\n\n'
+                            "data: "
+                            + json.dumps(
+                                {
+                                    "choices": [
+                                        {
+                                            "delta": {
+                                                "tool_calls": [
+                                                    {
+                                                        "index": 0,
+                                                        "id": "call-adv",
+                                                        "type": "function",
+                                                        "function": {
+                                                            "name": "advise",
+                                                            "arguments": json.dumps(args),
+                                                        },
+                                                    }
+                                                ]
+                                            }
+                                        }
+                                    ]
+                                }
+                            )
+                            + "\n\n"
                             + usage
                             + "data: [DONE]\n\n"
                         )
@@ -150,10 +170,30 @@ class MockModel:
                             }
                         )
                         chunk = (
-                            'data: {"choices":[{"delta":{"tool_calls":[{"index":0,'
-                            '"id":"call-task","type":"function","function":{"name":"task",'
-                            f'"arguments":{json.dumps(args)}}}}}]}}]}}\n\n'
-                            "data: [DONE]\n\n"
+                            "data: "
+                            + json.dumps(
+                                {
+                                    "choices": [
+                                        {
+                                            "delta": {
+                                                "tool_calls": [
+                                                    {
+                                                        "index": 0,
+                                                        "id": "call-task",
+                                                        "type": "function",
+                                                        "function": {
+                                                            "name": "task",
+                                                            "arguments": json.dumps(args),
+                                                        },
+                                                    }
+                                                ]
+                                            }
+                                        }
+                                    ]
+                                }
+                            )
+                            + "\n\n"
+                            + "data: [DONE]\n\n"
                         )
                     else:
                         chunk = (

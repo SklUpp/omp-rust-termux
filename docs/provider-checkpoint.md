@@ -46,8 +46,8 @@ Push triggers apply only to `main` and `feat/rust-agent-termux-bionic`; other ca
 
 ```sh
 git push origin HEAD:refs/heads/ci/<task>
-gh workflow run rust-agent.yml --repo SklUpp/omp-termux --ref ci/<task>
-gh run watch <RUN_ID> --repo SklUpp/omp-termux --exit-status
+gh workflow run rust-agent.yml --repo SklUpp/omp-rust-termux --ref ci/<task>
+gh run watch <RUN_ID> --repo SklUpp/omp-rust-termux --exit-status
 ```
 
 Confirm the run's `headSha` equals the candidate. A green Android build does not imply green host tests. An older green run never verifies newer changes.
@@ -57,7 +57,7 @@ Confirm the run's `headSha` equals the candidate. A green Android build does not
 ```sh
 ART="$HOME/task-tmp/omp-art-<RUN_ID>"
 mkdir -p "$ART"
-gh run download <RUN_ID> --repo SklUpp/omp-termux \
+gh run download <RUN_ID> --repo SklUpp/omp-rust-termux \
   -n omp-aarch64-linux-android -D "$ART"
 chmod +x "$ART/omp"
 python3 - "$ART/omp.sha256" "$ART/omp" <<'PY'

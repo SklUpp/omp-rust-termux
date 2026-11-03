@@ -593,7 +593,13 @@ function agent(prompt::String; agent="task", label=nothing, schema=nothing, sche
     end
     details = res isa AbstractDict ? get(res, "details", nothing) : nothing
     if !(details isa AbstractDict) || get(details, "outputId", nothing) === nothing
-        return Dict{String, Any}("text" => text, "output" => text, "handle" => nothing, "id" => nothing, "agent" => nothing)
+        return Dict{String, Any}(
+            "text" => text,
+            "output" => text,
+            "handle" => nothing,
+            "id" => details isa AbstractDict ? get(details, "id", nothing) : nothing,
+            "agent" => details isa AbstractDict ? get(details, "agent", nothing) : nothing,
+        )
     end
     node = Dict{String, Any}(
         "text" => text,

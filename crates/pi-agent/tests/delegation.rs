@@ -536,6 +536,10 @@ async fn saved_child_output_survives_restart_and_resolves_via_agent_uri() {
 		"child transcript stays under <producer>/subagents"
 	);
 	assert!(
+		!subagents.join(format!("{}.init.json", saved.id)).exists(),
+		"no lifecycle manager means no contract intent and no metadata failure"
+	);
+	assert!(
 		!subagents.join(format!("{output_id}.md")).exists(),
 		"saved output must not be written into the transcript directory"
 	);

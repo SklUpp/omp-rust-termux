@@ -268,6 +268,10 @@ pub struct ChildRecord {
 	/// id was assigned.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub output_id: Option<String>,
+	/// Whether `output_id` was actually published. Allocation alone is not a
+	/// readable `agent://` pointer and must not be exposed to consumers.
+	#[serde(skip)]
+	pub output_published: bool,
 	/// Real child transcript log (`<session artifacts>/<child_id>.jsonl`) the
 	/// task executor writes. `None` when no session root was installed.
 	#[serde(skip_serializing_if = "Option::is_none")]
@@ -1747,6 +1751,7 @@ impl Supervisor {
 				aborted: None,
 				abort_reason: None,
 				output_id: Some(output_id),
+				output_published: false,
 				session_file,
 				agent_source: spawn.agent_source.to_string(),
 				parent_tool_call_id: spawn.parent_tool_call_id.map(str::to_string),
@@ -1889,6 +1894,25 @@ impl Supervisor {
 		self.output_ids.reserve(output_id);
 	}
 
+	/// Confirm that this child's allocated output id is now readable.
+	pub fn mark_output_published(&self, id: &str) {
+		let mut state = self.state.lock().unwrap();
+		if let Some(record) = state.records.get_mut(id) {
+			record.output_published = true;
+		}
+	}
+
+	/// Published `agent://` identity for a child; never the pending allocation.
+	#[must_use]
+	pub fn child_published_output_id(&self, id: &str) -> Option<String> {
+		let state = self.state.lock().unwrap();
+		state
+			.records
+			.get(id)
+			.filter(|record| record.output_published)
+			.and_then(|record| record.output_id.clone())
+	}
+
 	/// Replace a child's saved-output id after a no-clobber retry.
 	pub fn set_child_output_id(&self, id: &str, output_id: &str) {
 		let mut state = self.state.lock().unwrap();
@@ -1909,7 +1933,10 @@ impl Supervisor {
 		let mut output_id = self.child_output_id(id)?;
 		for _ in 0..64 {
 			match agent_output::publish_agent_output(&root, &output_id, body) {
-				Ok(Some(_)) => return Some(output_id),
+				Ok(Some(_)) => {
+					self.mark_output_published(id);
+					return Some(output_id);
+				},
 				Ok(None) => {
 					self.mark_output_id_taken(&output_id);
 					let prefix = output_id

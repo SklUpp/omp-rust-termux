@@ -1119,11 +1119,18 @@ impl TaskTool {
 			let published = self
 				.supervisor
 				.save_agent_output(&outstanding_id, &item.name, &body);
-			let persisted = if invocation_task && result.isolation.is_none() {
-				persist_child_output_id(&self.supervisor, &outstanding_id, published.as_deref())
-			} else {
-				Ok(())
-			};
+			let expected = contract_expected(
+				&self.supervisor,
+				&outstanding_id,
+				invocation_task,
+				result.isolation.is_some(),
+			);
+			let persisted = persist_child_output_id(
+				&self.supervisor,
+				&outstanding_id,
+				published.as_deref(),
+				expected,
+			);
 			result.output_id = published;
 			if let Err(error) = persisted {
 				metadata_confirmed = false;
@@ -1131,6 +1138,8 @@ impl TaskTool {
 				result.exit_code = 1;
 				result.stderr = message.clone();
 				result.error = Some(message.clone());
+				result.aborted = None;
+				result.abort_reason = None;
 				terminal_mark = Some(TerminalMark::Failed(message));
 			}
 		}
@@ -1546,7 +1555,7 @@ struct ChildSalvage {
 }
 
 impl ChildSalvage {
-	fn capture_message(&mut self, message: &Message) {
+	fn capture_message(&mut self, message: &Message, status: &crate::state::TurnStatus) {
 		if message.role != crate::state::Role::Assistant {
 			return;
 		}
@@ -1564,7 +1573,10 @@ impl ChildSalvage {
 		if !text.trim().is_empty() {
 			self.last_assistant = Some(text.clone());
 		}
-		if !text.is_empty() {
+		// An aborted partial finalization is salvage, not completed raw output:
+		// TS never receives a completed `message_end` for it, so its raw output
+		// is empty and the `[cancelled after …]` label can use last activity.
+		if !text.is_empty() && !matches!(status, crate::state::TurnStatus::Aborted) {
 			self.chunks.push(text);
 		}
 	}
@@ -1794,11 +1806,11 @@ fn forward_child_events(
 ) -> tokio::task::JoinHandle<()> {
 	tokio::spawn(async move {
 		while let Some(event) = events.recv().await {
-			if let AgentEvent::MessageEnd { message, .. } = &event {
+			if let AgentEvent::MessageEnd { message, status } = &event {
 				salvage
 					.lock()
 					.unwrap_or_else(std::sync::PoisonError::into_inner)
-					.capture_message(message);
+					.capture_message(message, status);
 			}
 			if !supervisor.report_event(&child_id, event) {
 				break;
@@ -1891,13 +1903,16 @@ fn settle_background_result(
 				finalized.output.clone()
 			};
 			let output_id = supervisor.save_agent_output(&id, &item.name, &artifact);
-			let persisted = if isolation.is_none() {
-				persist_child_output_id(&supervisor, &id, output_id.as_deref())
-			} else {
-				Ok(())
-			};
+			let expected = contract_expected(&supervisor, &id, true, isolation.is_some());
+			let persisted = persist_child_output_id(
+				&supervisor,
+				&id,
+				output_id.as_deref(),
+				expected,
+			);
 			if let Err(error) = persisted {
 				let message = format!("saved output metadata unavailable: {error}");
+				tombstone_aborted_child(&supervisor, &id, &message);
 				let usage = child_usage(&turns);
 				let (output, _) = cap_result_text(&message);
 				let envelope = task_result_envelope(
@@ -2451,21 +2466,44 @@ fn persist_child_contract(
 /// A missing contract or write failure is returned to the caller: the task
 /// must surface the durable-metadata failure and must not be adopted without
 /// confirmed authority. A previously published file is never deleted here.
+fn contract_expected(
+	supervisor: &Arc<Supervisor>,
+	child_id: &str,
+	invocation_task: bool,
+	isolated: bool,
+) -> bool {
+	invocation_task
+		&& !isolated
+		&& crate::subagent_lifecycle::lookup(supervisor).is_some()
+		&& supervisor.child_session_file(child_id).is_some()
+}
+
 fn persist_child_output_id(
 	supervisor: &Arc<Supervisor>,
 	child_id: &str,
 	output_id: Option<&str>,
+	expected: bool,
 ) -> Result<(), String> {
-	let root = supervisor
+	let Some(root) = supervisor
 		.child_session_file(child_id)
 		.and_then(|path| path.parent().map(std::path::Path::to_path_buf))
-		.ok_or_else(|| format!("no child session directory for {child_id}"))?;
-	let mut contract = PersistedChildSession::load(&root, child_id)
-		.ok_or_else(|| format!("missing child contract for {child_id}"))?;
+	else {
+		if expected {
+			return Err(format!("no child session directory for {child_id}"));
+		}
+		return Ok(());
+	};
+	let Some(mut contract) = PersistedChildSession::load(&root, child_id) else {
+		if expected {
+			return Err(format!("missing child contract for {child_id}"));
+		}
+		return Ok(());
+	};
 	contract.output_id = output_id.map(str::to_string);
 	contract.output_published = output_id.is_some();
 	contract
 		.write(&root)
+		.map(|_| ())
 		.map_err(|error| format!("cannot persist child contract for {child_id}: {error}"))
 }
 
@@ -3527,8 +3565,8 @@ mod tests {
 		assert_eq!(aborted, aborted_output(Some("boom")));
 	}
 
-	#[test]
-	fn collision_publishes_saved_2_and_follow_up_preserves_foreign_bytes() {
+	#[tokio::test]
+	async fn collision_publishes_saved_2_and_follow_up_preserves_foreign_bytes() {
 		let nanos = std::time::SystemTime::now()
 			.duration_since(std::time::UNIX_EPOCH)
 			.map(|duration| duration.as_nanos())
@@ -3597,16 +3635,36 @@ mod tests {
 		contract.write(&subagents).expect("contract");
 		let foreign = root.join("Saved.md");
 		std::fs::write(&foreign, "foreign").expect("foreign artifact");
+		let hub = crate::tools::hub::HubTool::root(supervisor.clone());
+		let hub_ctx = AgentContext::new(root.clone());
+		let jobs = hub
+			.execute(&json!({ "op": "jobs" }), &hub_ctx)
+			.await
+			.expect("hub jobs before publish");
+		let jobs: crate::tools::hub::HubToolDetails =
+			serde_json::from_str(&jobs.content).expect("hub details");
+		assert_eq!(
+			jobs.jobs[0].output_id, None,
+			"allocated but unpublished ids must not be exposed"
+		);
 
 		let published = supervisor
 			.save_agent_output(&id, "Saved", "mine")
 			.expect("published output");
 		assert_eq!(published, "Saved-2");
-		persist_child_output_id(&supervisor, &id, Some(&published)).expect("persist authority");
+		persist_child_output_id(&supervisor, &id, Some(&published), true)
+			.expect("persist authority");
 		let mut contract =
 			PersistedChildSession::load(&subagents, &id).expect("reloaded contract");
 		assert_eq!(contract.published_output_id(), Some("Saved-2"));
 		assert_eq!(std::fs::read_to_string(&foreign).expect("foreign"), "foreign");
+		let jobs = hub
+			.execute(&json!({ "op": "jobs" }), &hub_ctx)
+			.await
+			.expect("hub jobs after publish");
+		let jobs: crate::tools::hub::HubToolDetails =
+			serde_json::from_str(&jobs.content).expect("hub details");
+		assert_eq!(jobs.jobs[0].output_id.as_deref(), Some("Saved-2"));
 
 		let agent = model_agent();
 		let turns = vec![TurnResult {
@@ -3640,12 +3698,64 @@ mod tests {
 			body
 		);
 
+		// Cancellation after a real yield: finalized output wins over the empty
+		// salvage buffer.
+		let background_turns = vec![TurnResult {
+			message: Message::assistant_with_tools(
+				"",
+				vec![crate::state::ToolCall {
+					id: "call-bg".to_string(),
+					name: "yield".to_string(),
+					arguments: json!({}),
+				}],
+			),
+			tool_results: vec![crate::state::ToolResult {
+				tool_call_id: "call-bg".to_string(),
+				content: r#"{"status":"success","data":{"key":"background-value"}}"#
+					.to_string(),
+				is_error: false,
+				terminate: true,
+				details: None,
+			}],
+			is_completed: true,
+		}];
+		settle_background_result(
+			Arc::clone(&supervisor),
+			id.clone(),
+			Instant::now(),
+			Ok(BackgroundOutcome {
+				turns: background_turns,
+				isolation: None,
+				cancelled: true,
+			}),
+			TaskItemSpec {
+				name: "Saved".to_string(),
+				agent: model_agent(),
+				task: "work".to_string(),
+				context: None,
+				output_schema: None,
+				schema_mode: SchemaMode::default(),
+				schema_error: None,
+				effort: None,
+				isolation: IsolationRequest::default(),
+			},
+			None,
+			Arc::new(Mutex::new(ChildSalvage::default())),
+		);
+		let cancelled_id = supervisor.child_output_id(&id).expect("cancelled id");
+		let cancelled_body = std::fs::read_to_string(root.join(format!("{cancelled_id}.md")))
+			.expect("cancelled artifact");
+		assert!(
+			cancelled_body.contains("background-value"),
+			"cancel after yield must keep finalized output: {cancelled_body}"
+		);
+
 		// A stale/old contract carrying only the spawn-time id has no authority.
 		contract.output_id = Some("Saved".to_string());
 		contract.output_published = false;
 		contract.write(&subagents).expect("stale contract");
 		assert_eq!(contract.published_output_id(), None);
-		persist_child_output_id(&supervisor, &id, None).expect("clear authority");
+		persist_child_output_id(&supervisor, &id, None, true).expect("clear authority");
 		let contract = PersistedChildSession::load(&subagents, &id).expect("cleared contract");
 		assert_eq!(contract.published_output_id(), None);
 		assert_eq!(contract.output_id, None);
@@ -3655,10 +3765,94 @@ mod tests {
 		// disappeared. The helper must report it and leave the published file.
 		std::fs::remove_file(crate::task_persisted_revive::init_path(&subagents, &id))
 			.expect("remove contract");
-		let error = persist_child_output_id(&supervisor, &id, Some("Saved-2"))
+		let error = persist_child_output_id(&supervisor, &id, Some("Saved-2"), true)
 			.expect_err("missing contract must fail");
 		assert!(error.contains("missing child contract"), "{error}");
 		assert!(root.join("Saved-2.md").is_file(), "published file must survive");
+		std::fs::remove_dir_all(&root).ok();
+	}
+
+	#[tokio::test]
+	async fn background_metadata_failure_tombstones_and_is_not_restored_as_parked() {
+		let nanos = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.map(|duration| duration.as_nanos())
+			.unwrap_or_default();
+		let home = std::env::var_os("HOME")
+			.map(std::path::PathBuf::from)
+			.expect("HOME must be set");
+		let root = home.join(format!(
+			".omp-agent-bg-failure-{}-{nanos}",
+			std::process::id()
+		));
+		let subagents = root.join("subagents");
+		std::fs::create_dir_all(&subagents).expect("subagents");
+		let supervisor = Supervisor::with_selection(
+			ToolRegistry::with_builtins(),
+			Arc::new(NullProvider),
+			None,
+			DelegationLimits::default(),
+			true,
+			false,
+		);
+		supervisor.set_child_session_root(Some(subagents.clone()));
+		let mut scope = crate::tools::internal_urls::UrlScope::default();
+		scope
+			.local_roots
+			.insert("local".to_string(), root.clone());
+		supervisor.set_url_scope(Arc::new(scope));
+		let reviver: Arc<dyn crate::task_persisted_revive::PersistedChildReviverFactory> =
+			Arc::new(crate::task_persisted_revive::DefaultPersistedReviverFactory::new(
+				Arc::new(NullProvider),
+				ToolRegistry::with_builtins(),
+			));
+		let manager = crate::subagent_lifecycle::attach(&supervisor, 120, reviver);
+		let (id, _cancel) = supervisor
+			.reserve_child_full(ChildSpawn {
+				name:                "bg-failure",
+				index:               0,
+				agent:               "task",
+				agent_source:        "builtin",
+				task:                "work",
+				parent_id:           None,
+				parent_tool_call_id: None,
+				detached:            true,
+				output_prefix:       None,
+			})
+			.expect("reserve");
+		supervisor.append_child_transcript(&id, &[&Message::user("work")]);
+		settle_background_result(
+			Arc::clone(&supervisor),
+			id.clone(),
+			Instant::now(),
+			Ok(BackgroundOutcome {
+				turns: Vec::new(),
+				isolation: None,
+				cancelled: false,
+			}),
+			TaskItemSpec {
+				name: "bg-failure".to_string(),
+				agent: model_agent(),
+				task: "work".to_string(),
+				context: None,
+				output_schema: None,
+				schema_mode: SchemaMode::default(),
+				schema_error: None,
+				effort: None,
+				isolation: IsolationRequest::default(),
+			},
+			None,
+			Arc::new(Mutex::new(ChildSalvage::default())),
+		);
+		assert!(manager.knows(&id), "metadata failure must tombstone the id");
+		assert!(!crate::task_persisted_revive::init_path(&subagents, &id).exists());
+		let restarted: Arc<dyn crate::task_persisted_revive::PersistedChildReviverFactory> =
+			Arc::new(crate::task_persisted_revive::DefaultPersistedReviverFactory::new(
+				Arc::new(NullProvider),
+				ToolRegistry::with_builtins(),
+			));
+		let restarted_manager = crate::subagent_lifecycle::attach(&supervisor, 120, restarted);
+		assert_eq!(restarted_manager.status(&id), None, "tombstoned id stays unparked");
 		std::fs::remove_dir_all(&root).ok();
 	}
 
@@ -3673,7 +3867,7 @@ mod tests {
 			total_tokens: 15,
 			..TokenUsage::default()
 		});
-		salvage.capture_message(&message);
+		salvage.capture_message(&message, &crate::state::TurnStatus::EndTurn);
 		assert_eq!(salvage.raw_output(), "partial answer");
 		assert_eq!(
 			salvage.cancelled_output(),
@@ -3681,15 +3875,20 @@ mod tests {
 			"streamed chunks win before salvage formatting"
 		);
 
-		let empty = ChildSalvage {
-			last_assistant: Some("last  activity\nseen".to_string()),
-			requests: 2,
-			tokens: 15,
-			..ChildSalvage::default()
-		};
+		let mut empty = ChildSalvage::default();
+		let mut aborted = Message::assistant("last  activity\nseen");
+		aborted.usage = Some(TokenUsage {
+			input: 10,
+			output: 4,
+			cache_write: 1,
+			total_tokens: 15,
+			..TokenUsage::default()
+		});
+		empty.capture_message(&aborted, &crate::state::TurnStatus::Aborted);
+		assert_eq!(empty.raw_output(), "", "aborted partials are not raw output");
 		assert_eq!(
 			empty.cancelled_output(),
-			"[cancelled after 2 req, 15 tok — last activity: \"last activity seen\"]"
+			"[cancelled after 1 req, 15 tok — last activity: \"last activity seen\"]"
 		);
 	}
 

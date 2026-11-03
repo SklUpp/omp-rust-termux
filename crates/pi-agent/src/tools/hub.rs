@@ -330,7 +330,10 @@ fn snapshot(record: &ChildRecord, consumed: bool) -> HubJobSnapshot {
 		.filter(|_| record.detached && !consumed);
 	HubJobSnapshot {
 		id: record.id.clone(),
-		output_id: record.output_id.clone(),
+		output_id: record
+			.output_published
+			.then(|| record.output_id.clone())
+			.flatten(),
 		name: record.name.clone(),
 		kind: "task".to_string(),
 		status: status.to_string(),

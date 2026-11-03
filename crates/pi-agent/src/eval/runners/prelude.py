@@ -556,8 +556,8 @@ if "__omp_prelude_loaded__" not in globals():
                 "text": text,
                 "output": text,
                 "handle": None,
-                "id": None,
-                "agent": None,
+                "id": details.get("id") if isinstance(details, dict) else None,
+                "agent": details.get("agent") if isinstance(details, dict) else None,
             }
         node = {
             "text": text,

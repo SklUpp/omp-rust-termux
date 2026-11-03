@@ -32,6 +32,8 @@ struct TestHost {
 	deliveries: Mutex<Vec<(String, String)>>,
 	agent_calls: Mutex<usize>,
 	agent_delay: Mutex<Duration>,
+	/// Simulate a host that did not publish an output id.
+	omit_output_id: Mutex<bool>,
 	/// Simulated host-level publish refusal (Android `link(2)` EACCES and
 	/// friends); `None` publishes one synthetic artifact.
 	artifact_error: Mutex<Option<String>>,
@@ -89,11 +91,22 @@ impl EvalHost for TestHost {
 		}
 		let mut value = json!({"text": "agent-ok"});
 		if args.get("handle").and_then(Value::as_bool).unwrap_or(false) {
-			value["details"] = json!({
-				"id": "task-1",
-				"outputId": "Saved",
-				"agent": "task",
-			});
+			let omit_output_id = *self
+				.omit_output_id
+				.lock()
+				.unwrap_or_else(|poison| poison.into_inner());
+			value["details"] = if omit_output_id {
+				json!({
+					"id": "task-1",
+					"agent": "task",
+				})
+			} else {
+				json!({
+					"id": "task-1",
+					"outputId": "Saved",
+					"agent": "task",
+				})
+			};
 		}
 		Ok(value)
 	}
@@ -1177,6 +1190,45 @@ async fn cancelled_background_job_delivers_its_error() {
 	}
 	let delivered = delivered.expect("cancelled background delivery");
 	assert!(delivered.contains("Command aborted"), "{}", delivered);
+	teardown(&runtime, cwd).await;
+}
+
+#[tokio::test]
+async fn js_agent_handle_without_output_id_keeps_lifecycle_id_and_agent() {
+	if js_path().is_none() {
+		eprintln!("skipping JS regression: bun is not installed");
+		return;
+	}
+	let host = Arc::new(TestHost::default());
+	*host
+		.omit_output_id
+		.lock()
+		.unwrap_or_else(|poison| poison.into_inner()) = true;
+	let Some((tool, runtime, ctx, cwd)) = harness_with(
+		one_language(EvalLanguage::Js),
+		Interpreters::default(),
+		test_session(),
+		Arc::clone(&host),
+		|settings| settings,
+	)
+	.await
+	else {
+		return;
+	};
+	let result = tool
+		.execute(
+			&json!({
+				"language": "js",
+				"code": "const node = await agent('x', { handle: true }); console.log(JSON.stringify(node));"
+			}),
+			&ctx,
+		)
+		.await
+		.expect("js agent handle cell");
+	assert!(!result.is_error, "{}", result.content);
+	assert!(result.content.contains("\"handle\":null"), "{}", result.content);
+	assert!(result.content.contains("\"id\":\"task-1\""), "{}", result.content);
+	assert!(result.content.contains("\"agent\":\"task\""), "{}", result.content);
 	teardown(&runtime, cwd).await;
 }
 

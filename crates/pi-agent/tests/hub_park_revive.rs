@@ -31,6 +31,7 @@ use pi_agent::{
 		hub_park,
 		internal_urls::{InternalUrlRouter, UrlScope},
 		registry::ToolRegistry,
+		task_catalog::{AgentCatalog, AgentDefinition, AgentSource},
 	},
 };
 use serde_json::json;
@@ -388,6 +389,119 @@ async fn gone_workspace_is_transcript_only_and_refuses_revive() {
 	assert!(resource.content.contains("prior-answer"));
 }
 
+
+fn home_session_root(label: &str) -> PathBuf {
+	let nanos = SystemTime::now()
+		.duration_since(UNIX_EPOCH)
+		.map(|duration| duration.as_nanos())
+		.unwrap_or_default();
+	let home = std::env::var_os("HOME")
+		.map(PathBuf::from)
+		.expect("HOME must be set");
+	let dir = home.join(format!(
+		".omp-hub-park-{label}-{}-{nanos}",
+		std::process::id()
+	));
+	std::fs::create_dir_all(&dir).expect("session root");
+	dir
+}
+
+fn scout_definition() -> AgentDefinition {
+	AgentDefinition {
+		name: "scout".to_string(),
+		description: "test scout".to_string(),
+		tools: None,
+		spawns: None,
+		model: vec!["@task".to_string()],
+		output: None,
+		thinking_level: None,
+		blocking: false,
+		read_summarize: None,
+		prewalk: None,
+		advisor: None,
+		autoload_skills: Vec::new(),
+		system_prompt: String::new(),
+		source: AgentSource::Bundled,
+		file_path: "embedded:scout.md".to_string(),
+	}
+}
+
+#[tokio::test]
+async fn actor_rewrites_only_yielding_follow_up_artifacts() {
+	let root = home_session_root("actor-artifact");
+	let provider = Arc::new(ScriptProvider::new(vec![
+		Message::assistant_with_tools(
+			"",
+			vec![ToolCall {
+				id:     "call-yield".to_string(),
+				name:   "yield".to_string(),
+				arguments: json!({ "result": { "data": { "value": "yielded" } } }),
+			}],
+		),
+		Message::assistant("plain reply"),
+	]));
+	let supervisor = one_turn(provider.clone(), 2);
+	supervisor.set_child_session_root(Some(root.clone()));
+	supervisor.set_agent_catalog(Arc::new(AgentCatalog::new(
+		vec![scout_definition()],
+		None,
+	)));
+	let (id, mut contract) = adoptable_child(&supervisor, &root);
+	contract.output_id = Some("Saved".to_string());
+	contract.output_published = true;
+	contract.write(&root).expect("published contract");
+	std::fs::write(root.join("Saved.md"), "initial artifact").expect("initial artifact");
+	let reviver: Arc<dyn PersistedChildReviverFactory> = Arc::new(
+		DefaultPersistedReviverFactory::new(
+			provider,
+			ToolRegistry::with_builtins(),
+		),
+	);
+	let manager = attach(&supervisor, 120, reviver);
+	manager.adopt(&id, Some(contract)).expect("adopt");
+	let hub = HubTool::root(supervisor.clone());
+	let ctx = AgentContext::new(root.clone());
+
+	let sent = hub
+		.execute(&json!({ "op": "send", "to": id, "message": "yield" }), &ctx)
+		.await
+		.expect("hub send");
+	let receipt = hub_details(sent).receipts.expect("receipts").remove(0);
+	assert!(receipt.error.is_none(), "{:?}", receipt.error);
+	let mut yielded = None;
+	for _ in 0..300 {
+		let body = std::fs::read_to_string(root.join("Saved.md")).unwrap_or_default();
+		if body.contains("yielded") {
+			yielded = Some(body);
+			break;
+		}
+		tokio::time::sleep(Duration::from_millis(10)).await;
+	}
+	let yielded = yielded.expect("yielding follow-up must rewrite Saved.md");
+
+	let sent = hub
+		.execute(&json!({ "op": "send", "to": id, "message": "plain" }), &ctx)
+		.await
+		.expect("second hub send");
+	let receipt = hub_details(sent).receipts.expect("receipts").remove(0);
+	assert!(receipt.error.is_none(), "{:?}", receipt.error);
+	let mut replied = false;
+	for _ in 0..300 {
+		let messages = load_transcript(&transcript_path(&root, &id)).unwrap_or_default();
+		if messages.iter().any(|message| message.content.contains("plain reply")) {
+			replied = true;
+			break;
+		}
+		tokio::time::sleep(Duration::from_millis(10)).await;
+	}
+	assert!(replied, "plain follow-up must run");
+	assert_eq!(
+		std::fs::read_to_string(root.join("Saved.md")).expect("artifact"),
+		yielded,
+		"yield-less follow-up must leave the prior artifact intact"
+	);
+	let _ = std::fs::remove_dir_all(&root);
+}
 
 fn contract_for(
 	id: &str,

@@ -450,7 +450,13 @@ unless defined?($__omp_prelude_loaded) && $__omp_prelude_loaded
     return parsed unless handle
     details = res.is_a?(Hash) ? res["details"] : nil
     if !details.is_a?(Hash) || details["outputId"].nil?
-      return { "text" => text, "output" => text, "handle" => nil, "id" => nil, "agent" => nil }
+      return {
+        "text" => text,
+        "output" => text,
+        "handle" => nil,
+        "id" => details.is_a?(Hash) ? details["id"] : nil,
+        "agent" => details.is_a?(Hash) ? details["agent"] : nil,
+      }
     end
     node = {
       "text" => text,

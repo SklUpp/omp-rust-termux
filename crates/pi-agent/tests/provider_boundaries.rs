@@ -344,6 +344,28 @@ async fn openai_top_level_sse_error_is_protocol_and_redacted() {
 	}
 }
 
+#[tokio::test]
+async fn openai_top_level_sse_error_with_empty_key_stays_readable() {
+	let body = "data: {\"error\":{\"type\":\"server_error\",\"message\":\"boom\"}}\n\n\
+		data: [DONE]\n\n";
+	for key in ["", "   "] {
+		let url = serve_responses(vec![response("200 OK", "text/event-stream", body)]).await;
+		let provider = OpenAiCompatibleProvider::new(url, key, "model").expect("provider");
+		let mut stream = provider
+			.stream(&[Message::user("hi")], &[], &ToolChoice::Auto)
+			.await
+			.expect("stream");
+		let item = stream.next().await.expect("error chunk");
+		match item {
+			Err(ProviderError::Protocol(message)) => {
+				assert_eq!(message, "server_error: boom");
+				assert!(!message.contains("[redacted]"), "{message}");
+			},
+			other => panic!("expected protocol error, got {other:?}"),
+		}
+	}
+}
+
 #[test]
 fn sse_finish_reason_maps_exactly_like_ts() {
 	fn mapped(reason: &str) -> (Option<StopReason>, Option<String>) {

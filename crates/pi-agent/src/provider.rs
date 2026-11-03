@@ -1826,7 +1826,7 @@ fn snippet(text: &str) -> String {
 /// that echo stream errors so a gateway cannot leak the key it received.
 pub(crate) fn redact_with(text: &str, secrets: &[String]) -> String {
 	let mut redacted = text.to_string();
-	for secret in secrets {
+	for secret in secrets.iter().filter(|secret| !secret.trim().is_empty()) {
 		redacted = redacted.replace(secret.as_str(), "[redacted]");
 	}
 	redacted

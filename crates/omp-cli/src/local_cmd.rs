@@ -3353,120 +3353,36 @@ fn rename_noreplace_native(from: &Path, to: &Path) -> io::Result<bool> {
 	}
 }
 
-struct MovedEntry {
-	path:   PathBuf,
-	stat:   LockStat,
-	is_dir: bool,
+fn existing_device(path: &Path) -> std::result::Result<u64, String> {
+	let mut current = Some(path);
+	while let Some(path) = current {
+		match fs::metadata(path) {
+			Ok(meta) => return Ok(meta.dev()),
+			Err(error) if error.kind() == io::ErrorKind::NotFound => current = path.parent(),
+			Err(error) => return Err(format!("{}: {error}", path.display())),
+		}
+	}
+	Err(format!("no existing ancestor for {}", path.display()))
 }
 
-/// Cross-device fallback: copy the snapshot, recording each source identity,
-/// then delete only entries that still match the copied snapshot. Entries that
-/// were created or modified concurrently stay in place; nothing is ever
-/// removed based on a stale copy.
-fn copy_tree_for_move(
+/// Cross-filesystem artifact movement cannot be done losslessly without a
+/// cooperative writer protocol: copying and then deleting the source loses
+/// appends made through an already-open descriptor. Refuse before mutating
+/// anything instead of porting the TS copy/delete fallback.
+fn ensure_same_filesystem(
 	source: &Path,
 	destination: &Path,
-	created: &mut Vec<(PathBuf, bool)>,
-	moved: &mut Vec<MovedEntry>,
 ) -> std::result::Result<(), String> {
-	let meta = fs::symlink_metadata(source)
-		.map_err(|error| format!("{}: {error}", source.display()))?;
-	if meta.file_type().is_symlink() {
-		return Err(format!("refusing to move symlink: {}", source.display()));
-	}
-	if meta.is_dir() {
-		fs::create_dir(destination)
-			.map_err(|error| format!("{}: {error}", destination.display()))?;
-		created.push((destination.to_path_buf(), true));
-		moved.push(MovedEntry {
-			path:   source.to_path_buf(),
-			stat:   lock_stat(&meta),
-			is_dir: true,
-		});
-		let entries = fs::read_dir(source)
-			.map_err(|error| format!("{}: {error}", source.display()))?;
-		for entry in entries {
-			let entry = entry.map_err(|error| format!("{}: {error}", source.display()))?;
-			copy_tree_for_move(
-				&entry.path(),
-				&destination.join(entry.file_name()),
-				created,
-				moved,
-			)?;
-		}
-		return Ok(());
-	}
-	if meta.is_file() {
-		let mut input = fs::File::open(source)
-			.map_err(|error| format!("{}: {error}", source.display()))?;
-		let mut output = OpenOptions::new()
-			.write(true)
-			.create_new(true)
-			.mode(0o600)
-			.open(destination)
-			.map_err(|error| format!("{}: {error}", destination.display()))?;
-		created.push((destination.to_path_buf(), false));
-		io::copy(&mut input, &mut output)
-			.and_then(|_| output.sync_all())
-			.map_err(|error| format!("{}: {error}", destination.display()))?;
-		drop(output);
-		let after = fs::symlink_metadata(source)
-			.map_err(|error| format!("{}: {error}", source.display()))?;
-		if lock_stat(&after) != lock_stat(&meta) {
-			return Err(format!(
-				"{} changed during archive move",
-				source.display()
-			));
-		}
-		moved.push(MovedEntry {
-			path:   source.to_path_buf(),
-			stat:   lock_stat(&after),
-			is_dir: false,
-		});
-		return Ok(());
-	}
-	Err(format!(
-		"unsupported artifacts entry: {}",
-		source.display()
-	))
-}
-
-fn cleanup_created(created: &mut Vec<(PathBuf, bool)>) {
-	for (path, is_dir) in created.drain(..).rev() {
-		if is_dir {
-			let _ = fs::remove_dir(&path);
-		} else {
-			let _ = fs::remove_file(&path);
-		}
-	}
-}
-
-fn prune_moved_source(moved: &[MovedEntry]) -> std::result::Result<(), String> {
-	for entry in moved.iter().rev() {
-		if entry.is_dir {
-			match fs::remove_dir(&entry.path) {
-				Ok(()) => {},
-				Err(error)
-					if error.kind() == io::ErrorKind::NotFound
-						|| error.raw_os_error() == Some(libc::ENOTEMPTY)
-						|| error.raw_os_error() == Some(libc::EEXIST) => {},
-				Err(error) => return Err(format!("{}: {error}", entry.path.display())),
-			}
-			continue;
-		}
-		let meta = match fs::symlink_metadata(&entry.path) {
-			Ok(meta) => meta,
-			Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-			Err(error) => return Err(format!("{}: {error}", entry.path.display())),
-		};
-		if lock_stat(&meta) != entry.stat {
-			continue;
-		}
-		match fs::remove_file(&entry.path) {
-			Ok(()) => {},
-			Err(error) if error.kind() == io::ErrorKind::NotFound => {},
-			Err(error) => return Err(format!("{}: {error}", entry.path.display())),
-		}
+	let source_dev = fs::metadata(source)
+		.map_err(|error| format!("{}: {error}", source.display()))?
+		.dev();
+	let destination_dev = existing_device(destination)?;
+	if source_dev != destination_dev {
+		return Err(format!(
+			"archive artifacts move across filesystems is unsupported: {} -> {}",
+			source.display(),
+			destination.display()
+		));
 	}
 	Ok(())
 }
@@ -3485,18 +3401,15 @@ fn move_tree_no_replace(
 		return Err(exists());
 	}
 	match rename_noreplace_native(source, destination) {
-		Ok(true) => return Ok(()),
-		Ok(false) => return Err(exists()),
-		Err(error) if error.raw_os_error() == Some(libc::EXDEV) => {},
-		Err(error) => return Err(format!("{}: {error}", source.display())),
+		Ok(true) => Ok(()),
+		Ok(false) => Err(exists()),
+		Err(error) if error.raw_os_error() == Some(libc::EXDEV) => Err(format!(
+			"archive artifacts move across filesystems is unsupported: {} -> {}",
+			source.display(),
+			destination.display()
+		)),
+		Err(error) => Err(format!("{}: {error}", source.display())),
 	}
-	let mut created = Vec::new();
-	let mut moved = Vec::new();
-	if let Err(error) = copy_tree_for_move(source, destination, &mut created, &mut moved) {
-		cleanup_created(&mut created);
-		return Err(error);
-	}
-	prune_moved_source(&moved)
 }
 
 fn rollback_moves(moves: &[(PathBuf, PathBuf, bool)]) {
@@ -3524,6 +3437,13 @@ fn move_session_with_artifacts(
 			.unwrap_or(destination_text.as_ref())
 			.to_string(),
 	);
+	let source_artifacts = session_artifacts_path(source);
+	let destination_artifacts = session_artifacts_path(destination);
+	let has_artifacts = path_exists_checked(&source_artifacts)?;
+	if has_artifacts {
+		ensure_source_within(sessions_root, &source_artifacts)?;
+		ensure_same_filesystem(&source_artifacts, &destination_artifacts)?;
+	}
 	ensure_destination_parent(archive_root, destination)?;
 	if path_exists_checked(destination)? {
 		return Err(format!(
@@ -3537,11 +3457,7 @@ fn move_session_with_artifacts(
 			legacy_destination.display()
 		));
 	}
-	let source_artifacts = session_artifacts_path(source);
-	let destination_artifacts = session_artifacts_path(destination);
-	let has_artifacts = path_exists_checked(&source_artifacts)?;
 	if has_artifacts {
-		ensure_source_within(sessions_root, &source_artifacts)?;
 		if path_exists_checked(&destination_artifacts)? {
 			return Err(format!(
 				"archive artifacts destination exists: {}",
@@ -4670,31 +4586,47 @@ fn remove_stale_gc_lock(lock_path: &Path) -> std::result::Result<bool, String> {
 	if !gc_lock_snapshot_still_current(lock_path, &snapshot)? {
 		return Ok(false);
 	}
-	// Move the observed inode aside atomically instead of snapshot-then-unlink:
-	// a concurrent recoverer may already have replaced the path with a live
-	// owner, which must never be unlinked.
-	let trash = gc_temp_path(lock_path);
-	match rename_noreplace_native(lock_path, &trash) {
-		Ok(true) => {},
-		Ok(false) => return Ok(false),
-		Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-		Err(error) => return Err(error.to_string()),
-	}
-	let moved = match fs::metadata(&trash) {
-		Ok(meta) => meta,
-		Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
-		Err(error) => return Err(error.to_string()),
-	};
-	if (moved.dev(), moved.ino()) != (snapshot.0, snapshot.1) {
-		// The path changed hands between snapshot and rename. Restore the live
-		// owner's inode (no-replace, so a newer owner still wins) and back off.
-		let _ = rename_noreplace_native(&trash, lock_path);
-		return Ok(false);
-	}
-	match fs::remove_file(&trash) {
+	match fs::remove_file(lock_path) {
 		Ok(()) => Ok(true),
-		Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+		Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
 		Err(error) => Err(error.to_string()),
+	}
+}
+
+fn gc_breaker_owner_live(lock_path: &Path) -> std::result::Result<bool, String> {
+	let breaker_path = PathBuf::from(format!("{}.break", lock_path.display()));
+	match read_gc_lock_snapshot(&breaker_path)? {
+		Some((text, _)) => Ok(gc_lock_pid(&text).is_some_and(process_exists)),
+		None => Ok(false),
+	}
+}
+
+/// Serialize every Rust GC acquisition, stale recovery and release on a stable
+/// guard inode that is created once and never unlinked. `flock` is released by
+/// the kernel on exit, so a crashed GC cannot wedge later runs.
+fn open_gc_guard(lock_path: &Path) -> std::result::Result<fs::File, String> {
+	use std::os::unix::io::AsRawFd;
+
+	let guard_path = PathBuf::from(format!("{}.guard", lock_path.display()));
+	let file = OpenOptions::new()
+		.read(true)
+		.write(true)
+		.create(true)
+		.mode(0o600)
+		.custom_flags(libc::O_NOFOLLOW)
+		.open(&guard_path)
+		.map_err(|error| format!("{}: {error}", guard_path.display()))?;
+	// SAFETY: `flock` operates on an owned, open descriptor.
+	if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+		return Ok(file);
+	}
+	let error = io::Error::last_os_error();
+	match error.raw_os_error() {
+		Some(libc::EWOULDBLOCK) => Err(format!(
+			"GC already running: {}",
+			lock_path.display()
+		)),
+		_ => Err(format!("{}: {error}", guard_path.display())),
 	}
 }
 
@@ -4737,49 +4669,26 @@ fn release_lock_file(lock_path: &Path, file: fs::File) {
 	}
 }
 
-fn open_gc_breaker_lock(
-	lock_path: &Path,
-) -> std::result::Result<(PathBuf, fs::File), String> {
-	let breaker_path = PathBuf::from(format!("{}.break", lock_path.display()));
-	for _ in 0..2 {
-		if let Some(mut file) = open_new_gc_lock(&breaker_path)? {
-			if let Err(error) = write_gc_lock_owner(&mut file) {
-				release_lock_file(&breaker_path, file);
-				return Err(error);
-			}
-			return Ok((breaker_path, file));
-		}
-		if !remove_stale_gc_lock(&breaker_path)? {
-			return Err(format!("GC already running: {}", lock_path.display()));
-		}
-	}
-	Err(format!("GC already running: {}", lock_path.display()))
-}
-
 fn open_gc_lock(lock_path: &Path) -> std::result::Result<fs::File, String> {
 	if let Some(file) = open_new_gc_lock(lock_path)? {
 		return Ok(file);
 	}
-	let (breaker_path, breaker_file) = open_gc_breaker_lock(lock_path)?;
-	let outcome: std::result::Result<fs::File, String> = (|| {
-		if let Some(file) = open_new_gc_lock(lock_path)? {
-			return Ok(file);
-		}
-		if !remove_stale_gc_lock(lock_path)? {
-			return Err(format!("GC already running: {}", lock_path.display()));
-		}
-		if let Some(file) = open_new_gc_lock(lock_path)? {
-			return Ok(file);
-		}
-		Err(format!("GC already running: {}", lock_path.display()))
-	})();
-	release_lock_file(&breaker_path, breaker_file);
-	outcome
+	// A live TS breaker means TS recovery is in progress; never take over
+	// underneath it. Stale breakers are ignored, and Rust no longer creates one.
+	if gc_breaker_owner_live(lock_path)? {
+		return Err(format!("GC already running: {}", lock_path.display()));
+	}
+	if !remove_stale_gc_lock(lock_path)? {
+		return Err(format!("GC already running: {}", lock_path.display()));
+	}
+	open_new_gc_lock(lock_path)?
+		.ok_or_else(|| format!("GC already running: {}", lock_path.display()))
 }
 
 struct GcLock {
-	path:  PathBuf,
-	_file: Option<fs::File>,
+	path:   PathBuf,
+	_file:  Option<fs::File>,
+	_guard: Option<fs::File>,
 }
 
 impl Drop for GcLock {
@@ -4787,6 +4696,8 @@ impl Drop for GcLock {
 		if let Some(file) = self._file.take() {
 			release_lock_file(&self.path, file);
 		}
+		// Release the guard only after the TS-visible lock is gone.
+		let _ = self._guard.take();
 	}
 }
 
@@ -4794,14 +4705,13 @@ fn acquire_gc_lock(agent_dir: &Path) -> std::result::Result<GcLock, String> {
 	fs::create_dir_all(agent_dir)
 		.map_err(|error| format!("{}: {error}", agent_dir.display()))?;
 	let lock_path = agent_dir.join("gc.lock");
-	for _ in 0..4 {
+	let guard = open_gc_guard(&lock_path)?;
+	for _ in 0..2 {
 		let mut file = open_gc_lock(&lock_path)?;
 		if let Err(error) = write_gc_lock_owner(&mut file) {
 			release_lock_file(&lock_path, file);
 			return Err(error);
 		}
-		// A stale-breaker takeover may have moved this inode off the lock path
-		// between creation and owner write; only run while the path is still ours.
 		let owned = match (file.metadata(), fs::metadata(&lock_path)) {
 			(Ok(mine), Ok(current)) => {
 				(mine.dev(), mine.ino()) == (current.dev(), current.ino())
@@ -4809,8 +4719,14 @@ fn acquire_gc_lock(agent_dir: &Path) -> std::result::Result<GcLock, String> {
 			_ => false,
 		};
 		if owned {
-			return Ok(GcLock { path: lock_path, _file: Some(file) });
+			return Ok(GcLock {
+				path:   lock_path,
+				_file:  Some(file),
+				_guard: Some(guard),
+			});
 		}
+		// Only a non-cooperating TS recovery can displace our inode; retry
+		// once while still holding the Rust guard.
 		release_lock_file(&lock_path, file);
 	}
 	Err(format!("GC already running: {}", lock_path.display()))

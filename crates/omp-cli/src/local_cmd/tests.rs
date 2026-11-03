@@ -732,43 +732,6 @@ fn gc_wal_apply_busy_checkpoint_is_nonzero_and_releases_lock() {
 }
 
 #[test]
-fn gc_archive_exdev_fallback_preserves_concurrent_artifact_writes() {
-	let dir = TempDir::new("gc-exdev-copy");
-	let source = dir.path().join("source");
-	let destination = dir.path().join("destination");
-	fs::create_dir_all(source.join("nested")).expect("source tree");
-	fs::write(source.join("stable.txt"), "stable").expect("stable");
-	fs::write(source.join("changed.txt"), "before").expect("changed");
-	fs::write(source.join("nested/old.txt"), "old").expect("nested");
-	let mut created = Vec::new();
-	let mut moved = Vec::new();
-	copy_tree_for_move(&source, &destination, &mut created, &mut moved).expect("cross-device copy");
-	fs::write(source.join("changed.txt"), "after").expect("concurrent write");
-	fs::write(source.join("new.txt"), "new").expect("concurrent create");
-	fs::write(source.join("nested/late.txt"), "late").expect("concurrent nested create");
-	prune_moved_source(&moved).expect("snapshot prune");
-	assert!(!source.join("stable.txt").exists(), "unchanged copied entry must be removed");
-	assert!(!source.join("nested/old.txt").exists());
-	assert_eq!(
-		fs::read_to_string(source.join("changed.txt")).expect("changed source"),
-		"after"
-	);
-	assert_eq!(
-		fs::read_to_string(source.join("new.txt")).expect("new source"),
-		"new"
-	);
-	assert_eq!(
-		fs::read_to_string(source.join("nested/late.txt")).expect("late source"),
-		"late"
-	);
-	assert!(source.exists(), "directory with concurrent entries must survive");
-	assert_eq!(
-		fs::read_to_string(destination.join("changed.txt")).expect("copied snapshot"),
-		"before"
-	);
-}
-
-#[test]
 fn gc_archive_rollback_restores_gzip_source_after_move_failure() {
 	let dir = TempDir::new("gc-rollback");
 	let source = dir.path().join("sessions/project/s1.jsonl");
@@ -874,7 +837,73 @@ fn gc_torn_empty_stale_lock_uses_mtime_milliseconds() {
 }
 
 #[test]
-fn gc_simultaneous_stale_breaker_recovery_keeps_exclusive_lock() {
+fn gc_archive_refuses_cross_filesystem_artifact_move_before_mutation() {
+	use std::os::unix::fs::MetadataExt as _;
+
+	let dir = TempDir::new("gc-exdev-refuse");
+	let agent = dir.path().join("agent");
+	let sessions_root = agent.join("sessions");
+	let session = dir.write(
+		"agent/sessions/project/s1.jsonl",
+		"{\"type\":\"session\",\"id\":\"s1\"}\n",
+	);
+	dir.write("agent/sessions/project/s1/artifacts/a.txt", "artifact");
+	set_old_mtime(&session, Duration::from_secs(60 * 86_400));
+	let foreign_root = Path::new("/dev");
+	assert_ne!(
+		fs::metadata(&sessions_root).expect("sessions device").dev(),
+		fs::metadata(foreign_root).expect("/dev device").dev(),
+		"test environment needs /dev on a different filesystem"
+	);
+	let candidate = ArchiveCandidate {
+		session: SessionMeta {
+			path: session.clone(),
+			modified: 0,
+			status: "idle",
+			cwd: None,
+			id: "s1".to_string(),
+			parent_session: None,
+		},
+		destination: foreign_root.join("omp-gc-exdev-project/s1.jsonl.gz"),
+	};
+	let error = move_session_with_artifacts(&candidate, &sessions_root, foreign_root)
+		.expect_err("cross-device refusal");
+	assert!(error.contains("across filesystems"), "{error}");
+	assert!(session.exists(), "session source must survive the refusal");
+	assert_eq!(
+		fs::read_to_string(agent.join("sessions/project/s1/artifacts/a.txt")).expect("artifact"),
+		"artifact"
+	);
+	assert!(
+		!foreign_root.join("omp-gc-exdev-project").exists(),
+		"refusal must not create archive directories"
+	);
+}
+
+#[test]
+fn gc_guard_lock_contends_and_persists_without_blocking_after_release() {
+	let dir = TempDir::new("gc-guard");
+	let agent = dir.path().join("agent");
+	fs::create_dir_all(&agent).expect("agent dir");
+	let lock_path = agent.join("gc.lock");
+	let guard = open_gc_guard(&lock_path).expect("first guard");
+	let error = acquire_gc_lock(&agent).expect_err("contended guard");
+	assert!(error.contains("GC already running"), "{error}");
+	assert!(!lock_path.exists(), "contention must not create gc.lock");
+	drop(guard);
+
+	let held = acquire_gc_lock(&agent).expect("guard released");
+	assert!(lock_path.exists(), "acquired lock must be visible to TS");
+	drop(held);
+	assert!(!lock_path.exists(), "lock must be released");
+	assert!(
+		agent.join("gc.lock.guard").exists(),
+		"guard inode must persist across runs"
+	);
+}
+
+#[test]
+fn gc_guard_serializes_concurrent_acquire_and_stale_lock_recovery() {
 	use std::sync::{Arc, Barrier};
 	use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 

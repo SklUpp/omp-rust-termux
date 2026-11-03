@@ -1689,9 +1689,10 @@ impl RpcSession {
 			return (false, false);
 		}
 		let manage = self.tool_selected(crate::autolearn::MANAGE_SKILL_TOOL_NAME);
-		let learn = manage
-			&& matches!(self.config.memory_backend(), crate::autolearn::MemoryBackend::Local)
-			&& self.tool_selected(crate::autolearn::LEARN_TOOL_NAME);
+		let learn = matches!(
+			self.config.memory_backend(),
+			crate::autolearn::MemoryBackend::Local
+		) && self.tool_selected(crate::autolearn::LEARN_TOOL_NAME);
 		(manage, learn)
 	}
 

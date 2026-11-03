@@ -590,6 +590,13 @@ fn local_autolearn_tools_validate_only_when_mounted() {
 		"{}",
 		String::from_utf8_lossy(&valid.stderr)
 	);
+	let standalone = run("read,learn");
+	assert_eq!(
+		standalone.status.code(),
+		Some(0),
+		"learn mounts without manage_skill upstream: {}",
+		String::from_utf8_lossy(&standalone.stderr)
+	);
 
 	let config = fs::read_to_string(agent_dir.join("config.yml")).expect("config");
 	fs::write(
@@ -598,10 +605,10 @@ fn local_autolearn_tools_validate_only_when_mounted() {
 	)
 	.expect("disable memory");
 	let disabled = run("read,learn,manage_skill");
-	assert_ne!(disabled.status.code(), Some(0), "learn must not validate without local memory");
+	assert_ne!(disabled.status.code(), Some(0), "learn must not run without local memory");
 	let stderr = String::from_utf8_lossy(&disabled.stderr);
-	assert!(stderr.contains("Unknown tool"), "{stderr}");
 	assert!(stderr.contains("learn"), "{stderr}");
+	assert!(stderr.contains("memory backend"), "{stderr}");
 	let manage_only = run("read,manage_skill");
 	assert_eq!(
 		manage_only.status.code(),
@@ -609,6 +616,21 @@ fn local_autolearn_tools_validate_only_when_mounted() {
 		"manage_skill stays valid without a memory backend: {}",
 		String::from_utf8_lossy(&manage_only.stderr)
 	);
+
+	let config = fs::read_to_string(agent_dir.join("config.yml")).expect("config");
+	fs::write(
+		agent_dir.join("config.yml"),
+		config.replace("autolearn:\n  enabled: true", "autolearn:\n  enabled: false"),
+	)
+	.expect("disable autolearn");
+	let no_autolearn = run("read,manage_skill");
+	assert_ne!(
+		no_autolearn.status.code(),
+		Some(0),
+		"manage_skill must report disabled autolearn"
+	);
+	let stderr = String::from_utf8_lossy(&no_autolearn.stderr);
+	assert!(stderr.contains("autolearn.enabled"), "{stderr}");
 }
 
 #[test]

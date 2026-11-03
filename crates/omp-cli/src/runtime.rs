@@ -999,6 +999,8 @@ pub fn reserved_tool_names() -> Vec<String> {
 	names.push(pi_agent::tools::checkpoint::CHECKPOINT_TOOL_NAME.to_string());
 	names.push(pi_agent::tools::checkpoint::REWIND_TOOL_NAME.to_string());
 	names.push(crate::goal_tool::GOAL_TOOL_NAME.to_string());
+	names.push(crate::autolearn::MANAGE_SKILL_TOOL_NAME.to_string());
+	names.push(crate::autolearn::LEARN_TOOL_NAME.to_string());
 	names.extend(crate::eval_host::OWNED_TOOL_NAMES.iter().map(|name| (*name).to_string()));
 	names
 }
@@ -3907,6 +3909,11 @@ fn allowed_tools(request: &RunRequest, _has_mcp_tools: bool) -> Result<Vec<&'sta
 				)));
 			}
 		}
+		// Auto-learn tools are extra top-level tools, not builtins; a selected
+		// name still has to report a disabled capability instead of vanishing.
+		if let Some(reason) = autolearn_selection_error(&request.config, allowed) {
+			return Err(Error::new(reason));
+		}
 		// A setting that turns a selected tool off is a configuration conflict,
 		// not a silent empty selection.
 		if allowed.iter().any(|tool| tool == "lsp") && !lsp_enabled {
@@ -4831,25 +4838,39 @@ async fn check_or_prompt_stdio_mcp_launch(
 	}
 }
 
-/// Extra top-level tools that `--tools` may name for this config. `learn` is
-/// only mountable with the local backend and only when `manage_skill` is also
-/// selected; disabled memory keeps it unknown instead of silently mounting.
-fn autolearn_selectable_tool_names(
+/// Explicit configuration error for a selected auto-learn tool whose
+/// capability is disabled. Upstream gates both on `autolearn.enabled`; `learn`
+/// additionally needs a live backend, which this build implements only as
+/// `local`. Reporting the disabled capability beats calling it unknown.
+fn autolearn_selection_error(
 	config: &crate::config::Config,
 	requested: &[String],
-) -> Vec<&'static str> {
+) -> Option<String> {
+	let manage = crate::autolearn::MANAGE_SKILL_TOOL_NAME;
+	let learn = crate::autolearn::LEARN_TOOL_NAME;
+	if !requested.iter().any(|name| name == manage || name == learn) {
+		return None;
+	}
+	if !config.autolearn.enabled() {
+		return Some("auto-learn tools require `autolearn.enabled`; enable it or drop `learn`/`manage_skill` from --tools".to_string());
+	}
+	if requested.iter().any(|name| name == learn)
+		&& !matches!(config.memory_backend(), crate::autolearn::MemoryBackend::Local)
+	{
+		return Some("tool `learn` requires a supported memory backend; this build implements `memory.backend=local`".to_string());
+	}
+	None
+}
+
+/// Auto-learn names `--tools` may name for this config: `manage_skill` under
+/// `autolearn.enabled`, `learn` only with the local backend. They mount as
+/// extra top-level tools, never as builtins.
+fn autolearn_selectable_tool_names(config: &crate::config::Config) -> Vec<&'static str> {
 	if !config.autolearn.enabled() {
 		return Vec::new();
 	}
 	let mut names = vec![crate::autolearn::MANAGE_SKILL_TOOL_NAME];
-	if requested
-		.iter()
-		.any(|name| name == crate::autolearn::MANAGE_SKILL_TOOL_NAME)
-		&& matches!(
-			config.memory_backend(),
-			crate::autolearn::MemoryBackend::Local
-		)
-	{
+	if matches!(config.memory_backend(), crate::autolearn::MemoryBackend::Local) {
 		names.push(crate::autolearn::LEARN_TOOL_NAME);
 	}
 	names
@@ -4891,6 +4912,9 @@ pub async fn filter_and_spawn_mcp_servers_with_paths_detailed(
 				)));
 			}
 		}
+		if let Some(reason) = autolearn_selection_error(config, requested_tools) {
+			return Err(Error::new(reason));
+		}
 		let mut valid: Vec<String> = BUILTIN_TOOLS.iter().map(|(n, _)| (*n).to_string()).collect();
 		valid.extend(DELEGATION_TOOLS.iter().map(|name| (*name).to_string()));
 		// `checkpoint`/`rewind` mount only when `checkpoint.enabled` supplies a
@@ -4901,7 +4925,7 @@ pub async fn filter_and_spawn_mcp_servers_with_paths_detailed(
 		// always name it (#9444).
 		valid.push(crate::goal_tool::GOAL_TOOL_NAME.to_string());
 		valid.extend(
-			autolearn_selectable_tool_names(config, requested_tools)
+			autolearn_selectable_tool_names(config)
 				.iter()
 				.map(|name| (*name).to_string()),
 		);
@@ -5075,6 +5099,10 @@ pub async fn filter_and_spawn_mcp_servers_with_paths_detailed(
 	}
 
 	if let Some(requested_tools) = &config.tools {
+		if let Some(reason) = autolearn_selection_error(config, requested_tools) {
+			close_mcp_sessions(connections.drain(..)).await;
+			return Err(Error::new(reason));
+		}
 		let mut known_tools: Vec<String> = BUILTIN_TOOLS.iter().map(|(n, _)| n.to_string()).collect();
 		known_tools.extend(DELEGATION_TOOLS.iter().map(|name| (*name).to_string()));
 		// `checkpoint`/`rewind` are not default builtins: they mount only when
@@ -5084,7 +5112,7 @@ pub async fn filter_and_spawn_mcp_servers_with_paths_detailed(
 		// name it so a restricted selection keeps the restored goal manageable.
 		known_tools.push(crate::goal_tool::GOAL_TOOL_NAME.to_string());
 		known_tools.extend(
-			autolearn_selectable_tool_names(config, requested_tools)
+			autolearn_selectable_tool_names(config)
 				.iter()
 				.map(|name| (*name).to_string()),
 		);
@@ -6032,6 +6060,46 @@ mod tests {
 		request.config.tools = Some(vec!["read".to_string(), "grep".to_string()]);
 		let tools = allowed_tools(&request, false).expect("selection");
 		assert_eq!(tools, ["grep", "read"]);
+	}
+
+	#[test]
+	fn autolearn_selection_reports_disabled_capabilities_not_builtins() {
+		use crate::autolearn::MemoryBackend;
+
+		let mut request = request(yolo());
+		request.config.autolearn.enabled = Some(false);
+		request.config.tools = Some(vec!["learn".to_string(), "manage_skill".to_string()]);
+		let error = allowed_tools(&request, false).expect_err("autolearn disabled");
+		assert!(error.to_string().contains("autolearn.enabled"), "{error}");
+
+		request.config.autolearn.enabled = Some(true);
+		request.config.memory_backend = Some(MemoryBackend::Off);
+		let error = allowed_tools(&request, false).expect_err("no local backend");
+		assert!(error.to_string().contains("`learn`"), "{error}");
+		assert!(error.to_string().contains("memory backend"), "{error}");
+
+		request.config.tools = Some(vec!["manage_skill".to_string()]);
+		assert_eq!(allowed_tools(&request, false).expect("manage only"), Vec::<&str>::new());
+
+		request.config.memory_backend = Some(MemoryBackend::Local);
+		request.config.tools = Some(vec!["learn".to_string()]);
+		let tools = allowed_tools(&request, false).expect("standalone learn selection");
+		assert!(
+			!tools.contains(&"learn"),
+			"learn is an extra top-level tool, never a builtin registry entry"
+		);
+
+		request.config.memory_backend = Some(MemoryBackend::Off);
+		request.tools_enabled = false;
+		let tools = allowed_tools(&request, false).expect("compaction must not validate");
+		assert!(tools.is_empty());
+	}
+
+	#[test]
+	fn autolearn_names_are_reserved_against_host_tools() {
+		let names = reserved_tool_names();
+		assert!(names.iter().any(|name| name == "learn"));
+		assert!(names.iter().any(|name| name == "manage_skill"));
 	}
 
 	#[test]

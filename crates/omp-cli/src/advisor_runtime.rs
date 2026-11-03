@@ -850,47 +850,57 @@ impl AdvisorManager {
 					self.notify();
 				},
 				Some(error) => {
-					let mut state = slot.state.lock().unwrap_or_else(|poison| poison.into_inner());
-					state.history = history;
-					state.failing = true;
-					state.transcript = transcript;
-					if is_quota_error(&error) {
-						state.quota = true;
-						state.failures = 0;
-						state.pending = requeue(batch, state.pending.clone());
-						state.transcript.abandon_turn();
-						drop(state);
-						let mut status =
-							slot.status.lock().unwrap_or_else(|poison| poison.into_inner());
-						*status = RuntimeStatus::QuotaExhausted;
-						drop(status);
-						self.notify();
-						break;
-					}
-					if is_permanent_error(&error) || state.failures + 1 >= 3 {
-						state.failures = 0;
-						state.dropped_backlogs += 1;
-						state.backlog = state.backlog.saturating_sub(turns);
-						state.failing = false;
-						state.transcript.abandon_turn();
-						if state.dropped_backlogs >= 3 {
-							state.halted = true;
-							state.pending.clear();
-							state.backlog = 0;
+					// Keep the state guard inside this block: the retry path
+					// awaits below, and a guard live across that await makes the
+					// spawned drain future non-Send.
+					let retry = {
+						let mut state =
+							slot.state.lock().unwrap_or_else(|poison| poison.into_inner());
+						state.history = history;
+						state.failing = true;
+						state.transcript = transcript;
+						if is_quota_error(&error) {
+							state.quota = true;
+							state.failures = 0;
+							state.pending = requeue(batch, state.pending.clone());
+							state.transcript.abandon_turn();
+							drop(state);
+							let mut status =
+								slot.status.lock().unwrap_or_else(|poison| poison.into_inner());
+							*status = RuntimeStatus::QuotaExhausted;
+							drop(status);
+							self.notify();
+							false
+						} else if is_permanent_error(&error) || state.failures + 1 >= 3 {
+							state.failures = 0;
+							state.dropped_backlogs += 1;
+							state.backlog = state.backlog.saturating_sub(turns);
+							state.failing = false;
+							state.transcript.abandon_turn();
+							if state.dropped_backlogs >= 3 {
+								state.halted = true;
+								state.pending.clear();
+								state.backlog = 0;
+							}
+							drop(state);
+							let mut status =
+								slot.status.lock().unwrap_or_else(|poison| poison.into_inner());
+							*status = RuntimeStatus::Error;
+							drop(status);
+							self.notify();
+							false
+						} else {
+							state.failures += 1;
+							state.pending = requeue(batch, state.pending.clone());
+							state.transcript.abandon_turn();
+							drop(state);
+							self.notify();
+							true
 						}
-						drop(state);
-						let mut status =
-							slot.status.lock().unwrap_or_else(|poison| poison.into_inner());
-						*status = RuntimeStatus::Error;
-						drop(status);
-						self.notify();
+					};
+					if !retry {
 						break;
 					}
-					state.failures += 1;
-					state.pending = requeue(batch, state.pending.clone());
-					state.transcript.abandon_turn();
-					drop(state);
-					self.notify();
 					drop(_epoch_guard);
 					tokio::time::sleep(Duration::from_millis(1000)).await;
 				},

@@ -14,7 +14,7 @@ use std::{
 	fs,
 	path::{Path, PathBuf},
 	sync::{
-		Arc, Mutex,
+		Arc, LazyLock, Mutex,
 		atomic::{AtomicBool, Ordering},
 	},
 	thread::JoinHandle,
@@ -149,12 +149,41 @@ fn unique_token() -> String {
 	})
 }
 
+/// Operations running anywhere in this process (TS
+/// `ACTIVE_SECURITY_OPERATIONS`).
+///
+/// Restart recovery runs per coordinator, but a scan started by another
+/// session's coordinator is still live: the set is process-wide so recovery
+/// never marks a running scan failed.
+static ACTIVE_OPERATIONS: LazyLock<Mutex<std::collections::BTreeSet<String>>> =
+	LazyLock::new(|| Mutex::new(std::collections::BTreeSet::new()));
+
+fn mark_active(operation_id: &str) {
+	ACTIVE_OPERATIONS
+		.lock()
+		.unwrap_or_else(std::sync::PoisonError::into_inner)
+		.insert(operation_id.to_string());
+}
+
+fn clear_active(operation_id: &str) {
+	ACTIVE_OPERATIONS
+		.lock()
+		.unwrap_or_else(std::sync::PoisonError::into_inner)
+		.remove(operation_id);
+}
+
+fn is_active(operation_id: &str) -> bool {
+	ACTIVE_OPERATIONS
+		.lock()
+		.unwrap_or_else(std::sync::PoisonError::into_inner)
+		.contains(operation_id)
+}
+
 /// One coordinator per host/session.
 pub struct SecurityCoordinator {
 	host: Arc<dyn SecurityHost>,
 	adapter: Arc<dyn SecurityGitAdapter>,
 	operations: Mutex<HashMap<String, Arc<OperationRecord>>>,
-	active: Mutex<std::collections::BTreeSet<String>>,
 	recovered: Mutex<bool>,
 }
 
@@ -164,7 +193,6 @@ impl SecurityCoordinator {
 			host,
 			adapter: Arc::new(NativeSecurityGitAdapter),
 			operations: Mutex::new(HashMap::new()),
-			active: Mutex::new(std::collections::BTreeSet::new()),
 			recovered: Mutex::new(false),
 		}
 	}
@@ -229,12 +257,7 @@ impl SecurityCoordinator {
 				continue;
 			}
 			drop(operations);
-			let active = self
-				.active
-				.lock()
-				.unwrap_or_else(std::sync::PoisonError::into_inner)
-				.contains(&operation_id);
-			if active {
+			if is_active(&operation_id) {
 				continue;
 			}
 			if bundle.scan.status == "running" || bundle.scan.status == "planned" {
@@ -305,7 +328,9 @@ impl SecurityCoordinator {
 		let work_root = store.work_directory();
 		ensure_private_directory(&work_root)?;
 		let mut model_ref = model;
-		model_ref.thinking_level = input.thinking_level;
+		if input.thinking_level.is_some() {
+			model_ref.thinking_level = input.thinking_level;
+		}
 		let output_root = input.output_root.unwrap_or_else(|| work_root.join(unique_token()));
 		let workflow = security_workflow_fingerprint();
 		let created_at = now_iso();
@@ -368,10 +393,7 @@ impl SecurityCoordinator {
 			.lock()
 			.unwrap_or_else(std::sync::PoisonError::into_inner)
 			.insert(operation_id.clone(), Arc::clone(&record));
-		self.active
-			.lock()
-			.unwrap_or_else(std::sync::PoisonError::into_inner)
-			.insert(operation_id.clone());
+		mark_active(&operation_id);
 		let host = Arc::clone(&self.host);
 		let adapter = Arc::clone(&self.adapter);
 		let op_record = Arc::clone(&record);
@@ -398,10 +420,7 @@ impl SecurityCoordinator {
 					.lock()
 					.unwrap_or_else(std::sync::PoisonError::into_inner)
 					.remove(&operation_id);
-				self.active
-					.lock()
-					.unwrap_or_else(std::sync::PoisonError::into_inner)
-					.remove(&operation_id);
+				clear_active(&operation_id);
 				return Err(crate::Error::new(format!(
 					"cannot start security scan thread: {error}"
 				)));
@@ -416,6 +435,22 @@ impl SecurityCoordinator {
 
 	pub fn status(&self, operation_id: &str) -> crate::Result<Option<SecurityOperationSnapshot>> {
 		self.ensure_recovered()?;
+		let known = self
+			.operations
+			.lock()
+			.unwrap_or_else(std::sync::PoisonError::into_inner)
+			.get(operation_id)
+			.map(|record| record.snapshot());
+		if known.is_some() {
+			return Ok(known);
+		}
+		if is_active(operation_id) {
+			return Ok(None);
+		}
+		// The operation may belong to another session's coordinator, or to a
+		// process that has since exited: its bundle is on disk, so rescan before
+		// reporting unknown.
+		self.recover_interrupted()?;
 		Ok(self
 			.operations
 			.lock()
@@ -863,5 +898,9 @@ fn run_operation(
 	if result {
 		record.update("failed", Some("Security scan worker panicked".to_string()), now_iso);
 	}
+	// Clear the process-wide mark before publishing `finished`, so a waiter that
+	// observes the terminal snapshot can never race restart recovery into
+	// treating this operation as still live.
+	clear_active(&operation_id);
 	record.finished.store(true, Ordering::SeqCst);
 }

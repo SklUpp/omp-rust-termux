@@ -79,6 +79,22 @@ def message_text(message):
     return ""
 
 
+def last_tool_name(messages):
+    call_id = None
+    for message in reversed(messages):
+        if message.get("role") == "tool":
+            call_id = message.get("tool_call_id")
+            continue
+        if message.get("role") != "assistant":
+            continue
+        for call in message.get("tool_calls") or []:
+            if call.get("id") == call_id:
+                return (call.get("function") or {}).get("name")
+        if call_id is not None:
+            break
+    return None
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -92,10 +108,23 @@ class Handler(BaseHTTPRequestHandler):
         last = messages[-1] if messages else {}
         role = last.get("role")
         if role == "tool":
-            # The wire carries no tool name on tool results; both roots' tool
-            # results are echoed. The second process only passes when the read
-            # result contains the saved child payload.
-            payload = text("READ_RESULT:" + message_text(last))
+            name = last_tool_name(messages)
+            content = message_text(last)
+            if '"async"' in content and "Spawned agent" in content:
+                # The real TaskTool defaults to a detached job. Keep the root
+                # alive until it settles, otherwise CLI shutdown can race the
+                # child's artifact publication.
+                payload = tool_call(
+                    "hub", {"op": "wait", "ids": ["task-1"], "timeoutMs": 5000}
+                )
+            elif name == "task":
+                payload = tool_call("read", {"path": "agent://CliChild"})
+            elif name == "hub":
+                payload = tool_call("read", {"path": "agent://CliChild"})
+            elif name == "read":
+                payload = text("READ_RESULT:" + content)
+            else:
+                payload = text("DONE")
         else:
             user = message_text(last)
             if "CHILD_WORK" in user:

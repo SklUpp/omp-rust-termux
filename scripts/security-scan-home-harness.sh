@@ -22,7 +22,10 @@
 #
 # Nothing is written outside `$HOME`, and the harness never deletes a tree it
 # did not create: it prints `$ROOT` and leaves it for inspection.
-# Hand-run recipe, not a cargo test.
+#
+# Invoked by `crates/omp-cli/tests/security_scan_runtime_harness.rs` with
+# `OMP_BIN`/`HOME`/`OMP_SECURITY_HARNESS_ROOT` set; it can also be run by hand
+# with the same variables.
 
 set -euo pipefail
 
@@ -196,8 +199,6 @@ FINDING = re.compile(r"secf_[0-9a-zA-Z]+")
 def root_reply(messages, body):
     last = messages[-1] if messages else {}
     if last.get("role") == "user":
-        if "NO_TOOLS_TASK" in message_text(last):
-            return text("NO_TOOLS_OK")
         return tool_call("security_scan", {
             "action": "preflight",
             "target_kind": "repository",
@@ -310,15 +311,20 @@ class Handler(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(length) or b"{}")
         messages = body.get("messages") or []
         names = tool_names(body)
-        if "security_scan" in names:
+        if message_text(messages[-1] if messages else {}).find("NO_TOOLS_TASK") >= 0:
+            # `--no-tools` must carry an empty tool definition list: any mounted
+            # tool (not just `security_scan`) is a mount leak, so report the
+            # actual names instead of blindly answering OK.
+            if names:
+                payload = text("SECURITY_SMOKE_FAIL_NO_TOOLS_MOUNTED:" + ",".join(names))
+            else:
+                payload = text("NO_TOOLS_OK")
+        elif "security_scan" in names:
             payload = root_reply(messages, body)
         elif "security_publish" in names:
             with open(tools_log, "a", encoding="utf-8") as handle:
                 handle.write(",".join(names) + "\n")
             payload = scan_reply(messages)
-        elif message_text(messages[-1] if messages else {}).find("NO_TOOLS_TASK") >= 0:
-            # `--no-tools`: the request carries no tool definitions at all.
-            payload = text("NO_TOOLS_OK")
         else:
             payload = text("SECURITY_SMOKE_FAIL_UNEXPECTED_SESSION:" + ",".join(names))
         if payload is None:
@@ -424,6 +430,7 @@ check "cli exited 0" test "$STATUS" -eq 0
 check "preflight reported a plan" grep -q "Security plan secplan_" "$RUN_OUT"
 check "scan started" grep -q "started as secop_" "$RUN_OUT"
 check "smoke verdict" grep -q "SECURITY_SMOKE_OK" "$RUN_OUT"
+check "no mock failure marker" bash -c "! grep -q 'SECURITY_SMOKE_FAIL' '$RUN_OUT'"
 check "findings written" test -f "$OUTPUT/findings.json"
 check "report written" test -f "$OUTPUT/report.md"
 check "sarif written" test -f "$OUTPUT/results.sarif"
@@ -467,6 +474,8 @@ NO_TOOLS_STATUS=$?
 set -e
 check "no-tools run exited 0" test "$NO_TOOLS_STATUS" -eq 0
 check "no-tools mock answered" grep -q "NO_TOOLS_OK" "$NO_TOOLS_OUT"
+check "no-tools mock saw no mounted tools" \
+	bash -c "! grep -q 'SECURITY_SMOKE_FAIL' '$NO_TOOLS_OUT'"
 check "no-tools did not mount security_scan" bash -c "! grep -q '\"toolName\":\"security_scan\"' '$NO_TOOLS_OUT'"
 
 DISABLED_AGENT="$ROOT/agent-disabled"

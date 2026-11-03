@@ -6,7 +6,7 @@ permissions:
 jobs:
   import:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - name: Fetch complete source history
         run: |
@@ -19,7 +19,7 @@ jobs:
         run: |
           gh auth setup-git
           git -C source remote add destination https://github.com/SklUpp/omp-rust-termux.git
-          git -C source push destination 'refs/remotes/source/*:refs/heads/archive/source/*'
+          git -C source -c pack.threads=2 -c pack.compression=1 -c http.version=HTTP/1.1 push --progress destination refs/remotes/source/feat/rust-agent-termux-bionic:refs/heads/archive/source/feat/rust-agent-termux-bionic
           expected=$(git -C source rev-parse refs/remotes/source/feat/rust-agent-termux-bionic)
           actual=$(git ls-remote https://github.com/SklUpp/omp-rust-termux.git refs/heads/archive/source/feat/rust-agent-termux-bionic | cut -f1)
           test "$expected" = "$actual"

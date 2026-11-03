@@ -641,7 +641,13 @@ async fn nested_spawn_writes_dotted_outputs_in_the_producer_root() {
 		ToolRegistry::new(),
 		provider,
 		None,
-		DelegationLimits::default(),
+		// Explicit fixture depth: root -> NestedParent (1) -> NestedChild (2)
+		// -> NestedGrand (3). The default limit intentionally stops before the
+		// grandchild, so this test must opt into one extra level.
+		DelegationLimits {
+			max_depth:       3,
+			max_concurrency: 32,
+		},
 	);
 	supervisor.set_agent_catalog(Arc::new(AgentCatalog::new(
 		vec![test_catalog_agent("task"), test_catalog_agent("scout")],

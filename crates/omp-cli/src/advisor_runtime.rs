@@ -192,6 +192,8 @@ struct SlotState {
 	seen_prefix:        Vec<u64>,
 	pending:            Vec<PendingDelta>,
 	backlog:            usize,
+	/// Deltas handed to a worker whose provider call has not settled yet.
+	inflight:           usize,
 	seen_context:       BTreeMap<String, String>,
 	include_thinking:   bool,
 	failures:           u32,
@@ -210,6 +212,7 @@ impl Default for SlotState {
 			seen_prefix: Vec::new(),
 			pending: Vec::new(),
 			backlog: 0,
+			inflight: 0,
 			seen_context: BTreeMap::new(),
 			include_thinking: true,
 			failures: 0,
@@ -492,6 +495,7 @@ impl AdvisorManager {
 				state.history.clear();
 				state.pending.clear();
 				state.backlog = 0;
+				state.inflight = 0;
 				state.seen_context.clear();
 			}
 		}
@@ -622,6 +626,7 @@ impl AdvisorManager {
 			state.history.clear();
 			state.pending.clear();
 			state.backlog = 0;
+			state.inflight = 0;
 			state.seen_context.clear();
 			state.include_thinking = true;
 			feed.clone()
@@ -691,6 +696,7 @@ impl AdvisorManager {
 					state.backlog = state.backlog.saturating_sub(turns);
 					continue;
 				};
+				state.inflight = state.inflight.saturating_add(turns);
 				state.cancel = Some(pi_agent::CancellationToken::new());
 				let cancel = state.cancel.clone().expect("cancel");
 				let history = std::mem::take(&mut state.history);
@@ -710,6 +716,7 @@ impl AdvisorManager {
 					let mut state = slot.state.lock().unwrap_or_else(|poison| poison.into_inner());
 					state.history = history;
 					state.backlog = state.backlog.saturating_sub(turns);
+					state.inflight = state.inflight.saturating_sub(turns);
 					let mut status = slot.status.lock().unwrap_or_else(|poison| poison.into_inner());
 					*status = RuntimeStatus::NoModel;
 					break;
@@ -780,12 +787,15 @@ impl AdvisorManager {
 				// its outcome belong to the old transcript. Drop both without
 				// requeueing into the new epoch and without touching history.
 				transcript.abandon_turn();
+				let mut state = slot.state.lock().unwrap_or_else(|poison| poison.into_inner());
+				state.inflight = state.inflight.saturating_sub(turns);
 				continue;
 			}
 			let cancelled = cancel.is_cancelled();
 			if cancelled && self.inner.disposed.load(Ordering::SeqCst) {
 				transcript.abandon_turn();
 				let mut state = slot.state.lock().unwrap_or_else(|poison| poison.into_inner());
+				state.inflight = state.inflight.saturating_sub(turns);
 				state.transcript = transcript;
 				state.history = history;
 				break;
@@ -793,6 +803,7 @@ impl AdvisorManager {
 			if self.inner.disposed.load(Ordering::SeqCst) {
 				transcript.abandon_turn();
 				let mut state = slot.state.lock().unwrap_or_else(|poison| poison.into_inner());
+				state.inflight = state.inflight.saturating_sub(turns);
 				state.transcript = transcript;
 				state.history = history;
 				break;
@@ -806,6 +817,7 @@ impl AdvisorManager {
 						state.failures = 0;
 						state.failing = false;
 						state.backlog = state.backlog.saturating_sub(turns);
+						state.inflight = state.inflight.saturating_sub(turns);
 						state.transcript = transcript;
 						state.transcript.commit_turn();
 						let session_file = self
@@ -863,6 +875,7 @@ impl AdvisorManager {
 							state.quota = true;
 							state.failures = 0;
 							state.pending = requeue(batch, state.pending.clone());
+							state.inflight = state.inflight.saturating_sub(turns);
 							state.transcript.abandon_turn();
 							drop(state);
 							let mut status =
@@ -875,12 +888,14 @@ impl AdvisorManager {
 							state.failures = 0;
 							state.dropped_backlogs += 1;
 							state.backlog = state.backlog.saturating_sub(turns);
+							state.inflight = state.inflight.saturating_sub(turns);
 							state.failing = false;
 							state.transcript.abandon_turn();
 							if state.dropped_backlogs >= 3 {
 								state.halted = true;
 								state.pending.clear();
 								state.backlog = 0;
+								state.inflight = 0;
 							}
 							drop(state);
 							let mut status =
@@ -892,6 +907,7 @@ impl AdvisorManager {
 						} else {
 							state.failures += 1;
 							state.pending = requeue(batch, state.pending.clone());
+							state.inflight = state.inflight.saturating_sub(turns);
 							state.transcript.abandon_turn();
 							drop(state);
 							self.notify();
@@ -910,8 +926,9 @@ impl AdvisorManager {
 		self.notify();
 	}
 
-	/// Block until every advisor's backlog drops below one, or the runtime is
-	/// failing/quota/halted (a failing advisor must never park the primary).
+	/// Block until every advisor has no queued delta and no provider call in
+	/// flight, or the runtime is failing/quota/halted (a failing advisor must
+	/// never park the primary).
 	#[must_use]
 	pub fn wait_for_catchup(&self, timeout: Duration) -> bool {
 		let deadline = Instant::now() + timeout;
@@ -923,7 +940,8 @@ impl AdvisorManager {
 				let guard = self.inner.signal.lock().unwrap_or_else(|poison| poison.into_inner());
 				{
 					let state = slot.state.lock().unwrap_or_else(|poison| poison.into_inner());
-					if state.backlog < 1 || state.quota || state.halted || state.failing {
+					let idle = state.pending.is_empty() && state.inflight == 0;
+					if idle || state.quota || state.halted || state.failing {
 						break;
 					}
 				}
@@ -997,6 +1015,16 @@ impl AdvisorManager {
 					.len()
 			})
 			.sum();
+		let inflight: usize = self
+			.slots
+			.iter()
+			.map(|slot| {
+				slot.state
+					.lock()
+					.unwrap_or_else(|poison| poison.into_inner())
+					.inflight
+			})
+			.sum();
 		let slots: Vec<String> = self
 			.slots
 			.iter()
@@ -1013,9 +1041,10 @@ impl AdvisorManager {
 			})
 			.collect();
 		format!(
-			"slots={} pending={} backlog={} needs_seed={} [{}]",
+			"slots={} pending={} inflight={} backlog={} needs_seed={} [{}]",
 			self.slots.len(),
 			pending,
+			inflight,
 			self.backlog(),
 			self.inner.needs_seed.load(Ordering::SeqCst),
 			slots.join(",")
@@ -1191,6 +1220,7 @@ impl AdvisorManager {
 			state.seen_prefix = prefix.clone();
 			state.pending.clear();
 			state.backlog = 0;
+			state.inflight = 0;
 			state.seen_context.clear();
 			state.failures = 0;
 			state.dropped_backlogs = 0;
@@ -1224,6 +1254,7 @@ impl AdvisorManager {
 			state.history.clear();
 			state.pending.clear();
 			state.backlog = 0;
+			state.inflight = 0;
 			state.failures = 0;
 			state.failing = false;
 			state.dropped_backlogs = 0;
@@ -1418,6 +1449,7 @@ impl AdvisorManager {
 			}
 			state.pending.clear();
 			state.backlog = 0;
+			state.inflight = 0;
 		}
 		self.inner.asides.lock().unwrap_or_else(|poison| poison.into_inner()).clear();
 		self.notify();
@@ -2020,6 +2052,39 @@ mod tests {
 			history.push(Message::assistant("stale answer"));
 			AdvisorCallResult { history, assistant_messages: Vec::new(), error: None }
 		}
+	}
+
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn catchup_waits_for_an_inflight_provider_call() {
+		let executor = Arc::new(GatedExecutor {
+			started: tokio::sync::Notify::new(),
+			release: tokio::sync::Notify::new(),
+		});
+		let manager = manager(executor.clone());
+		manager.begin_primary_run(&[]);
+		manager.push_user(&Message::user("fix it"));
+		manager.push_turn(&Message::assistant("done"), &[]);
+		tokio::time::timeout(Duration::from_secs(1), executor.started.notified())
+			.await
+			.expect("advisor call started");
+		assert_eq!(manager.slots[0].state.lock().unwrap().inflight, 1);
+
+		let wait_manager = Arc::clone(&manager);
+		let (tx, rx) = std::sync::mpsc::channel();
+		let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+		std::thread::spawn(move || {
+			let _ = entered_tx.send(());
+			let _ = tx.send(wait_manager.wait_for_catchup(Duration::from_secs(5)));
+		});
+		entered_rx.recv_timeout(Duration::from_secs(1)).expect("waiter thread started");
+		assert!(
+			rx.recv_timeout(Duration::from_millis(200)).is_err(),
+			"catchup returned while the provider call was still in flight"
+		);
+
+		executor.release.notify_one();
+		assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok(true));
+		manager.dispose();
 	}
 
 	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]

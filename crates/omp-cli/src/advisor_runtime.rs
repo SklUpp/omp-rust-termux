@@ -1819,6 +1819,45 @@ mod tests {
 		manager.dispose();
 	}
 
+	#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+	async fn reset_and_delivery_do_not_invert_advise_and_epoch_locks() {
+		let manager = manager(Arc::new(FakeExecutor {
+			calls: StdMutex::new(Vec::new()),
+			error: StdMutex::new(None),
+		}));
+		let advise = Arc::clone(&manager.slots[0].advise);
+		let barrier = Arc::new(std::sync::Barrier::new(2));
+		let (tx_delivery, rx_delivery) = std::sync::mpsc::channel();
+		let (tx_reset, rx_reset) = std::sync::mpsc::channel();
+		let delivery_barrier = Arc::clone(&barrier);
+		let delivery = std::thread::spawn(move || {
+			delivery_barrier.wait();
+			let result = advise.execute_note(&serde_json::json!({
+				"note": "concurrent delivery",
+				"severity": "blocker"
+			}));
+			let _ = tx_delivery.send(result.is_ok());
+		});
+		let reset_barrier = Arc::clone(&barrier);
+		let reset_manager = Arc::clone(&manager);
+		let reset = std::thread::spawn(move || {
+			reset_barrier.wait();
+			reset_manager.reset("concurrent reset", &[]);
+			let _ = tx_reset.send(());
+		});
+		assert!(
+			rx_delivery.recv_timeout(Duration::from_secs(5)).is_ok_and(|ok| ok),
+			"delivery must not deadlock against reset"
+		);
+		assert!(
+			rx_reset.recv_timeout(Duration::from_secs(5)).is_ok(),
+			"reset must not deadlock against delivery"
+		);
+		delivery.join().expect("delivery thread");
+		reset.join().expect("reset thread");
+		manager.dispose();
+	}
+
 	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 	async fn disposed_manager_drops_late_cards_before_the_sink() {
 		let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));

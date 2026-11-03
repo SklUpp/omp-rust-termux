@@ -924,7 +924,7 @@ fn run() -> std::result::Result<(), CliError> {
 		}
 	}
 
-	let advisor_cards_rx;
+	let (advisor_cards_tx, advisor_cards_rx) = std::sync::mpsc::channel();
 	let mut session = Session {
 		runner,
 		config,
@@ -960,11 +960,8 @@ fn run() -> std::result::Result<(), CliError> {
 		prewalk: prewalk::PrewalkState::new(prewalk_policy.arm.clone()),
 		plan_yolo: None,
 		plan_yolo_tools: None,
-		advisor_cards_tx: {
-			let (tx, rx) = std::sync::mpsc::channel();
-			advisor_cards_rx = rx;
-			Arc::new(std::sync::Mutex::new(tx))
-		},
+		advisor_cards_tx: Arc::new(std::sync::Mutex::new(advisor_cards_tx)),
+		advisor_cards_rx,
 	};
 	if let Some(model) = requested_model.or(default_model) {
 		session.select_model(model);
@@ -1614,6 +1611,15 @@ struct Session<'a> {
 	advisor_cards_rx: std::sync::mpsc::Receiver<(String, serde_json::Value)>,
 }
 
+/// Scope selector matching a run request, derived from the live store rather
+/// than from `self`: rewind/fork handlers need the current journal identity.
+fn advisor_scope_for(store: &SessionStore) -> (Option<String>, Option<PathBuf>) {
+	(
+		store.enabled().then(|| store.id().to_string()),
+		store.file().map(Path::to_path_buf),
+	)
+}
+
 impl Session<'_> {
 	/// TS `sdk.ts:1505-1545`: with no explicit `--model`, a restored session
 	/// selects the first recorded model on its branch that exists in the
@@ -1804,14 +1810,6 @@ impl Session<'_> {
 		self.apply_goal_pending();
 	}
 
-	/// Scope tuple the runner keys advisor state by (same selector as a run).
-	fn advisor_scope(&self) -> (Option<String>, Option<PathBuf>) {
-		(
-			self.store.enabled().then(|| self.store.id().to_string()),
-			self.store.file().map(Path::to_path_buf),
-		)
-	}
-
 	/// Persist and render every advisor card queued since the last boundary.
 	fn drain_advisor_cards<W: Write, E: Write>(
 		&mut self,
@@ -1832,7 +1830,7 @@ impl Session<'_> {
 		reporter: &mut Reporter<W, E>,
 		timeout: Duration,
 	) -> Result<()> {
-		let (id, file) = self.advisor_scope();
+		let (id, file) = advisor_scope_for(&self.store);
 		self
 			.runner
 			.advisor_prepare_headless_drain(id.as_deref(), file.as_deref());
@@ -2567,7 +2565,7 @@ impl Session<'_> {
 								match rebuilt {
 									Ok(messages) => {
 										if let Some(runner) = agent::runner() {
-											let (id, file) = self.advisor_scope();
+											let (id, file) = advisor_scope_for(store);
 											runner.advisor_reset_boundary(
 												id.as_deref(),
 												file.as_deref(),
@@ -2609,7 +2607,7 @@ impl Session<'_> {
 										messages, &rewind,
 									);
 									if let Some(runner) = agent::runner() {
-										let (id, file) = self.advisor_scope();
+										let (id, file) = advisor_scope_for(store);
 										runner.advisor_reset_boundary(
 											id.as_deref(),
 											file.as_deref(),
@@ -2620,7 +2618,7 @@ impl Session<'_> {
 								},
 								None => {
 									if let Some(runner) = agent::runner() {
-										let (id, file) = self.advisor_scope();
+										let (id, file) = advisor_scope_for(store);
 										runner.advisor_reset_boundary(
 											id.as_deref(),
 											file.as_deref(),

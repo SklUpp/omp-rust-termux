@@ -9432,6 +9432,9 @@ mod tests {
 #[cfg(test)]
 mod process_scope_tests {
 	use super::*;
+	use std::sync::atomic::{AtomicUsize, Ordering};
+
+	use pi_agent::AssistantGuard;
 
 	#[test]
 	fn fallback_scope_root_is_stable_and_per_project() {

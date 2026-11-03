@@ -45,11 +45,20 @@ impl AdviseTool {
 		let mut state = self.state.lock().unwrap_or_else(|poison| poison.into_inner());
 		let was = state.in_progress;
 		state.in_progress = in_progress;
+		let mut deliver = Vec::new();
 		if was && !in_progress && !state.deferred.is_empty() {
 			let pending = std::mem::take(&mut state.deferred);
 			for note in pending {
-				deliver(&self.sink, &mut state, note);
+				if reserve(&mut state, &note) {
+					deliver.push(note);
+				}
 			}
+		}
+		drop(state);
+		// The sink can route through the manager's epoch lock; never hold the
+		// advise lock across it, or reset's epoch -> advise order can invert.
+		for note in deliver {
+			(self.sink)(note);
 		}
 	}
 
@@ -99,34 +108,44 @@ impl AdviseTool {
 			}
 		}
 		let entry = Note { note: note.clone(), severity, advisor: None };
-		let mut state = self.state.lock().unwrap_or_else(|poison| poison.into_inner());
-		if let Some(quarantined) =
-			crate::advisor_runtime::quarantine_note(&note, &state.source_text)
-		{
-			drop(state);
-			return Err(ToolError::ExecutionFailed(quarantined));
-		}
-		let content = if state.in_progress && severity != Some(Severity::Blocker) {
-			let key = dedupe_key(&note);
-			match state.deferred.iter_mut().find(|pending| dedupe_key(&pending.note) == key) {
-				Some(pending) => {
-					if severity.map(Severity::rank).unwrap_or(1)
-						> pending.severity.map(Severity::rank).unwrap_or(1)
-					{
-						pending.severity = severity;
-					}
-				},
-				None => state.deferred.push(entry.clone()),
+		let delivery = {
+			let mut state = self.state.lock().unwrap_or_else(|poison| poison.into_inner());
+			if let Some(quarantined) =
+				crate::advisor_runtime::quarantine_note(&note, &state.source_text)
+			{
+				return Err(ToolError::ExecutionFailed(quarantined));
 			}
-			"Deferred — primary is mid-turn; this note will be delivered automatically when the \
-			 turn completes. Do not re-raise the same point."
-				.to_string()
-		} else if deliver(&self.sink, &mut state, entry.clone()) {
-			"Recorded.".to_string()
-		} else {
-			"Duplicate advice ignored.".to_string()
+			if state.in_progress && severity != Some(Severity::Blocker) {
+				let key = dedupe_key(&note);
+				match state.deferred.iter_mut().find(|pending| dedupe_key(&pending.note) == key) {
+					Some(pending) => {
+						if severity.map(Severity::rank).unwrap_or(1)
+							> pending.severity.map(Severity::rank).unwrap_or(1)
+						{
+							pending.severity = severity;
+						}
+					},
+					None => state.deferred.push(entry.clone()),
+				}
+				Delivery::Deferred
+			} else if reserve(&mut state, &entry) {
+				Delivery::Now(entry.clone())
+			} else {
+				Delivery::Duplicate
+			}
 		};
-		drop(state);
+		let content = match delivery {
+			Delivery::Deferred => {
+				"Deferred — primary is mid-turn; this note will be delivered automatically when \
+				 the turn completes. Do not re-raise the same point."
+					.to_string()
+			},
+			Delivery::Now(note) => {
+				(self.sink)(note);
+				"Recorded.".to_string()
+			},
+			Delivery::Duplicate => "Duplicate advice ignored.".to_string(),
+		};
 		Ok(ToolResult {
 			tool_call_id: String::new(),
 			content,
@@ -137,7 +156,13 @@ impl AdviseTool {
 	}
 }
 
-fn deliver(sink: &AdviceSink, state: &mut State, note: Note) -> bool {
+enum Delivery {
+	Deferred,
+	Now(Note),
+	Duplicate,
+}
+
+fn reserve(state: &mut State, note: &Note) -> bool {
 	let key = dedupe_key(&note.note);
 	let rank = note.severity.map(Severity::rank).unwrap_or(1);
 	let previous = state.delivered.get(&key).copied().unwrap_or(0);
@@ -145,7 +170,6 @@ fn deliver(sink: &AdviceSink, state: &mut State, note: Note) -> bool {
 		return false;
 	}
 	state.delivered.insert(key, rank);
-	sink(note);
 	true
 }
 

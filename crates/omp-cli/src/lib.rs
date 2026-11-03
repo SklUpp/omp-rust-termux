@@ -6,6 +6,15 @@
 //! registered [`agent::AgentRunner`].
 
 pub mod acp;
+pub mod advisor_child;
+pub mod advisor_child_host;
+pub mod advisor_config;
+pub mod advisor_emit;
+pub mod advisor_identity;
+pub mod advisor_render;
+pub mod advisor_runtime;
+pub mod advisor_tool;
+pub mod advisor_transcript;
 pub mod agent;
 pub mod agents;
 pub mod approve;

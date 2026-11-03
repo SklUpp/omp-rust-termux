@@ -83,9 +83,10 @@ impl Spawns {
 	}
 }
 
-/// `prewalk` / `advisor` frontmatter value. Both describe hand-off/advice
-/// behaviour this runtime does not implement, so the task tool rejects an agent
-/// that requests one instead of silently ignoring it.
+/// `prewalk` / `advisor` frontmatter value. `prewalk` is rejected because this
+/// runtime does not implement hand-off; `advisor` is live: the task tool hands
+/// the value to the host's child advisor hook (`task.agentAdvisor` override
+/// first, TS `resolveAgentAdvisorSelection`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HandoffTarget {
 	Default,

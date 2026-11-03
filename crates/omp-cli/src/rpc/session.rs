@@ -347,6 +347,10 @@ pub struct RpcSession {
 	/// Failed approved switch surfaced to the turn owner instead of silently
 	/// ending the run.
 	pub(crate) plan_yolo_commit_error: Option<String>,
+	/// Advisor cards queued by the active turn's sink; the transport drains
+	/// them, persists one `custom_message`, and emits the wire frames.
+	pub(crate) advisor_cards_tx: std::sync::mpsc::Sender<(String, serde_json::Value)>,
+	pub(crate) advisor_cards_rx: std::sync::mpsc::Receiver<(String, serde_json::Value)>,
 }
 
 impl RpcSession {
@@ -460,6 +464,7 @@ impl RpcSession {
 		let mut checkpoint_host = CheckpointHost::new();
 		checkpoint_host.rehydrate(&store);
 		let todo_phases = store.branch_todo_phases();
+		let (advisor_cards_tx, advisor_cards_rx) = std::sync::mpsc::channel();
 		let mut session = Self {
 			runner,
 			resolver,
@@ -519,6 +524,8 @@ impl RpcSession {
 			plan_yolo: None,
 			plan_yolo_tools: None,
 			plan_yolo_commit_error: None,
+			advisor_cards_tx,
+			advisor_cards_rx,
 		};
 		if let Some(arm) = plan_yolo {
 			// Explicit `--plan-yolo` is the grant: TS `armPlanYoloIfNeeded`
@@ -1090,6 +1097,54 @@ impl RpcSession {
 		self.plan_yolo_commit_error.take()
 	}
 
+	/// Drain advisor cards queued since the last boundary. Each card is written
+	/// once as a `custom_message` (resume replays it); the caller emits the
+	/// returned `(content, details)` pairs as frames, never a second card.
+	pub fn take_advisor_cards(&mut self) -> Vec<(String, serde_json::Value)> {
+		let mut cards = Vec::new();
+		while let Ok(card) = self.advisor_cards_rx.try_recv() {
+			cards.push(card);
+		}
+		if self.store.enabled() {
+			for (content, details) in &cards {
+				if let Err(err) = self.store.append_custom_message(
+					crate::advisor_runtime::CARD_CUSTOM_TYPE,
+					content,
+					true,
+					details.clone(),
+				) {
+					eprintln!("warning: {err}");
+				}
+			}
+		}
+		cards
+	}
+
+	/// Scope tuple the runner keys advisor state by.
+	fn advisor_scope(&self) -> (Option<String>, Option<PathBuf>) {
+		(
+			self.store.enabled().then(|| self.store.id().to_string()),
+			self.store.file().map(Path::to_path_buf),
+		)
+	}
+
+	/// Conversation boundary: re-prime advisor state for the new transcript.
+	pub fn reset_advisor_boundary(&self) {
+		let (id, file) = self.advisor_scope();
+		self
+			.runner
+			.advisor_reset_boundary(id.as_deref(), file.as_deref());
+	}
+
+	/// Rendered advisor status for the live scope, if a manager exists.
+	#[must_use]
+	pub fn advisor_status(&self) -> Option<String> {
+		let (id, file) = self.advisor_scope();
+		self
+			.runner
+			.advisor_status(id.as_deref(), file.as_deref())
+	}
+
 	/// Journal the failed cutover so a resumed session sees the turn was not a
 	/// successful implementation; the live error frame is not durable.
 	pub fn record_plan_yolo_commit_failure(&mut self, error: &str) -> Option<String> {
@@ -1312,6 +1367,7 @@ impl RpcSession {
 		self.tokens_per_second = None;
 		self.checkpoint_host = CheckpointHost::new();
 		self.checkpoint_host.rehydrate(&self.store);
+		self.reset_advisor_boundary();
 		self.restore_service_tiers();
 		let target = self.session_scope_identity();
 		self.runner
@@ -1384,6 +1440,7 @@ impl RpcSession {
 		self.restore_service_tiers();
 		self.checkpoint_host = CheckpointHost::new();
 		self.checkpoint_host.rehydrate(&self.store);
+		self.reset_advisor_boundary();
 		self.restore_service_tiers();
 		let target = self.session_scope_identity();
 		self.runner
@@ -1493,6 +1550,7 @@ impl RpcSession {
 		// rewind from the path just abandoned must not leak into the new branch.
 		self.checkpoint_host = CheckpointHost::new();
 		self.checkpoint_host.rehydrate(&self.store);
+		self.reset_advisor_boundary();
 		self.restore_service_tiers();
 		// The branch changed under the same log: rebuild the context the next
 		// request and the frame surface read from.
@@ -2032,6 +2090,15 @@ impl RpcSession {
 			extra_tools.push(crate::agent::ExtraTool::from(tool));
 		}
 		let goal_context = self.goal_mode_context();
+		// Advisor cards cross the transport as one sink call per card; the turn
+		// loop drains them, persists one `custom_message`, then emits frames.
+		let advisor_cards = Arc::new(std::sync::Mutex::new(self.advisor_cards_tx.clone()));
+		let advisor_card_sink: crate::advisor_runtime::CardSink =
+			Arc::new(move |content: &str, details: &serde_json::Value| {
+				if let Ok(tx) = advisor_cards.lock() {
+					let _ = tx.send((content.to_string(), details.clone()));
+				}
+			});
 		Ok(RunRequest {
 			prompt,
 			parts,
@@ -2078,6 +2145,7 @@ impl RpcSession {
 			plan_mode: self.plan_mode.clone(),
 			continuation,
 			plan_context: self.plan_context(),
+			advisor_card_sink: Some(crate::agent::AdvisorCardHandle(advisor_card_sink)),
 			service_tier_by_family: self.service_tier_by_family(),
 })
 	}
@@ -2594,6 +2662,10 @@ impl RpcSession {
 						.map(|turn| turn.assistant.clone())
 						.filter(|text| !text.is_empty());
 					rewound = true;
+					// The conversation was rewritten: re-prime advisor state so
+					// the abandoned tail is not reviewed and a quota latch from the
+					// abandoned branch cannot leak into the new one.
+					self.reset_advisor_boundary();
 				},
 				Ok(None) => {},
 				Err(err) => eprintln!("warning: cannot apply rewind: {err}"),

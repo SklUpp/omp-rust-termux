@@ -134,6 +134,7 @@ fn request(catalog: Catalog, tiers: &[(&str, &str)]) -> RunRequest {
 		plan_mode: Default::default(),
 		continuation: false,
 		plan_context: None,
+		advisor_card_sink: None,
 		service_tier_by_family,
 	}
 }

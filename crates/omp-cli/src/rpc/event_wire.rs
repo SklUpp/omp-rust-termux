@@ -80,6 +80,40 @@ pub fn user_message_pair(parts: &[ContentPart], timestamp_ms: u64) -> [Value; 2]
 	]
 }
 
+/// `message_start` + `message_end` pair for one advisor advice card.
+///
+/// TS `preserveAdvisorCard` emits the custom `advisor` message with
+/// `display: true`; the same pair is used for an aside flush, a steered note,
+/// and the headless drain. The host persisted one `custom_message` entry for the
+/// same card, so the pair is emitted exactly once and never duplicated.
+pub fn advisor_card_frames(
+	content: &str,
+	details: &Value,
+	timestamp_ms: u64,
+) -> [Value; 2] {
+	let mut message = json!({
+		"role": "custom",
+		"customType": crate::advisor_runtime::CARD_CUSTOM_TYPE,
+		"display": true,
+		"content": [{ "type": "text", "text": content }],
+		"timestamp": timestamp_ms,
+	});
+	if !details.is_null() {
+		message["details"] = details.clone();
+	}
+	[
+		json!({
+			"type": "message_start",
+			"message": {
+				"role": "custom",
+				"customType": crate::advisor_runtime::CARD_CUSTOM_TYPE,
+				"display": true,
+			},
+		}),
+		json!({ "type": "message_end", "message": message }),
+	]
+}
+
 /// Assistant message snapshot in TS `AssistantMessage` shape.
 pub fn assistant_message(
 	message: &Message,

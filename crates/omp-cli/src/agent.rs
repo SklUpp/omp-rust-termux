@@ -242,6 +242,10 @@ pub struct RunRequest {
 	/// Detached plan-reminder continuation: no caller message is appended and
 	/// the first request uses the policy's one-shot forced choice.
 	pub continuation: bool,
+	/// Host-owned advisor card sink. The runner calls it exactly once per card
+	/// (aside flush, preserve, or steered note) so each host persists/forwards
+	/// the custom `advisor` message without duplicating it on the event wire.
+	pub advisor_card_sink: Option<AdvisorCardHandle>,
 }
 
 /// Host plan-mode wiring for one run.
@@ -263,6 +267,16 @@ impl std::fmt::Debug for PlanModeHooks {
 			.field("propose", &self.propose.is_some())
 			.field("policy", &self.policy.is_some())
 			.finish()
+	}
+}
+
+/// Advisor card sink that keeps [`RunRequest`]'s derived `Debug` intact.
+#[derive(Clone)]
+pub struct AdvisorCardHandle(pub crate::advisor_runtime::CardSink);
+
+impl std::fmt::Debug for AdvisorCardHandle {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str("AdvisorCardHandle")
 	}
 }
 
@@ -362,6 +376,61 @@ pub trait AgentRunner: Send + Sync {
 		session_file: Option<&std::path::Path>,
 	) {
 		let _ = (session_id, session_file);
+	}
+
+	/// Enter the headless advisor drain: from here on every advice card is
+	/// preserved (never a hidden primary turn). Hosts call this **after every
+	/// primary prompt turn has settled**, immediately before waiting.
+	fn advisor_prepare_headless_drain(
+		&self,
+		session_id: Option<&str>,
+		session_file: Option<&std::path::Path>,
+	) {
+		let _ = (session_id, session_file);
+	}
+
+	/// Wait for the advisor backlog to settle. Returns `true` when every
+	/// advisor is caught up or has stopped retrying (quota/error); a timeout
+	/// returns `false` and must not abort the session.
+	fn advisor_wait_catchup(
+		&self,
+		session_id: Option<&str>,
+		session_file: Option<&std::path::Path>,
+		timeout: std::time::Duration,
+	) -> bool {
+		let _ = (session_id, session_file, timeout);
+		true
+	}
+
+	/// Stop advisor work for this session scope (idempotent).
+	fn advisor_dispose(
+		&self,
+		session_id: Option<&str>,
+		session_file: Option<&std::path::Path>,
+	) {
+		let _ = (session_id, session_file);
+	}
+
+	/// Re-prime every advisor after a conversation boundary (`/new`, branch
+	/// switch, compaction/rewind rewrite). Clears the quota latch and backlog so
+	/// a new conversation starts clean; a scope without a manager is a no-op.
+	fn advisor_reset_boundary(
+		&self,
+		session_id: Option<&str>,
+		session_file: Option<&std::path::Path>,
+	) {
+		let _ = (session_id, session_file);
+	}
+
+	/// Rendered advisor status for this scope (`None` when the advisor never
+	/// activated, i.e. disabled or no turn has run yet).
+	fn advisor_status(
+		&self,
+		session_id: Option<&str>,
+		session_file: Option<&std::path::Path>,
+	) -> Option<String> {
+		let _ = (session_id, session_file);
+		None
 	}
 }
 

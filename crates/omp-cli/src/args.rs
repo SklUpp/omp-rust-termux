@@ -108,6 +108,10 @@ struct LaunchArgs {
 	#[arg(long = "plan-yolo-into", value_name = "MODEL")]
 	plan_yolo_into: Option<String>,
 
+	/// Enable the passive advisor model for this session.
+	#[arg(long = "advisor")]
+	advisor: bool,
+
 	/// Private think scratchpad; disables supported native provider reasoning.
 	#[arg(long = "external-thinking")]
 	external_thinking: bool,
@@ -333,6 +337,9 @@ pub struct Cli {
 	/// Target model or role for plan-yolo execution (default `@smol`).
 	pub plan_yolo_into: Option<String>,
 
+	/// Enable the passive advisor model for this session (`--advisor`).
+	pub advisor: bool,
+
 	/// Private think scratchpad; disables supported native provider reasoning.
 	pub external_thinking: bool,
 
@@ -546,6 +553,7 @@ impl Cli {
 			prewalk_into: raw.prewalk_into,
 			plan_yolo: raw.plan_yolo,
 			plan_yolo_into: raw.plan_yolo_into,
+			advisor: raw.advisor,
 			external_thinking: raw.external_thinking,
 			service_tier: raw.service_tier,
 			provider: raw.provider,

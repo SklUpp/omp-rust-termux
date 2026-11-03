@@ -761,9 +761,21 @@ impl TaskTool {
 		let child_cancel_for_loop = child_cancel.clone();
 		let (event_tx, event_rx) = tokio::sync::mpsc::channel(256);
 		let salvage = Arc::new(Mutex::new(ChildSalvage::default()));
+		if let Some(hook) = self.supervisor.child_advisor_hook() {
+			let session_file = self.supervisor.child_session_file(&child_id);
+			let context = child_advisor_context(
+				&child_id,
+				Some(&item.agent.name),
+				item.agent.advisor.as_ref(),
+				session_file.as_deref(),
+			);
+			hook.on_child_start(&context, &initial_message);
+		}
 		let events = forward_child_events(
 			self.supervisor.clone(),
 			child_id.clone(),
+			Some(item.agent.name.clone()),
+			item.agent.advisor.clone(),
 			event_rx,
 			Arc::clone(&salvage),
 		);
@@ -1777,9 +1789,21 @@ async fn run_background_child(
 		.with_background_results(supervisor.owner_results_sink(Some(&child_id)))
 		.with_peer_inbox(supervisor.mailbox(), child_id.clone());
 	let (event_tx, event_rx) = tokio::sync::mpsc::channel(256);
+	if let Some(hook) = supervisor.child_advisor_hook() {
+		let session_file = supervisor.child_session_file(&child_id);
+		let context = child_advisor_context(
+			&child_id,
+			Some(&item.agent.name),
+			item.agent.advisor.as_ref(),
+			session_file.as_deref(),
+		);
+		hook.on_child_start(&context, &initial_message);
+	}
 	let events = forward_child_events(
 		Arc::clone(&supervisor),
 		child_id.clone(),
+		Some(item.agent.name.clone()),
+		item.agent.advisor.clone(),
 		event_rx,
 		salvage,
 	);
@@ -1833,11 +1857,36 @@ async fn run_background_child(
 	})
 }
 
+/// Host advisor context for one child session. The definition fields carry the
+/// agent frontmatter; the host applies `task.agentAdvisor` first (TS
+/// `resolveAgentAdvisorSelection`).
+fn child_advisor_context<'a>(
+	child_id: &'a str,
+	agent: Option<&'a str>,
+	definition: Option<&HandoffTarget>,
+	session_file: Option<&'a std::path::Path>,
+) -> crate::subagent_advisor::ChildAdvisorContext<'a> {
+	let (definition_advisor, definition_pattern) = match definition {
+		Some(HandoffTarget::Default) => (true, None),
+		Some(HandoffTarget::Pattern(pattern)) => (true, Some(pattern.as_str())),
+		None => (false, None),
+	};
+	crate::subagent_advisor::ChildAdvisorContext {
+		child_id,
+		agent,
+		session_file,
+		definition_advisor,
+		definition_pattern,
+	}
+}
+
 /// Forward real child agent events to the supervisor's observer bus. Stops when
 /// the record stops being live, so a frame never outlives its child.
 fn forward_child_events(
 	supervisor: Arc<Supervisor>,
 	child_id: String,
+	agent: Option<String>,
+	definition: Option<HandoffTarget>,
 	mut events: tokio::sync::mpsc::Receiver<AgentEvent>,
 	salvage: Arc<Mutex<ChildSalvage>>,
 ) -> tokio::task::JoinHandle<()> {
@@ -1849,6 +1898,24 @@ fn forward_child_events(
 					.lock()
 					.unwrap_or_else(std::sync::PoisonError::into_inner)
 					.capture_message(message, status);
+			}
+			// Advisor trigger parity: one settled turn, after its tool results,
+			// never an aborted one (TS `setOnTurnEnd` skips an aborted signal,
+			// `session-advisors.ts:337`). The hook schedules its own work.
+			if let AgentEvent::TurnEnd { message, tool_results, status } = &event
+				&& !matches!(status, crate::TurnStatus::Aborted)
+				&& let Some(hook) = supervisor.child_advisor_hook()
+			{
+				let session_file = supervisor.child_session_file(&child_id);
+				let context = child_advisor_context(
+					&child_id,
+					agent.as_deref(),
+					definition.as_ref(),
+					session_file.as_deref(),
+				);
+				let will_continue = matches!(status, crate::TurnStatus::ToolUse)
+					|| !message.tool_calls.is_empty();
+				hook.on_child_turn(&context, message, tool_results, will_continue);
 			}
 			// Live `history://` sees the event exactly as emitted; accounting
 			// still observes it once through `report_event` below.
@@ -1872,6 +1939,16 @@ impl Drop for LiveHistoryScope {
 	fn drop(&mut self) {
 		if let Some(manager) = crate::subagent_lifecycle::lookup(&self.supervisor) {
 			manager.drop_live(&self.id);
+		}
+		if let Some(hook) = self.supervisor.child_advisor_hook() {
+			let session_file = self.supervisor.child_session_file(&self.id);
+			let context = child_advisor_context(
+				&self.id,
+				None,
+				None,
+				session_file.as_deref(),
+			);
+			hook.on_child_end(&context);
 		}
 	}
 }
@@ -2452,12 +2529,6 @@ fn check_agent_capabilities(agent: &AgentDefinition) -> Result<(), ToolError> {
 	if agent.prewalk.is_some() {
 		return Err(ToolError::InvalidArguments(format!(
 			"Agent '{}' requests prewalk hand-off, which this build does not implement",
-			agent.name
-		)));
-	}
-	if agent.advisor.is_some() {
-		return Err(ToolError::InvalidArguments(format!(
-			"Agent '{}' requests an advisor model, which this build does not implement",
 			agent.name
 		)));
 	}

@@ -1,0 +1,1545 @@
+//! Advisor roster runtime: deltas, retries, quota latch, delivery, status.
+//!
+//! Owns the lifecycle that used to live in TS `AdvisorRuntime` +
+//! `SessionAdvisors`: one isolated advisor loop per configured entry, an
+//! append-only advisor context fed incrementally from the primary transcript,
+//! failure/backlog accounting, the quota latch (cleared only by an explicit
+//! reset), and the headless drain gate. The provider/loop execution is injected
+//! through [`AdvisorExecutor`] so this module stays independent of the runner's
+//! private wire helpers.
+//!
+//! Delivery contract: a `nit` rides the non-interrupting aside queue; a
+//! `concern`/`blocker` steers a live primary turn; an idle concern is preserved
+//! as a visible card (this build has no agent-initiated turns); during a
+//! headless drain every severity is preserved, blocker included, without
+//! starting a hidden primary turn.
+
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
+
+use pi_agent::{Message, Role, StopReason};
+
+use crate::advisor_config::{AdvisorEntry, slugify};
+use crate::advisor_emit::{
+	self, Channel, ChannelInputs, EmissionGuard, Note, Severity, details_json, format_batch,
+	immune_active,
+};
+use crate::advisor_identity::{self, AdvisorIdentities};
+use crate::advisor_render::{fingerprint, render_delta};
+use crate::advisor_tool::AdviseTool;
+use crate::advisor_transcript::{AdvisorTranscript, load_costs};
+use crate::approve::Approvals;
+use crate::catalog::Catalog;
+use crate::config::Config;
+
+/// Visible health of one advisor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeStatus {
+	Running,
+	Paused,
+	QuotaExhausted,
+	Error,
+	NoModel,
+}
+
+impl RuntimeStatus {
+	#[must_use]
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Self::Running => "running",
+			Self::Paused => "paused",
+			Self::QuotaExhausted => "quota_exhausted",
+			Self::Error => "error",
+			Self::NoModel => "no_model",
+		}
+	}
+}
+
+/// Resolved provider route for one advisor. Credentials are the advisor's own —
+/// never the primary's in-memory key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdvisorRoute {
+	pub provider: String,
+	pub model:    String,
+	pub effort:   Option<String>,
+	pub api_key:  Option<String>,
+}
+
+/// Injected provider/loop execution.
+#[async_trait::async_trait]
+pub trait AdvisorExecutor: Send + Sync {
+	async fn execute(&self, spec: AdvisorCallSpec) -> AdvisorCallResult;
+}
+
+/// Everything one advisor model call needs. The executor owns provider and tool
+/// construction; the manager owns context, delivery, and failure policy.
+pub struct AdvisorCallSpec {
+	pub advisor_name:         String,
+	pub slug:                 String,
+	pub route:                AdvisorRoute,
+	pub system_prompt:        String,
+	pub history:              Vec<Message>,
+	pub prompt:               String,
+	pub tools:                Option<Vec<String>>,
+	pub cwd:                  std::path::PathBuf,
+	pub context_limit:        usize,
+	pub max_turns:            usize,
+	pub provider_session_id:  String,
+	pub prompt_cache_key:     String,
+	pub service_tier_by_family: BTreeMap<String, String>,
+	pub config:               Config,
+	pub catalog:              Arc<Catalog>,
+	pub approvals:            Approvals,
+	pub advise:               Arc<AdviseTool>,
+	pub cancel:               pi_agent::CancellationToken,
+}
+
+impl std::fmt::Debug for AdvisorCallSpec {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("AdvisorCallSpec")
+			.field("advisor_name", &self.advisor_name)
+			.field("slug", &self.slug)
+			.field("route", &self.route)
+			.field("history", &self.history.len())
+			.finish()
+	}
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct AdvisorCallResult {
+	/// Complete advisor context after the call (never includes a system
+	/// message; the executor keeps that out of stored history).
+	pub history:            Vec<Message>,
+	/// Assistant turns this call billed, for transcript/cost accounting.
+	pub assistant_messages: Vec<Message>,
+	pub error:              Option<String>,
+}
+
+/// Card sink: `(formatted advisory body, details {notes:[…]})`.
+pub type CardSink = Arc<dyn Fn(&str, &serde_json::Value) + Send + Sync>;
+/// Persisted `custom_message` type for one delivered advice card.
+pub const CARD_CUSTOM_TYPE: &str = "advisor";
+/// Steer sink: inject text into the live primary turn; `false` when idle.
+pub type SteerSink = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+/// Resolve a model pattern to a provider route.
+pub type RouteResolver = Arc<dyn Fn(&str) -> Result<AdvisorRoute, String> + Send + Sync>;
+
+pub struct AdvisorManagerOptions {
+	pub cwd:                std::path::PathBuf,
+	pub agent_dir:          Option<std::path::PathBuf>,
+	pub config:             Config,
+	pub catalog:            Arc<Catalog>,
+	pub approvals:          Approvals,
+	pub primary_session_id: Option<String>,
+	pub primary_cache_key:  Option<String>,
+	pub session_file:       Option<std::path::PathBuf>,
+	pub service_tier:       BTreeMap<String, String>,
+	pub context_prompt:     Option<String>,
+	pub watchdog_prompt:    Option<String>,
+	pub shared_instructions: Option<String>,
+	pub roster:             Vec<AdvisorEntry>,
+	pub executor:           Arc<dyn AdvisorExecutor>,
+	pub resolver:           RouteResolver,
+	pub identities:         Arc<AdvisorIdentities>,
+	pub handle:             tokio::runtime::Handle,
+}
+
+const ADVISOR_SYSTEM_PROMPT: &str = "You are a passive advisor watching another coding agent work.\n\n\
+Review the session update. Prefer silence when the agent is on track: a turn with no advice is a \
+complete review, not a failure. When you do advise, send at most one `advise` call per update, \
+with one concrete, specific, actionable note. Never repeat advice you already gave. Use the read/\
+grep/glob tools (when granted) to verify claims before flagging them. Severity: `nit` for a \
+suggestion, `concern` for a likely defect, `blocker` only for handed-off broken or unexercised \
+work.";
+
+/// One queued update.
+#[derive(Debug, Clone)]
+struct PendingDelta {
+	raw:   Vec<Message>,
+	text:  String,
+	wip:   bool,
+	turns: usize,
+}
+
+/// Forwards `advise` notes from a slot's tool into the manager once the
+/// manager's `Arc` exists (slots are built before the manager).
+struct AdviceRouter {
+	manager: Mutex<Option<std::sync::Weak<AdvisorManager>>>,
+	index:   usize,
+}
+
+impl AdviceRouter {
+	fn dispatch(&self, note: Note) {
+		let manager = self
+			.manager
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner())
+			.as_ref()
+			.and_then(std::sync::Weak::upgrade);
+		if let Some(manager) = manager
+			&& let Some(slot) = manager.slots.get(self.index)
+		{
+			manager.route_advice(slot, note);
+		}
+	}
+}
+
+struct SlotState {
+	history:            Vec<Message>,
+	/// Fingerprints of the primary feed prefix already rendered.
+	seen_prefix:        Vec<u64>,
+	pending:            Vec<PendingDelta>,
+	backlog:            usize,
+	seen_context:       BTreeMap<String, String>,
+	include_thinking:   bool,
+	failures:           u32,
+	dropped_backlogs:   u32,
+	quota:              bool,
+	halted:             bool,
+	failing:            bool,
+	transcript:         AdvisorTranscript,
+	cancel:             Option<pi_agent::CancellationToken>,
+}
+
+impl Default for SlotState {
+	fn default() -> Self {
+		Self {
+			history: Vec::new(),
+			seen_prefix: Vec::new(),
+			pending: Vec::new(),
+			backlog: 0,
+			seen_context: BTreeMap::new(),
+			include_thinking: true,
+			failures: 0,
+			dropped_backlogs: 0,
+			quota: false,
+			halted: false,
+			failing: false,
+			transcript: AdvisorTranscript::new(),
+			cancel: None,
+		}
+	}
+}
+
+pub struct AdvisorSlot {
+	pub name:          String,
+	pub slug:          String,
+	route:             Option<AdvisorRoute>,
+	tools:             Option<Vec<String>>,
+	system_prompt:     String,
+	status:            Mutex<RuntimeStatus>,
+	state:             Mutex<SlotState>,
+	advise:            Arc<AdviseTool>,
+	guard:             Mutex<EmissionGuard>,
+	cost:              Mutex<f64>,
+	busy:              AtomicBool,
+}
+
+struct Inner {
+	executor:             Arc<dyn AdvisorExecutor>,
+	identities:           Arc<AdvisorIdentities>,
+	cwd:                  std::path::PathBuf,
+	config:               Config,
+	catalog:              Arc<Catalog>,
+	approvals:            Approvals,
+	service_tier:         BTreeMap<String, String>,
+	handle:               tokio::runtime::Handle,
+	primary_session_id:   Mutex<Option<String>>,
+	primary_cache_key:    Mutex<Option<String>>,
+	session_file:         Mutex<Option<std::path::PathBuf>>,
+	card_sink:            Mutex<Option<CardSink>>,
+	steer_sink:           Mutex<Option<SteerSink>>,
+	feed:                 Mutex<Vec<Message>>,
+	asides:               Mutex<Vec<Note>>,
+	pending_injection:    Mutex<Option<String>>,
+	streaming:            AtomicBool,
+	aborting:             AtomicBool,
+	terminal_answer:      AtomicBool,
+	completed_turns:      AtomicU64,
+	immune_start:         Mutex<Option<u64>>,
+	auto_resume_suppressed: AtomicBool,
+	preserve_only:        AtomicBool,
+	disposed:             AtomicBool,
+	/// The next primary run must seed its feed cursor instead of replaying the
+	/// whole history (fresh manager, or a conversation-boundary reset).
+	needs_seed:           AtomicBool,
+	/// Wake primitive for catch-up waiters.
+	signal:               Mutex<()>,
+	cv:                   Condvar,
+}
+
+pub struct AdvisorManager {
+	inner:    Arc<Inner>,
+	slots:    Vec<Arc<AdvisorSlot>>,
+	signature: String,
+}
+
+/// `AdvisorStats` per advisor, for `/advisor status` equivalents.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PerAdvisorStat {
+	pub name:           String,
+	pub status:         RuntimeStatus,
+	pub model:          Option<String>,
+	pub context_window: usize,
+	pub context_tokens: usize,
+	pub input:          u64,
+	pub output:         u64,
+	pub reasoning:      u64,
+	pub cache_read:     u64,
+	pub cache_write:    u64,
+	pub total_tokens:   u64,
+	pub cost:           f64,
+	pub user_messages:  usize,
+	pub assistant_messages: usize,
+	pub session_id:     Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AdvisorStats {
+	pub configured: bool,
+	pub active:     bool,
+	pub advisors:   Vec<PerAdvisorStat>,
+}
+
+impl AdvisorManager {
+	/// Build the roster. Disabled entries stay in the status list as `paused`;
+	/// an unresolvable model stays `no_model` instead of silently borrowing
+	/// another model.
+	#[must_use]
+	pub fn new(options: AdvisorManagerOptions) -> Arc<Self> {
+		let existing_costs = load_costs(options.session_file.as_deref());
+		let identities = Arc::clone(&options.identities);
+		let resolver = Arc::clone(&options.resolver);
+		let mut slots = Vec::new();
+		let mut routers: Vec<Arc<AdviceRouter>> = Vec::new();
+		let mut used_slugs: Vec<String> = Vec::new();
+
+		for entry in &options.roster {
+			let legacy = options.roster.len() == 1 && entry.name == "default";
+			let mut slug = if legacy { String::new() } else { slugify(&entry.name) };
+			if !slug.is_empty() {
+				let base = slug.clone();
+				let mut suffix = 2;
+				while used_slugs.contains(&slug) {
+					slug = format!("{base}-{suffix}");
+					suffix += 1;
+				}
+				used_slugs.push(slug.clone());
+			}
+			let pattern = entry
+				.model
+				.clone()
+				.unwrap_or_else(|| "@advisor".to_string());
+			let route = resolver(&pattern).ok();
+			let status = if entry.enabled == Some(false) {
+				RuntimeStatus::Paused
+			} else if route.is_none() {
+				RuntimeStatus::NoModel
+			} else {
+				RuntimeStatus::Running
+			};
+			let mut system_parts = vec![ADVISOR_SYSTEM_PROMPT.to_string()];
+			if let Some(context) = &options.context_prompt {
+				system_parts.push(context.clone());
+			}
+			if let Some(watchdog) = &options.watchdog_prompt {
+				system_parts.push(watchdog.clone());
+			}
+			if let Some(shared) = &options.shared_instructions {
+				system_parts.push(shared.clone());
+			}
+			if let Some(instructions) = &entry.instructions {
+				system_parts.push(instructions.clone());
+			}
+			let system_prompt = system_parts.join("\n\n");
+			let router = Arc::new(AdviceRouter {
+				manager: Mutex::new(None),
+				index:   slots.len(),
+			});
+			routers.push(Arc::clone(&router));
+			let advise: Arc<AdviseTool> = Arc::new(AdviseTool::new(Arc::new({
+				move |note: Note| router.dispatch(note)
+			})));
+			let cost = Mutex::new(*existing_costs.get(&slug).unwrap_or(&0.0));
+			slots.push(Arc::new(AdvisorSlot {
+				name: entry.name.clone(),
+				slug,
+				route,
+				tools: entry.tools.clone(),
+				system_prompt,
+				status: Mutex::new(status),
+				state: Mutex::new(SlotState::default()),
+				advise,
+				guard: Mutex::new(EmissionGuard::new()),
+				cost,
+				busy: AtomicBool::new(false),
+			}));
+		}
+		let signature = roster_signature(
+			&slots,
+			options.cwd.as_path(),
+			options.context_prompt.as_deref(),
+			options.watchdog_prompt.as_deref(),
+			options.shared_instructions.as_deref(),
+			&options.config,
+		);
+
+		let inner = Arc::new(Inner {
+			executor: options.executor,
+			identities,
+			cwd: options.cwd,
+			config: options.config,
+			catalog: options.catalog,
+			approvals: options.approvals,
+			service_tier: options.service_tier,
+			handle: options.handle,
+			primary_session_id: Mutex::new(options.primary_session_id),
+			primary_cache_key: Mutex::new(options.primary_cache_key),
+			session_file: Mutex::new(options.session_file),
+			card_sink: Mutex::new(None),
+			steer_sink: Mutex::new(None),
+			feed: Mutex::new(Vec::new()),
+			asides: Mutex::new(Vec::new()),
+			pending_injection: Mutex::new(None),
+			streaming: AtomicBool::new(false),
+			aborting: AtomicBool::new(false),
+			terminal_answer: AtomicBool::new(false),
+			completed_turns: AtomicU64::new(0),
+			immune_start: Mutex::new(None),
+			auto_resume_suppressed: AtomicBool::new(false),
+			preserve_only: AtomicBool::new(false),
+			disposed: AtomicBool::new(false),
+			needs_seed: AtomicBool::new(true),
+			signal: Mutex::new(()),
+			cv: Condvar::new(),
+		});
+
+		let manager = Arc::new(Self {
+			inner,
+			slots,
+			signature,
+		});
+		for router in routers {
+			*router
+				.manager
+				.lock()
+				.unwrap_or_else(|poison| poison.into_inner()) = Some(Arc::downgrade(&manager));
+		}
+		manager
+	}
+
+	#[must_use]
+	pub fn signature(&self) -> &str {
+		&self.signature
+	}
+
+	/// Install the per-run sinks: persistence/display for cards, and live-turn
+	/// steering. Called on every run so a resumed session never writes through a
+	/// stale channel.
+	pub fn configure_run(
+		self: &Arc<Self>,
+		primary_session_id: Option<String>,
+		primary_cache_key: Option<String>,
+		session_file: Option<std::path::PathBuf>,
+		card_sink: Option<CardSink>,
+		steer_sink: Option<SteerSink>,
+	) {
+		*self.inner.primary_session_id.lock().unwrap_or_else(|poison| poison.into_inner()) =
+			primary_session_id;
+		*self.inner.primary_cache_key.lock().unwrap_or_else(|poison| poison.into_inner()) =
+			primary_cache_key;
+		*self.inner.session_file.lock().unwrap_or_else(|poison| poison.into_inner()) = session_file;
+		*self.inner.card_sink.lock().unwrap_or_else(|poison| poison.into_inner()) = card_sink;
+		*self.inner.steer_sink.lock().unwrap_or_else(|poison| poison.into_inner()) = steer_sink;
+	}
+
+	/// Start a primary run: reset the live flag, set the base transcript, and
+	/// hand back any aside advice that must ride the next provider request.
+	///
+	/// A fresh manager (mid-session enable, resume) or a conversation-boundary
+	/// reset seeds the cursor at the current history length, so the advisors
+	/// review later turns instead of being handed the whole transcript.
+	pub fn begin_primary_run(self: &Arc<Self>, history: &[Message]) {
+		if self.inner.disposed.load(Ordering::SeqCst) {
+			return;
+		}
+		let mut feed = self.inner.feed.lock().unwrap_or_else(|poison| poison.into_inner());
+		feed.clear();
+		feed.extend(
+			history
+				.iter()
+				.filter(|message| {
+					!matches!(message.role, Role::System | Role::Developer)
+				})
+				.cloned(),
+		);
+		if self.inner.needs_seed.swap(false, Ordering::SeqCst) {
+			let prefix: Vec<u64> = feed.iter().map(fingerprint).collect();
+			for slot in &self.slots {
+				let mut state =
+					slot.state.lock().unwrap_or_else(|poison| poison.into_inner());
+				state.seen_prefix = prefix.clone();
+				state.history.clear();
+				state.pending.clear();
+				state.backlog = 0;
+				state.seen_context.clear();
+			}
+		}
+		drop(feed);
+		self.inner.streaming.store(true, Ordering::SeqCst);
+		self.inner.aborting.store(false, Ordering::SeqCst);
+		self.inner.terminal_answer.store(false, Ordering::SeqCst);
+	}
+
+	/// Append the accepted user message (the primary loop appends it itself).
+	pub fn push_user(self: &Arc<Self>, message: &Message) {
+		if self.inner.disposed.load(Ordering::SeqCst) {
+			return;
+		}
+		self.inner
+			.feed
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner())
+			.push(message.clone());
+	}
+
+	/// Append one completed primary turn and queue its delta.
+	pub fn push_turn(self: &Arc<Self>, message: &Message, tool_results: &[pi_agent::ToolResult]) {
+		if self.inner.disposed.load(Ordering::SeqCst) {
+			return;
+		}
+		let mut feed = self.inner.feed.lock().unwrap_or_else(|poison| poison.into_inner());
+		let terminal = message.role == Role::Assistant
+			&& message.tool_calls.is_empty()
+			&& !message.content.trim().is_empty();
+		feed.push(message.clone());
+		let names: BTreeMap<&str, &str> = message
+			.tool_calls
+			.iter()
+			.map(|call| (call.id.as_str(), call.name.as_str()))
+			.collect();
+		for result in tool_results {
+			let name = names.get(result.tool_call_id.as_str()).copied().unwrap_or("tool");
+			feed.push(Message::tool_with_status(
+				result.tool_call_id.clone(),
+				name,
+				result.content.clone(),
+				result.is_error,
+			));
+		}
+		let will_continue = !message.tool_calls.is_empty()
+			|| message.stop_reason == Some(StopReason::ToolUse);
+		drop(feed);
+		self.inner
+			.completed_turns
+			.fetch_add(1, Ordering::SeqCst);
+		self.inner.terminal_answer.store(terminal, Ordering::SeqCst);
+		for slot in &self.slots {
+			self.queue_delta(slot, will_continue);
+		}
+		self.notify();
+	}
+
+	/// End a primary run. Idle asides are announced now (they will still ride the
+	/// next provider request) so a user sees the advice without a new prompt.
+	pub fn end_primary_run(self: &Arc<Self>) {
+		self.inner.streaming.store(false, Ordering::SeqCst);
+		self.inner.aborting.store(false, Ordering::SeqCst);
+		if self.inner.disposed.load(Ordering::SeqCst) {
+			return;
+		}
+		self.announce_asides();
+		self.notify();
+	}
+
+	/// Mark the primary turn as interrupted/aborting (steer must not auto-resume).
+	pub fn mark_primary_aborted(&self) {
+		self.inner.aborting.store(true, Ordering::SeqCst);
+		self.inner.auto_resume_suppressed.store(true, Ordering::SeqCst);
+	}
+
+	fn notify(&self) {
+		self.inner.cv.notify_all();
+	}
+
+	/// Compute the delta for one advisor from the shared feed.
+	fn queue_delta(self: &Arc<Self>, slot: &Arc<AdvisorSlot>, wip: bool) {
+		let feed = self.inner.feed.lock().unwrap_or_else(|poison| poison.into_inner());
+		let mut state = slot.state.lock().unwrap_or_else(|poison| poison.into_inner());
+		if state.quota || state.halted || self.inner.disposed.load(Ordering::SeqCst) {
+			return;
+		}
+		let prefix_changed = feed.len() < state.seen_prefix.len()
+			|| state
+				.seen_prefix
+				.iter()
+				.enumerate()
+				.any(|(index, seen)| fingerprint(&feed[index]) != *seen);
+		let raw: Vec<Message> = if prefix_changed {
+			state.history.clear();
+			state.pending.clear();
+			state.backlog = 0;
+			state.seen_context.clear();
+			state.include_thinking = true;
+			feed.clone()
+		} else {
+			feed[state.seen_prefix.len()..].to_vec()
+		};
+		state.seen_prefix = feed.iter().map(fingerprint).collect();
+		drop(feed);
+		if raw.is_empty() {
+			return;
+		}
+		// Preview render: do not advance the live seen-context map; the dispatch
+		// render advances it once, after a successful turn.
+		let mut preview = state.seen_context.clone();
+		let Some(text) = render_delta(&raw, wip, state.include_thinking, &mut preview) else {
+			return;
+		};
+		state.pending.push(PendingDelta { raw, text, wip, turns: 1 });
+		state.backlog += 1;
+		drop(state);
+		self.schedule(slot);
+	}
+
+	fn schedule(self: &Arc<Self>, slot: &Arc<AdvisorSlot>) {
+		if slot.busy.swap(true, Ordering::SeqCst) {
+			return;
+		}
+		let manager = Arc::clone(self);
+		let slot = Arc::clone(slot);
+		self.inner.handle.spawn(async move {
+			manager.drain(slot).await;
+		});
+	}
+
+	async fn drain(self: Arc<Self>, slot: Arc<AdvisorSlot>) {
+		loop {
+			let (batch, prompt, seen_after, epoch) = {
+				let mut state = slot.state.lock().unwrap_or_else(|poison| poison.into_inner());
+				if state.pending.is_empty()
+					|| state.quota
+					|| state.halted
+					|| self.inner.disposed.load(Ordering::SeqCst)
+				{
+					break;
+				}
+				let batch: Vec<PendingDelta> = std::mem::take(&mut state.pending);
+				let raw: Vec<Message> = batch.iter().flat_map(|item| item.raw.clone()).collect();
+				let wip = batch.last().is_some_and(|item| item.wip);
+				let turns = batch.iter().map(|item| item.turns).sum::<usize>();
+				let mut seen = state.seen_context.clone();
+				let rendered = render_delta(&raw, wip, state.include_thinking, &mut seen)
+					.or_else(|| {
+						let joined = batch
+							.iter()
+							.map(|item| item.text.as_str())
+							.collect::<Vec<_>>()
+							.join("\n\n");
+						(!joined.trim().is_empty()).then_some(joined)
+					});
+				let Some(prompt) = rendered else {
+					state.backlog = state.backlog.saturating_sub(turns);
+					continue;
+				};
+				state.cancel = Some(pi_agent::CancellationToken::new());
+				let cancel = state.cancel.clone().expect("cancel");
+				let history = std::mem::take(&mut state.history);
+				(
+					BatchState { batch, turns, wip, history, cancel },
+					prompt,
+					seen,
+					state.dropped_backlogs,
+				)
+			};
+			let BatchState { batch, turns, wip, history, cancel } = batch;
+			let _ = epoch;
+
+			let cwd = self.inner.cwd.clone();
+			let route = match &slot.route {
+				Some(route) => route.clone(),
+				None => {
+					let mut state = slot.state.lock().unwrap_or_else(|poison| poison.into_inner());
+					state.history = history;
+					state.backlog = state.backlog.saturating_sub(turns);
+					let mut status = slot.status.lock().unwrap_or_else(|poison| poison.into_inner());
+					*status = RuntimeStatus::NoModel;
+					break;
+				},
+			};
+			let primary = self
+				.inner
+				.primary_session_id
+				.lock()
+				.unwrap_or_else(|poison| poison.into_inner())
+				.clone();
+			let cache_key = self
+				.inner
+				.primary_cache_key
+				.lock()
+				.unwrap_or_else(|poison| poison.into_inner())
+				.clone();
+			let session_id = self
+				.inner
+				.identities
+				.provider_session_id(primary.as_deref(), &slot.slug);
+			let prompt_cache_key =
+				advisor_identity::prompt_cache_key(cache_key.as_deref(), &session_id);
+			let context_limit = self
+				.inner
+				.catalog
+				.context_window(&route.provider, &route.model)
+				.unwrap_or(crate::runtime::DEFAULT_CONTEXT_LIMIT);
+			slot.advise.begin_update(wip);
+			let mut guard = slot.guard.lock().unwrap_or_else(|poison| poison.into_inner());
+			guard.begin_update();
+			drop(guard);
+			let mut transcript = {
+				let mut state = slot.state.lock().unwrap_or_else(|poison| poison.into_inner());
+				std::mem::replace(&mut state.transcript, AdvisorTranscript::new())
+			};
+			transcript.begin_turn();
+
+			let spec = AdvisorCallSpec {
+				advisor_name: slot.name.clone(),
+				slug: slot.slug.clone(),
+				route: route.clone(),
+				system_prompt: slot.system_prompt.clone(),
+				history: history.clone(),
+				prompt: prompt.clone(),
+				tools: slot.tools.clone(),
+				cwd: cwd.clone(),
+				context_limit,
+				max_turns: crate::runtime::DEFAULT_MAX_TURNS,
+				provider_session_id: session_id.clone(),
+				prompt_cache_key,
+				service_tier_by_family: self.inner.service_tier.clone(),
+				config: self.inner.config.clone(),
+				catalog: Arc::clone(&self.inner.catalog),
+				approvals: self.inner.approvals.clone(),
+				advise: Arc::clone(&slot.advise),
+				cancel: cancel.clone(),
+			};
+			let result = self.inner.executor.execute(spec).await;
+			let cancelled = cancel.is_cancelled();
+			if cancelled && self.inner.disposed.load(Ordering::SeqCst) {
+				transcript.abandon_turn();
+				let mut state = slot.state.lock().unwrap_or_else(|poison| poison.into_inner());
+				state.transcript = transcript;
+				state.history = history;
+				break;
+			}
+
+			match result.error {
+				None => {
+					{
+						let mut state = slot.state.lock().unwrap_or_else(|poison| poison.into_inner());
+						state.history = result.history;
+						state.seen_context = seen_after;
+						state.failures = 0;
+						state.failing = false;
+						state.backlog = state.backlog.saturating_sub(turns);
+						state.transcript = transcript;
+						state.transcript.commit_turn();
+						let session_file = self
+							.inner
+							.session_file
+							.lock()
+							.unwrap_or_else(|poison| poison.into_inner())
+							.clone();
+						for message in result.history.iter().skip(history.len()) {
+							state
+								.transcript
+								.record(
+									message,
+									session_file.as_deref(),
+									&slot.slug,
+									&cwd,
+									&self.inner.catalog,
+									&route.provider,
+									&route.model,
+								);
+						}
+					}
+					let mut cost = slot.cost.lock().unwrap_or_else(|poison| poison.into_inner());
+					for message in &result.assistant_messages {
+						*cost += crate::advisor_transcript::priced_usage(
+							message,
+							&self.inner.catalog,
+							&route.provider,
+							&route.model,
+						)
+						.and_then(|usage| usage.cost)
+						.map(|cost| cost.total)
+						.unwrap_or(0.0);
+					}
+					drop(cost);
+					let mut status = slot.status.lock().unwrap_or_else(|poison| poison.into_inner());
+					if *status != RuntimeStatus::Paused {
+						*status = RuntimeStatus::Running;
+					}
+					drop(status);
+					self.notify();
+				},
+				Some(error) => {
+					let mut state = slot.state.lock().unwrap_or_else(|poison| poison.into_inner());
+					state.history = history;
+					state.failing = true;
+					state.transcript = transcript;
+					if is_quota_error(&error) {
+						state.quota = true;
+						state.failures = 0;
+						state.pending = requeue(batch, state.pending.clone());
+						state.transcript.abandon_turn();
+						drop(state);
+						let mut status =
+							slot.status.lock().unwrap_or_else(|poison| poison.into_inner());
+						*status = RuntimeStatus::QuotaExhausted;
+						drop(status);
+						self.notify();
+						break;
+					}
+					if is_permanent_error(&error) || state.failures + 1 >= 3 {
+						state.failures = 0;
+						state.dropped_backlogs += 1;
+						state.backlog = state.backlog.saturating_sub(turns);
+						state.failing = false;
+						state.transcript.abandon_turn();
+						if state.dropped_backlogs >= 3 {
+							state.halted = true;
+							state.pending.clear();
+							state.backlog = 0;
+						}
+						drop(state);
+						let mut status =
+							slot.status.lock().unwrap_or_else(|poison| poison.into_inner());
+						*status = RuntimeStatus::Error;
+						drop(status);
+						self.notify();
+						break;
+					}
+					state.failures += 1;
+					state.pending = requeue(batch, state.pending.clone());
+					state.transcript.abandon_turn();
+					drop(state);
+					self.notify();
+					tokio::time::sleep(Duration::from_millis(1000)).await;
+				},
+			}
+		}
+		slot.busy.store(false, Ordering::SeqCst);
+		self.notify();
+	}
+
+	/// Block until every advisor's backlog drops below one, or the runtime is
+	/// failing/quota/halted (a failing advisor must never park the primary).
+	#[must_use]
+	pub fn wait_for_catchup(&self, timeout: Duration) -> bool {
+		let deadline = Instant::now() + timeout;
+		let mut caught_up = true;
+		for slot in &self.slots {
+			loop {
+				{
+					let state = slot.state.lock().unwrap_or_else(|poison| poison.into_inner());
+					if state.backlog < 1 || state.quota || state.halted || state.failing {
+						break;
+					}
+				}
+				let now = Instant::now();
+				if now >= deadline {
+					caught_up = false;
+					break;
+				}
+				let guard = self.inner.signal.lock().unwrap_or_else(|poison| poison.into_inner());
+				let _ = self
+					.inner
+					.cv
+					.wait_timeout(guard, deadline.saturating_duration_since(now));
+			}
+		}
+		caught_up
+	}
+
+	/// Pause the primary while any advisor is `threshold` or more turns behind.
+	/// Bounded by `timeout` (TS `syncBacklog`'s 30s); a failing, quota-latched,
+	/// or halted advisor never parks the primary. `true` when the roster is
+	/// within the threshold (or was allowed to proceed).
+	#[must_use]
+	pub fn sync_backlog(&self, threshold: usize, timeout: Duration) -> bool {
+		let deadline = Instant::now() + timeout;
+		loop {
+			let blocked = self.slots.iter().any(|slot| {
+				let state = slot.state.lock().unwrap_or_else(|poison| poison.into_inner());
+				state.backlog >= threshold && !(state.quota || state.halted || state.failing)
+			});
+			if !blocked {
+				return true;
+			}
+			let now = Instant::now();
+			if now >= deadline {
+				return false;
+			}
+			let guard = self.inner.signal.lock().unwrap_or_else(|poison| poison.into_inner());
+			let _ = self
+				.inner
+				.cv
+				.wait_timeout(guard, deadline.saturating_duration_since(now));
+		}
+	}
+
+	/// Total queued updates across the roster (diagnostics).
+	#[must_use]
+	pub fn backlog(&self) -> usize {
+		self.slots
+			.iter()
+			.map(|slot| {
+				slot.state
+					.lock()
+					.unwrap_or_else(|poison| poison.into_inner())
+					.backlog
+			})
+			.sum()
+	}
+
+	/// Take the next aside batch for the primary request, without announcing it
+	/// again. Returns the already-announced text when present.
+	pub fn take_pending_aside_content(&self) -> Option<String> {
+		self.inner
+			.pending_injection
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner())
+			.take()
+	}
+
+	fn announce_asides(self: &Arc<Self>) {
+		let notes: Vec<Note> = {
+			let mut asides = self.inner.asides.lock().unwrap_or_else(|poison| poison.into_inner());
+			std::mem::take(&mut *asides)
+		};
+		if notes.is_empty() {
+			return;
+		}
+		let content = format_batch(&notes);
+		let details = details_json(&notes);
+		self.emit_card(&content, &details);
+		*self
+			.inner
+			.pending_injection
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner()) = Some(content);
+	}
+
+	/// Hourly-safe card emission: one card per note batch, persisted/displayed
+	/// through the host sink (never a duplicate event-wire card).
+	pub fn emit_card(&self, content: &str, details: &serde_json::Value) {
+		if let Some(sink) = self
+			.inner
+			.card_sink
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner())
+			.as_ref()
+		{
+			sink(content, details);
+		}
+	}
+
+	/// Route one accepted note from `slot`.
+	fn route_advice(self: &Arc<Self>, slot: &Arc<AdvisorSlot>, note: Note) {
+		if self.inner.disposed.load(Ordering::SeqCst) {
+			return;
+		}
+		let mut guard = slot.guard.lock().unwrap_or_else(|poison| poison.into_inner());
+		if !guard.accept(&note.note) {
+			return;
+		}
+		drop(guard);
+		let interrupting = advisor_emit::is_interrupting(note.severity);
+		let immune = {
+			let start = *self
+				.inner
+				.immune_start
+				.lock()
+				.unwrap_or_else(|poison| poison.into_inner());
+			immune_active(
+				self.inner.completed_turns.load(Ordering::SeqCst),
+				start,
+				self.inner.config.advisor.immune_turns(),
+			)
+		};
+		let channel = advisor_emit::resolve_channel(ChannelInputs {
+			severity: note.severity,
+			auto_resume_suppressed: self.inner.auto_resume_suppressed.load(Ordering::SeqCst),
+			streaming: self.inner.streaming.load(Ordering::SeqCst),
+			aborting: self.inner.aborting.load(Ordering::SeqCst),
+			terminal_answer_no_queued: self.inner.terminal_answer.load(Ordering::SeqCst)
+				&& self.inner.asides.lock().map(|asides| asides.is_empty()).unwrap_or(true),
+			interrupt_immune_turn: interrupting && immune,
+			preserve_only: self.inner.preserve_only.load(Ordering::SeqCst),
+		});
+		let batch = [note];
+		match channel {
+			Channel::Aside => {
+				self
+					.inner
+					.asides
+					.lock()
+					.unwrap_or_else(|poison| poison.into_inner())
+					.extend(batch);
+			},
+			Channel::Preserve => {
+				self.emit_card(&format_batch(&batch), &details_json(&batch));
+			},
+			Channel::Steer => {
+				let content = format_batch(&batch);
+				let steered = self
+					.inner
+					.steer_sink
+					.lock()
+					.unwrap_or_else(|poison| poison.into_inner())
+					.as_ref()
+					.is_some_and(|sink| sink(&content));
+				if steered {
+					self.emit_card(&content, &details_json(&batch));
+					let completed = self.inner.completed_turns.load(Ordering::SeqCst);
+					*self
+						.inner
+						.immune_start
+						.lock()
+						.unwrap_or_else(|poison| poison.into_inner()) = Some(completed + 1);
+				} else {
+					// No live turn: this build never starts an agent-initiated turn.
+					self.emit_card(&content, &details_json(&batch));
+				}
+			},
+		}
+	}
+
+	/// Prepare the headless drain: from here on every severity is preserved and
+	/// no note can start a hidden primary turn.
+	pub fn prepare_headless_drain(self: &Arc<Self>) {
+		self.inner.preserve_only.store(true, Ordering::SeqCst);
+		self.announce_asides();
+		self.notify();
+	}
+
+	/// Restore normal routing when a kept-alive session starts new work.
+	pub fn on_primary_turn_start(&self) {
+		self.inner.preserve_only.store(false, Ordering::SeqCst);
+	}
+
+	/// Re-prime every advisor after a conversation boundary or history rewrite.
+	pub fn reset(&self, _reason: &str) {
+		self.inner.aborting.store(false, Ordering::SeqCst);
+		self.inner.auto_resume_suppressed.store(false, Ordering::SeqCst);
+		self.inner.completed_turns.store(0, Ordering::SeqCst);
+		self.inner.needs_seed.store(true, Ordering::SeqCst);
+		*self
+			.inner
+			.immune_start
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner()) = None;
+		self.inner.asides.lock().unwrap_or_else(|poison| poison.into_inner()).clear();
+		*self
+			.inner
+			.pending_injection
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner()) = None;
+		for slot in &self.slots {
+			let mut state = slot.state.lock().unwrap_or_else(|poison| poison.into_inner());
+			if let Some(cancel) = state.cancel.take() {
+				cancel.cancel();
+			}
+			state.history.clear();
+			state.seen_prefix.clear();
+			state.pending.clear();
+			state.backlog = 0;
+			state.seen_context.clear();
+			state.failures = 0;
+			state.dropped_backlogs = 0;
+			state.failing = false;
+			state.quota = false;
+			state.halted = false;
+			drop(state);
+			slot.advise.reset_delivered_notes();
+			slot.guard
+				.lock()
+				.unwrap_or_else(|poison| poison.into_inner())
+				.reset();
+			let mut status = slot.status.lock().unwrap_or_else(|poison| poison.into_inner());
+			if *status != RuntimeStatus::Paused && *status != RuntimeStatus::NoModel {
+				*status = RuntimeStatus::Running;
+			}
+		}
+		self.notify();
+	}
+
+	/// Seed the cursor to the current transcript length (enabled mid-session or
+	/// resumed): the next turn must not replay older history.
+	pub fn seed_to(&self, count: usize) {
+		let feed = self.inner.feed.lock().unwrap_or_else(|poison| poison.into_inner());
+		let len = count.min(feed.len());
+		let prefix: Vec<u64> = feed[..len].iter().map(fingerprint).collect();
+		drop(feed);
+		for slot in &self.slots {
+			let mut state = slot.state.lock().unwrap_or_else(|poison| poison.into_inner());
+			state.seen_prefix = prefix.clone();
+			state.history.clear();
+			state.pending.clear();
+			state.backlog = 0;
+			state.failures = 0;
+			state.failing = false;
+			state.dropped_backlogs = 0;
+			state.seen_context.clear();
+		}
+		self.notify();
+	}
+
+	/// Per-slug spend ledger snapshot.
+	#[must_use]
+	pub fn cost_snapshot(&self) -> BTreeMap<String, f64> {
+		self.slots
+			.iter()
+			.map(|slot| {
+				(
+					slot.slug.clone(),
+					*slot.cost.lock().unwrap_or_else(|poison| poison.into_inner()),
+				)
+			})
+			.collect()
+	}
+
+	/// Add the process-local delta billed after a persisted snapshot.
+	pub fn restore_costs(&self, restored: &BTreeMap<String, f64>, snapshot: &BTreeMap<String, f64>) {
+		for slot in &self.slots {
+			let mut cost = slot.cost.lock().unwrap_or_else(|poison| poison.into_inner());
+			let accrued = *cost - snapshot.get(&slot.slug).copied().unwrap_or(0.0);
+			*cost = restored.get(&slot.slug).copied().unwrap_or(0.0) + accrued.max(0.0);
+		}
+	}
+
+	#[must_use]
+	pub fn status_overview(&self) -> Vec<(String, RuntimeStatus)> {
+		self.slots
+			.iter()
+			.map(|slot| {
+				let live = {
+					let state = slot.state.lock().unwrap_or_else(|poison| poison.into_inner());
+					if state.quota {
+						RuntimeStatus::QuotaExhausted
+					} else if state.failing || state.halted {
+						RuntimeStatus::Error
+					} else {
+						*slot.status.lock().unwrap_or_else(|poison| poison.into_inner())
+					}
+				};
+				(slot.name.clone(), live)
+			})
+			.collect()
+	}
+
+	#[must_use]
+	pub fn stats(&self) -> AdvisorStats {
+		let mut advisors = Vec::new();
+		for slot in &self.slots {
+			let state = slot.state.lock().unwrap_or_else(|poison| poison.into_inner());
+			let (input, output, reasoning, cache_read, cache_write, total_tokens) = state
+				.history
+				.iter()
+				.filter(|message| message.role == Role::Assistant)
+				.filter_map(|message| message.usage.as_ref())
+				.fold((0u64, 0u64, 0u64, 0u64, 0u64, 0u64), |acc, usage| {
+					(
+						acc.0 + usage.input,
+						acc.1 + usage.output,
+						acc.2 + usage.reasoning_tokens.unwrap_or(0),
+						acc.3 + usage.cache_read,
+						acc.4 + usage.cache_write,
+						acc.5 + usage.total_tokens,
+					)
+				});
+			let user_messages = state
+				.history
+				.iter()
+				.filter(|message| message.role == Role::User)
+				.count();
+			let assistant_messages = state
+				.history
+				.iter()
+				.filter(|message| message.role == Role::Assistant)
+				.count();
+			let context_tokens = pi_agent::Tokenizer::count_messages(&state.history);
+			drop(state);
+			let status = if slot
+				.state
+				.lock()
+				.unwrap_or_else(|poison| poison.into_inner())
+				.quota
+			{
+				RuntimeStatus::QuotaExhausted
+			} else {
+				*slot.status.lock().unwrap_or_else(|poison| poison.into_inner())
+			};
+			let session_id = Some(
+				self.inner.identities.provider_session_id(
+					self.inner
+						.primary_session_id
+						.lock()
+						.unwrap_or_else(|poison| poison.into_inner())
+						.as_deref(),
+					&slot.slug,
+				),
+			);
+			let context_window = slot
+				.route
+				.as_ref()
+				.and_then(|route| self.inner.catalog.context_window(&route.provider, &route.model))
+				.unwrap_or(0);
+			advisors.push(PerAdvisorStat {
+				name: slot.name.clone(),
+				status,
+				model: slot
+					.route
+					.as_ref()
+					.map(|route| format!("{}/{}", route.provider, route.model)),
+				context_window,
+				context_tokens,
+				input,
+				output,
+				reasoning,
+				cache_read,
+				cache_write,
+				total_tokens,
+				cost: *slot.cost.lock().unwrap_or_else(|poison| poison.into_inner()),
+				user_messages,
+				assistant_messages,
+				session_id,
+			});
+		}
+		let active = advisors
+			.iter()
+			.any(|advisor| advisor.status == RuntimeStatus::Running);
+		AdvisorStats { configured: true, active, advisors }
+	}
+
+	#[must_use]
+	pub fn format_status(&self) -> String {
+		let stats = self.stats();
+		if stats.advisors.is_empty() {
+			return "Advisor is disabled.".to_string();
+		}
+		if stats.advisors.len() == 1 {
+			let advisor = &stats.advisors[0];
+			if advisor.status == RuntimeStatus::NoModel {
+				return "Advisor setting is enabled, but no model is assigned to the 'advisor' role."
+					.to_string();
+			}
+			if advisor.status != RuntimeStatus::Running {
+				return format!("Advisor \"{}\" is {}.", advisor.name, advisor.status.as_str().replace('_', " "));
+			}
+			return format!(
+				"Advisor is enabled ({}). Context: {} / {} tokens ({}%). Spend: {} input, {} output, ${:.4}.",
+				advisor.model.as_deref().unwrap_or("unknown"),
+				advisor.context_tokens,
+				advisor.context_window,
+				if advisor.context_window > 0 {
+					(advisor.context_tokens * 100) / advisor.context_window
+				} else {
+					0
+				},
+				advisor.input,
+				advisor.output,
+				advisor.cost
+			);
+		}
+		let mut lines = vec![format!("Advisors enabled ({}):", stats.advisors.len())];
+		for advisor in &stats.advisors {
+			lines.push(format!(
+				"  • {} [{}] — context {} tokens, ${:.4}",
+				advisor.name,
+				advisor.status.as_str(),
+				advisor.context_tokens,
+				advisor.cost
+			));
+		}
+		lines.join("\n")
+	}
+
+	/// Stop all work; safe to call twice.
+	pub fn dispose(&self) {
+		if self.inner.disposed.swap(true, Ordering::SeqCst) {
+			return;
+		}
+		for slot in &self.slots {
+			let mut state = slot.state.lock().unwrap_or_else(|poison| poison.into_inner());
+			if let Some(cancel) = state.cancel.take() {
+				cancel.cancel();
+			}
+			state.pending.clear();
+			state.backlog = 0;
+		}
+		self.inner.asides.lock().unwrap_or_else(|poison| poison.into_inner()).clear();
+		self.notify();
+	}
+}
+
+/// Rebuild signature: roster identity/routes/tools plus the prompt sources and
+/// advisor settings. A change disposes the old manager instead of letting a
+/// stale roster answer for a configuration the session no longer has.
+#[must_use]
+pub fn roster_signature(
+	slots: &[Arc<AdvisorSlot>],
+	cwd: &std::path::Path,
+	context_prompt: Option<&str>,
+	watchdog_prompt: Option<&str>,
+	shared_instructions: Option<&str>,
+	config: &Config,
+) -> String {
+	let mut parts: Vec<String> = slots
+		.iter()
+		.map(|slot| {
+			format!(
+				"{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
+				slot.name,
+				slot.slug,
+				slot.route
+					.as_ref()
+					.map(|route| format!("{}/{}:{:?}", route.provider, route.model, route.effort))
+					.unwrap_or_default(),
+				slot.tools
+					.as_ref()
+					.map(|tools| tools.join("\u{1e}"))
+					.unwrap_or_default(),
+				slot.system_prompt,
+				*slot.status.lock().unwrap_or_else(|poison| poison.into_inner()) == RuntimeStatus::Paused
+			)
+		})
+		.collect();
+	parts.push(format!(
+		"{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
+		cwd.display(),
+		context_prompt.unwrap_or_default(),
+		watchdog_prompt.unwrap_or_default(),
+		shared_instructions.unwrap_or_default(),
+		config.advisor.enabled(),
+		config.advisor.tier_setting(),
+		config.advisor.sync_backlog.as_deref().unwrap_or("off"),
+		config.advisor.immune_turns()
+	));
+	parts.join("\u{1d}")
+}
+
+struct BatchState {
+	batch:   Vec<PendingDelta>,
+	turns:   usize,
+	wip:     bool,
+	history: Vec<Message>,
+	cancel:  pi_agent::CancellationToken,
+}
+
+fn requeue(batch: Vec<PendingDelta>, mut pending: Vec<PendingDelta>) -> Vec<PendingDelta> {
+	let mut merged = batch;
+	merged.append(&mut pending);
+	merged
+}
+
+fn is_quota_error(error: &str) -> bool {
+	let lower = error.to_ascii_lowercase();
+	lower.contains("429")
+		|| lower.contains("rate limit")
+		|| lower.contains("rate_limit")
+		|| lower.contains("quota")
+		|| lower.contains("usage limit")
+		|| lower.contains("insufficient_quota")
+}
+
+fn is_permanent_error(error: &str) -> bool {
+	let lower = error.to_ascii_lowercase();
+	lower.contains("invalid_request_error")
+		|| lower.contains("model_not_found")
+		|| lower.contains("model not found")
+		|| lower.contains("does not exist")
+		|| lower.contains("is not supported")
+}
+
+/// Default tool subset when a config omits `tools`.
+#[must_use]
+pub fn default_tool_names() -> Vec<String> {
+	vec!["read".to_string(), "grep".to_string(), "glob".to_string()]
+}
+
+/// Tools the executor may mount for one advisor. `None` keeps the default
+/// subset; `Some([])` grants only `advise`.
+#[must_use]
+pub fn effective_tool_names(tools: Option<&[String]>) -> Vec<String> {
+	match tools {
+		None => default_tool_names(),
+		Some(tools) => tools
+			.iter()
+			.filter(|name| {
+				crate::runtime::BUILTIN_TOOLS
+					.iter()
+					.any(|(known, _)| known == &name.as_str())
+			})
+			.cloned()
+			.collect(),
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use std::sync::Mutex as StdMutex;
+
+	struct FakeExecutor {
+		calls:  StdMutex<Vec<AdvisorCallSpec>>,
+		error:  StdMutex<Option<String>>,
+	}
+
+	#[async_trait::async_trait]
+	impl AdvisorExecutor for FakeExecutor {
+		async fn execute(&self, spec: AdvisorCallSpec) -> AdvisorCallResult {
+			self.calls.lock().expect("calls").push(AdvisorCallSpec {
+				history: Vec::new(),
+				prompt: String::new(),
+				..spec
+			});
+			if let Some(error) = self.error.lock().expect("error").clone() {
+				return AdvisorCallResult { error: Some(error), ..AdvisorCallResult::default() };
+			}
+			let mut history = Vec::new();
+			history.push(Message::user("update"));
+			history.push(Message::assistant(""));
+			AdvisorCallResult { history, assistant_messages: Vec::new(), error: None }
+		}
+	}
+
+	fn manager(executor: Arc<dyn AdvisorExecutor>) -> Arc<AdvisorManager> {
+		let config = Config::default();
+		let catalog = Arc::new(Catalog::default());
+		let resolver: RouteResolver = Arc::new(|pattern| {
+			if pattern.contains("bad") {
+				return Err("no model".to_string());
+			}
+			Ok(AdvisorRoute {
+				provider: "mock".to_string(),
+				model:    "advisor".to_string(),
+				effort:   None,
+				api_key:  Some("advisor-key".to_string()),
+			})
+		});
+		AdvisorManager::new(AdvisorManagerOptions {
+			cwd: std::env::temp_dir(),
+			agent_dir: None,
+			config,
+			catalog,
+			approvals: Approvals::default(),
+			primary_session_id: Some("primary".to_string()),
+			primary_cache_key: None,
+			session_file: None,
+			service_tier: BTreeMap::new(),
+			context_prompt: None,
+			watchdog_prompt: None,
+			shared_instructions: None,
+			roster: vec![AdvisorEntry {
+				name:         "reviewer".to_string(),
+				model:        Some("mock/advisor".to_string()),
+				tools:        None,
+				instructions: None,
+				enabled:      None,
+			}],
+			executor,
+			resolver,
+			identities: Arc::new(AdvisorIdentities::new()),
+			handle: tokio::runtime::Handle::current(),
+		})
+	}
+
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn delta_is_queued_rendered_and_delivered_once() {
+		let executor = Arc::new(FakeExecutor {
+			calls: StdMutex::new(Vec::new()),
+			error: StdMutex::new(None),
+		});
+		let manager = manager(executor.clone());
+		manager.begin_primary_run(&[]);
+		manager.push_user(&Message::user("fix it"));
+		manager.push_turn(&Message::assistant("done"), &[]);
+		assert!(manager.wait_for_catchup(Duration::from_secs(5)));
+		let calls = executor.calls.lock().expect("calls");
+		assert_eq!(calls.len(), 1);
+		assert!(calls[0].prompt.contains("### Session update"));
+		assert!(calls[0].prompt.contains("fix it"));
+		assert_eq!(calls[0].provider_session_id.len(), 36);
+		assert_ne!(calls[0].provider_session_id, calls[0].prompt_cache_key);
+		manager.dispose();
+	}
+
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn quota_error_latches_and_reset_clears_it() {
+		let executor = Arc::new(FakeExecutor {
+			calls: StdMutex::new(Vec::new()),
+			error: StdMutex::new(Some("429 rate limit exceeded".to_string())),
+		});
+		let manager = manager(executor.clone());
+		manager.begin_primary_run(&[]);
+		manager.push_user(&Message::user("fix it"));
+		manager.push_turn(&Message::assistant("done"), &[]);
+		// A failing/quota advisor must not park the primary.
+		assert!(manager.wait_for_catchup(Duration::from_secs(5)));
+		assert_eq!(
+			manager.status_overview()[0].1,
+			RuntimeStatus::QuotaExhausted
+		);
+		assert_eq!(manager.backlog(), 1, "the batch stays queued for reset replay");
+		manager.push_user(&Message::user("again"));
+		manager.push_turn(&Message::assistant("done again"), &[]);
+		assert_eq!(executor.calls.lock().expect("calls").len(), 1);
+		manager.reset("conversation-boundary");
+		assert_eq!(manager.status_overview()[0].1, RuntimeStatus::Running);
+		manager.begin_primary_run(&[]);
+		manager.push_user(&Message::user("fresh"));
+		manager.push_turn(&Message::assistant("done"), &[]);
+		assert!(manager.wait_for_catchup(Duration::from_secs(5)));
+		assert_eq!(executor.calls.lock().expect("calls").len(), 2);
+		manager.dispose();
+	}
+
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn preserve_only_keeps_blocker_as_card_without_steer() {
+		let executor = Arc::new(FakeExecutor {
+			calls: StdMutex::new(Vec::new()),
+			error: StdMutex::new(None),
+		});
+		let manager = manager(executor);
+		let cards = Arc::new(StdMutex::new(Vec::new()));
+		let sink_cards = Arc::clone(&cards);
+		let sink: CardSink = Arc::new(move |content, _details| {
+			sink_cards.lock().expect("cards").push(content.to_string());
+		});
+		let steers = Arc::new(StdMutex::new(0usize));
+		let sink_steers = Arc::clone(&steers);
+		let steer: SteerSink = Arc::new(move |_content| {
+			*sink_steers.lock().expect("steers") += 1;
+			true
+		});
+		manager.configure_run(
+			Some("primary".to_string()),
+			None,
+			None,
+			Some(sink),
+			Some(steer),
+		);
+		manager.prepare_headless_drain();
+		let slot = &manager.slots[0];
+		manager.route_advice(
+			slot,
+			Note { note: "Write target was deleted.".to_string(), severity: Some(Severity::Blocker), advisor: None },
+		);
+		assert_eq!(*steers.lock().expect("steers"), 0);
+		assert_eq!(cards.lock().expect("cards").len(), 1);
+		assert!(cards.lock().expect("cards")[0].contains("severity=\"blocker\""));
+		manager.dispose();
+	}
+}

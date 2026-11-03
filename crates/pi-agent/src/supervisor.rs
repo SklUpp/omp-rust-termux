@@ -526,6 +526,8 @@ pub struct Supervisor {
 	/// Agent catalog installed by the host (CLI) runtime. Definitions and policy
 	/// are stable; the catalog's model resolver is refreshed per root turn.
 	agent_catalog: Mutex<Option<Arc<AgentCatalog>>>,
+	/// Host advisor seam for spawned child sessions (`subagent_advisor`).
+	child_advisor_hook: Mutex<Option<Arc<dyn crate::subagent_advisor::ChildAdvisorHook>>>,
 	/// Process supervisor shared by root/child `bash` and `hub` process ops.
 	/// Injected by the host (broker client); otherwise a lazily created local
 	/// manager rooted at `process_root`.
@@ -683,6 +685,7 @@ impl Supervisor {
 			display_resolver: Mutex::new(None),
 			active_model: Mutex::new(None),
 			agent_catalog: Mutex::new(None),
+			child_advisor_hook: Mutex::new(None),
 			processes: Mutex::new(None),
 			eval_binder: Mutex::new(None),
 			acp_bridge: Mutex::new(None),
@@ -760,6 +763,29 @@ impl Supervisor {
 			.agent_catalog
 			.lock()
 			.unwrap_or_else(|poison| poison.into_inner()) = Some(catalog);
+	}
+
+	/// Install the host's per-child advisor seam (`subagent_advisor`).
+	pub fn set_child_advisor_hook(
+		&self,
+		hook: Option<Arc<dyn crate::subagent_advisor::ChildAdvisorHook>>,
+	) {
+		*self
+			.child_advisor_hook
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner()) = hook;
+	}
+
+	/// The installed child advisor seam, if any.
+	#[must_use]
+	pub fn child_advisor_hook(
+		&self,
+	) -> Option<Arc<dyn crate::subagent_advisor::ChildAdvisorHook>> {
+		self
+			.child_advisor_hook
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner())
+			.clone()
 	}
 
 	/// Install the session's internal URL router so child `read`/`write`

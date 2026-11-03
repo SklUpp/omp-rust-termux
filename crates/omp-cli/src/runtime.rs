@@ -146,6 +146,12 @@ struct SessionResources {
 	/// registry only holds a weak reference, so this slot is what keeps the
 	/// manager (and its live actors) alive between turns of the same scope.
 	lifecycle:  Mutex<Option<Arc<pi_agent::subagent_lifecycle::SubagentLifecycleManager>>>,
+	/// Advisor roster runtime for this scope (`None` before the first enabled
+	/// run, and cleared when the session turns the advisor off).
+	advisor:    Mutex<Option<Arc<crate::advisor_runtime::AdvisorManager>>>,
+	/// Stable `(primary, slug) -> UUIDv7` identities; survives manager rebuilds
+	/// so an advisor keeps its provider session across config edits.
+	advisor_identities: Arc<crate::advisor_identity::AdvisorIdentities>,
 }
 
 /// Closed scopes stay as tombstones so a late or stale run cannot recreate
@@ -592,6 +598,10 @@ impl PiAgentRunner {
 						}),
 						goal:       Mutex::new(None),
 						lifecycle:  Mutex::new(None),
+						advisor:    Mutex::new(None),
+						advisor_identities: Arc::new(
+							crate::advisor_identity::AdvisorIdentities::new(),
+						),
 					});
 					lifecycle.slots.insert(
 						scope.clone(),
@@ -650,6 +660,14 @@ impl PiAgentRunner {
 				.unwrap_or_else(|poison| poison.into_inner())
 				.clone();
 			let session = Arc::clone(&resources.tools);
+			if let Some(advisor) = resources
+				.advisor
+				.lock()
+				.unwrap_or_else(|poison| poison.into_inner())
+				.take()
+			{
+				advisor.dispose();
+			}
 			let handle = self.runtime.handle().clone();
 			// Supervisor cancellation and session release are both owned by this
 			// published handle; the global latch joins it, so it cannot finish while
@@ -1199,6 +1217,137 @@ impl TimerGuard {
 	}
 }
 
+impl PiAgentRunner {
+	fn advisor_for_scope(
+		&self,
+		session_id: Option<&str>,
+		session_file: Option<&std::path::Path>,
+	) -> Option<Arc<crate::advisor_runtime::AdvisorManager>> {
+		let scope = session_scope(session_id, session_file);
+		let lifecycle = self
+			.lifecycle
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner());
+		match lifecycle.slots.get(&scope) {
+			Some(SessionSlot::Open(resources)) => resources
+				.advisor
+				.lock()
+				.unwrap_or_else(|poison| poison.into_inner())
+				.clone(),
+			_ => None,
+		}
+	}
+
+	/// Build (or reuse) the advisor roster for this session scope. Discovery and
+	/// the resolved roster are re-read each run so a `WATCHDOG.yml` edit or a
+	/// model-role change rebuilds the runtime instead of answering with a stale
+	/// roster. Turning `advisor.enabled` off disposes the live runtime.
+	fn ensure_advisor_manager(
+		&self,
+		request: &RunRequest,
+		resources: &Arc<SessionResources>,
+	) -> Option<Arc<crate::advisor_runtime::AdvisorManager>> {
+		let mut slot = resources
+			.advisor
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner());
+		if !request.config.advisor.enabled() {
+			if let Some(existing) = slot.take() {
+				existing.dispose();
+			}
+			return None;
+		}
+		let agent_dir = crate::dirs::agent_dir();
+		let discovered =
+			crate::advisor_config::discover(&request.cwd, Some(agent_dir.as_path()));
+		let roster = if discovered.advisors.is_empty() {
+			vec![crate::advisor_config::AdvisorEntry {
+				name:         "default".to_string(),
+				model:        None,
+				tools:        None,
+				instructions: None,
+				enabled:      None,
+			}]
+		} else {
+			discovered.advisors
+		};
+		let context_prompt = advisor_context_prompt(&request.context_files);
+		let watchdog_docs =
+			crate::advisor_config::discover_watchdog_docs(&request.cwd, Some(agent_dir.as_path()));
+		let watchdog_prompt = (!watchdog_docs.is_empty()).then(|| watchdog_docs.join("\n\n"));
+		let config = request.config.clone();
+		let catalog = Arc::clone(&request.catalog);
+		let resolver: crate::advisor_runtime::RouteResolver = Arc::new(move |pattern| {
+			let switch = resolve_model_switch(&catalog, &config, pattern, None)?;
+			let api_key = config.resolve_api_key(&switch.provider);
+			Ok(crate::advisor_runtime::AdvisorRoute {
+				provider: switch.provider,
+				model:    switch.model,
+				effort:   switch.effort,
+				api_key,
+			})
+		});
+		let executor: Arc<dyn crate::advisor_runtime::AdvisorExecutor> =
+			Arc::new(CliAdvisorExecutor);
+		let manager = crate::advisor_runtime::AdvisorManager::new(
+			crate::advisor_runtime::AdvisorManagerOptions {
+				cwd: request.cwd.clone(),
+				agent_dir: Some(agent_dir),
+				config: request.config.clone(),
+				catalog: Arc::clone(&request.catalog),
+				approvals: request.approvals.clone(),
+				primary_session_id: advisor_primary_session_id(request),
+				primary_cache_key: request.prompt_cache_key.clone(),
+				session_file: request.session_file.clone(),
+				service_tier: crate::advisor_identity::service_tier_map(
+					Some(request.config.advisor.tier_setting()),
+					&request.service_tier_by_family,
+				),
+				context_prompt,
+				watchdog_prompt,
+				shared_instructions: discovered.shared_instructions,
+				roster,
+				executor,
+				resolver,
+				identities: Arc::clone(&resources.advisor_identities),
+				handle: self.runtime.handle().clone(),
+			},
+		);
+		// The candidate resolves routes through the live config, so its
+		// signature covers `WATCHDOG.*` edits, roster changes, and a changed
+		// `modelRoles.advisor`. An unchanged roster keeps the live manager (and
+		// its in-flight context); a changed one replaces it.
+		if let Some(existing) = slot.as_ref() {
+			if existing.signature() == manager.signature() {
+				manager.dispose();
+				return Some(Arc::clone(existing));
+			}
+			existing.dispose();
+		}
+		*slot = Some(Arc::clone(&manager));
+		Some(manager)
+	}
+}
+
+fn advisor_primary_session_id(request: &RunRequest) -> Option<String> {
+	request
+		.session_id
+		.clone()
+		.or_else(|| request.session_file.as_deref().map(|path| path.display().to_string()))
+}
+
+fn advisor_context_prompt(files: &[crate::prompts::ContextFile]) -> Option<String> {
+	if files.is_empty() {
+		return None;
+	}
+	let body = files
+		.iter()
+		.map(|file| format!("### {}\n{}", file.path.display(), file.content.trim_end()))
+		.collect::<Vec<_>>()
+		.join("\n\n");
+	Some(format!("## Project context\n\n{body}"))
+}
+
 impl AgentRunner for PiAgentRunner {
 	fn close_session(
 		&self,
@@ -1459,6 +1608,15 @@ impl AgentRunner for PiAgentRunner {
 				plan.provider, plan.model
 			)));
 		}
+		// Advisor roster for this run: built before the first turn so the
+		// manager owns the same history the primary is about to extend.
+		let advisor = self.ensure_advisor_manager(request, &resources);
+		if let Some(manager) = &advisor {
+			manager.begin_primary_run(&messages);
+			if !request.continuation {
+				manager.push_user(&user_message);
+			}
+		}
 		let plan_api = plan.api.clone();
 		let plan_provider = plan.provider.clone();
 		let plan_model = plan.model.clone();
@@ -1642,6 +1800,13 @@ impl AgentRunner for PiAgentRunner {
 			}
 			supervisor.set_async_enabled(request.config.async_config.enabled());
 			supervisor.set_external_thinking(request.config.external_thinking);
+			supervisor.set_child_advisor_hook(Some(Arc::new(
+				crate::advisor_child_host::ChildAdvisorHost::new(
+					request,
+					self.runtime.handle().clone(),
+					Arc::clone(&resources.advisor_identities),
+				),
+			)));
 			root_sink = Some(supervisor.owner_results_sink(None));
 			root_supervisor = Some(Arc::clone(&supervisor));
 			supervisor.root_registry()
@@ -1759,6 +1924,36 @@ impl AgentRunner for PiAgentRunner {
 		let (event_tx, event_rx) = tokio::sync::mpsc::channel::<Result<Event>>(64);
 		let (pi_events_tx, mut pi_events_rx) = tokio::sync::mpsc::channel::<AgentEvent>(64);
 		let (steering_tx, steering_rx) = tokio::sync::mpsc::channel::<SteeringEvent>(8);
+		// Advisor delivery sinks: cards go to the host-owned sink exactly once
+		// (it persists/forwards them), while `steer` injects into this run's
+		// steering channel. An aside announced at the previous turn end rides
+		// this run's first provider request as an injected user message.
+		if let Some(manager) = &advisor {
+			let steer_tx = steering_tx.clone();
+			let steer_sink: crate::advisor_runtime::SteerSink =
+				Arc::new(move |text: &str| {
+					steer_tx
+						.try_send(SteeringEvent::InjectMessage(vec![
+							pi_agent::ContentPart::text(text),
+						]))
+						.is_ok()
+				});
+			manager.configure_run(
+				advisor_primary_session_id(request),
+				request.prompt_cache_key.clone(),
+				request.session_file.clone(),
+				request
+					.advisor_card_sink
+					.as_ref()
+					.map(|handle| Arc::clone(&handle.0)),
+				Some(steer_sink),
+			);
+			if let Some(aside) = manager.take_pending_aside_content() {
+				let _ = steering_tx.try_send(SteeringEvent::InjectMessage(vec![
+					pi_agent::ContentPart::text(aside),
+				]));
+			}
+		}
 		// The goal limit steer rides this run's own steering channel: replacing
 		// the hook per run means a stale closure can only reach a dead channel.
 		if let Some(goal) = request.goal.clone() {
@@ -1809,6 +2004,8 @@ impl AgentRunner for PiAgentRunner {
 		let event_tx_clone = event_tx.clone();
 		let cancel_on_err = cancellation_token.clone();
 		let steering_tx_err = steering_tx.clone();
+		let advisor_sync = request.config.advisor.sync_backlog();
+		let advisor_events = advisor.clone();
 		self.runtime.spawn(async move {
 			let mut message_started = false;
 			let abort_after_grace = |dialog_abort: tokio::task::AbortHandle| {
@@ -1979,6 +2176,25 @@ impl AgentRunner for PiAgentRunner {
 					},
 					AgentEvent::TurnEnd { message, tool_results, status } => {
 						drain_ledger();
+						if let Some(manager) = &advisor_events {
+							manager.push_turn(&message, &tool_results);
+							// Late-turn backlog brake: the primary's next request
+							// waits (bounded) for the roster to catch up instead of
+							// drifting arbitrarily far behind. A failing advisor is
+							// already excluded inside the wait.
+							if let Some(threshold) = advisor_sync {
+								if manager.backlog() >= threshold {
+									let manager = Arc::clone(manager);
+									let _ = tokio::task::spawn_blocking(move || {
+										manager.sync_backlog(
+											threshold,
+											std::time::Duration::from_secs(30),
+										)
+									})
+									.await;
+								}
+							}
+						}
 						let stop_reason = match status {
 							pi_agent::TurnStatus::EndTurn => "stop",
 							pi_agent::TurnStatus::ToolUse => "toolUse",
@@ -2085,6 +2301,14 @@ impl AgentRunner for PiAgentRunner {
 						.await;
 				},
 			}
+			if let Some(manager) = &advisor_events {
+				// An interrupted/aborted run suppresses auto-resume and still
+				// settles the live flag; asides announced here ride the next run.
+				if cancel_on_err.is_cancelled() {
+					manager.mark_primary_aborted();
+				}
+				manager.end_primary_run();
+			}
 		});
 
 		let runtime_handle = self.runtime.handle().clone();
@@ -2104,6 +2328,57 @@ impl AgentRunner for PiAgentRunner {
 			yielded_closure_error: false,
 			_handles: handles,
 		}))
+	}
+
+	fn advisor_prepare_headless_drain(
+		&self,
+		session_id: Option<&str>,
+		session_file: Option<&std::path::Path>,
+	) {
+		if let Some(manager) = self.advisor_for_scope(session_id, session_file) {
+			manager.prepare_headless_drain();
+		}
+	}
+
+	fn advisor_wait_catchup(
+		&self,
+		session_id: Option<&str>,
+		session_file: Option<&std::path::Path>,
+		timeout: std::time::Duration,
+	) -> bool {
+		match self.advisor_for_scope(session_id, session_file) {
+			Some(manager) => manager.wait_for_catchup(timeout),
+			None => true,
+		}
+	}
+
+	fn advisor_dispose(
+		&self,
+		session_id: Option<&str>,
+		session_file: Option<&std::path::Path>,
+	) {
+		if let Some(manager) = self.advisor_for_scope(session_id, session_file) {
+			manager.dispose();
+		}
+	}
+
+	fn advisor_reset_boundary(
+		&self,
+		session_id: Option<&str>,
+		session_file: Option<&std::path::Path>,
+	) {
+		if let Some(manager) = self.advisor_for_scope(session_id, session_file) {
+			manager.reset("conversation-boundary");
+		}
+	}
+
+	fn advisor_status(
+		&self,
+		session_id: Option<&str>,
+		session_file: Option<&std::path::Path>,
+	) -> Option<String> {
+		self.advisor_for_scope(session_id, session_file)
+			.map(|manager| manager.format_status())
 	}
 }
 
@@ -3071,6 +3346,157 @@ pub fn build_switch_provider(
 		prompt_cache_key,
 		service_tier,
 	)
+}
+
+/// Build the provider for one advisor route. Reuses the same candidate/wire
+/// mapping as root and child requests; the advisor's credential is its own
+/// (`route.api_key`, then the route's connection block), never the primary's.
+pub(crate) fn build_advisor_provider(
+	catalog: &crate::catalog::Catalog,
+	config: &crate::config::Config,
+	route: &crate::advisor_runtime::AdvisorRoute,
+	provider_session_id: Option<String>,
+	prompt_cache_key: Option<String>,
+	service_tier_by_family: &std::collections::BTreeMap<String, String>,
+) -> std::result::Result<Arc<dyn ModelProvider>, String> {
+	let pattern = format!("{}/{}", route.provider, route.model);
+	let candidate = candidate_for(catalog, config, Some(&route.provider), &pattern)?;
+	let api_key = route
+		.api_key
+		.clone()
+		.filter(|key| !key.trim().is_empty())
+		.or_else(|| candidate.connection.as_ref().and_then(|connection| connection.resolve_api_key()))
+		.unwrap_or_default();
+	let wire_target = WireTarget {
+		dialect: candidate.dialect,
+		provider: &candidate.provider,
+		model: &candidate.model,
+		base_url: &candidate.base_url,
+		api_key: &api_key,
+		effort: route.effort.as_deref(),
+		supports_images: catalog
+			.supports_images(&candidate.provider, &candidate.model)
+			.unwrap_or(true),
+		usage_in_streaming: Some(
+			catalog
+				.supports_usage_in_streaming(&candidate.provider, &candidate.model)
+				.unwrap_or(candidate.provider != "cerebras"),
+		),
+	};
+	let service_tier = crate::service_tier::resolve(
+		service_tier_by_family,
+		&wire_target.provider,
+		Some(wire_target.dialect.api()),
+		&wire_target.model,
+	)
+	.map(str::to_string);
+	wire_provider(
+		catalog,
+		config,
+		&wire_target,
+		provider_session_id,
+		prompt_cache_key,
+		service_tier,
+	)
+}
+
+/// Advisor executor bound to this runner's tokio runtime: builds a standalone
+/// provider/registry and drives `pi_agent` directly, so the advisor never
+/// registers a signal dialog or touches the primary's session resources.
+pub(crate) struct CliAdvisorExecutor;
+
+#[async_trait]
+impl crate::advisor_runtime::AdvisorExecutor for CliAdvisorExecutor {
+	async fn execute(
+		&self,
+		spec: crate::advisor_runtime::AdvisorCallSpec,
+	) -> crate::advisor_runtime::AdvisorCallResult {
+		match run_advisor_call(spec).await {
+			Ok(result) => result,
+			Err(error) => crate::advisor_runtime::AdvisorCallResult {
+				error: Some(error),
+				..crate::advisor_runtime::AdvisorCallResult::default()
+			},
+		}
+	}
+}
+
+async fn run_advisor_call(
+	spec: crate::advisor_runtime::AdvisorCallSpec,
+) -> std::result::Result<crate::advisor_runtime::AdvisorCallResult, String> {
+	if spec.cancel.is_cancelled() {
+		return Err("cancelled".to_string());
+	}
+	let provider = build_advisor_provider(
+		&spec.catalog,
+		&spec.config,
+		&spec.route,
+		Some(spec.provider_session_id.clone()),
+		Some(spec.prompt_cache_key.clone()),
+		&spec.service_tier_by_family,
+	)?;
+	// `ask` is never offered to a passive reviewer: there is no human channel
+	// inside the advisor turn.
+	let names = crate::advisor_runtime::effective_tool_names(spec.tools.as_deref());
+	let static_names: Vec<&'static str> = names
+		.iter()
+		.filter(|name| name.as_str() != "ask" && name.as_str() != "eval")
+		.filter_map(|name| {
+			BUILTIN_TOOLS
+				.iter()
+				.find(|(known, _)| *known == name.as_str())
+				.map(|(known, _)| *known)
+		})
+		.collect();
+	let mut registry = build_registry(&static_names).map_err(|error| error.to_string())?;
+	let advise: Arc<dyn Tool> = spec.advise.clone();
+	registry.register(advise);
+	let approvals: Arc<dyn ToolApprover> =
+		Arc::new(spec.approvals.clone().without_ask());
+	let config = AgentConfig {
+		max_turns: spec.max_turns,
+		context_limit: spec.context_limit,
+		system_prompt: Some(spec.system_prompt.clone()),
+		cwd: spec.cwd.clone(),
+	};
+	let mut history = spec.history.clone();
+	while history
+		.first()
+		.is_some_and(|message| message.role == pi_agent::Role::System)
+	{
+		history.remove(0);
+	}
+	let mut state = AgentState { messages: history, total_turns: 0 };
+	let agent = AgentLoop::with_approver(config, provider, registry, approvals);
+	let turns = agent
+		.run_dialog_message_with_cancel(
+			pi_agent::Message::user(spec.prompt.clone()),
+			&mut state,
+			None,
+			None,
+			spec.cancel.clone(),
+		)
+		.await
+		.map_err(|error| error.to_string())?;
+	let mut history = state.messages;
+	while history
+		.first()
+		.is_some_and(|message| message.role == pi_agent::Role::System)
+	{
+		history.remove(0);
+	}
+	if turns.is_empty() {
+		return Err("advisor returned no assistant turn".to_string());
+	}
+	let assistant_messages = turns
+		.iter()
+		.map(|turn| turn.message.clone())
+		.collect();
+	Ok(crate::advisor_runtime::AdvisorCallResult {
+		history,
+		assistant_messages,
+		error: None,
+	})
 }
 
 
@@ -5965,6 +6391,7 @@ mod tests {
 			plan_mode: Default::default(),
 			continuation: false,
 			plan_context: None,
+			advisor_card_sink: None,
 			service_tier_by_family: std::collections::BTreeMap::new(),
 		}
 }

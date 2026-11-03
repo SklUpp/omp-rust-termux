@@ -11,6 +11,7 @@ pub mod provider;
 pub mod provider_anthropic;
 pub mod provider_ollama;
 pub mod state;
+pub mod subagent_advisor;
 pub mod subagent_lifecycle;
 pub mod supervisor;
 pub mod task_persisted_revive;

@@ -539,6 +539,75 @@ impl EvalConfig {
 	}
 }
 
+/// `advisor.*`, `tier.advisor`, and `task.agentAdvisor`.
+///
+/// The advisor is a second model that passively reviews each primary turn.
+/// `enabled` defaults to `false`; `syncBacklog` pauses the primary up to 30s
+/// when the advisor falls this many turns behind (off/1/3/5, TS schema);
+/// `immuneTurns` is the post-interrupt cooldown (default 3). Invalid file
+/// values are warned about and dropped, matching the TS schema validator's
+/// "never kill the session" behavior in the Rust reader.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AdvisorSettings {
+	pub enabled:      Option<bool>,
+	/// `off` | `1` | `3` | `5`.
+	pub sync_backlog: Option<String>,
+	pub immune_turns: Option<i64>,
+	/// `none` | `inherit` | a concrete service tier.
+	pub tier:         Option<String>,
+	/// `task.agentAdvisor`: agent name -> `on` | `off` | model pattern.
+	pub agent_advisor: BTreeMap<String, String>,
+}
+
+impl AdvisorSettings {
+	#[must_use]
+	pub fn enabled(&self) -> bool {
+		self.enabled.unwrap_or(false)
+	}
+
+	/// Catch-up backlog threshold; `off`/absent disables the primary pause.
+	#[must_use]
+	pub fn sync_backlog(&self) -> Option<usize> {
+		match self.sync_backlog.as_deref() {
+			Some("1") => Some(1),
+			Some("3") => Some(3),
+			Some("5") => Some(5),
+			_ => None,
+		}
+	}
+
+	#[must_use]
+	pub fn immune_turns(&self) -> i64 {
+		self.immune_turns.unwrap_or(3).max(0)
+	}
+
+	#[must_use]
+	pub fn tier_setting(&self) -> &str {
+		self.tier.as_deref().unwrap_or("none")
+	}
+
+	#[must_use]
+	pub fn agent_advisor_for(&self, agent: &str) -> Option<&str> {
+		self.agent_advisor.get(agent).map(String::as_str)
+	}
+
+	fn merge(&mut self, overlay: Self) {
+		if overlay.enabled.is_some() {
+			self.enabled = overlay.enabled;
+		}
+		if overlay.sync_backlog.is_some() {
+			self.sync_backlog = overlay.sync_backlog;
+		}
+		if overlay.immune_turns.is_some() {
+			self.immune_turns = overlay.immune_turns;
+		}
+		if overlay.tier.is_some() {
+			self.tier = overlay.tier;
+		}
+		self.agent_advisor.extend(overlay.agent_advisor);
+	}
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Config {
 	pub default_model:        Option<String>,
@@ -561,6 +630,8 @@ pub struct Config {
 	pub plan:                 PlanConfig,
 	/// `prewalk.*`: one-way model switch for fresh sessions.
 	pub prewalk:              PrewalkConfig,
+	/// `advisor.*`, `tier.advisor`, `task.agentAdvisor`.
+	pub advisor:              AdvisorSettings,
 	/// `eval.*` backend enablement and interpreter groups.
 	pub eval_config:          EvalConfig,
 	/// `searxng.*`: the web-search endpoint and its credentials.
@@ -651,6 +722,7 @@ impl Config {
 		self.goal.merge(overlay.goal);
 		self.plan.merge(overlay.plan);
 		self.prewalk.merge(overlay.prewalk);
+		self.advisor.merge(overlay.advisor);
 		self.eval_config.merge(overlay.eval_config);
 		// `searxng.*` merges per leaf so an explicit host overlay can add
 		// credentials to a globally configured endpoint (and vice versa).
@@ -1067,6 +1139,9 @@ impl Config {
 		if let Some(models) = &cli.models {
 			self.model_scope = Some(models.clone());
 		}
+		if cli.advisor {
+			self.advisor.enabled = Some(true);
+		}
 		if cli.external_thinking {
 			self.external_thinking = true;
 		}
@@ -1095,6 +1170,33 @@ impl Config {
 fn apply_nested_settings(config: &mut Config, value: &Value, path: &Path) -> Result<()> {
 	if let Some(tier) = value.get("tier").and_then(Value::as_map) {
 		for (family, item) in tier {
+			if family == "advisor" {
+				let parsed = match item {
+					Value::Null => Some("none".to_string()),
+					_ => match expect_text(item, "tier.advisor", path)? {
+						Some(value) if matches!(value.as_str(), "none" | "inherit") => Some(value),
+						Some(value)
+							if ["openai", "anthropic", "google"]
+								.iter()
+								.any(|family| crate::service_tier::family_value(family, &value).is_some()) =>
+						{
+							Some(value)
+						},
+						Some(value) => {
+							eprintln!(
+								"warning: {}: tier.advisor value `{value}` is not realizable; ignoring",
+								path.display()
+							);
+							None
+						},
+						None => None,
+					},
+				};
+				if let Some(tier) = parsed {
+					config.advisor.tier = Some(tier);
+				}
+				continue;
+			}
 			if !matches!(family.as_str(), "openai" | "anthropic" | "google") {
 				continue;
 			}
@@ -1163,6 +1265,21 @@ fn apply_nested_settings(config: &mut Config, value: &Value, path: &Path) -> Res
 				},
 				"maxEffort" => {
 					config.max_effort = expect_text(item, "task.maxEffort", path)?;
+				},
+				"agentAdvisor" => {
+					let overrides = item.as_map().ok_or_else(|| {
+						invalid(path, "task.agentAdvisor", "expected a mapping")
+					})?;
+					for (agent, value) in overrides {
+						let Some(pattern) = value.to_text().filter(|value| !value.trim().is_empty())
+						else {
+							continue;
+						};
+						config
+							.advisor
+							.agent_advisor
+							.insert(agent.clone(), pattern.trim().to_string());
+					}
 				},
 				_ => {},
 			}
@@ -1238,6 +1355,38 @@ fn apply_nested_settings(config: &mut Config, value: &Value, path: &Path) -> Res
 	}
 	if let Some(enabled) = settings_leaf(value, "prewalk", "enabled", "prewalk.enabled") {
 		config.prewalk.enabled = expect_bool(enabled, "prewalk.enabled", path)?;
+	}
+	if let Some(enabled) = settings_leaf(value, "advisor", "enabled", "advisor.enabled") {
+		config.advisor.enabled = expect_bool(enabled, "advisor.enabled", path)?;
+	}
+	if let Some(sync) = settings_leaf(value, "advisor", "syncBacklog", "advisor.syncBacklog") {
+		match sync.to_text().as_deref() {
+			Some(value @ ("off" | "1" | "3" | "5")) => {
+				config.advisor.sync_backlog = Some(value.to_string());
+			},
+			_ => {
+				eprintln!(
+					"warning: {}: advisor.syncBacklog must be one of off, 1, 3, 5; ignoring",
+					path.display()
+				);
+			},
+		}
+	}
+	if let Some(immune) =
+		settings_leaf(value, "advisor", "immuneTurns", "advisor.immuneTurns")
+	{
+		match immune {
+			Value::Null => {},
+			Value::Int(value) if *value >= 0 => {
+				config.advisor.immune_turns = Some(*value);
+			},
+			_ => {
+				eprintln!(
+					"warning: {}: advisor.immuneTurns must be a non-negative integer; ignoring",
+					path.display()
+				);
+			},
+		}
 	}
 	// `searxng.*` feeds the `web_search` tool; environment fallbacks are applied
 	// by the runtime, which is the only place that may read `SEARXNG_*`.

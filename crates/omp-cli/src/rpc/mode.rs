@@ -1129,6 +1129,13 @@ impl RpcMode {
 			},
 
 			RpcCommand::GetSessionStats { .. } => Some(ok_data(self.lock_session().stats())),
+			RpcCommand::GetAdvisorStatus { .. } => {
+				let status = self.lock_session().advisor_status();
+				Some(ok_data(json!({
+					"configured": status.is_some(),
+					"status": status,
+				})))
+			},
 			RpcCommand::ExportHtml { output_path, .. } => {
 				Some(match self.lock_session().export_html(output_path.as_deref()) {
 					Ok(path) => ok_data(json!({ "path": path })),
@@ -1784,6 +1791,17 @@ fn run_turn(
 							for frame in guard.goal_frames() {
 								sink.send(frame);
 							}
+							// Advisor cards: one persisted `custom_message` per card,
+							// then the TS custom message pair on the wire.
+							for (content, details) in guard.take_advisor_cards() {
+								for frame in event_wire::advisor_card_frames(
+									&content,
+									&details,
+									event_wire::now_ms(),
+								) {
+									sink.send(frame);
+								}
+							}
 						}
 						Ok(())
 					},
@@ -1796,6 +1814,22 @@ fn run_turn(
 				)
 			},
 		};
+		// Cards that settled just after the last stream event still belong to
+		// this turn: persist and emit them before the turn closes.
+		{
+			let mut guard = session
+				.lock()
+				.unwrap_or_else(std::sync::PoisonError::into_inner);
+			for (content, details) in guard.take_advisor_cards() {
+				for frame in event_wire::advisor_card_frames(
+					&content,
+					&details,
+					event_wire::now_ms(),
+				) {
+					sink.send(frame);
+				}
+			}
+		}
 		let Some(error) = attempt_error else {
 			if attempt > 0 {
 				sink.send(json!({

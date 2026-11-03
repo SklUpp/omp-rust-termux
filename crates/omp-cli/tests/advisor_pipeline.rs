@@ -333,8 +333,8 @@ fn advisor_flag_runs_isolated_roster_and_preserves_late_blocker_card() {
 fn advisor_role_falls_back_to_slow_and_quota_failure_is_contained() {
 	let server = MockWireServer::start(vec![primary_sse("done"), primary_sse("noted")]);
 	let base = temp_dir("slow");
-	let setup = setup(server.port, &base, "modelRoles:\n  slow: mock/slow\n");
-	let out = run_omp(&setup, &["--advisor"]);
+	let first = setup(server.port, &base, "modelRoles:\n  slow: mock/slow\n");
+	let out = run_omp(&first, &["--advisor"]);
 	assert!(
 		out.status.success(),
 		"advisor failure must not fail the session: {}",

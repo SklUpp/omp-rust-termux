@@ -665,4 +665,59 @@ mod tests {
 		}
 		let _ = fs::remove_dir_all(root);
 	}
+
+	#[test]
+	fn unicode_roots_keep_distinct_stable_store_identity() {
+		fn init_repo(path: &Path) {
+			// The store resolves an enclosing worktree; make each fixture its own
+			// repository so the identity under test is the path, not a parent repo.
+			let status = std::process::Command::new("git")
+				.arg("init")
+				.arg("-q")
+				.arg(path)
+				.status()
+				.expect("run git init");
+			assert!(status.success(), "git init failed for {}", path.display());
+		}
+
+		let root = temp_root("unicode");
+		let state = root.join("state");
+		let left = root.join("aπππb");
+		let right = root.join("aπππc");
+		fs::create_dir_all(&left).expect("left");
+		fs::create_dir_all(&right).expect("right");
+		init_repo(&left);
+		init_repo(&right);
+
+		let left_store = SecurityStore::open(&left, Some(&state)).expect("left store");
+		let right_store = SecurityStore::open(&right, Some(&state)).expect("right store");
+		let (left_slug, left_hash) =
+			left_store.project_key().rsplit_once('-').expect("slug and hash");
+		let (right_slug, right_hash) =
+			right_store.project_key().rsplit_once('-').expect("slug and hash");
+
+		// A run of Unicode characters collapses to exactly one separator, and the
+		// store's directory name is that key, so the identity is consumer-visible.
+		assert!(left_slug.ends_with("a-b"), "{left_slug}");
+		assert!(right_slug.ends_with("a-c"), "{right_slug}");
+		assert_eq!(
+			left_store.project_directory().file_name().and_then(std::ffi::OsStr::to_str),
+			Some(left_store.project_key())
+		);
+
+		// Neighbouring roots that read the same stay separate: the 12 hex suffix
+		// covers the raw path, not the collapsed slug.
+		assert_eq!(left_hash.len(), 12);
+		assert_eq!(right_hash.len(), 12);
+		assert_ne!(left_hash, right_hash);
+		assert_ne!(left_store.project_key(), right_store.project_key());
+		assert_ne!(left_store.project_directory(), right_store.project_directory());
+
+		// Re-opening one root reuses the same identity and directory.
+		let reopened = SecurityStore::open(&left, Some(&state)).expect("reopen");
+		assert_eq!(reopened.project_key(), left_store.project_key());
+		assert_eq!(reopened.project_directory(), left_store.project_directory());
+
+		let _ = fs::remove_dir_all(root);
+	}
 }

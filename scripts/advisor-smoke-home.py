@@ -173,6 +173,10 @@ class MockModel:
             self.child_error = False
             self.child_phase = False
 
+    def dump(self, path: Path) -> None:
+        with self.lock:
+            path.write_text(json.dumps(self.requests, indent=2))
+
     def stop(self) -> None:
         self.server.shutdown()
         self.server.server_close()
@@ -250,8 +254,8 @@ def cli_run(binary: str, agent_dir: Path, cwd: Path, sessions: Path) -> subproce
             "--session-dir", str(sessions),
             "--no-tools",
             "--no-title",
-            "--advisor",
             "--mode", "text",
+            "--advisor",
             "say hi",
         ],
         env=omp_env(agent_dir),
@@ -361,10 +365,20 @@ def close_stdin(proc: subprocess.Popen[str], timeout: float = TIMEOUT) -> int:
 def phase_cli_text(binary: str, mock: MockModel, base: Path) -> Path:
     agent_dir, cwd, sessions, _ = write_config(base, mock.port)
     out = cli_run(binary, agent_dir, cwd, sessions)
+    (base / "cli-text.stdout").write_text(out.stdout)
+    (base / "cli-text.stderr").write_text(out.stderr)
+    mock.dump(base / "mock-requests.json")
     if out.returncode != 0:
         fail(f"CLI text exited {out.returncode}: {out.stderr}")
     if "advisor:" not in out.stderr or "write target deleted" not in out.stderr:
-        fail(f"CLI text must show the card on stderr: {out.stderr!r}")
+        systems = [
+            json.dumps(request.get("messages", [])[:1])[:200]
+            for request in mock.requests
+        ]
+        fail(
+            f"CLI text must show the card on stderr: {out.stderr!r}; "
+            f"provider requests={len(systems)} {systems}"
+        )
     logs = session_logs(sessions)
     if len(logs) != 1:
         fail(f"expected one session log, got {logs}")
@@ -389,8 +403,8 @@ def phase_cli_json(binary: str, mock: MockModel, base: Path) -> None:
             "--session-dir", str(sessions),
             "--no-tools",
             "--no-title",
-            "--advisor",
             "--mode", "json",
+            "--advisor",
             "say hi",
         ],
         env=omp_env(agent_dir),

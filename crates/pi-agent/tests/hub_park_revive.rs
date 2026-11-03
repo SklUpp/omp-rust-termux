@@ -442,6 +442,11 @@ async fn actor_rewrites_only_yielding_follow_up_artifacts() {
 	]));
 	let supervisor = one_turn(provider.clone(), 2);
 	supervisor.set_child_session_root(Some(root.clone()));
+	let mut scope = UrlScope::default();
+	scope
+		.local_roots
+		.insert("local".to_string(), root.clone());
+	supervisor.set_url_scope(Arc::new(scope));
 	supervisor.set_agent_catalog(Arc::new(AgentCatalog::new(
 		vec![scout_definition()],
 		None,

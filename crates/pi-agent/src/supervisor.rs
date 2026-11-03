@@ -541,6 +541,9 @@ pub struct Supervisor {
 	/// [`ChildToolSettings`]). Set by the host from `lsp.shared` and
 	/// `tools.maxTimeout` on every root turn.
 	child_tool_settings: Mutex<ChildToolSettings>,
+	/// C6 security-scan action ceiling: children get read-only `lsp` instances
+	/// so a delegated worker cannot rename/edit through the language server.
+	lsp_read_only: AtomicBool,
 	/// `task.isolation.*` + resolved `worktree.base`. Installed by the CLI on
 	/// every root turn; each `task` spawn snapshots it through `ChildContext`.
 	task_isolation: Mutex<TaskIsolationSettings>,
@@ -687,6 +690,7 @@ impl Supervisor {
 			eval_binder: Mutex::new(None),
 			acp_bridge: Mutex::new(None),
 			child_tool_settings: Mutex::new(ChildToolSettings::default()),
+			lsp_read_only: AtomicBool::new(false),
 			task_isolation: Mutex::new(TaskIsolationSettings::default()),
 			process_root: {
 				std::env::temp_dir()
@@ -1020,6 +1024,13 @@ impl Supervisor {
 
 	pub fn task_enabled(&self) -> bool {
 		self.allow_task.load(Ordering::SeqCst)
+	}
+
+	/// Install/replace the child `lsp` action ceiling. Set on every root turn
+	/// from the run's security-worker marker; children built afterwards inherit
+	/// it, including descendants.
+	pub fn set_lsp_read_only(&self, read_only: bool) {
+		self.lsp_read_only.store(read_only, Ordering::SeqCst);
 	}
 
 	pub fn hub_enabled(&self) -> bool {
@@ -1531,7 +1542,10 @@ impl Supervisor {
 		let child_tools = self.child_tool_settings();
 		if reg.get("lsp").is_some() {
 			reg.remove("lsp");
-			reg.register(Arc::new(LspTool::with_shared(child_tools.lsp_shared)));
+			reg.register(Arc::new(LspTool::with_shared_read_only(
+				child_tools.lsp_shared,
+				self.lsp_read_only.load(Ordering::SeqCst),
+			)));
 		}
 		if reg.get("debug").is_some() {
 			reg.remove("debug");

@@ -40,10 +40,12 @@ pub const LOCAL_SCHEME: &str = "local";
 /// the security review surface, `local://` for the built-in root handler,
 /// `artifact://` for the built-in spilled-output reader, `agent://` for saved
 /// subagent outputs, `ssh://` for the built-in native OpenSSH read handler,
-/// `mcp://` for the built-in MCP resource consumer, and `issue://`/`pr://` for
-/// the built-in native GitHub handlers.
-pub const RESERVED_SCHEMES: [&str; 8] =
-	["agent", "artifact", "issue", "local", "mcp", "pr", "security", "ssh"];
+/// `mcp://` for the built-in MCP resource consumer, `issue://`/`pr://` for the
+/// built-in native GitHub handlers, and `history://` for the session transcript
+/// reader mounted by `hub_park::register_history`.
+pub const RESERVED_SCHEMES: [&str; 9] = [
+	"agent", "artifact", "history", "issue", "local", "mcp", "pr", "security", "ssh",
+];
 
 /// One parsed internal URL (`skill://plugin:name` style colons are preserved in
 /// the path because only the first `://` separates the scheme).
@@ -299,8 +301,8 @@ impl InternalUrlRouter {
 	}
 
 	/// Reserved namespaces are built in and refuse replacement, so a host can
-	/// never displace `local://`, `artifact://`, `agent://`, `security://`,
-	/// `ssh://`, `mcp://`, `issue://`, or `pr://`.
+	/// never displace `local://`, `artifact://`, `agent://`, `history://`,
+	/// `security://`, `ssh://`, `mcp://`, `issue://`, or `pr://`.
 	pub fn register(
 		&self,
 		handler: Arc<dyn ProtocolHandler>,
@@ -308,6 +310,23 @@ impl InternalUrlRouter {
 		let scheme = handler.scheme().to_ascii_lowercase();
 		if is_reserved_scheme(&scheme) {
 			return Err(format!("{scheme}:// is reserved for built-in handlers"));
+		}
+		Ok(self.lock_handlers().insert(scheme, handler))
+	}
+
+	/// Mount a reserved built-in handler.
+	///
+	/// Only OMP's own `history://` mount uses this: the scheme is reserved so a
+	/// host bridge cannot replace it, but the handler is still installed per
+	/// session because it is bound to one lifecycle manager. Every other
+	/// registration goes through [`Self::register`] and is refused.
+	pub(crate) fn register_core(
+		&self,
+		handler: Arc<dyn ProtocolHandler>,
+	) -> Result<Option<Arc<dyn ProtocolHandler>>, String> {
+		let scheme = handler.scheme().to_ascii_lowercase();
+		if !is_reserved_scheme(&scheme) {
+			return Err(format!("{scheme}:// is not a reserved built-in scheme"));
 		}
 		Ok(self.lock_handlers().insert(scheme, handler))
 	}

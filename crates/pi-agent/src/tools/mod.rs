@@ -7,6 +7,7 @@ pub mod checkpoint;
 pub mod conflict;
 pub mod edit_variants;
 pub mod hashline;
+pub mod history_format;
 pub mod hub;
 pub mod hub_park;
 pub mod internal_urls;

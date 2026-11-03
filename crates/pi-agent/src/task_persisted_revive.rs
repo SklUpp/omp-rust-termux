@@ -224,13 +224,17 @@ impl PersistedChildSession {
 	}
 }
 
-/// Read a child transcript into real messages.
+/// Read a child transcript into real messages, without touching the replay.
+///
+/// The `history://` reader uses this: an unanswered call or an orphan result
+/// is still part of what happened and must be visible (rendered as pending or
+/// orphaned), so the display path never applies [`sanitize_replay`].
 ///
 /// The executor writes `{"type":"message","message":{...}}` lines; a raw
 /// message object is accepted too so older/foreign files are not fatal. A
-/// malformed line is skipped rather than destroying the whole replay, matching
-/// a crash-truncated trailing write.
-pub fn load_transcript(path: &Path) -> Result<Vec<Message>, String> {
+/// malformed line is skipped rather than destroying the whole read, matching a
+/// crash-truncated trailing write.
+pub fn read_transcript(path: &Path) -> Result<Vec<Message>, String> {
 	let file =
 		fs::File::open(path).map_err(|error| format!("cannot open {}: {error}", path.display()))?;
 	let mut messages = Vec::new();
@@ -248,7 +252,14 @@ pub fn load_transcript(path: &Path) -> Result<Vec<Message>, String> {
 			messages.push(message);
 		}
 	}
-	Ok(sanitize_replay(messages))
+	Ok(messages)
+}
+
+/// Read a child transcript and drop the turns a provider would reject.
+///
+/// Used by revive: a replay must be a valid model conversation.
+pub fn load_transcript(path: &Path) -> Result<Vec<Message>, String> {
+	Ok(sanitize_replay(read_transcript(path)?))
 }
 
 /// Drop replay turns the provider would reject.

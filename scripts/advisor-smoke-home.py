@@ -716,17 +716,13 @@ def phase_rpc(binary: str, mock: MockModel, base: Path) -> None:
         proc,
         lines,
         TIMEOUT,
-        lambda frame: frame.get("type") == "response" and frame.get("command") == "prompt",
+        lambda frame: frame.get("type") == "turn_end",
     )
     if not any(frame.get("type") == "turn_end" for frame in turn):
         fail("RPC prompt completed without a turn_end frame")
-    if not any(
-        frame.get("type") == "message_end"
-        and isinstance(frame.get("message"), dict)
-        and frame["message"].get("customType") == "advisor"
-        for frame in turn
-    ):
-        fail("RPC wire must carry the advisor card as a custom message")
+    # The transport response may precede `turn_end`; advisor cards may settle
+    # just after it. The status response is the post-turn barrier that drains
+    # those late frames before we assert the card.
     send(proc, {"id": "2", "type": "get_advisor_status"})
     status = read_lines(
         proc,
@@ -738,12 +734,22 @@ def phase_rpc(binary: str, mock: MockModel, base: Path) -> None:
     response = next(
         (frame for frame in status if frame.get("command") == "get_advisor_status"), None
     )
+    frames = turn + status
+    if not any(
+        frame.get("type") == "message_end"
+        and isinstance(frame.get("message"), dict)
+        and frame["message"].get("customType") == "advisor"
+        for frame in frames
+    ):
+        fail("RPC wire must carry the advisor card as a custom message")
     if response is None or not response.get("success"):
         fail(f"get_advisor_status failed: {response}")
     data = response.get("data") or {}
     if not data.get("configured") or not data.get("status"):
         fail(f"advisor status must report the live roster: {data}")
     code = close_stdin(proc)
+    tail = read_lines(proc, lines, 5, lambda _frame: False)
+    frames += tail
     if code != 0:
         fail(f"RPC dispose exited {code}")
     print("PASS rpc card + advisor status + dispose")

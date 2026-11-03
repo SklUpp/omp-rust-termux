@@ -56,7 +56,7 @@ New provider features remain paused. Correctness fixes required by the current b
 | Subsystem | Runtime contract | Source |
 |---|---|---|
 | Plan/prewalk | Explicit policy transitions, required-tool reminders, persisted model changes and contained proposal writes | `plan_yolo.rs`, `prewalk.rs`, `acp/plan.rs` |
-| Delegation | Session-owned jobs, park/revive, isolation, background delivery and deduplicated usage | `pi-agent/src/supervisor.rs`, `tools/task.rs`, `hub_park.rs` |
+| Delegation | Session-owned jobs, park/revive, isolation, background delivery and deduplicated usage | `pi-agent/src/supervisor.rs`, `pi-agent/src/tools/task.rs`, `pi-agent/src/tools/hub_park.rs` |
 | Eval | Interpreters started on demand, child-specific provider selection, caller-scoped artifacts and tool calls | `eval_host.rs`, `pi-agent/src/eval/` |
 | Protocols | MCP stdio/HTTP/SSE, LSP and DAP with bounded cancellation/reap | `pi-agent/src/mcp/`, `lsp/`, `dap/` |
 | Security scan | Opt-in local coordinator, restricted worker, persistent journal, once-only bundle publication, read-only `security://` | `security/`, `security_runtime.rs`, `auth/security.rs` |

@@ -17,6 +17,8 @@ Excluded: interactive TUI, desktop control, plugin/hook execution, local audio c
 A requirement closes only with implementation, independent review, relevant tests, the actual runtime path and exact-commit CI. Android-specific behavior requires Android execution.
 
 Source review is not runtime proof. A successful Android build is not host-test success. A missing prerequisite must produce the correct error without side effects.
+Every upstream registry entry must have equivalent Rust behavior or an explicit exclusion: modes, flags, subcommands, tools, wire dialects and configuration/session paths. Use real TypeScript session and protocol fixtures, not source-text assertions. Excluded requests fail with a specific reason and no side effects. Never accept a rejected option as a no-op.
+
 
 Do not add a `session` subcommand. Use existing resume/fork/continue flags and RPC session methods. Rewind changes conversation history, not Git or filesystem state.
 
@@ -30,7 +32,7 @@ Do not add a `session` subcommand. Use existing resume/fork/continue flags and R
 | GC apply | Actual isolated-HOME dry-run/apply/repeat/collision scenario passes | Cross-filesystem artifact moves refuse; earlier phone test link timeout is not a test pass |
 | Local security scan | 14 coordinator tests, 7 HTTP authentication tests and 29 mounted-runtime assertions pass | Local OAuth fixture, not a live account; cloud actions remain open |
 | C7 `e10cae8998a40f6350537ce24dcc1e9125dfcb0b` | [CI 41720874309](https://github.com/SklUpp/omp-termux/actions/runs/41720874309): host, native and Android pass | Downloaded-artifact runtime acceptance and base integration remain open |
-| C4 advisor | Independent source review closed known fixes; earlier pinned binary passed CLI, RPC, ACP and successful-child scenarios | Latest child-error, accounting and transcript fixes still need full runtime acceptance and CI |
+| C4 advisor | Pinned `170345d12b` binary passed CLI text/JSON, RPC, ACP, child opt-in, failure and cancellation | CI 41725278360 found test compilation errors; correction and integrated CI remain open |
 
 No row closes an entire category unless every retained contract below is verified.
 
@@ -39,12 +41,15 @@ No row closes an entire category unless every retained contract below is verifie
 ### C1 — Files, processes and session data
 
 - Internal URLs: caller-scoped `agent://`, `history://`, `artifact://`, `local://`, `memory://`, `skill://` and supported protocol resources. Preserve real producers, selectors, provenance, read-only behavior and access boundaries.
+- `@file`: text up to 5 MiB, images up to 25 MiB, directory listings and piped stdin before attached file text.
+- SQLite: schema/sample, primary-key or rowid lookup, paged `where`/`order` and raw `SELECT`. Enforce `query_only` and the authorizer.
 - Saved agent outputs: stable named and nested output IDs, no overwrite of foreign files, failed/aborted output handling and fresh-process resume. Output IDs differ from lifecycle IDs and `resultKey`.
 - History: live producer snapshots, persisted fallback, nested IDs, scope isolation and actual lifecycle transitions. Do not present a renamed file as live history.
 - Artifacts: bounded reads, spilling, descriptor-based containment, cancellation and atomic no-clobber publication. Preserve foreign destinations.
 - Archives: existing Python standard-library ZIP/package aliases, tar variants and compressed streams work. Unsupported formats must report a missing backend, not return binary data as text.
 - Document conversion remains open for PDF, DOCX, PPTX, XLSX and EPUB. Legacy DOC/PPT/XLS/RTF are excluded. New converter dependencies require approval.
 - Conflict resolution: session-owned conflict history, numeric IDs, bulk directives, stale-write refusal and cross-turn/reset isolation. Existing 28-case and numeric regressions remain accepted evidence.
+- Preserve `conflict://<N>[/ours|/theirs|/base]` reads and `write conflict://<N>` / `conflict://*`. Keep the accepted apply-patch corpus adapter; never edit the corpus to make tests pass.
 - Processes: PTY interaction, readiness by log/port, bounded 25 MiB logs, cancellation/reap and no orphan child. Reject `detached+pty`. Preserve broker-owned cleanup and same-name reuse.
 - Julia: ordered candidate selection, bounded readiness, one retained interpreter and no false ready. Real cold-start fixtures use an explicit budget; production deadline tests remain separate.
 - Session JSONL: lossless TypeScript resume/fork with IDs, parents, text, images, tool calls/results, signed/redacted thinking and usage. Do not modify the source session during fork.
@@ -56,24 +61,27 @@ No row closes an entire category unless every retained contract below is verifie
 - Usage: account once by `resultKey`, including hub consumption, automatic delivery, nested results and aborted work. Do not claim one global linear conversation.
 - Isolation: clean, dirty, untracked, symlink, conflict, merge-back and abort paths preserve data. Preserve accepted transcript-only rewind and atomic publication behavior.
 - Eval: persistent state, timeout, cancellation, background completion and output routing. Bind child models to the existing provider factory, including nested calls.
+- Start interpreters only for explicit eval. Require zero JavaScript processes before that call, one managed interpreter per kernel and cleanup on cancellation or EOF.
 - Checkpoint/rewind: preserve branch metadata through resume/fork and retain abandoned JSONL entries. Do not restore Git or files.
 
 ### C3 — MCP, LSP, DAP, RPC and ACP
 
 - MCP protocol `2025-11-25`: initialization, discovery, calls, resources, cancellation, EOF and cleanup over stdio and HTTP/SSE.
+- Consume the upstream MCP JSON configuration path and schema. Use `mcp__<server>_<tool>` names and fail-closed launch/approval gates. Return failures as tool errors, not empty results.
 - Client-side cancellation is required. A `notifications/cancelled` notification is optional for this protocol version. Deduplicate only identical terminal payloads.
 - Preserve authentication, same-origin redirects, session-ID rotation, safe read-only recovery, mutating-request no-replay and overall deadlines.
 - Resource pagination is bounded to 64 pages and 10,000 entries. Release transport locks before awaiting other work.
 - LSP/DAP: actual invocation, typed results, cancellation and bounded shutdown/reap. Fixtures prove the protocol, not availability of an uninstalled external server.
 - RPC: streaming events, session switching and authentication failure before ready. ACP: session isolation, Plan guards, approvals and cancellation.
+- The existing RPC integration harness must run against `--mode rpc`; protocol types alone do not close this consumer contract.
 - Existing scoped LSP/DAP and MCP resource/redirect/recovery/cancellation tests remain evidence. Remaining transport and interactive-approval combinations are open.
 
 ### C4 — CLI policies and advisor
 
-- `--plan <model>` selects a role override. It does not enter Plan mode.
-- Prewalk and Plan are separate policies. `--plan-yolo-into` requires `--plan-yolo`; default prewalk target is `@smol`.
+- `--plan <model>` selects a role override with the same argument/environment precedence as `--smol` and `--slow`. It does not enter Plan mode.
+- Keep `--prewalk`, `--no-prewalk`, `--prewalk-into`, `--plan-yolo` and `--plan-yolo-into` distinct. `--plan-yolo-into` requires `--plan-yolo`; default prewalk target is `@smol`.
 - Plan reminder continuation stays within the current prompt. Required tool choice is one-shot; text/yield does not reset the waiting gate. Limit reminders to three events.
-- ACP Plan writes remain confined to proposal artifacts until approval. Preserve typed AST policy handling, safe child capability inheritance and durable model transitions.
+- ACP Plan writes remain confined to `local://` proposal artifacts until approval. Preserve the `xd://propose` composite policy, typed AST handling, child capabilities and durable model transitions.
 - `--smol`/`--slow` preserve argument/environment precedence. `--no-lsp` applies to normal requests; explicitly restricted workers follow their own verified contract.
 - `--external-thinking` enables `think` and disables native reasoning. `--print-thoughts` applies only to print output.
 - `--service-tier` validates the exact enum. Omit empty, `none` and `inherit`; send supported values only to the OpenAI family.
@@ -86,7 +94,7 @@ No row closes an entire category unless every retained contract below is verifie
 
 ### C5 — Local commands and storage
 
-- `stats`, `render`, `export`: real session input, output files/stdout and JSON. Corrupt databases fail before stdout or ready.
+- `stats`, `render`, `export`: real session input, output files/stdout and JSON. Corrupt databases exit 1 before stdout or ready.
 - `compress`, `cleanse`, `commit`, `ttsr`: preserve actual model/Git/ruleset behavior. Do not replace them with invented shared abstractions.
 - `images`, `gallery`, `grievances`, `gc`, `setup`: preserve approvals, scoped file output and error behavior. Do not delete data automatically.
 - Gallery uses native ANSI output without `vhs`. Speech acceptance is file generation, not playback.
@@ -101,6 +109,7 @@ No row closes an entire category unless every retained contract below is verifie
 - Search commands and `web_search` share a backend. Credentials and network access are runtime prerequisites.
 - Local `security_scan`: disabled by default, normal allowlist selection, preflight/start/status/cancel/validate, restricted worker, persistent journal and once-only publication.
 - Preserve `--no-tools`, explicit disabled errors, reserved-name protection, real API `sessionFile`, forced worker LSP with read-only actions and child inheritance.
+- Select worker tools from `SECURITY_SESSION_TOOLS`, excluding `security_publish` from that configured set. Mount the scan-specific publication tool separately. Force `lsp.enabled` on and inherit the read-only action ceiling in children.
 - Exact OAuth selection uses an explicit row or the sole eligible row. A session hash is not a stored account pin. Refresh the same row per failed request; never replay the whole scan session.
 - `security://` is read-only. Project identity uses the canonical root, readable slug and 12-hex hash. Earlier stores with runs of forbidden characters can need explicit reconciliation after the slug correction.
 - Cloud security actions, broker and gateway behavior remain open. Local fixture success does not establish live-account acceptance.
@@ -119,7 +128,7 @@ No row closes an entire category unless every retained contract below is verifie
 ### C8 — Paused provider and optional dependency work
 
 - Keep auth/discovery complexity low. Verify each of the 14 wire dialects with request, stream, error and cancellation fixtures.
-- Retain cloud `say`, `share`, `usage`, `token` and account-dependent broker/gateway contracts. Do not substitute generic OAuth for a service-specific flow.
+- Retain cloud `say`, `generate_image`, `share`, `usage`, `token` and account-dependent broker/gateway contracts. Do not substitute generic OAuth for a service-specific flow.
 - `tiny-models` requires ONNX dependency approval. Browser work requires working external CDP; installed Chromium is not a validated backend.
 - `inspect_image` remains deferred without decoder/resvg/WebP approval. External credentials do not justify removing interfaces.
 - No new dependency, installed-CLI replacement, tag, release or PR is authorized by this plan.
@@ -134,6 +143,6 @@ No row closes an entire category unless every retained contract below is verifie
 
 Final acceptance includes cancellation/leak checks, lazy JavaScript startup, two model/tool turns, resume/fork and applicable MCP/RPC/ACP/task/hub/SSH scenarios.
 
-Measure startup, CPU and PSS against the installed Bun CLI with matched 8-turn and 30-turn histories. Use the same device and isolated configuration. No repository-defined threshold exists, so do not invent one.
+Measure startup, CPU and PSS against the installed Bun CLI with matched 8-turn and 30-turn histories. Use the same device and isolated configuration. No Rust-specific threshold exists. Bun packaging targets are not Rust acceptance criteria.
 
 `android/scripts/bench.sh` measures Bun and cannot establish Rust performance. Add a live credential-backed smoke only when credentials are available.

@@ -27,6 +27,15 @@ env CARGO_TARGET_DIR="$HOME/omp-work/target" \
 
 Run one scoped Cargo command at a time, bounded to 600 seconds. Full/heavy suites run in Actions. A link timeout means no test result; do not repeat an unchanged failing or heavy command without a new hypothesis.
 
+`cargo check` does not produce an executable. For a scoped runtime check, build the CLI with the same environment:
+
+```sh
+env TMPDIR="$HOME/task-tmp" CARGO_TARGET_DIR="$HOME/omp-work/target" \
+  CARGO_INCREMENTAL=1 RUSTC_BOOTSTRAP=1 \
+  RUSTFLAGS='-C link-arg=-Wl,--threads=1' \
+  nice -n 15 cargo build --offline --locked -j1 -p omp-cli --bin omp
+```
+
 After a successful build, copy the executable to a unique HOME path and record SHA-256 before another worktree uses the shared target. Test that pinned copy. Another Cargo invocation can replace `target/debug/omp`.
 
 ## Exact-SHA CI

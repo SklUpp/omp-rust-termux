@@ -2122,11 +2122,22 @@ fn settle_background_result(
 			let usage = child_usage(&turns);
 			let (output, _) = cap_result_text(&finalized.output);
 			if finalized.failed {
+				let terminal_error = terminal_error_message(&turns).is_some();
+				let (status, output) = if terminal_error {
+					let output = if finalized.stderr.is_empty() {
+						output
+					} else {
+						format!("{}{output}", finalized.stderr)
+					};
+					("failed (provider_error)", output)
+				} else {
+					("failed (schema_violation)", output)
+				};
 				let envelope = task_result_envelope(
 					&id,
 					&agent,
 					output_id.as_deref(),
-					"failed (schema_violation)",
+					status,
 					duration_ms,
 					&output,
 					None,
@@ -4086,6 +4097,96 @@ mod tests {
 		let restarted_manager = crate::subagent_lifecycle::attach(&supervisor, 120, restarted);
 		assert_eq!(restarted_manager.status(&id), None, "tombstoned id stays unparked");
 		std::fs::remove_dir_all(&root).ok();
+	}
+
+	#[tokio::test]
+	async fn background_terminal_provider_error_keeps_message_and_partial_output() {
+		let nanos = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.map(|duration| duration.as_nanos())
+			.unwrap_or_default();
+		let home = std::env::var_os("HOME")
+			.map(std::path::PathBuf::from)
+			.expect("HOME must be set");
+		let root = home.join(format!(
+			".omp-agent-provider-error-{}-{nanos}",
+			std::process::id()
+		));
+		let subagents = root.join("subagents");
+		std::fs::create_dir_all(&subagents).expect("subagents");
+		let supervisor = Supervisor::with_selection(
+			ToolRegistry::with_builtins(),
+			Arc::new(NullProvider),
+			None,
+			DelegationLimits::default(),
+			true,
+			false,
+		);
+		supervisor.set_child_session_root(Some(subagents));
+		let mut scope = crate::tools::internal_urls::UrlScope::default();
+		scope
+			.local_roots
+			.insert("local".to_string(), root.clone());
+		supervisor.set_url_scope(Arc::new(scope));
+		let (id, _cancel) = supervisor
+			.reserve_child_full(ChildSpawn {
+				name:                "bg-provider-error",
+				index:               0,
+				agent:               "task",
+				agent_source:        "builtin",
+				task:                "work",
+				parent_id:           None,
+				parent_tool_call_id: None,
+				detached:            true,
+				output_prefix:       None,
+			})
+			.expect("reserve");
+		supervisor.mark_contract_expected(&id);
+		let mut message = Message::assistant("partial answer");
+		message.stop_reason = Some(crate::state::StopReason::Error);
+		message.error_message = Some("upstream failed".to_string());
+		message.usage = Some(TokenUsage {
+			input: 11,
+			output: 7,
+			total_tokens: 18,
+			..TokenUsage::default()
+		});
+		let turns = vec![TurnResult {
+			message,
+			tool_results: Vec::new(),
+			is_completed: true,
+		}];
+		settle_background_result(
+			Arc::clone(&supervisor),
+			id,
+			Instant::now(),
+			Ok(BackgroundOutcome {
+				turns,
+				isolation: None,
+				cancelled: false,
+			}),
+			TaskItemSpec {
+				name: "bg-provider-error".to_string(),
+				agent: model_agent(),
+				task: "work".to_string(),
+				context: None,
+				output_schema: None,
+				schema_mode: SchemaMode::default(),
+				schema_error: None,
+				effort: None,
+				isolation: IsolationRequest::default(),
+			},
+			None,
+			Arc::new(Mutex::new(ChildSalvage::default())),
+		);
+		let deliveries = supervisor.take_results_for(None);
+		assert_eq!(deliveries.len(), 1);
+		let envelope = &deliveries[0];
+		assert!(envelope.contains("status=\"failed (provider_error)\""), "{envelope}");
+		assert!(envelope.contains("upstream failed"), "{envelope}");
+		assert!(envelope.contains("partial answer"), "{envelope}");
+		assert!(envelope.contains("<usage input=\"11\""), "{envelope}");
+		std::fs::remove_dir_all(root).ok();
 	}
 
 	#[test]

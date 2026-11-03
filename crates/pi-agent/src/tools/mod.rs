@@ -7,6 +7,7 @@ pub mod checkpoint;
 pub mod conflict;
 pub mod edit_variants;
 pub mod hashline;
+pub(crate) mod history_files;
 pub mod history_format;
 pub mod hub;
 pub mod hub_park;

@@ -16,7 +16,7 @@ use crate::state::{ContentPart, Message, Role};
 const PRIMARY_ARG_MAX: usize = 120;
 
 /// Per-tool preference order for the most informative scalar argument.
-const PRIMARY_ARG_KEYS: [&str; 13] = [
+const PRIMARY_ARG_KEYS: [&str; 15] = [
 	"path",
 	"file_path",
 	"filePath",
@@ -30,6 +30,8 @@ const PRIMARY_ARG_KEYS: [&str; 13] = [
 	"note",
 	"message",
 	"op",
+	"name",
+	"id",
 ];
 
 /// Tool-call intent field (never a useful summary on its own).
@@ -63,6 +65,9 @@ fn message_text(message: &Message) -> String {
 }
 
 fn line_count(text: &str) -> usize {
+	if text.is_empty() {
+		return 0;
+	}
 	text.split('\n').count()
 }
 
@@ -85,6 +90,19 @@ fn primary_arg(name: &str, arguments: Option<&Value>) -> String {
 	let Some(Value::Object(args)) = arguments else {
 		return String::new();
 	};
+	if name == "advise" {
+		let note = primary_arg_value(args.get("note").unwrap_or(&Value::Null));
+		let severity = primary_arg_value(args.get("severity").unwrap_or(&Value::Null));
+		if !note.is_empty() && !severity.is_empty() {
+			return one_line(&format!("{severity}: {note}"), PRIMARY_ARG_MAX);
+		}
+		if !note.is_empty() {
+			return one_line(&note, PRIMARY_ARG_MAX);
+		}
+		if !severity.is_empty() {
+			return one_line(&severity, PRIMARY_ARG_MAX);
+		}
+	}
 	if name == "grep" {
 		let pattern = primary_arg_value(args.get("pattern").unwrap_or(&Value::Null));
 		let paths = primary_arg_value(args.get("path").unwrap_or(&Value::Null));
@@ -101,6 +119,12 @@ fn primary_arg(name: &str, arguments: Option<&Value>) -> String {
 		}
 		if !paths.is_empty() {
 			return one_line(&paths, PRIMARY_ARG_MAX);
+		}
+	}
+	if name == "ast_grep" {
+		let pattern = primary_arg_value(args.get("pat").unwrap_or(&Value::Null));
+		if !pattern.is_empty() {
+			return one_line(&pattern, PRIMARY_ARG_MAX);
 		}
 	}
 	if name == "glob" {
@@ -339,6 +363,31 @@ mod tests {
 		assert!(
 			markdown.contains("→ bash() ⇒ error · 2 lines — one line"),
 			"{markdown}"
+		);
+	}
+
+	#[test]
+	fn empty_tool_result_reports_zero_lines_and_specials_pick_primary_arg() {
+		let call = ToolCall {
+			id:     "call-empty".to_string(),
+			name:   "bash".to_string(),
+			arguments: json!({ "command": "true" }),
+		};
+		let mut empty = Message::tool("call-empty", "");
+		empty.name = Some("bash".to_string());
+		let markdown = format_history_markdown(
+			"Worker",
+			&[Message::assistant_with_tools("", vec![call]), empty],
+		);
+		assert!(markdown.contains("→ bash(true) ⇒ ok · 0 lines"), "{markdown}");
+
+		assert_eq!(
+			super::primary_arg("advise", Some(&json!({ "severity": "error", "note": "blocking" }))),
+			"error: blocking"
+		);
+		assert_eq!(
+			super::primary_arg("ast_grep", Some(&json!({ "pat": "fn $F($$$)", "path": "src" }))),
+			"fn $F($$$)"
 		);
 	}
 

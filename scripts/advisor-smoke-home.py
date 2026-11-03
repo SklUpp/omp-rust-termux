@@ -799,6 +799,16 @@ def phase_child(binary: str, mock: MockModel, base: Path) -> None:
         fail("mock never received a real child provider request")
     if not advisor_requests:
         fail("mock never received a child advisor provider request")
+    if any(
+        "spawn one child-smoke task" in json.dumps(request.get("messages", []))
+        for request in advisor_requests
+    ):
+        fail("root advisor ran despite --advisor being off")
+    if not any(
+        "child finished" in json.dumps(request.get("messages", []))
+        for request in advisor_requests
+    ):
+        fail("child advisor requests do not contain the child's completed turn")
     root_logs = [
         path for path in session_logs(sessions)
         if "subagents" not in path.parts and "__advisor" not in path.name
@@ -806,14 +816,33 @@ def phase_child(binary: str, mock: MockModel, base: Path) -> None:
     if len(root_logs) != 1:
         fail(f"expected one root session log, got {root_logs}")
     root_log = root_logs[0].read_text()
+    if "child-smoke" not in root_log:
+        fail("root session log does not record the real child task spawn")
     if "child advice marker" not in root_log:
         fail("child advice card was not persisted by the parent host")
+    root_advisors = [
+        path for path in sessions.rglob("__advisor*.jsonl")
+        if "subagents" not in path.parts
+    ]
+    if root_advisors:
+        fail(f"root advisor ran despite --advisor being off: {root_advisors}")
+    child_logs = [
+        path for path in session_logs(sessions)
+        if "subagents" in path.parts
+    ]
+    if not child_logs:
+        fail("child session log missing under subagents")
+    child_text = "\n".join(path.read_text() for path in child_logs)
+    if "19191" not in child_text:
+        fail("child provider usage is not recorded in the child session log")
     child_advisors = [
         path for path in sessions.rglob("__advisor*.jsonl")
         if "subagents" in path.parts
     ]
     if not child_advisors:
         fail("child-local __advisor transcript missing")
+    if "child advice marker" not in child_advisors[0].read_text():
+        fail("child advisor transcript does not contain its delivered note")
     if "19191" in root_log:
         fail("advisor usage leaked into the parent session log")
     print(f"PASS child advisor opt-in, card, provider calls, transcript ({child_advisors[0]})")
@@ -832,6 +861,14 @@ def phase_child_failure(binary: str, mock: MockModel, base: Path) -> None:
         for request in requests
     ):
         fail("child failure phase never reached the child provider")
+    if "child advice marker" in out.stdout:
+        fail("failed child advisor fabricated a card")
+    root_advisors = [
+        path for path in sessions.rglob("__advisor*.jsonl")
+        if "subagents" not in path.parts
+    ]
+    if root_advisors:
+        fail(f"root advisor ran despite --advisor being off: {root_advisors}")
     print("PASS child provider failure contained")
 
 

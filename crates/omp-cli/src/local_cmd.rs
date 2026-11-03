@@ -1,21 +1,32 @@
-//! Safe, read-only/local C5 commands: `ttsr`, `gallery`, `grievances list`,
-//! `gc` dry-run, and `setup` probes.
+//! Local C5 commands: `ttsr`, `gallery`, `grievances list`, `gc` (dry-run and
+//! `--apply`), and `setup` probes.
 //!
 //! Anchors are the TypeScript CLI handlers in
 //! `packages/coding-agent/src/cli/{ttsr,gallery,grievances,gc,setup}-cli.ts`.
-//! Nothing here deletes data, reaches the network, starts a daemon, or downloads
-//! models; those remain approval-gated slices. `setup python` does execute the
+//! `gc --apply` mutates local agent storage; every other command here is
+//! read-only and none reaches the network, starts a daemon, or downloads models. `setup python` does execute the
 //! configured/discovered interpreter (with startup hooks) for its availability
 //! probe, so it is limited to trusted projects; the CLI itself performs no
 //! install/download/mutation.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
-use std::io::{self, IsTerminal, Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::fs::OpenOptions;
+use std::io::{self, BufRead, BufReader, IsTerminal, Read, Seek, SeekFrom, Write};
+#[cfg(not(target_os = "linux"))]
+use std::os::unix::io::AsRawFd;
+#[cfg(target_os = "linux")]
+use std::os::linux::net::SocketAddrExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+#[cfg(target_os = "linux")]
+use std::os::unix::net::{SocketAddr, UnixDatagram};
+use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
@@ -2248,10 +2259,11 @@ pub fn run_grievances(opts: &GrievancesOptions, out: &mut dyn Write) -> Result<u
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// `omp gc` (dry-run)
+// `omp gc` (dry-run unless `--apply`)
 // ───────────────────────────────────────────────────────────────────────────
 
 pub struct GcOptions {
+	pub apply:                  bool,
 	pub json:                   bool,
 	pub agent_dir:              Option<PathBuf>,
 	pub blobs:                  bool,
@@ -2575,52 +2587,74 @@ fn collect_referenced_blob_hashes(
 	Ok(hashes)
 }
 
-fn run_blob_gc(paths: &GcPaths) -> std::result::Result<Value, String> {
+fn run_blob_gc(paths: &GcPaths, apply: bool) -> std::result::Result<Value, String> {
 	let referenced = collect_referenced_blob_hashes(&[&paths.sessions, &paths.archive])?;
 	let mut by_hash: BTreeMap<String, (Vec<PathBuf>, u64, u64)> = BTreeMap::new();
-	if let Ok(entries) = fs::read_dir(&paths.blobs) {
-		for entry in entries.flatten() {
-			let path = entry.path();
-			let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-				continue;
-			};
-			let Some(hash) = is_blob_file(name) else {
-				continue;
-			};
-			let Ok(meta) = fs::metadata(&path) else {
-				continue;
-			};
-			if !meta.is_file() {
-				continue;
-			}
-			let candidate = by_hash.entry(hash.to_string()).or_insert_with(|| (Vec::new(), 0, 0));
-			candidate.0.push(path);
-			candidate.1 += meta.len();
-			candidate.2 = candidate.2.max(modified_ms(&meta));
+	let entries = match fs::read_dir(&paths.blobs) {
+		Ok(entries) => entries
+			.collect::<std::result::Result<Vec<_>, _>>()
+			.map_err(|error| format!("{}: {error}", paths.blobs.display()))?,
+		Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+		Err(error) => return Err(format!("{}: {error}", paths.blobs.display())),
+	};
+	for entry in entries {
+		let path = entry.path();
+		let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+			continue;
+		};
+		let Some(hash) = is_blob_file(name) else {
+			continue;
+		};
+		let meta = match fs::metadata(&path) {
+			Ok(meta) => meta,
+			Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+			Err(error) => return Err(format!("{}: {error}", path.display())),
+		};
+		if !meta.is_file() {
+			continue;
 		}
+		let candidate = by_hash.entry(hash.to_string()).or_insert_with(|| (Vec::new(), 0, 0));
+		candidate.0.push(path);
+		candidate.1 += meta.len();
+		candidate.2 = candidate.2.max(modified_ms(&meta));
 	}
 	let delete_before = now_ms().saturating_sub(GC_WRITE_GRACE_MS);
 	let mut would_delete = 0u64;
+	let mut deleted = 0u64;
 	let mut bytes = 0u64;
+	let mut errors: Vec<String> = Vec::new();
 	for (hash, (files, group_bytes, mtime)) in &by_hash {
 		if referenced.contains(hash) || *mtime > delete_before {
 			continue;
 		}
 		would_delete += files.len() as u64;
 		bytes += group_bytes;
+		if !apply {
+			continue;
+		}
+		for file in files {
+			match fs::remove_file(file) {
+				Ok(()) => deleted += 1,
+				Err(error) if error.kind() == io::ErrorKind::NotFound => {},
+				Err(error) => errors.push(format!("{}: {error}", file.display())),
+			}
+		}
 	}
 	Ok(json!({
 		"referenced": referenced.len(),
 		"candidates": by_hash.len(),
 		"wouldDelete": would_delete,
-		"deleted": 0,
+		"deleted": deleted,
 		"bytes": bytes,
-		"errors": Vec::<String>::new(),
+		"errors": errors,
 	}))
 }
 
 struct SessionHeader {
-	cwd: Option<String>,
+	id:                     String,
+	cwd:                    Option<String>,
+	parent_session:         Option<String>,
+	previous_session_files: Vec<String>,
 }
 
 /// TS `parseSessionListHeader`: optional leading `title` slot, then a
@@ -2648,8 +2682,27 @@ fn parse_session_header(content: &str) -> Option<SessionHeader> {
 		if id.is_empty() {
 			return None;
 		}
+		let parent_session = record
+			.get("parentSession")
+			.and_then(Value::as_str)
+			.map(str::to_string);
+		let previous_session_files = record
+			.get("previousSessionFiles")
+			.and_then(Value::as_array)
+			.map(|items| {
+				items
+					.iter()
+					.filter_map(Value::as_str)
+					.filter(|value| !value.is_empty())
+					.map(str::to_string)
+					.collect()
+			})
+			.unwrap_or_default();
 		return Some(SessionHeader {
+			id: id.to_string(),
 			cwd: record.get("cwd").and_then(Value::as_str).map(str::to_string),
+			parent_session,
+			previous_session_files,
 		});
 	}
 	None
@@ -2703,11 +2756,14 @@ fn session_status_text(suffix: &str) -> &'static str {
 	"unknown"
 }
 
+#[derive(Clone)]
 struct SessionMeta {
-	path:     PathBuf,
-	modified: u64,
-	status:   &'static str,
-	cwd:      Option<String>,
+	path:                   PathBuf,
+	modified:               u64,
+	status:                 &'static str,
+	cwd:            Option<String>,
+	id:             String,
+	parent_session: Option<String>,
 }
 
 /// TS `listSessionsReadOnly(dir)`: non-recursive visible `*.jsonl` files with
@@ -2744,23 +2800,9 @@ fn list_sessions_in_dir(dir: &Path) -> Vec<SessionMeta> {
 			modified: modified_ms(&meta),
 			status,
 			cwd: header.cwd,
+			id: header.id,
+			parent_session: header.parent_session,
 		});
-	}
-	sessions.sort_by(|left, right| right.modified.cmp(&left.modified));
-	sessions
-}
-
-fn list_active_sessions(sessions_root: &Path) -> Vec<SessionMeta> {
-	let Ok(entries) = fs::read_dir(sessions_root) else {
-		return Vec::new();
-	};
-	let mut sessions = Vec::new();
-	for entry in entries.flatten() {
-		let dir = entry.path();
-		if !dir.is_dir() {
-			continue;
-		}
-		sessions.extend(list_sessions_in_dir(&dir));
 	}
 	sessions.sort_by(|left, right| right.modified.cmp(&left.modified));
 	sessions
@@ -2812,21 +2854,72 @@ fn session_cwd_key(sessions_root: &Path, session: &SessionMeta) -> String {
 	}
 }
 
+fn list_active_sessions_checked(
+	sessions_root: &Path,
+) -> std::result::Result<Vec<SessionMeta>, String> {
+	let entries = match fs::read_dir(sessions_root) {
+		Ok(entries) => entries,
+		Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+		Err(error) => {
+			return Err(format!("{}: {error}", sessions_root.display()));
+		},
+	};
+	let mut sessions = Vec::new();
+	for entry in entries {
+		let entry = entry.map_err(|error| format!("{}: {error}", sessions_root.display()))?;
+		let dir = entry.path();
+		if !dir.is_dir() {
+			continue;
+		}
+		sessions.extend(list_sessions_in_dir(&dir));
+	}
+	sessions.sort_by(|left, right| right.modified.cmp(&left.modified));
+	Ok(sessions)
+}
+
+struct ArchiveCandidate {
+	session:     SessionMeta,
+	destination: PathBuf,
+}
+
+fn archive_destination(
+	archive_root: &Path,
+	sessions_root: &Path,
+	session: &SessionMeta,
+) -> Option<PathBuf> {
+	let relative = session.path.strip_prefix(sessions_root).ok()?;
+	if relative.as_os_str().is_empty()
+		|| relative.is_absolute()
+		|| relative
+			.components()
+			.any(|component| matches!(component, Component::ParentDir | Component::RootDir | Component::Prefix(_)))
+	{
+		return None;
+	}
+	let relative_text = normalize_slashes(&relative.display().to_string());
+	if !relative_text.ends_with(".jsonl") {
+		return None;
+	}
+	Some(archive_root.join(format!("{relative_text}.gz")))
+}
+
 fn run_archive_gc(
 	paths: &GcPaths,
+	cwd: &Path,
+	apply: bool,
 	cold_archive_after_days: u64,
 	retain_newest_global: u64,
 	retain_newest_per_cwd: u64,
-) -> Value {
-	let sessions = list_active_sessions(&paths.sessions);
+) -> std::result::Result<Value, String> {
+	let sessions = list_active_sessions_checked(&paths.sessions)?;
 	let cutoff = now_ms().saturating_sub(cold_archive_after_days.saturating_mul(DAY_MS));
 	let archive_before = now_ms().saturating_sub(GC_WRITE_GRACE_MS);
 	let mut skipped_active = 0u64;
 	let mut kept_newest_global = 0u64;
 	let mut kept_newest_per_cwd = 0u64;
-	let mut would_archive = 0u64;
 	let mut inactive_seen = 0u64;
 	let mut inactive_by_cwd: HashMap<String, u64> = HashMap::new();
+	let mut candidates: Vec<ArchiveCandidate> = Vec::new();
 
 	for session in &sessions {
 		if matches!(session.status, "pending" | "interrupted" | "unknown") {
@@ -2858,48 +2951,141 @@ fn run_archive_gc(
 		if cold_archive_after_days > 0 && session.modified > cutoff {
 			continue;
 		}
-		let Ok(relative) = session.path.strip_prefix(&paths.sessions) else {
+		let Some(destination) = archive_destination(&paths.archive, &paths.sessions, session) else {
 			continue;
 		};
-		let relative = normalize_slashes(&relative.display().to_string());
-		if !relative.ends_with(".jsonl") {
-			continue;
-		}
-		// Destination is deterministic, but a dry-run never creates or moves it.
-		let _destination = paths.archive.join(format!("{relative}.gz"));
-		would_archive += 1;
+		candidates.push(ArchiveCandidate { session: session.clone(), destination });
 	}
 
-	json!({
+	let would_archive = candidates.len() as u64;
+	let mut archived = 0u64;
+	let mut history_rows_deleted = 0u64;
+	let mut stats_rows_deleted = 0u64;
+	let mut fts_rebuilt = false;
+	let mut errors: Vec<String> = Vec::new();
+	let mut archived_sessions: Vec<SessionMeta> = Vec::new();
+	let mut archived_session_ids: Vec<String> = Vec::new();
+
+	if apply {
+		for candidate in &candidates {
+			match move_session_with_artifacts(candidate, &paths.sessions, &paths.archive) {
+				Ok(()) => {
+					archived += 1;
+					archived_session_ids.push(candidate.session.id.clone());
+					archived_sessions.push(candidate.session.clone());
+				},
+				Err(message) => {
+					errors.push(format!("{}: {message}", candidate.session.path.display()));
+				},
+			}
+		}
+		cleanup_history_rows_for_archived_sessions(
+			paths,
+			&archived_session_ids,
+			&mut history_rows_deleted,
+			&mut fts_rebuilt,
+			&mut errors,
+		);
+		stats_rows_deleted = cleanup_stats_rows_for_archived_sessions(
+			paths,
+			cwd,
+			&archived_sessions,
+			&mut errors,
+		);
+	}
+
+	Ok(json!({
 		"scanned": sessions.len(),
 		"skippedActive": skipped_active,
 		"keptNewestGlobal": kept_newest_global,
 		"keptNewestPerCwd": kept_newest_per_cwd,
 		"wouldArchive": would_archive,
-		"archived": 0,
-		"historyRowsDeleted": 0,
-		"statsRowsDeleted": 0,
-		"ftsRebuilt": false,
-		"errors": Vec::<String>::new(),
-	})
+		"archived": archived,
+		"historyRowsDeleted": history_rows_deleted,
+		"statsRowsDeleted": stats_rows_deleted,
+		"ftsRebuilt": fts_rebuilt,
+		"errors": errors,
+	}))
 }
 
-fn wal_state(db_path: &Path) -> Value {
+fn wal_file_bytes(wal_path: &Path) -> std::result::Result<u64, String> {
+	match fs::metadata(wal_path) {
+		Ok(meta) => Ok(meta.len()),
+		Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(0),
+		Err(error) => Err(format!("{}: {error}", wal_path.display())),
+	}
+}
+
+fn path_exists_checked(path: &Path) -> std::result::Result<bool, String> {
+	match fs::metadata(path) {
+		Ok(_) => Ok(true),
+		Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+		Err(error) => Err(format!("{}: {error}", path.display())),
+	}
+}
+
+fn checkpoint_wal(
+	db_path: &Path,
+	apply: bool,
+) -> std::result::Result<Value, String> {
 	let wal_path = PathBuf::from(format!("{}-wal", db_path.display()));
-	let wal_bytes = fs::metadata(&wal_path).map_or(0, |meta| meta.len());
-	json!({
+	let mut wal_bytes = wal_file_bytes(&wal_path)?;
+	let would_checkpoint = wal_bytes > 0;
+	let mut checkpointed = false;
+	let mut busy = 0i64;
+	let mut log = 0i64;
+	let mut checkpointed_frames = 0i64;
+	if apply && path_exists_checked(db_path)? {
+		let connection = rusqlite::Connection::open(db_path)
+			.map_err(|error| format!("{}: {error}", db_path.display()))?;
+		connection
+			.busy_timeout(Duration::from_millis(5_000))
+			.map_err(|error| format!("{}: {error}", db_path.display()))?;
+		let row = match connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+			Ok((
+				row.get::<_, i64>(0)?,
+				row.get::<_, i64>(1)?,
+				row.get::<_, i64>(2)?,
+			))
+		}) {
+			Ok(row) => Some(row),
+			Err(rusqlite::Error::QueryReturnedNoRows) => None,
+			Err(error) => return Err(format!("{}: {error}", db_path.display())),
+		};
+		if let Some((next_busy, next_log, next_frames)) = row {
+			busy = next_busy;
+			log = next_log;
+			checkpointed_frames = next_frames;
+		}
+		drop(connection);
+		wal_bytes = wal_file_bytes(&wal_path)?;
+		if busy > 0 || wal_bytes > 0 {
+			return Err(format!(
+				"WAL checkpoint failed for {}: busy={busy}, walBytes={wal_bytes}",
+				db_path.display()
+			));
+		}
+		checkpointed = true;
+	}
+	Ok(json!({
 		"dbPath": display_path(db_path),
 		"walBytes": wal_bytes,
-		"wouldCheckpoint": wal_bytes > 0,
-		"checkpointed": false,
-		"busy": 0,
-		"log": 0,
-		"checkpointedFrames": 0,
-	})
+		"wouldCheckpoint": would_checkpoint,
+		"checkpointed": checkpointed,
+		"busy": busy,
+		"log": log,
+		"checkpointedFrames": checkpointed_frames,
+	}))
 }
 
-fn run_wal_gc(paths: &GcPaths) -> Value {
-	let databases = vec![wal_state(&paths.history_db), wal_state(&paths.models_db)];
+fn run_wal_gc(
+	paths: &GcPaths,
+	apply: bool,
+) -> std::result::Result<Value, String> {
+	let databases = vec![
+		checkpoint_wal(&paths.history_db, apply)?,
+		checkpoint_wal(&paths.models_db, apply)?,
+	];
 	let wal_bytes: u64 = databases
 		.iter()
 		.filter_map(|database| database["walBytes"].as_u64())
@@ -2907,17 +3093,1634 @@ fn run_wal_gc(paths: &GcPaths) -> Value {
 	let would_checkpoint = databases
 		.iter()
 		.any(|database| database["wouldCheckpoint"].as_bool().unwrap_or(false));
-	json!({
+	let checkpointed = databases
+		.iter()
+		.any(|database| database["checkpointed"].as_bool().unwrap_or(false));
+	Ok(json!({
 		"databases": databases,
 		"walBytes": wal_bytes,
 		"wouldCheckpoint": would_checkpoint,
-		"checkpointed": false,
-	})
+		"checkpointed": checkpointed,
+	}))
+}
+
+fn gc_path_key(cwd: &Path, path: &Path) -> PathBuf {
+	crate::config::normalize_lexically(&dirs::absolute(cwd, path))
+}
+
+fn gc_temp_path(destination: &Path) -> PathBuf {
+	static COUNTER: AtomicU64 = AtomicU64::new(0);
+	let nonce = COUNTER.fetch_add(1, Ordering::Relaxed);
+	PathBuf::from(format!(
+		"{}.{}.{}.{}.tmp",
+		destination.display(),
+		std::process::id(),
+		now_ms(),
+		nonce
+	))
+}
+
+/// Create the destination parent and refuse to leave the archive root through
+/// a symlinked directory.
+fn ensure_destination_parent(
+	archive_root: &Path,
+	destination: &Path,
+) -> std::result::Result<(), String> {
+	let parent = destination
+		.parent()
+		.ok_or_else(|| format!("invalid archive destination: {}", destination.display()))?;
+	fs::create_dir_all(archive_root)
+		.and_then(|()| fs::create_dir_all(parent))
+		.map_err(|error| format!("{}: {error}", parent.display()))?;
+	let root = fs::canonicalize(archive_root)
+		.map_err(|error| format!("{}: {error}", archive_root.display()))?;
+	let resolved = fs::canonicalize(parent)
+		.map_err(|error| format!("{}: {error}", parent.display()))?;
+	if !resolved.starts_with(&root) {
+		return Err(format!(
+			"archive destination escapes root: {}",
+			destination.display()
+		));
+	}
+	Ok(())
+}
+
+fn ensure_source_within(
+	root: &Path,
+	source: &Path,
+) -> std::result::Result<(), String> {
+	let meta = fs::symlink_metadata(source)
+		.map_err(|error| format!("{}: {error}", source.display()))?;
+	if meta.file_type().is_symlink() {
+		return Err(format!("refusing to move symlink: {}", source.display()));
+	}
+	let root = fs::canonicalize(root)
+		.map_err(|error| format!("{}: {error}", root.display()))?;
+	let resolved = fs::canonicalize(source)
+		.map_err(|error| format!("{}: {error}", source.display()))?;
+	if !resolved.starts_with(&root) {
+		return Err(format!("source escapes sessions root: {}", source.display()));
+	}
+	Ok(())
+}
+
+fn copy_new_file(
+	source: &Path,
+	destination: &Path,
+) -> std::result::Result<(), String> {
+	let mut input = fs::File::open(source)
+		.map_err(|error| format!("{}: {error}", source.display()))?;
+	let mut output = OpenOptions::new()
+		.write(true)
+		.create_new(true)
+		.mode(0o600)
+		.open(destination)
+		.map_err(|error| format!("{}: {error}", destination.display()))?;
+	let copied = io::copy(&mut input, &mut output)
+		.and_then(|_| output.sync_all())
+		.map_err(|error| format!("{}: {error}", destination.display()));
+	drop(output);
+	if let Err(error) = copied {
+		let _ = fs::remove_file(destination);
+		return Err(error);
+	}
+	Ok(())
+}
+
+fn gzip_session_file(
+	source: &Path,
+	destination: &Path,
+	archive_root: &Path,
+) -> std::result::Result<(), String> {
+	ensure_destination_parent(archive_root, destination)?;
+	if path_exists_checked(destination)? {
+		return Err(format!(
+			"archive destination exists: {}",
+			destination.display()
+		));
+	}
+	let temp = gc_temp_path(destination);
+	let written = (|| -> io::Result<()> {
+		let input = fs::File::open(source)?;
+		let output = OpenOptions::new()
+			.write(true)
+			.create_new(true)
+			.mode(0o600)
+			.open(&temp)?;
+		let mut encoder = GzEncoder::new(output, Compression::best());
+		io::copy(&mut BufReader::new(input), &mut encoder)?;
+		let output = encoder.finish()?;
+		output.sync_all()?;
+		Ok(())
+	})();
+	if let Err(error) = written {
+		let _ = fs::remove_file(&temp);
+		return Err(format!("{}: {error}", source.display()));
+	}
+	match fs::hard_link(&temp, destination) {
+		Ok(()) => {},
+		Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+			let _ = fs::remove_file(&temp);
+			return Err(format!(
+				"archive destination exists: {}",
+				destination.display()
+			));
+		},
+		Err(_) => {
+			if let Err(error) = copy_new_file(&temp, destination) {
+				let _ = fs::remove_file(&temp);
+				return Err(error);
+			}
+		},
+	}
+	let _ = fs::remove_file(&temp);
+	if let Err(error) = fs::remove_file(source) {
+		let _ = fs::remove_file(destination);
+		return Err(format!("{}: {error}", source.display()));
+	}
+	Ok(())
+}
+
+fn restore_gzip_session_file(
+	source: &Path,
+	destination: &Path,
+) -> std::result::Result<(), String> {
+	if let Some(parent) = destination.parent() {
+		fs::create_dir_all(parent)
+			.map_err(|error| format!("{}: {error}", parent.display()))?;
+	}
+	let input = fs::File::open(source)
+		.map_err(|error| format!("{}: {error}", source.display()))?;
+	let mut decoder = GzDecoder::new(input);
+	let mut output = OpenOptions::new()
+		.write(true)
+		.create_new(true)
+		.mode(0o600)
+		.open(destination)
+		.map_err(|error| format!("{}: {error}", destination.display()))?;
+	let copied = io::copy(&mut decoder, &mut output)
+		.and_then(|_| output.sync_all())
+		.map_err(|error| format!("{}: {error}", destination.display()));
+	drop(output);
+	if let Err(error) = copied {
+		let _ = fs::remove_file(destination);
+		return Err(error);
+	}
+	fs::remove_file(source).map_err(|error| format!("{}: {error}", source.display()))
+}
+
+fn copy_tree_no_replace(
+	source: &Path,
+	destination: &Path,
+	created: &mut Vec<(PathBuf, bool)>,
+) -> std::result::Result<(), String> {
+	let meta = fs::symlink_metadata(source)
+		.map_err(|error| format!("{}: {error}", source.display()))?;
+	if meta.file_type().is_symlink() {
+		return Err(format!("refusing to move symlink: {}", source.display()));
+	}
+	if meta.is_dir() {
+		fs::create_dir(destination)
+			.map_err(|error| format!("{}: {error}", destination.display()))?;
+		created.push((destination.to_path_buf(), true));
+		let entries = fs::read_dir(source)
+			.map_err(|error| format!("{}: {error}", source.display()))?;
+		for entry in entries {
+			let entry = entry.map_err(|error| format!("{}: {error}", source.display()))?;
+			copy_tree_no_replace(
+				&entry.path(),
+				&destination.join(entry.file_name()),
+				created,
+			)?;
+		}
+		return Ok(());
+	}
+	if meta.is_file() {
+		let mut input = fs::File::open(source)
+			.map_err(|error| format!("{}: {error}", source.display()))?;
+		let mut output = OpenOptions::new()
+			.write(true)
+			.create_new(true)
+			.mode(0o600)
+			.open(destination)
+			.map_err(|error| format!("{}: {error}", destination.display()))?;
+		created.push((destination.to_path_buf(), false));
+		io::copy(&mut input, &mut output)
+			.and_then(|_| output.sync_all())
+			.map_err(|error| format!("{}: {error}", destination.display()))?;
+		return Ok(());
+	}
+	Err(format!(
+		"unsupported artifacts entry: {}",
+		source.display()
+	))
+}
+
+fn cleanup_created(created: &mut Vec<(PathBuf, bool)>) {
+	for (path, is_dir) in created.drain(..).rev() {
+		if is_dir {
+			let _ = fs::remove_dir(&path);
+		} else {
+			let _ = fs::remove_file(&path);
+		}
+	}
+}
+
+fn move_tree_no_replace(
+	source: &Path,
+	destination: &Path,
+) -> std::result::Result<(), String> {
+	if path_exists_checked(destination)? {
+		return Err(format!(
+			"archive artifacts destination exists: {}",
+			destination.display()
+		));
+	}
+	let mut created = Vec::new();
+	if let Err(error) = copy_tree_no_replace(source, destination, &mut created) {
+		cleanup_created(&mut created);
+		return Err(error);
+	}
+	fs::remove_dir_all(source).map_err(|error| format!("{}: {error}", source.display()))
+}
+
+fn rollback_moves(moves: &[(PathBuf, PathBuf, bool)]) {
+	for (source, destination, compressed) in moves.iter().rev() {
+		if *compressed {
+			let _ = restore_gzip_session_file(destination, source);
+		} else {
+			let _ = move_tree_no_replace(destination, source);
+		}
+	}
+}
+
+fn move_session_with_artifacts(
+	candidate: &ArchiveCandidate,
+	sessions_root: &Path,
+	archive_root: &Path,
+) -> std::result::Result<(), String> {
+	let source = &candidate.session.path;
+	let destination = &candidate.destination;
+	ensure_source_within(sessions_root, source)?;
+	let destination_text = destination.to_string_lossy();
+	let legacy_destination = PathBuf::from(
+		destination_text
+			.strip_suffix(".gz")
+			.unwrap_or(destination_text.as_ref())
+			.to_string(),
+	);
+	ensure_destination_parent(archive_root, destination)?;
+	if path_exists_checked(destination)? {
+		return Err(format!(
+			"archive destination exists: {}",
+			destination.display()
+		));
+	}
+	if path_exists_checked(&legacy_destination)? {
+		return Err(format!(
+			"archive destination exists: {}",
+			legacy_destination.display()
+		));
+	}
+	let source_artifacts = session_artifacts_path(source);
+	let destination_artifacts = session_artifacts_path(destination);
+	let has_artifacts = path_exists_checked(&source_artifacts)?;
+	if has_artifacts {
+		ensure_source_within(sessions_root, &source_artifacts)?;
+		if path_exists_checked(&destination_artifacts)? {
+			return Err(format!(
+				"archive artifacts destination exists: {}",
+				destination_artifacts.display()
+			));
+		}
+	}
+	let mut moves: Vec<(PathBuf, PathBuf, bool)> = Vec::new();
+	gzip_session_file(source, destination, archive_root)?;
+	moves.push((source.clone(), destination.clone(), true));
+	if has_artifacts {
+		if let Err(error) = move_tree_no_replace(&source_artifacts, &destination_artifacts) {
+			rollback_moves(&moves);
+			return Err(error);
+		}
+	}
+	Ok(())
+}
+
+fn read_text_if_present(path: &Path) -> std::result::Result<String, String> {
+	let bytes = match fs::File::open(path) {
+		Ok(file) => {
+			if path
+				.file_name()
+				.and_then(|name| name.to_str())
+				.is_some_and(is_compressed_jsonl_name)
+			{
+				let mut decoder = GzDecoder::new(file);
+				let mut bytes = Vec::new();
+				decoder.read_to_end(&mut bytes).map_err(|error| error.to_string())?;
+				bytes
+			} else {
+				let mut bytes = Vec::new();
+				io::BufReader::new(file)
+					.read_to_end(&mut bytes)
+					.map_err(|error| error.to_string())?;
+				bytes
+			}
+		},
+		Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(String::new()),
+		Err(error) => return Err(error.to_string()),
+	};
+	Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn collect_archived_session_ids(archive_root: &Path) -> std::result::Result<Vec<String>, String> {
+	let mut ids = BTreeSet::new();
+	for file in walk_visible_files(archive_root, is_compressed_jsonl_name) {
+		let text = read_text_if_present(&file)?;
+		if let Some(header) = parse_session_header(&text) {
+			ids.insert(header.id);
+		}
+	}
+	Ok(ids.into_iter().collect())
+}
+
+fn sqlite_table_exists(
+	connection: &rusqlite::Connection,
+	table: &str,
+) -> std::result::Result<bool, String> {
+	use rusqlite::OptionalExtension as _;
+	connection
+		.query_row(
+			"SELECT 1 FROM sqlite_master WHERE type IN ('table','view') AND name = ?1",
+			[table],
+			|_| Ok(()),
+		)
+		.optional()
+		.map(|row| row.is_some())
+		.map_err(|error| error.to_string())
+}
+
+fn sqlite_table_has_column(
+	connection: &rusqlite::Connection,
+	table: &str,
+	column: &str,
+) -> std::result::Result<bool, String> {
+	let sql = format!("PRAGMA table_info({table})");
+	let mut statement = connection.prepare(&sql).map_err(|error| error.to_string())?;
+	let mut rows = statement.query([]).map_err(|error| error.to_string())?;
+	while let Some(row) = rows.next().map_err(|error| error.to_string())? {
+		let name = row.get::<_, Option<String>>(1).map_err(|error| error.to_string())?;
+		if name.as_deref() == Some(column) {
+			return Ok(true);
+		}
+	}
+	Ok(false)
+}
+
+fn delete_history_rows_for_sessions(
+	db_path: &Path,
+	session_ids: &[String],
+) -> std::result::Result<(u64, bool), String> {
+	if session_ids.is_empty() {
+		return Ok((0, false));
+	}
+	let mut connection =
+		rusqlite::Connection::open(db_path).map_err(|error| error.to_string())?;
+	connection
+		.busy_timeout(Duration::from_millis(5_000))
+		.map_err(|error| error.to_string())?;
+	if !sqlite_table_exists(&connection, "history")? {
+		return Ok((0, false));
+	}
+	if !sqlite_table_has_column(&connection, "history", "session_id")? {
+		return Ok((0, false));
+	}
+	let has_fts = sqlite_table_exists(&connection, "history_fts")?;
+	let transaction = connection
+		.transaction()
+		.map_err(|error| error.to_string())?;
+	let mut deleted = 0u64;
+	{
+		let mut statement = transaction
+			.prepare("DELETE FROM history WHERE session_id = ?")
+			.map_err(|error| error.to_string())?;
+		for id in session_ids {
+			deleted += statement
+				.execute([id.as_str()])
+				.map_err(|error| error.to_string())? as u64;
+		}
+	}
+	if deleted > 0 && has_fts {
+		transaction
+			.execute("INSERT INTO history_fts(history_fts) VALUES('rebuild')", [])
+			.map_err(|error| error.to_string())?;
+	}
+	transaction.commit().map_err(|error| error.to_string())?;
+	Ok((deleted, deleted > 0 && has_fts))
+}
+
+fn cleanup_history_rows_for_archived_sessions(
+	paths: &GcPaths,
+	newly_archived_ids: &[String],
+	deleted_rows: &mut u64,
+	fts_rebuilt: &mut bool,
+	errors: &mut Vec<String>,
+) {
+	match path_exists_checked(&paths.history_db) {
+		Ok(false) => return,
+		Ok(true) => {},
+		Err(message) => {
+			errors.push(format!("history cleanup: {message}"));
+			return;
+		},
+	}
+	let mut cleanup_ids: BTreeSet<String> = newly_archived_ids.iter().cloned().collect();
+	match collect_archived_session_ids(&paths.archive) {
+		Ok(ids) => cleanup_ids.extend(ids),
+		Err(message) => errors.push(format!("history cleanup scan: {message}")),
+	}
+	match delete_history_rows_for_sessions(&paths.history_db, &cleanup_ids.into_iter().collect::<Vec<_>>())
+	{
+		Ok((deleted, rebuilt)) => {
+			*deleted_rows = deleted;
+			*fts_rebuilt = rebuilt;
+		},
+		Err(message) => errors.push(format!("history cleanup: {message}")),
+	}
+}
+
+#[derive(Clone, Default)]
+struct StatsIdentities {
+	messages:      Vec<StatsIdentity>,
+	user_messages: Vec<StatsIdentity>,
+	tool_calls:    Vec<StatsIdentity>,
+}
+
+#[derive(Clone)]
+struct StatsIdentity {
+	entry_id:     String,
+	timestamp:    i64,
+	tool_call_id: String,
+}
+
+#[derive(Clone)]
+struct StatsSession {
+	path:              PathBuf,
+	id:                String,
+	parent_session:    Option<String>,
+	historical_paths:  Vec<PathBuf>,
+	identities:        StatsIdentities,
+}
+
+#[derive(Clone)]
+struct StatsNode {
+	session:       StatsSession,
+	stats_paths:   BTreeSet<PathBuf>,
+	identity_keys: HashSet<String>,
+}
+
+#[derive(Clone)]
+struct StatsTransfer {
+	path:       PathBuf,
+	identities: StatsIdentities,
+}
+
+struct StatsPlan {
+	session_paths:           Vec<PathBuf>,
+	retained:                Vec<usize>,
+	transfers:               Vec<StatsTransfer>,
+	archived_identity_keys:  HashSet<String>,
+	preserve_all:            bool,
+}
+
+struct StatsCleanupContext {
+	plans:               Vec<StatsPlan>,
+	incomplete_retained: Vec<usize>,
+}
+
+fn stats_identity_key(table: &str, identity: &StatsIdentity) -> String {
+	format!(
+		"{table}\0{}\0{}\0{}",
+		identity.entry_id, identity.timestamp, identity.tool_call_id
+	)
+}
+
+fn stats_identity_keys(identities: &StatsIdentities) -> HashSet<String> {
+	let mut keys = HashSet::new();
+	for identity in &identities.messages {
+		keys.insert(stats_identity_key("messages", identity));
+	}
+	for identity in &identities.user_messages {
+		keys.insert(stats_identity_key("user_messages", identity));
+	}
+	for identity in &identities.tool_calls {
+		keys.insert(stats_identity_key("tool_calls", identity));
+	}
+	keys
+}
+
+fn add_session_stats_identity(line: &str, identities: &mut StatsIdentities) {
+	if line.is_empty() {
+		return;
+	}
+	let Ok(record) = serde_json::from_str::<Value>(line) else {
+		return;
+	};
+	if record.get("type").and_then(Value::as_str) != Some("message") {
+		return;
+	}
+	let Some(entry_id) = record
+		.get("id")
+		.and_then(Value::as_str)
+		.filter(|id| !id.is_empty())
+	else {
+		return;
+	};
+	let Some(message) = record.get("message").filter(|message| message.is_object()) else {
+		return;
+	};
+	let parsed_entry_timestamp = record
+		.get("timestamp")
+		.and_then(Value::as_str)
+		.and_then(crate::foreign_session::parse_iso_timestamp_ms)
+		.map_or(0, |value| value as i64);
+	match message.get("role").and_then(Value::as_str) {
+		Some("user") => identities.user_messages.push(StatsIdentity {
+			entry_id: entry_id.to_string(),
+			timestamp: parsed_entry_timestamp,
+			tool_call_id: String::new(),
+		}),
+		Some("assistant") => {
+			let timestamp = message
+				.get("timestamp")
+				.and_then(Value::as_f64)
+				.filter(|value| value.is_finite())
+				.map_or(parsed_entry_timestamp, |value| value as i64);
+			identities.messages.push(StatsIdentity {
+				entry_id: entry_id.to_string(),
+				timestamp,
+				tool_call_id: String::new(),
+			});
+			if let Some(blocks) = message.get("content").and_then(Value::as_array) {
+				for block in blocks {
+					let Some(tool_call_id) = block
+						.get("type")
+						.filter(|kind| kind.as_str() == Some("toolCall"))
+						.and_then(|_| block.get("id"))
+						.and_then(Value::as_str)
+					else {
+						continue;
+					};
+					identities.tool_calls.push(StatsIdentity {
+						entry_id: entry_id.to_string(),
+						timestamp,
+						tool_call_id: tool_call_id.to_string(),
+					});
+				}
+			}
+		},
+		_ => {},
+	}
+}
+
+fn collect_session_stats_identities_from_text(text: &str) -> StatsIdentities {
+	let mut identities = StatsIdentities::default();
+	for line in text.split('\n') {
+		add_session_stats_identity(line, &mut identities);
+	}
+	identities
+}
+
+fn collect_session_stats_identities(
+	path: &Path,
+) -> std::result::Result<StatsIdentities, String> {
+	let mut identities = StatsIdentities::default();
+	let file = fs::File::open(path).map_err(|error| error.to_string())?;
+	let mut reader = BufReader::new(file);
+	let mut buffer = Vec::new();
+	loop {
+		buffer.clear();
+		let read = reader
+			.read_until(b'\n', &mut buffer)
+			.map_err(|error| error.to_string())?;
+		if read == 0 {
+			break;
+		}
+		let line = String::from_utf8_lossy(&buffer);
+		add_session_stats_identity(&line, &mut identities);
+	}
+	Ok(identities)
+}
+
+fn read_session_lineage_header(
+	path: &Path,
+) -> std::result::Result<Option<SessionHeader>, String> {
+	let file = fs::File::open(path).map_err(|error| error.to_string())?;
+	let mut reader = BufReader::new(file);
+	let mut lines: Vec<String> = Vec::new();
+	let mut buffer = String::new();
+	loop {
+		buffer.clear();
+		let read = reader
+			.read_line(&mut buffer)
+			.map_err(|error| error.to_string())?;
+		if read == 0 {
+			break;
+		}
+		let line = buffer.trim();
+		if line.is_empty() {
+			continue;
+		}
+		lines.push(line.to_string());
+		if let Some(header) = parse_session_header(&lines.join("\n")) {
+			return Ok(Some(header));
+		}
+		if lines.len() >= 2 {
+			return Ok(None);
+		}
+	}
+	Ok(None)
+}
+
+fn managed_historical_session_paths(
+	header: &SessionHeader,
+	current_session_path: &Path,
+	sessions_root: &Path,
+	cwd: &Path,
+) -> Vec<PathBuf> {
+	let Some(filename) = current_session_path.file_name() else {
+		return Vec::new();
+	};
+	let root = gc_path_key(cwd, sessions_root);
+	let mut paths = BTreeSet::new();
+	for previous in &header.previous_session_files {
+		let previous_path = Path::new(previous);
+		if !previous_path.is_absolute() || previous_path.file_name() != Some(filename) {
+			continue;
+		}
+		let resolved = gc_path_key(cwd, previous_path);
+		let Ok(relative) = resolved.strip_prefix(&root) else {
+			continue;
+		};
+		if relative.as_os_str().is_empty()
+			|| relative
+				.components()
+				.any(|component| matches!(component, Component::ParentDir))
+			|| !resolved.to_string_lossy().ends_with(".jsonl")
+		{
+			continue;
+		}
+		paths.insert(resolved);
+	}
+	paths.into_iter().collect()
+}
+
+fn logical_session_root_for_stats_path(
+	stats_path: &Path,
+	session_path: &Path,
+	cwd: &Path,
+) -> Option<PathBuf> {
+	let stats_path = gc_path_key(cwd, stats_path);
+	if stats_path.file_name() == session_path.file_name() {
+		return Some(stats_path);
+	}
+	let session_filename = session_path.file_name()?.to_str()?;
+	let artifacts_dirname = session_filename.strip_suffix(".jsonl")?;
+	let mut directory = stats_path.parent()?.to_path_buf();
+	loop {
+		if directory.file_name().and_then(|name| name.to_str()) == Some(artifacts_dirname) {
+			return Some(PathBuf::from(format!("{}.jsonl", directory.display())));
+		}
+		let parent = directory.parent()?.to_path_buf();
+		if parent == directory {
+			return None;
+		}
+		directory = parent;
+	}
+}
+
+fn session_path_encodes_id(session_path: &Path, session_id: &str) -> bool {
+	let Some(name) = session_path.file_name().and_then(|name| name.to_str()) else {
+		return false;
+	};
+	let stem = name.strip_suffix(".jsonl").unwrap_or(name);
+	stem == session_id || stem.ends_with(&format!("_{session_id}"))
+}
+
+fn resolve_logical_session_match(
+	stats_path: &Path,
+	nodes: &[StatsNode],
+	cwd: &Path,
+) -> Option<(usize, PathBuf)> {
+	let mut matches = Vec::new();
+	for (index, node) in nodes.iter().enumerate() {
+		if let Some(logical_root) =
+			logical_session_root_for_stats_path(stats_path, &node.session.path, cwd)
+		{
+			matches.push((index, logical_root));
+		}
+	}
+	let exact: Vec<&(usize, PathBuf)> = matches
+		.iter()
+		.filter(|(index, logical_root)| {
+			gc_path_key(cwd, logical_root) == gc_path_key(cwd, &nodes[*index].session.path)
+		})
+		.collect();
+	if exact.len() == 1 {
+		return Some((exact[0].0, exact[0].1.clone()));
+	}
+	if exact.len() > 1 {
+		return None;
+	}
+	let known: Vec<&(usize, PathBuf)> = matches
+		.iter()
+		.filter(|(index, logical_root)| {
+			nodes[*index]
+				.stats_paths
+				.contains(&gc_path_key(cwd, logical_root))
+		})
+		.collect();
+	if known.len() == 1 {
+		return Some((known[0].0, known[0].1.clone()));
+	}
+	if known.len() > 1 {
+		return None;
+	}
+	let by_id: Vec<&(usize, PathBuf)> = matches
+		.iter()
+		.filter(|(index, logical_root)| {
+			session_path_encodes_id(logical_root, &nodes[*index].session.id)
+		})
+		.collect();
+	if by_id.len() == 1 {
+		return Some((by_id[0].0, by_id[0].1.clone()));
+	}
+	None
+}
+
+fn collect_stored_stats_session_paths(
+	connection: &rusqlite::Connection,
+) -> std::result::Result<Vec<String>, String> {
+	let mut paths = BTreeSet::new();
+	for table in ["messages", "user_messages", "tool_calls", "file_offsets"] {
+		if !sqlite_table_exists(connection, table)?
+			|| !sqlite_table_has_column(connection, table, "session_file")?
+		{
+			continue;
+		}
+		let sql = format!("SELECT DISTINCT session_file FROM {table}");
+		let mut statement = connection.prepare(&sql).map_err(|error| error.to_string())?;
+		let mut rows = statement.query([]).map_err(|error| error.to_string())?;
+		while let Some(row) = rows.next().map_err(|error| error.to_string())? {
+			if let Ok(Some(path)) = row.get::<_, Option<String>>(0) {
+				paths.insert(path);
+			}
+		}
+	}
+	Ok(paths.into_iter().collect())
+}
+
+fn build_stats_cleanup_plans(
+	archived_sessions: &[StatsSession],
+	retained_sessions: &[StatsSession],
+	db_path: &Path,
+	cwd: &Path,
+) -> std::result::Result<StatsCleanupContext, String> {
+	let mut nodes: Vec<StatsNode> = archived_sessions
+		.iter()
+		.chain(retained_sessions)
+		.map(|session| {
+			let mut stats_paths = BTreeSet::new();
+			stats_paths.insert(gc_path_key(cwd, &session.path));
+			for path in &session.historical_paths {
+				stats_paths.insert(gc_path_key(cwd, path));
+			}
+			StatsNode {
+				session: session.clone(),
+				stats_paths,
+				identity_keys: stats_identity_keys(&session.identities),
+			}
+		})
+		.collect();
+
+	{
+		let connection =
+			rusqlite::Connection::open(db_path).map_err(|error| error.to_string())?;
+		connection
+			.busy_timeout(Duration::from_millis(5_000))
+			.map_err(|error| error.to_string())?;
+		for stored_path in collect_stored_stats_session_paths(&connection)? {
+			let stored_path = PathBuf::from(stored_path);
+			if let Some((index, logical_root)) =
+				resolve_logical_session_match(&stored_path, &nodes, cwd)
+			{
+				nodes[index]
+					.stats_paths
+					.insert(gc_path_key(cwd, &logical_root));
+			}
+		}
+	}
+
+	for index in 0..nodes.len() {
+		let Some(parent_session) = nodes[index].session.parent_session.clone() else {
+			continue;
+		};
+		let parent_path = Path::new(&parent_session);
+		if !parent_path.is_absolute() && !parent_session.ends_with(".jsonl") {
+			continue;
+		}
+		if let Some((parent_index, logical_root)) =
+			resolve_logical_session_match(parent_path, &nodes, cwd)
+		{
+			nodes[parent_index]
+				.stats_paths
+				.insert(gc_path_key(cwd, &logical_root));
+		}
+	}
+
+	let archived_count = archived_sessions.len();
+	let mut claim_counts: HashMap<PathBuf, usize> = HashMap::new();
+	for node in nodes.iter().take(archived_count) {
+		for path in &node.stats_paths {
+			*claim_counts.entry(path.clone()).or_default() += 1;
+		}
+	}
+	let ambiguous: HashSet<PathBuf> = claim_counts
+		.into_iter()
+		.filter_map(|(path, count)| (count > 1).then_some(path))
+		.collect();
+
+	let alias_keys_by_node: Vec<HashSet<String>> = nodes
+		.iter()
+		.map(|node| {
+			let mut keys = HashSet::new();
+			keys.insert(format!("id:{}", node.session.id));
+			for path in &node.stats_paths {
+				keys.insert(format!("path:{}", path.display()));
+			}
+			keys
+		})
+		.collect();
+	let mut aliases: HashMap<String, Option<usize>> = HashMap::new();
+	for (index, keys) in alias_keys_by_node.iter().enumerate() {
+		for key in keys {
+			match aliases.get(key) {
+				None => {
+					aliases.insert(key.clone(), Some(index));
+				},
+				Some(Some(existing)) if *existing == index => {},
+				Some(_) => {
+					aliases.insert(key.clone(), None);
+				},
+			}
+		}
+	}
+
+	let mut incomplete: HashSet<usize> = HashSet::new();
+	let mut lineage_keys: HashMap<usize, HashSet<String>> = HashMap::new();
+	for index in 0..nodes.len() {
+		let mut keys = alias_keys_by_node[index].clone();
+		let mut current = Some(index);
+		let mut seen = HashSet::new();
+		while let Some(node_index) = current {
+			if !seen.insert(node_index) {
+				incomplete.insert(index);
+				break;
+			}
+			let Some(parent_session) = nodes[node_index].session.parent_session.clone() else {
+				break;
+			};
+			let parent_ref = Path::new(&parent_session);
+			let parent_key = if parent_ref.is_absolute() || parent_session.ends_with(".jsonl") {
+				format!("path:{}", gc_path_key(cwd, parent_ref).display())
+			} else {
+				format!("id:{parent_session}")
+			};
+			keys.insert(parent_key.clone());
+			let Some(Some(parent_index)) = aliases.get(&parent_key).copied() else {
+				incomplete.insert(index);
+				break;
+			};
+			keys.extend(alias_keys_by_node[parent_index].iter().cloned());
+			current = Some(parent_index);
+		}
+		lineage_keys.insert(index, keys);
+	}
+
+	let retained_path_keys: HashSet<PathBuf> = nodes
+		.iter()
+		.skip(archived_count)
+		.flat_map(|node| node.stats_paths.iter().cloned())
+		.collect();
+	let mut plans = Vec::new();
+	for index in 0..archived_count {
+		let archived_lineage: HashSet<String> =
+			lineage_keys.get(&index).cloned().unwrap_or_default();
+		let session_paths: Vec<PathBuf> = nodes[index]
+			.stats_paths
+			.iter()
+			.filter(|path| !retained_path_keys.contains(*path) && !ambiguous.contains(*path))
+			.cloned()
+			.collect();
+		let retained: Vec<usize> = (archived_count..nodes.len())
+			.filter(|retained_index| {
+				!incomplete.contains(retained_index)
+					&& lineage_keys.get(retained_index).is_some_and(|keys| {
+						keys.iter().any(|key| archived_lineage.contains(key))
+					})
+			})
+			.collect();
+		plans.push(StatsPlan {
+			session_paths,
+			retained,
+			transfers: Vec::new(),
+			archived_identity_keys: nodes[index].identity_keys.clone(),
+			preserve_all: false,
+		});
+	}
+	let incomplete_retained = (archived_count..nodes.len())
+		.filter(|index| incomplete.contains(index))
+		.collect();
+	Ok(StatsCleanupContext { plans, incomplete_retained })
+}
+
+fn cached_stats_identities(
+	cache: &mut HashMap<PathBuf, StatsIdentities>,
+	path: &Path,
+) -> std::result::Result<StatsIdentities, String> {
+	if let Some(identities) = cache.get(path) {
+		return Ok(identities.clone());
+	}
+	let identities = collect_session_stats_identities(path)?;
+	cache.insert(path.to_path_buf(), identities.clone());
+	Ok(identities)
+}
+
+fn populate_stats_transfer_targets(
+	context: &mut StatsCleanupContext,
+	nodes: &[StatsNode],
+) -> std::result::Result<(), String> {
+	let mut cache: HashMap<PathBuf, StatsIdentities> = HashMap::new();
+	let mut incomplete_identity_keys: HashSet<String> = HashSet::new();
+	let mut has_unidentifiable_incomplete_session = false;
+	for index in &context.incomplete_retained {
+		let path = &nodes[*index].session.path;
+		let identities = cached_stats_identities(&mut cache, path)?;
+		let keys = stats_identity_keys(&identities);
+		if keys.is_empty() {
+			has_unidentifiable_incomplete_session = true;
+		}
+		incomplete_identity_keys.extend(keys);
+	}
+	for plan_index in 0..context.plans.len() {
+		let retained = context.plans[plan_index].retained.clone();
+		if !context.incomplete_retained.is_empty() {
+			let preserve = {
+				let archived_keys = &context.plans[plan_index].archived_identity_keys;
+				has_unidentifiable_incomplete_session
+					|| archived_keys.is_empty()
+					|| archived_keys
+						.iter()
+						.any(|key| incomplete_identity_keys.contains(key))
+			};
+			context.plans[plan_index].preserve_all = preserve;
+		}
+		for index in retained {
+			let path = &nodes[index].session.path;
+			let identities = cached_stats_identities(&mut cache, path)?;
+			context.plans[plan_index].transfers.push(StatsTransfer {
+				path: path.clone(),
+				identities,
+			});
+		}
+	}
+	Ok(())
+}
+
+fn reconcile_stats_rows_for_sessions(
+	db_path: &Path,
+	plans: &[StatsPlan],
+) -> std::result::Result<u64, String> {
+	if plans.is_empty() {
+		return Ok(0);
+	}
+	let mut connection =
+		rusqlite::Connection::open(db_path).map_err(|error| error.to_string())?;
+	connection
+		.busy_timeout(Duration::from_millis(5_000))
+		.map_err(|error| error.to_string())?;
+	let session_tables: Vec<&str> = ["messages", "user_messages", "tool_calls", "file_offsets"]
+		.into_iter()
+		.filter(|table| {
+			sqlite_table_exists(&connection, table).unwrap_or(false)
+				&& sqlite_table_has_column(&connection, table, "session_file").unwrap_or(false)
+		})
+		.collect();
+	let entry_tables: Vec<&str> = ["messages", "user_messages", "tool_calls"]
+		.into_iter()
+		.filter(|table| {
+			session_tables.contains(table)
+				&& match *table {
+					"tool_calls" => {
+						["entry_id", "timestamp", "tool_call_id"]
+							.iter()
+							.all(|column| {
+								sqlite_table_has_column(&connection, table, column)
+									.unwrap_or(false)
+							})
+					},
+					_ => ["entry_id", "timestamp"].iter().all(|column| {
+						sqlite_table_has_column(&connection, table, column).unwrap_or(false)
+					}),
+				}
+		})
+		.collect();
+	connection
+		.execute(
+			"CREATE TEMP TABLE gc_retained_entries (
+				table_name TEXT NOT NULL,
+				entry_id TEXT NOT NULL,
+				timestamp INTEGER NOT NULL,
+				tool_call_id TEXT NOT NULL,
+				target_session_file TEXT NOT NULL,
+				PRIMARY KEY (table_name, entry_id, timestamp, tool_call_id)
+			)",
+			[],
+		)
+		.map_err(|error| error.to_string())?;
+	let transaction = connection
+		.transaction()
+		.map_err(|error| error.to_string())?;
+	let mut deleted = 0u64;
+	for plan in plans {
+		if plan.preserve_all {
+			continue;
+		}
+		transaction
+			.execute("DELETE FROM gc_retained_entries", [])
+			.map_err(|error| error.to_string())?;
+		{
+			let mut insert = transaction
+				.prepare(
+					"INSERT OR IGNORE INTO gc_retained_entries (
+						table_name, entry_id, timestamp, tool_call_id, target_session_file
+					) VALUES (?, ?, ?, ?, ?)",
+				)
+				.map_err(|error| error.to_string())?;
+			for transfer in &plan.transfers {
+				let target = transfer.path.to_string_lossy().into_owned();
+				for identity in &transfer.identities.messages {
+					insert
+						.execute(rusqlite::params![
+							"messages",
+							identity.entry_id,
+							identity.timestamp,
+							identity.tool_call_id,
+							target
+						])
+						.map_err(|error| error.to_string())?;
+				}
+				for identity in &transfer.identities.user_messages {
+					insert
+						.execute(rusqlite::params![
+							"user_messages",
+							identity.entry_id,
+							identity.timestamp,
+							identity.tool_call_id,
+							target
+						])
+						.map_err(|error| error.to_string())?;
+				}
+				for identity in &transfer.identities.tool_calls {
+					insert
+						.execute(rusqlite::params![
+							"tool_calls",
+							identity.entry_id,
+							identity.timestamp,
+							identity.tool_call_id,
+							target
+						])
+						.map_err(|error| error.to_string())?;
+				}
+			}
+		}
+		let mut session_paths = BTreeSet::new();
+		for path in &plan.session_paths {
+			session_paths.insert(path.to_string_lossy().into_owned());
+		}
+		for table in &entry_tables {
+			let tool_call_match = if *table == "tool_calls" {
+				format!("retained.tool_call_id = {table}.tool_call_id")
+			} else {
+				"retained.tool_call_id = ''".to_string()
+			};
+			let identity_match = format!(
+				"retained.table_name = '{table}'
+					AND retained.entry_id = {table}.entry_id
+					AND retained.timestamp = {table}.timestamp
+					AND {tool_call_match}"
+			);
+			let sql = format!(
+				"UPDATE OR IGNORE {table}
+					SET session_file = (
+						SELECT retained.target_session_file
+						FROM gc_retained_entries AS retained
+						WHERE {identity_match}
+					)
+					WHERE session_file = ?
+						AND EXISTS (
+							SELECT 1
+							FROM gc_retained_entries AS retained
+							WHERE {identity_match}
+						)"
+			);
+			let mut update = transaction
+				.prepare(&sql)
+				.map_err(|error| error.to_string())?;
+			for path in &session_paths {
+				update
+					.execute([path.as_str()])
+					.map_err(|error| error.to_string())?;
+			}
+		}
+		for path in &session_paths {
+			let nested_prefix = format!(
+				"{}{}",
+				session_artifacts_path(Path::new(path)).display(),
+				std::path::MAIN_SEPARATOR
+			);
+			for table in &session_tables {
+				let requires_transfer = !plan.retained.is_empty()
+					&& *table != "file_offsets"
+					&& !entry_tables.contains(table);
+				if requires_transfer {
+					continue;
+				}
+				let sql = format!(
+					"DELETE FROM {table} WHERE session_file = ? OR instr(session_file, ?) = 1"
+				);
+				deleted += (transaction
+					.execute(&sql, rusqlite::params![path.as_str(), nested_prefix.as_str()])
+					.map_err(|error| error.to_string())?) as u64;
+			}
+		}
+	}
+	transaction.commit().map_err(|error| error.to_string())?;
+	Ok(deleted)
+}
+
+fn collect_archived_stats_sessions(
+	archive_root: &Path,
+	sessions_root: &Path,
+	cwd: &Path,
+	errors: &mut Vec<String>,
+) -> Vec<StatsSession> {
+	let mut sessions = Vec::new();
+	for file in walk_visible_files(archive_root, is_compressed_jsonl_name) {
+		let Ok(relative) = file.strip_prefix(archive_root) else {
+			continue;
+		};
+		if relative.as_os_str().is_empty()
+			|| relative.is_absolute()
+			|| relative
+				.components()
+				.any(|component| matches!(component, Component::ParentDir))
+		{
+			continue;
+		}
+		let relative_text = relative.to_string_lossy();
+		let Some(without_gz) = relative_text.strip_suffix(".gz") else {
+			continue;
+		};
+		let source_path = sessions_root.join(without_gz);
+		let text = match read_text_if_present(&file) {
+			Ok(text) => text,
+			Err(error) => {
+				errors.push(format!("stats cleanup scan {}: {error}", file.display()));
+				continue;
+			},
+		};
+		let Some(header) = parse_session_header(&text) else {
+			errors.push(format!(
+				"stats cleanup scan {}: archive is missing a valid session header",
+				file.display()
+			));
+			continue;
+		};
+		let historical_paths =
+			managed_historical_session_paths(&header, &source_path, sessions_root, cwd);
+		let identities = collect_session_stats_identities_from_text(&text);
+		sessions.push(StatsSession {
+			path: source_path,
+			id: header.id,
+			parent_session: header.parent_session,
+			historical_paths,
+			identities,
+		});
+	}
+	sessions
+}
+
+fn stats_db_path(paths: &GcPaths, cwd: &Path) -> PathBuf {
+	if gc_path_key(cwd, &paths.agent_dir) == gc_path_key(cwd, &dirs::agent_dir()) {
+		dirs::root_subdir("stats.db", AgentDirCategory::Data)
+	} else {
+		paths.agent_dir.join("stats.db")
+	}
+}
+
+fn with_stats_sync_lock<T>(
+	db_path: &Path,
+	run: impl FnOnce() -> std::result::Result<T, String>,
+) -> std::result::Result<T, String> {
+	if let Some(parent) = db_path.parent() {
+		fs::create_dir_all(parent)
+			.map_err(|error| format!("{}: {error}", parent.display()))?;
+	}
+	let _lock = StatsSyncLock::acquire(db_path)?;
+	run()
+}
+
+enum StatsSyncHandle {
+	#[cfg(target_os = "linux")]
+	Socket(UnixDatagram),
+	#[cfg(not(target_os = "linux"))]
+	File(fs::File),
+}
+
+struct StatsSyncLock {
+	_handle: StatsSyncHandle,
+}
+
+impl StatsSyncLock {
+	const RETRIES: u64 = 60 * 60 * 1_000 / 25;
+	const RETRY_DELAY: Duration = Duration::from_millis(25);
+
+	fn acquire(db_path: &Path) -> std::result::Result<Self, String> {
+		let target = format!("{}.sync", db_path.display());
+		let lock_path = format!("{target}.lock");
+		for attempt in 0..Self::RETRIES {
+			if let Some(handle) = try_stats_sync_lock(&lock_path)? {
+				return Ok(Self { _handle: handle });
+			}
+			if attempt + 1 < Self::RETRIES {
+				std::thread::sleep(Self::RETRY_DELAY);
+			}
+		}
+		Err(format!(
+			"Failed to acquire lock for {target} after {} attempts",
+			Self::RETRIES
+		))
+	}
+}
+
+#[cfg(target_os = "linux")]
+fn try_stats_sync_lock(
+	lock_path: &str,
+) -> std::result::Result<Option<StatsSyncHandle>, String> {
+	const HIGH_SEED: u64 = 0x4f4d_502d_4c4f_434b;
+	const LOW_SEED: u64 = 0x5049_2d46_494c_454c;
+	let bytes = lock_path.as_bytes();
+	let name = format!(
+		"omp-file-lock-{:016x}{:016x}",
+		xxhash_rust::xxh64::xxh64(bytes, HIGH_SEED),
+		xxhash_rust::xxh64::xxh64(bytes, LOW_SEED)
+	);
+	let address = SocketAddr::from_abstract_name(name.as_bytes()).map_err(|error| error.to_string())?;
+	match UnixDatagram::bind_addr(&address) {
+		Ok(socket) => Ok(Some(StatsSyncHandle::Socket(socket))),
+		Err(error) if error.kind() == io::ErrorKind::AddrInUse => Ok(None),
+		Err(error) => Err(error.to_string()),
+	}
+}
+
+#[cfg(not(target_os = "linux"))]
+fn try_stats_sync_lock(
+	lock_path: &str,
+) -> std::result::Result<Option<StatsSyncHandle>, String> {
+	let file = OpenOptions::new()
+		.read(true)
+		.write(true)
+		.create(true)
+		.mode(0o600)
+		.open(lock_path)
+		.map_err(|error| error.to_string())?;
+	// SAFETY: `file` owns a live descriptor for the duration of this call.
+	let status = unsafe {
+		libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB)
+	};
+	if status == 0 {
+		return Ok(Some(StatsSyncHandle::File(file)));
+	}
+	let error = io::Error::last_os_error();
+	if error.kind() == io::ErrorKind::WouldBlock {
+		return Ok(None);
+	}
+	Err(error.to_string())
+}
+
+type LockStat = (u64, u64, u64, i64, i64, i64, i64);
+
+fn lock_stat(meta: &fs::Metadata) -> LockStat {
+	(
+		meta.dev(),
+		meta.ino(),
+		meta.len(),
+		meta.mtime(),
+		meta.mtime_nsec(),
+		meta.ctime(),
+		meta.ctime_nsec(),
+	)
+}
+
+fn read_gc_lock_snapshot(
+	lock_path: &Path,
+) -> std::result::Result<Option<(String, LockStat)>, String> {
+	let before = match fs::metadata(lock_path) {
+		Ok(meta) => meta,
+		Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+		Err(error) => return Err(error.to_string()),
+	};
+	let text = match fs::read_to_string(lock_path) {
+		Ok(text) => text,
+		Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+		Err(error) => return Err(error.to_string()),
+	};
+	let after = match fs::metadata(lock_path) {
+		Ok(meta) => meta,
+		Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+		Err(error) => return Err(error.to_string()),
+	};
+	if lock_stat(&before) != lock_stat(&after) {
+		return Ok(None);
+	}
+	Ok(Some((text, lock_stat(&after))))
+}
+
+fn gc_lock_pid(text: &str) -> Option<i64> {
+	let first = text.split('\n').next()?.trim();
+	let pid = first.parse::<i64>().ok()?;
+	(pid > 0).then_some(pid)
+}
+
+fn process_exists(pid: i64) -> bool {
+	if pid <= 0 || pid > i64::from(i32::MAX) {
+		return false;
+	}
+	// SAFETY: `kill(pid, 0)` performs only an existence/permission check.
+	let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+	if result == 0 {
+		return true;
+	}
+	let error = io::Error::last_os_error();
+	!matches!(error.raw_os_error(), Some(libc::ESRCH) | Some(libc::EINVAL))
+}
+
+fn should_break_gc_lock(text: &str, stat: LockStat) -> bool {
+	if let Some(pid) = gc_lock_pid(text) {
+		return !process_exists(pid);
+	}
+	let created_at = text
+		.split('\n')
+		.nth(1)
+		.map(str::trim)
+		.and_then(crate::foreign_session::parse_iso_timestamp_ms);
+	let created_at = created_at.unwrap_or_else(|| {
+		let millis = stat.4.max(0) as u64;
+		(stat.3.max(0) as u64)
+			.saturating_mul(1_000)
+			.saturating_add(millis)
+	});
+	now_ms().saturating_sub(created_at) > GC_WRITE_GRACE_MS
+}
+
+fn gc_lock_snapshot_still_current(
+	lock_path: &Path,
+	snapshot: &LockStat,
+) -> std::result::Result<bool, String> {
+	match fs::metadata(lock_path) {
+		Ok(meta) => Ok(lock_stat(&meta) == *snapshot),
+		Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+		Err(error) => Err(error.to_string()),
+	}
+}
+
+fn remove_stale_gc_lock(lock_path: &Path) -> std::result::Result<bool, String> {
+	let Some((text, snapshot)) = read_gc_lock_snapshot(lock_path)? else {
+		return Ok(false);
+	};
+	if !should_break_gc_lock(&text, snapshot) {
+		return Ok(false);
+	}
+	if !gc_lock_snapshot_still_current(lock_path, &snapshot)? {
+		return Ok(false);
+	}
+	match fs::remove_file(lock_path) {
+		Ok(()) => Ok(true),
+		Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+		Err(error) => Err(error.to_string()),
+	}
+}
+
+fn open_new_gc_lock(
+	lock_path: &Path,
+) -> std::result::Result<Option<fs::File>, String> {
+	match OpenOptions::new()
+		.write(true)
+		.create_new(true)
+		.mode(0o600)
+		.open(lock_path)
+	{
+		Ok(file) => Ok(Some(file)),
+		Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(None),
+		Err(error) => Err(error.to_string()),
+	}
+}
+
+fn write_gc_lock_owner(file: &mut fs::File) -> std::result::Result<(), String> {
+	let content = format!(
+		"{}\n{}\n",
+		std::process::id(),
+		crate::foreign_session::format_iso_timestamp(now_ms())
+	);
+	file.write_all(content.as_bytes())
+		.and_then(|()| file.flush())
+		.map_err(|error| error.to_string())
+}
+
+fn release_lock_file(lock_path: &Path, file: fs::File) {
+	drop(file);
+	let _ = fs::remove_file(lock_path);
+}
+
+fn open_gc_breaker_lock(
+	lock_path: &Path,
+) -> std::result::Result<(PathBuf, fs::File), String> {
+	let breaker_path = PathBuf::from(format!("{}.break", lock_path.display()));
+	for _ in 0..2 {
+		if let Some(mut file) = open_new_gc_lock(&breaker_path)? {
+			if let Err(error) = write_gc_lock_owner(&mut file) {
+				release_lock_file(&breaker_path, file);
+				return Err(error);
+			}
+			return Ok((breaker_path, file));
+		}
+		if !remove_stale_gc_lock(&breaker_path)? {
+			return Err(format!("GC already running: {}", lock_path.display()));
+		}
+	}
+	Err(format!("GC already running: {}", lock_path.display()))
+}
+
+fn open_gc_lock(lock_path: &Path) -> std::result::Result<fs::File, String> {
+	if let Some(file) = open_new_gc_lock(lock_path)? {
+		return Ok(file);
+	}
+	let (breaker_path, breaker_file) = open_gc_breaker_lock(lock_path)?;
+	let outcome: std::result::Result<fs::File, String> = (|| {
+		if let Some(file) = open_new_gc_lock(lock_path)? {
+			return Ok(file);
+		}
+		if !remove_stale_gc_lock(lock_path)? {
+			return Err(format!("GC already running: {}", lock_path.display()));
+		}
+		if let Some(file) = open_new_gc_lock(lock_path)? {
+			return Ok(file);
+		}
+		Err(format!("GC already running: {}", lock_path.display()))
+	})();
+	release_lock_file(&breaker_path, breaker_file);
+	outcome
+}
+
+struct GcLock {
+	path:  PathBuf,
+	_file: Option<fs::File>,
+}
+
+impl Drop for GcLock {
+	fn drop(&mut self) {
+		if let Some(file) = self._file.take() {
+			drop(file);
+		}
+		let _ = fs::remove_file(&self.path);
+	}
+}
+
+fn acquire_gc_lock(agent_dir: &Path) -> std::result::Result<GcLock, String> {
+	fs::create_dir_all(agent_dir)
+		.map_err(|error| format!("{}: {error}", agent_dir.display()))?;
+	let lock_path = agent_dir.join("gc.lock");
+	let mut file = open_gc_lock(&lock_path)?;
+	if let Err(error) = write_gc_lock_owner(&mut file) {
+		release_lock_file(&lock_path, file);
+		return Err(error);
+	}
+	Ok(GcLock { path: lock_path, _file: Some(file) })
+}
+
+fn cleanup_stats_rows_for_archived_sessions(
+	paths: &GcPaths,
+	cwd: &Path,
+	newly_archived: &[SessionMeta],
+	errors: &mut Vec<String>,
+) -> u64 {
+	let db_path = stats_db_path(paths, cwd);
+	match path_exists_checked(&db_path) {
+		Ok(false) => return 0,
+		Ok(true) => {},
+		Err(message) => {
+			errors.push(format!("stats cleanup: {message}"));
+			return 0;
+		},
+	}
+	let mut archived_by_path: BTreeMap<PathBuf, StatsSession> = BTreeMap::new();
+	for session in newly_archived {
+		archived_by_path.insert(
+			gc_path_key(cwd, &session.path),
+			StatsSession {
+				path: session.path.clone(),
+				id: session.id.clone(),
+				parent_session: session.parent_session.clone(),
+				historical_paths: Vec::new(),
+				identities: StatsIdentities::default(),
+			},
+		);
+	}
+	for session in collect_archived_stats_sessions(&paths.archive, &paths.sessions, cwd, errors) {
+		archived_by_path.insert(gc_path_key(cwd, &session.path), session);
+	}
+	let retained_sessions = match list_active_sessions_checked(&paths.sessions) {
+		Ok(sessions) => sessions,
+		Err(message) => {
+			errors.push(format!("stats cleanup scan: {message}"));
+			return 0;
+		},
+	};
+	let archived_sessions: Vec<StatsSession> = archived_by_path.into_values().collect();
+	let result = with_stats_sync_lock(&db_path, || {
+		let mut retained_stats = Vec::new();
+		for session in &retained_sessions {
+			let header = read_session_lineage_header(&session.path)?;
+			let Some(header) = header else {
+				return Err(format!(
+					"session header changed during stats cleanup: {}",
+					session.path.display()
+				));
+			};
+			if header.id != session.id {
+				return Err(format!(
+					"session header changed during stats cleanup: {}",
+					session.path.display()
+				));
+			}
+			let historical_paths =
+				managed_historical_session_paths(&header, &session.path, &paths.sessions, cwd);
+			retained_stats.push(StatsSession {
+				path: session.path.clone(),
+				id: header.id,
+				parent_session: header.parent_session,
+				historical_paths,
+				identities: StatsIdentities::default(),
+			});
+		}
+		let mut context =
+			build_stats_cleanup_plans(&archived_sessions, &retained_stats, &db_path, cwd)?;
+		let nodes: Vec<StatsNode> = archived_sessions
+			.iter()
+			.chain(retained_stats.iter())
+			.map(|session| {
+				let mut stats_paths = BTreeSet::new();
+				stats_paths.insert(gc_path_key(cwd, &session.path));
+				for path in &session.historical_paths {
+					stats_paths.insert(gc_path_key(cwd, path));
+				}
+				StatsNode {
+					session: session.clone(),
+					stats_paths,
+					identity_keys: stats_identity_keys(&session.identities),
+				}
+			})
+			.collect();
+		populate_stats_transfer_targets(&mut context, &nodes)?;
+		reconcile_stats_rows_for_sessions(&db_path, &context.plans)
+	});
+	match result {
+		Ok(deleted) => deleted,
+		Err(message) => {
+			errors.push(format!("stats cleanup: {message}"));
+			0
+		},
+	}
 }
 
 fn gc_text(result: &Value) -> String {
 	let agent_dir = escape_terminal_text(result["agentDir"].as_str().unwrap_or_default(), false);
-	let mut lines = vec![format!("GC dry-run ({agent_dir})")];
+	let mode = if result["apply"].as_bool().unwrap_or(false) {
+		"applied"
+	} else {
+		"dry-run"
+	};
+	let mut lines = vec![format!("GC {mode} ({agent_dir})")];
 	if let Some(blobs) = result.get("blobs") {
 		lines.push(format!(
 			"blobs: {}/{} files, {}, {} refs",
@@ -3119,25 +4922,28 @@ pub fn run_gc(opts: &GcOptions, cwd: &Path, out: &mut dyn Write, err: &mut dyn W
 		.map(u64::from)
 		.unwrap_or_else(|| gc_config_number(cwd, &paths.agent_dir, "gc.retainNewestPerCwd", 10));
 
+	let _lock = acquire_gc_lock(&paths.agent_dir).map_err(Error::new)?;
 	let mut result = json!({
 		"agentDir": display_path(&paths.agent_dir),
-		"apply": false,
+		"apply": opts.apply,
 		"lockPath": display_path(&paths.lock_path),
 	});
 	if run_blobs {
-		match run_blob_gc(&paths) {
-			Ok(blobs) => result["blobs"] = blobs,
-			Err(message) => {
-				write_line(err, &format!("error: {}", escape_terminal_text(&message, false)))?;
-				return Ok(1);
-			},
-		}
+		result["blobs"] = run_blob_gc(&paths, opts.apply).map_err(Error::new)?;
 	}
 	if run_archive {
-		result["archive"] = run_archive_gc(&paths, cold_days, retain_global, retain_cwd);
+		result["archive"] = run_archive_gc(
+			&paths,
+			cwd,
+			opts.apply,
+			cold_days,
+			retain_global,
+			retain_cwd,
+		)
+		.map_err(Error::new)?;
 	}
 	if run_wal {
-		result["wal"] = run_wal_gc(&paths);
+		result["wal"] = run_wal_gc(&paths, opts.apply).map_err(Error::new)?;
 	}
 
 	if opts.json {

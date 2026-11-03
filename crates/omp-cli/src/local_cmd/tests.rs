@@ -357,6 +357,7 @@ fn gc_blob_dry_run_counts_referenced_and_unreferenced() {
 	set_old_mtime(&orphan_file, Duration::from_secs(3600));
 
 	let opts = GcOptions {
+		apply:                  false,
 		json:                    true,
 		agent_dir:               Some(agent),
 		blobs:                   true,
@@ -389,6 +390,7 @@ fn gc_archive_dry_run_counts_cold_complete_sessions() {
 	set_old_mtime(&session, Duration::from_secs(60 * 86_400));
 
 	let opts = GcOptions {
+		apply:                  false,
 		json:                    true,
 		agent_dir:               Some(agent),
 		blobs:                   false,
@@ -414,6 +416,7 @@ fn gc_wal_dry_run_reports_wal_bytes() {
 	let db = dir.write("agent/history.db", "");
 	dir.write("agent/history.db-wal", "wal-bytes");
 	let opts = GcOptions {
+		apply:                  false,
 		json:                    true,
 		agent_dir:               Some(agent),
 		blobs:                   false,
@@ -430,6 +433,302 @@ fn gc_wal_dry_run_reports_wal_bytes() {
 	assert_eq!(value["wal"]["checkpointed"], false);
 	assert_eq!(value["wal"]["databases"].as_array().map(Vec::len), Some(2));
 	assert!(db.exists());
+}
+
+fn gc_apply_options(agent: PathBuf, blobs: bool, archive: bool, wal: bool) -> GcOptions {
+	GcOptions {
+		apply:                   true,
+		json:                    true,
+		agent_dir:               Some(agent),
+		blobs,
+		archive,
+		wal,
+		cold_archive_after_days: Some(30),
+		retain_newest_global:    Some(0),
+		retain_newest_per_cwd:   Some(0),
+	}
+}
+
+fn read_gzip_text(path: &Path) -> String {
+	use std::io::Read as _;
+	let file = fs::File::open(path).expect("open gzip");
+	let mut decoder = flate2::read::GzDecoder::new(file);
+	let mut text = String::new();
+	decoder.read_to_string(&mut text).expect("gunzip fixture");
+	text
+}
+
+#[test]
+fn gc_blob_apply_deletes_orphans_and_keeps_referenced_fresh_files() {
+	let dir = TempDir::new("gc-blob-apply");
+	let agent = dir.path().join("agent");
+	let referenced = "a".repeat(64);
+	let orphan = "b".repeat(64);
+	let fresh = "c".repeat(64);
+	let referenced_file = dir.write(&format!("agent/blobs/{referenced}"), "ref");
+	let orphan_file = dir.write(&format!("agent/blobs/{orphan}"), "orphan");
+	let fresh_file = dir.write(&format!("agent/blobs/{fresh}"), "fresh");
+	dir.write(
+		"agent/sessions/project/s1.jsonl",
+		&format!("{{\"type\":\"message\",\"message\":{{\"content\":\"blob:sha256:{referenced}\"}}}}\n"),
+	);
+	set_old_mtime(&referenced_file, Duration::from_secs(3600));
+	set_old_mtime(&orphan_file, Duration::from_secs(3600));
+
+	let opts = gc_apply_options(agent.clone(), true, false, false);
+	let (code, value, stderr) = gc_json(&opts, dir.path());
+	assert_eq!(code, 0, "{stderr}");
+	assert_eq!(value["apply"], true);
+	assert_eq!(value["blobs"]["deleted"], 1);
+	assert_eq!(value["blobs"]["wouldDelete"], 1);
+	assert!(!orphan_file.exists(), "unreferenced old blob must be swept");
+	assert!(referenced_file.exists(), "referenced blob must survive");
+	assert!(fresh_file.exists(), "fresh blob must survive the write grace");
+	assert!(!agent.join("gc.lock").exists(), "lock must be released");
+}
+
+#[test]
+fn gc_archive_apply_moves_gzip_and_artifacts() {
+	let dir = TempDir::new("gc-archive-apply");
+	let agent = dir.path().join("agent");
+	let content = "{\"type\":\"session\",\"id\":\"s1\",\"cwd\":\"/tmp/project\"}\n{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"stopReason\":\"stop\",\"content\":[]}}\n";
+	let session = dir.write("agent/sessions/project/s1.jsonl", content);
+	dir.write("agent/sessions/project/s1/artifacts/a.txt", "artifact");
+	set_old_mtime(&session, Duration::from_secs(60 * 86_400));
+	let pending = dir.write(
+		"agent/sessions/project/pending.jsonl",
+		"{\"type\":\"session\",\"id\":\"pending\"}\n{\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"waiting\"}}\n",
+	);
+	set_old_mtime(&pending, Duration::from_secs(60 * 86_400));
+	let fresh = dir.write(
+		"agent/sessions/project/fresh.jsonl",
+		"{\"type\":\"session\",\"id\":\"fresh\"}\n{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"stopReason\":\"stop\",\"content\":[]}}\n",
+	);
+
+	let opts = gc_apply_options(agent.clone(), false, true, false);
+	let (code, value, stderr) = gc_json(&opts, dir.path());
+	assert_eq!(code, 0, "{stderr}");
+	assert_eq!(value["archive"]["archived"], 1);
+	assert_eq!(value["archive"]["wouldArchive"], 1);
+	assert_eq!(value["archive"]["skippedActive"], 2);
+	assert!(pending.exists(), "pending session must not be archived");
+	assert!(fresh.exists(), "fresh session must not be archived");
+	assert!(!session.exists(), "archived source must be removed");
+	let archived = agent.join("archive/sessions/project/s1.jsonl.gz");
+	assert!(archived.exists(), "session must be gzipped into the archive");
+	assert_eq!(read_gzip_text(&archived), content);
+	assert_eq!(
+		fs::read_to_string(agent.join("archive/sessions/project/s1/artifacts/a.txt")).expect("artifact"),
+		"artifact"
+	);
+}
+
+#[test]
+fn gc_archive_apply_preserves_foreign_destination_and_source() {
+	let dir = TempDir::new("gc-archive-collision");
+	let agent = dir.path().join("agent");
+	let session = dir.write(
+		"agent/sessions/project/s1.jsonl",
+		"{\"type\":\"session\",\"id\":\"s1\"}\n{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"stopReason\":\"stop\",\"content\":[]}}\n",
+	);
+	set_old_mtime(&session, Duration::from_secs(60 * 86_400));
+	let foreign = dir.write("agent/archive/sessions/project/s1.jsonl.gz", "foreign");
+
+	let opts = gc_apply_options(agent.clone(), false, true, false);
+	let (code, value, stderr) = gc_json(&opts, dir.path());
+	assert_eq!(code, 1);
+	assert!(stderr.contains("GC completed with 1 error"), "{stderr}");
+	assert_eq!(value["archive"]["archived"], 0);
+	assert!(session.exists(), "collision must preserve the source");
+	assert_eq!(fs::read_to_string(&foreign).expect("foreign file"), "foreign");
+}
+
+#[test]
+fn gc_archive_apply_retries_history_and_stats_for_archived_sessions() {
+	let dir = TempDir::new("gc-archive-retry");
+	let agent = dir.path().join("agent");
+	let archived = agent.join("archive/sessions/project/old.jsonl.gz");
+	fs::create_dir_all(archived.parent().expect("archive parent")).expect("archive dir");
+	let header = "{\"type\":\"session\",\"id\":\"old\",\"cwd\":\"/tmp\"}\n";
+	write_gzip(
+		&archived,
+		&format!(
+			"{header}{{\"type\":\"message\",\"id\":\"entry\",\"timestamp\":\"2026-06-26T12:00:00.000Z\",\"message\":{{\"role\":\"assistant\",\"content\":[]}}}}\n"
+		),
+	);
+	let history_db = dir.write(
+		"agent/history.db",
+		"",
+	);
+	let history = rusqlite::Connection::open(&history_db).expect("history db");
+	history
+		.execute_batch(
+			"CREATE TABLE history (id INTEGER PRIMARY KEY, prompt TEXT NOT NULL, session_id TEXT);\
+			 INSERT INTO history (prompt, session_id) VALUES ('keep', 'old');",
+		)
+		.expect("history fixture");
+	drop(history);
+	let stats_db = dir.write("agent/stats.db", "");
+	let stats = rusqlite::Connection::open(&stats_db).expect("stats db");
+	stats
+		.execute_batch(
+			"CREATE TABLE messages (session_file TEXT NOT NULL, entry_id TEXT NOT NULL, timestamp INTEGER NOT NULL);",
+		)
+		.expect("stats schema");
+	let source_path = agent.join("sessions/project/old.jsonl");
+	stats
+		.execute(
+			"INSERT INTO messages (session_file, entry_id, timestamp) VALUES (?, ?, ?)",
+			rusqlite::params![source_path.to_string_lossy().into_owned(), "entry", 1i64],
+		)
+		.expect("stats row");
+	drop(stats);
+
+	let opts = gc_apply_options(agent.clone(), false, true, false);
+	let (code, value, stderr) = gc_json(&opts, dir.path());
+	assert_eq!(code, 0, "{stderr}");
+	assert_eq!(value["archive"]["archived"], 0);
+	assert_eq!(value["archive"]["historyRowsDeleted"], 1);
+	assert_eq!(value["archive"]["statsRowsDeleted"], 1);
+	assert!(value["archive"]["errors"].as_array().is_some_and(Vec::is_empty));
+	let history = rusqlite::Connection::open(&history_db).expect("history db");
+	let history_rows: i64 = history
+		.query_row("SELECT COUNT(*) FROM history", [], |row| row.get(0))
+		.expect("history count");
+	assert_eq!(history_rows, 0);
+	let stats = rusqlite::Connection::open(&stats_db).expect("stats db");
+	let stats_rows: i64 = stats
+		.query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+		.expect("stats count");
+	assert_eq!(stats_rows, 0);
+}
+
+#[test]
+fn gc_archive_apply_retargets_shared_stats_identities_to_retained_peer() {
+	let dir = TempDir::new("gc-archive-transfer");
+	let agent = dir.path().join("agent");
+	let parent_path = agent.join("sessions/project/parent.jsonl");
+	let archived = agent.join("archive/sessions/project/parent.jsonl.gz");
+	fs::create_dir_all(archived.parent().expect("archive parent")).expect("archive dir");
+	let header = |id: &str, parent: Option<&Path>| {
+		let parent_field = parent
+			.map(|path| format!(",\"parentSession\":\"{}\"", path.display()))
+			.unwrap_or_default();
+		format!("{{\"type\":\"session\",\"id\":\"{id}\",\"cwd\":\"/tmp\"{parent_field}}}\n")
+	};
+	let entry = "{\"type\":\"message\",\"id\":\"shared\",\"timestamp\":\"2026-06-26T12:00:00.000Z\",\"message\":{\"role\":\"assistant\",\"content\":[]}}\n";
+	write_gzip(&archived, &format!("{}{entry}", header("parent", None)));
+	let child = dir.write(
+		"agent/sessions/project/child.jsonl",
+		&format!("{}{entry}", header("child", Some(&parent_path))),
+	);
+	let stats_db = dir.write("agent/stats.db", "");
+	let stats = rusqlite::Connection::open(&stats_db).expect("stats db");
+	stats
+		.execute_batch(
+			"CREATE TABLE messages (session_file TEXT NOT NULL, entry_id TEXT NOT NULL, timestamp INTEGER NOT NULL, UNIQUE(session_file, entry_id));",
+		)
+		.expect("stats schema");
+	let timestamp = crate::foreign_session::parse_iso_timestamp_ms("2026-06-26T12:00:00.000Z")
+		.expect("timestamp") as i64;
+	stats
+		.execute(
+			"INSERT INTO messages (session_file, entry_id, timestamp) VALUES (?, ?, ?)",
+			rusqlite::params![parent_path.to_string_lossy().into_owned(), "shared", timestamp],
+		)
+		.expect("stats row");
+	drop(stats);
+
+	let opts = gc_apply_options(agent.clone(), false, true, false);
+	let (code, value, stderr) = gc_json(&opts, dir.path());
+	assert_eq!(code, 0, "{stderr}");
+	assert_eq!(value["archive"]["archived"], 0);
+	assert_eq!(value["archive"]["statsRowsDeleted"], 0);
+	assert!(value["archive"]["errors"].as_array().is_some_and(Vec::is_empty));
+	let stats = rusqlite::Connection::open(&stats_db).expect("stats db");
+	let mut statement = stats
+		.prepare("SELECT session_file, entry_id FROM messages")
+		.expect("query");
+	let rows: Vec<(String, String)> = statement
+		.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+		.expect("rows")
+		.collect::<std::result::Result<_, _>>()
+		.expect("collect");
+	assert_eq!(rows, vec![(child.to_string_lossy().into_owned(), "shared".to_string())]);
+}
+
+#[test]
+fn gc_live_and_breaker_locks_block_and_stale_lock_recovers() {
+	let dir = TempDir::new("gc-locks");
+	let agent = dir.path().join("agent");
+	let lock = agent.join("gc.lock");
+	dir.write("agent/blobs/.keep", "");
+	let live = format!("{}\n2026-01-01T00:00:00.000Z\n", std::process::id());
+	dir.write("agent/gc.lock", &live);
+	let opts = gc_apply_options(agent.clone(), true, false, false);
+	let mut out = Vec::new();
+	let mut err = Vec::new();
+	let error = run_gc(&opts, dir.path(), &mut out, &mut err).expect_err("live lock");
+	assert!(error.to_string().contains("GC already running"), "{error}");
+	assert!(lock.exists(), "live lock must not be broken");
+
+	dir.write("agent/gc.lock.break", &live);
+	dir.write("agent/gc.lock", "2147483647\n2026-01-01T00:00:00.000Z\n");
+	let error = run_gc(&opts, dir.path(), &mut out, &mut err).expect_err("breaker lock");
+	assert!(error.to_string().contains("GC already running"), "{error}");
+	assert!(lock.exists());
+	assert!(agent.join("gc.lock.break").exists());
+
+	fs::remove_file(agent.join("gc.lock.break")).expect("remove breaker");
+	let opts = gc_apply_options(agent.clone(), true, false, false);
+	let (code, value, stderr) = gc_json(&opts, dir.path());
+	assert_eq!(code, 0, "{stderr}");
+	assert_eq!(value["blobs"]["wouldDelete"], 0);
+	assert!(!lock.exists(), "stale lock must be replaced and released");
+}
+
+#[test]
+fn gc_wal_apply_failure_is_nonzero_and_releases_lock() {
+	let dir = TempDir::new("gc-wal-apply");
+	let agent = dir.path().join("agent");
+	dir.write("agent/history.db", "not sqlite");
+	dir.write("agent/history.db-wal", "wal");
+	let opts = gc_apply_options(agent.clone(), false, false, true);
+	let mut out = Vec::new();
+	let mut err = Vec::new();
+	let error = run_gc(&opts, dir.path(), &mut out, &mut err).expect_err("invalid wal database");
+	assert!(error.to_string().contains("history.db"), "{error}");
+	assert!(out.is_empty(), "fatal WAL failure must not print a result");
+	assert!(!agent.join("gc.lock").exists(), "lock must be released");
+	assert!(agent.join("history.db-wal").exists());
+}
+
+#[test]
+fn gc_wal_apply_busy_checkpoint_is_nonzero_and_releases_lock() {
+	let dir = TempDir::new("gc-wal-busy");
+	let agent = dir.path().join("agent");
+	let db_path = agent.join("history.db");
+	fs::create_dir_all(&agent).expect("agent dir");
+	let holder = rusqlite::Connection::open(&db_path).expect("holder db");
+	holder
+		.execute_batch(
+			"PRAGMA journal_mode=WAL;\
+			 PRAGMA wal_autocheckpoint=0;\
+			 CREATE TABLE t (x INTEGER);\
+			 INSERT INTO t VALUES (1);\
+			 BEGIN IMMEDIATE;\
+			 INSERT INTO t VALUES (2);",
+		)
+		.expect("writer transaction");
+
+	let opts = gc_apply_options(agent.clone(), false, false, true);
+	let mut out = Vec::new();
+	let mut err = Vec::new();
+	let error = run_gc(&opts, dir.path(), &mut out, &mut err).expect_err("busy checkpoint");
+	assert!(error.to_string().contains("history.db"), "{error}");
+	assert!(out.is_empty());
+	assert!(!agent.join("gc.lock").exists(), "lock must be released");
+	drop(holder);
 }
 
 #[test]
@@ -639,6 +938,7 @@ fn gc_blob_refs_scan_compressed_and_backup_jsonl() {
 	set_old_mtime(&b_file, Duration::from_secs(3600));
 
 	let opts = GcOptions {
+		apply:                  false,
 		json:                    true,
 		agent_dir:               Some(agent),
 		blobs:                   true,
@@ -693,6 +993,7 @@ fn gc_archive_uses_tail_status_and_nested_liveness() {
 	}
 
 	let opts = GcOptions {
+		apply:                  false,
 		json:                    true,
 		agent_dir:               Some(agent),
 		blobs:                   false,
@@ -848,6 +1149,7 @@ fn gc_agent_dir_uses_its_own_settings() {
 		"gc:\n  blobs: false\n  archive: false\n  wal: false\n",
 	);
 	let opts = GcOptions {
+		apply:                  false,
 		json:                    true,
 		agent_dir:               Some(agent),
 		blobs:                   false,

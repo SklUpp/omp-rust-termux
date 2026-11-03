@@ -549,6 +549,7 @@ fn run() -> std::result::Result<(), CliError> {
 			return local_exit(code);
 		},
 		Some(Command::Gc {
+			apply,
 			json,
 			agent_dir,
 			blobs,
@@ -560,6 +561,7 @@ fn run() -> std::result::Result<(), CliError> {
 		}) => {
 			let base = base_dir(&cli)?;
 			let opts = local_cmd::GcOptions {
+				apply: *apply,
 				json: *json,
 				agent_dir: agent_dir.clone(),
 				blobs: *blobs,

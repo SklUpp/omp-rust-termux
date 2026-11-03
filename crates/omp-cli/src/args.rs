@@ -1325,8 +1325,11 @@ pub enum Command {
 		json:   bool,
 	},
 
-	/// On-disk storage maintenance (dry-run only in this build).
+	/// On-disk storage maintenance (dry-run unless `--apply`).
 	Gc {
+		/// Apply changes (default is dry-run).
+		#[arg(long)]
+		apply:                 bool,
 		/// Output JSON.
 		#[arg(long)]
 		json:                  bool,
@@ -2273,6 +2276,7 @@ mod tests {
 		assert_eq!(
 			parse(&["omp", "gc"]).command,
 			Some(Command::Gc {
+				apply:                   false,
 				json:                    false,
 				agent_dir:               None,
 				blobs:                   false,
@@ -2300,6 +2304,7 @@ mod tests {
 			])
 			.command,
 			Some(Command::Gc {
+				apply:                   false,
 				json:                    true,
 				agent_dir:               Some(PathBuf::from("/tmp/agent")),
 				blobs:                   true,
@@ -2310,8 +2315,20 @@ mod tests {
 				retain_newest_per_cwd:   Some(1),
 			})
 		);
-		// Destructive apply is deliberately absent.
-		assert!(Cli::try_parse_from(["omp", "gc", "--apply"]).is_err());
+		assert_eq!(
+			parse(&["omp", "gc", "--apply", "--wal"]).command,
+			Some(Command::Gc {
+				apply:                   true,
+				json:                    false,
+				agent_dir:               None,
+				blobs:                   false,
+				archive:                 false,
+				wal:                     true,
+				cold_archive_after_days: None,
+				retain_newest_global:    None,
+				retain_newest_per_cwd:   None,
+			})
+		);
 	}
 
 	#[test]

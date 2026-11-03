@@ -711,6 +711,12 @@ fn disabled_extensions_remove_a_skill_from_every_surface() {
 		"---\nname: blocked\ndescription: Disabled project skill\n---\nBLOCKED BODY MARKER\n",
 	)
 	.expect("skill md");
+	fs::create_dir_all(cwd.join(".omp/skills/visible")).expect("visible skill dir");
+	fs::write(
+		cwd.join(".omp/skills/visible/SKILL.md"),
+		"---\nname: visible\ndescription: Enabled project skill\n---\nVISIBLE BODY MARKER\n",
+	)
+	.expect("visible skill md");
 
 	let output = ProcCommand::new(env!("CARGO_BIN_EXE_omp"))
 		.env("PI_CODING_AGENT_DIR", &agent_dir)
@@ -735,7 +741,11 @@ fn disabled_extensions_remove_a_skill_from_every_surface() {
 	assert!(!requests.is_empty(), "provider was reached");
 	let system = system_text(&requests[0]);
 	assert!(!system.is_empty(), "prompt listing/system prompt was not observed");
-	assert!(!system.contains("blocked"), "prompt listing must omit it: {system}");
+	assert!(
+		system.contains("visible"),
+		"enabled sibling skill must appear in the prompt listing: {system}"
+	);
+	assert!(!system.contains("blocked"), "prompt listing must omit disabled skill: {system}");
 	let user = requests[0]
 		.get("messages")
 		.and_then(serde_json::Value::as_array)

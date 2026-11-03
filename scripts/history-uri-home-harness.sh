@@ -4,11 +4,13 @@
 # Requires a built `omp` binary. Runs the real CLI against a localhost
 # OpenAI-compatible mock under an isolated $HOME:
 #   1. root spawns an ASYNC child. The child's first provider call answers
-#      "live-child-answer", its second blocks on the root's history read. The
-#      root must see that in-turn answer in `history://task-1` BEFORE releasing
-#      the child; a file-only view never contains it and the harness fails.
-#      After release the child settles, is adopted, and history falls back to
-#      the journaled transcript.
+#      "live-child-answer" plus a harmless real `bash true` tool call, so the
+#      second request is reachable; that second request blocks on the root's
+#      history read. The root must see the in-turn answer in `history://task-1`
+#      BEFORE releasing the child, and a bounded probe of the exact fixture
+#      transcript must prove the marker is not journaled yet. After release the
+#      child settles, is adopted, and history falls back to the journaled
+#      transcript.
 #   2. a fresh CLI process resumes the session, reads the parked row, cold-
 #      revives the same id with `hub send`, and reads its history again.
 #   3. a second, independent session spawns its own `task-1` and must read only
@@ -46,19 +48,31 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 port_file = sys.argv[1]
 release_child = threading.Event()
 
+# Exact fixture transcript under the harness-owned sessions root. No HOME scan.
+MARKER_PROBE = r'''root="${OMP_HARNESS_SESSIONS:-$HOME/sessions}"
+set -- "$root"/*/subagents/task-1.jsonl
+if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then echo MARKER_PROBE_BAD_COUNT; exit 0; fi
+if grep -qs 'live-child-answer' "$1"; then echo MARKER_JOURNALED; else echo MARKER_ABSENT; fi'''
+
 
 def sse(chunks):
     return "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks) + "data: [DONE]\n\n"
 
 
-def tool_call(name, arguments, call_id="call_1"):
-    return sse([
-        {"choices": [{"delta": {"role": "assistant", "tool_calls": [{
+def tool_call(name, arguments, call_id="call_1", content=None):
+    delta = {
+        "role": "assistant",
+        "tool_calls": [{
             "index": 0,
             "id": call_id,
             "type": "function",
             "function": {"name": name, "arguments": json.dumps(arguments)},
-        }]}}]},
+        }],
+    }
+    if content is not None:
+        delta["content"] = content
+    return sse([
+        {"choices": [{"delta": delta}]},
         {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]},
     ])
 
@@ -133,6 +147,8 @@ def count_tool_calls(messages, name, op=None, path=None):
 
 def root_reply(messages):
     last = messages[-1] if messages else {}
+    if last.get("role") == "user":
+        return tool_call("task", {"name": "Live", "task": "CHILD_WORK"})
     if last.get("role") != "tool":
         return None
     name, arguments = last_tool_call(messages)
@@ -141,17 +157,23 @@ def root_reply(messages):
     reads = count_tool_calls(messages, "read", path="history://task-1")
 
     if name == "task":
+        if '"async"' not in content or '"running"' not in content:
+            return text("PHASE1_FAIL_TASK_NOT_ASYNC:" + content)
         return tool_call("read", {"path": "history://"})
     if name == "read" and "# Agents" in content:
         return tool_call("read", {"path": "history://task-1"})
     if name == "read" and waits == 0:
         if "live-child-answer" in content:
-            # Live proof established: only now may the gated child finish.
-            release_child.set()
-            return tool_call("hub", {"op": "wait", "ids": ["task-1"], "timeoutMs": 10000})
+            # Prove this turn is live and not yet in the journal before release.
+            return tool_call("bash", {"command": MARKER_PROBE})
         if reads < 8:
             return tool_call("read", {"path": "history://task-1"})
         return text("PHASE1_FAIL_NO_LIVE")
+    if name == "bash":
+        if "MARKER_ABSENT" in content:
+            release_child.set()
+            return tool_call("hub", {"op": "wait", "ids": ["task-1"], "timeoutMs": 10000})
+        return text("PHASE1_FAIL_MARKER_PROBE:" + content)
     if name == "hub" and arguments.get("op") == "wait":
         return tool_call("read", {"path": "history://task-1"})
     if name == "read" and waits >= 1:
@@ -163,6 +185,8 @@ def root_reply(messages):
 
 def resume_reply(messages):
     last = messages[-1] if messages else {}
+    if last.get("role") == "user":
+        return tool_call("read", {"path": "history://task-1"})
     if last.get("role") != "tool":
         return None
     name, arguments = last_tool_call(messages)
@@ -181,6 +205,8 @@ def resume_reply(messages):
 
 def isolated_reply(messages):
     last = messages[-1] if messages else {}
+    if last.get("role") == "user":
+        return tool_call("task", {"name": "Iso", "task": "CHILD_WORK_ISOLATED"})
     if last.get("role") != "tool":
         return None
     name, arguments = last_tool_call(messages)
@@ -198,10 +224,10 @@ def isolated_reply(messages):
 
 
 def child_live_reply(messages):
-    """First call answers in-turn, second waits for the root's live read."""
+    """First call answers plus a real tool turn; second waits for the root's live read."""
     assistant_turns = sum(1 for message in messages if message.get("role") == "assistant")
     if assistant_turns == 0:
-        return text("live-child-answer")
+        return tool_call("bash", {"command": "true"}, content="live-child-answer")
     release_child.wait(timeout=20)
     return tool_call("yield", {"result": {"data": "child-body-A"}})
 
@@ -288,7 +314,7 @@ providers:
 YAML
 
 run_cli() {
-	HOME="$ROOT" PI_CODING_AGENT_DIR="$AGENT_DIR" \
+	HOME="$ROOT" PI_CODING_AGENT_DIR="$AGENT_DIR" OMP_HARNESS_SESSIONS="$SESSIONS" \
 		"$OMP_BIN" --cwd "$PROJECT" --session-dir "$SESSIONS" --yolo "$@"
 }
 

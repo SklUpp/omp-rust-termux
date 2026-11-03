@@ -157,15 +157,10 @@ class MockModel:
                             + "data: [DONE]\n\n"
                         )
                     elif child and mock.child_error:
-                        status = 500
-                        content_type = "application/json"
-                        chunk = json.dumps(
-                            {
-                                "error": {
-                                    "type": "server_error",
-                                    "message": "child provider failed",
-                                }
-                            }
+                        chunk = (
+                            'data: {"error":{"type":"server_error",'
+                            '"message":"child provider failed"}}\n\n'
+                            "data: [DONE]\n\n"
                         )
                     elif child:
                         chunk = (

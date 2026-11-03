@@ -862,6 +862,24 @@ impl AdvisorManager {
 					self.notify();
 				},
 				Some(error) => {
+					// Completed requests were billed even when the call ends in
+					// a terminal provider error. Charge their reported cost
+					// before the failed turn is abandoned or retried.
+					{
+						let mut cost =
+							slot.cost.lock().unwrap_or_else(|poison| poison.into_inner());
+						for message in &result.assistant_messages {
+							*cost += crate::advisor_transcript::priced_usage(
+								message,
+								&self.inner.catalog,
+								&route.provider,
+								&route.model,
+							)
+							.and_then(|usage| usage.cost)
+							.map(|cost| cost.total)
+							.unwrap_or(0.0);
+						}
+					}
 					// Keep the state guard inside this block: the retry path
 					// awaits below, and a guard live across that await makes the
 					// spawned drain future non-Send.
@@ -1006,57 +1024,6 @@ impl AdvisorManager {
 					.backlog
 			})
 			.sum()
-	}
-
-	/// Env-gated diagnostic snapshot: slot count, pending deltas, backlog, seed
-	/// flag, and per-slot status/route. No prompts, credentials, or file paths.
-	#[must_use]
-	pub fn diagnostic_state(&self) -> String {
-		let pending: usize = self
-			.slots
-			.iter()
-			.map(|slot| {
-				slot.state
-					.lock()
-					.unwrap_or_else(|poison| poison.into_inner())
-					.pending
-					.len()
-			})
-			.sum();
-		let inflight: usize = self
-			.slots
-			.iter()
-			.map(|slot| {
-				slot.state
-					.lock()
-					.unwrap_or_else(|poison| poison.into_inner())
-					.inflight
-			})
-			.sum();
-		let slots: Vec<String> = self
-			.slots
-			.iter()
-			.map(|slot| {
-				let status = slot
-					.status
-					.lock()
-					.unwrap_or_else(|poison| poison.into_inner());
-				let route = slot
-					.route
-					.as_ref()
-					.map_or_else(|| "-".to_string(), |route| format!("{}/{}", route.provider, route.model));
-				format!("{}={status:?}:{route}", slot.slug)
-			})
-			.collect();
-		format!(
-			"slots={} pending={} inflight={} backlog={} needs_seed={} [{}]",
-			self.slots.len(),
-			pending,
-			inflight,
-			self.backlog(),
-			self.inner.needs_seed.load(Ordering::SeqCst),
-			slots.join(",")
-		)
 	}
 
 	/// Take the next aside batch for the primary request, without announcing it
@@ -1811,8 +1778,14 @@ mod tests {
 	}
 
 	fn manager(executor: Arc<dyn AdvisorExecutor>) -> Arc<AdvisorManager> {
+		manager_with_catalog(executor, Arc::new(Catalog::default()))
+	}
+
+	fn manager_with_catalog(
+		executor: Arc<dyn AdvisorExecutor>,
+		catalog: Arc<Catalog>,
+	) -> Arc<AdvisorManager> {
 		let config = Config::default();
-		let catalog = Arc::new(Catalog::default());
 		let resolver: RouteResolver = Arc::new(|pattern| {
 			if pattern.contains("bad") {
 				return Err("no model".to_string());
@@ -2157,6 +2130,52 @@ mod tests {
 			"quota with backlog must still return incomplete after reset"
 		);
 		assert_eq!(executor.calls.lock().expect("calls").len(), 2);
+		manager.dispose();
+	}
+
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn terminal_error_charges_reported_assistant_usage_once() {
+		struct FailingUsageExecutor;
+		#[async_trait::async_trait]
+		impl AdvisorExecutor for FailingUsageExecutor {
+			async fn execute(&self, _spec: AdvisorCallSpec) -> AdvisorCallResult {
+				let mut message = Message::assistant("partial advice");
+				message.usage = Some(TokenUsage {
+					input: 1_000,
+					output: 0,
+					total_tokens: 1_000,
+					..TokenUsage::default()
+				});
+				AdvisorCallResult {
+					history: vec![Message::user("update")],
+					assistant_messages: vec![message],
+					error: Some("invalid_request_error: upstream failed".to_string()),
+				}
+			}
+		}
+		let mut providers = BTreeMap::new();
+		let mut models = BTreeMap::new();
+		models.insert(
+			"advisor".to_string(),
+			crate::catalog::ModelInfo {
+				cost: Some(serde_json::json!({ "input": 1_000_000.0 })),
+				..crate::catalog::ModelInfo::default()
+			},
+		);
+		providers.insert("mock".to_string(), models);
+		let catalog = Arc::new(Catalog {
+			providers,
+			connections: BTreeMap::new(),
+			source: std::path::PathBuf::new(),
+		});
+		let manager = manager_with_catalog(Arc::new(FailingUsageExecutor), catalog);
+		manager.begin_primary_run(&[]);
+		manager.push_user(&Message::user("fix it"));
+		manager.push_turn(&Message::assistant("done"), &[]);
+		let _ = manager.wait_for_catchup(Duration::from_secs(5));
+		assert_eq!(manager.status_overview()[0].1, RuntimeStatus::Error);
+		let cost = manager.cost_snapshot()["reviewer"];
+		assert!((cost - 1_000.0).abs() < f64::EPSILON, "cost={cost}");
 		manager.dispose();
 	}
 

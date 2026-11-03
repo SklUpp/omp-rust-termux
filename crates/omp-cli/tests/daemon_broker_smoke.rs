@@ -775,7 +775,10 @@ async fn refused_duplicate_start_cannot_kill_running_process() {
 		host: None,
 		timeout_ms: 30_000,
 	});
-	let err = client.start(dup, None).await.expect_err("refused duplicate");
+	let err = match client.start(dup, None).await {
+		Ok(_) => panic!("refused duplicate unexpectedly started"),
+		Err(err) => err,
+	};
 	assert!(err.contains("already registered"), "unexpected error: {err}");
 	assert!(process_alive(pid), "refused duplicate must not signal the running owner");
 

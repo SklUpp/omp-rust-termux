@@ -30,7 +30,11 @@ use crate::{
 		AgentConfig, AgentState, Message, PlanModeGuard, Role, ToolApprover, TurnResult,
 	},
 	supervisor::Supervisor,
-	tools::{registry::ToolRegistry, task::TaskTool, task_catalog::Spawns},
+	tools::{
+		registry::ToolRegistry,
+		task::TaskTool,
+		task_catalog::{AgentDefinition, Spawns},
+	},
 };
 
 /// Contract file suffix, next to the child transcript.
@@ -351,6 +355,12 @@ pub fn append_messages(path: &Path, messages: &[&Message]) {
 pub struct RevivedChild {
 	pub agent_loop: AgentLoop,
 	pub state:     AgentState,
+	/// Original definition when the live catalog still has it. A follow-up
+	/// rewrite needs the agent output schema, so an unresolvable definition
+	/// simply disables that rewrite rather than guessing.
+	pub agent:     Option<AgentDefinition>,
+	/// Contract is needed for the saved-output id and follow-up schema policy.
+	pub contract:  PersistedChildSession,
 }
 
 /// Host-owned cold-revive factory (upstream
@@ -450,6 +460,9 @@ fn revived_child_registry(
 	supervisor: &Arc<Supervisor>,
 	contract: &PersistedChildSession,
 ) -> ToolRegistry {
+	if let Some(output_id) = contract.output_id.as_deref() {
+		supervisor.set_revived_output_prefix(&contract.id, output_id);
+	}
 	let mut registry = supervisor.child_registry_unbound(contract.depth, Some(contract.id.as_str()));
 	apply_contract_tools(&mut registry, contract);
 	if registry.get("task").is_some() {
@@ -582,8 +595,19 @@ impl PersistedChildReviverFactory for DefaultPersistedReviverFactory {
 				.with_background_results(supervisor.owner_results_sink(Some(&contract.id)))
 				.with_peer_inbox(supervisor.mailbox(), contract.id.clone());
 		}
+		let agent = supervisor
+			.and_then(|supervisor| supervisor.agent_catalog())
+			.and_then(|catalog| {
+				contract
+					.agent
+					.as_deref()
+					.and_then(|name| catalog.get(name))
+					.cloned()
+			});
 		Ok(RevivedChild {
 			agent_loop,
+			agent,
+			contract: contract.clone(),
 			state: AgentState {
 				messages:    replayed,
 				total_turns: replayed_turns,

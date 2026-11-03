@@ -3390,6 +3390,32 @@ mod display_tests {
 	}
 
 	#[tokio::test]
+	async fn agent_extraction_refuses_line_selectors_and_bypasses_pagination() {
+		let dir = TempDir::new("agent-extraction");
+		fs::write(dir.0.join("Saved.md"), r#"{"foo":[1,2]}"#).expect("agent output");
+		let mut scope = UrlScope::default();
+		scope.local_roots.insert("local".to_string(), dir.0.clone());
+		let tool = ReadTool::new().with_internal_urls(
+			Arc::new(InternalUrlRouter::new()),
+			Arc::new(scope),
+		);
+		for uri in ["agent://Saved/foo:1-1", "agent://Saved?q=.foo:1-1"] {
+			let refused = read_with(&tool, &dir, uri).await;
+			assert!(refused.is_error);
+			assert_eq!(
+				refused.content,
+				"Cannot combine query extraction with line selectors"
+			);
+		}
+		let extracted = read_with(&tool, &dir, "agent://Saved/foo").await;
+		assert!(!extracted.is_error, "{}", extracted.content);
+		assert_eq!(extracted.content, "[\n  1,\n  2\n]");
+		let paginated = read_with(&tool, &dir, "agent://Saved:1-1").await;
+		assert!(!paginated.is_error, "{}", paginated.content);
+		assert!(paginated.content.contains("1:"), "{}", paginated.content);
+	}
+
+	#[tokio::test]
 	async fn immutable_sources_never_fabricate_anchors() {
 		// `artifact://`, `agent://` and `memory://` have no edit path, so even in
 		// hashline mode a mounted handler's read must not emit anchors: line

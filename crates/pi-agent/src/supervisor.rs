@@ -559,6 +559,9 @@ pub struct Supervisor {
 	child_session_root: Mutex<Option<PathBuf>>,
 	/// Saved `agent://` output ids allocated across this session tree.
 	output_ids: OutputIdAllocator,
+	/// Output prefixes for revived children that are not in `state.records`
+	/// (notably eval-owned nested tasks). Live children read the record.
+	revived_output_prefixes: Mutex<HashMap<String, String>>,
 	/// Session internal URL router. Children rebuild `read`/`write` with their
 	/// own snapshot/pending stores, so the router must be re-applied there.
 	internal_urls: Mutex<Option<Arc<InternalUrlRouter>>>,
@@ -704,6 +707,7 @@ impl Supervisor {
 			emission: Mutex::new(()),
 			child_session_root: Mutex::new(None),
 			output_ids: OutputIdAllocator::default(),
+			revived_output_prefixes: Mutex::new(HashMap::new()),
 			internal_urls: Mutex::new(None),
 			url_scope: Mutex::new(Arc::new(UrlScope::default())),
 		})
@@ -1100,6 +1104,9 @@ impl Supervisor {
 			(depth.max(1), agent.unwrap_or_else(|| "task".to_string()))
 		};
 		let mut tool = TaskTool::with_parent(Arc::clone(self), depth, Some(owner.to_string()));
+		if let Some(prefix) = self.revived_output_prefix(owner) {
+			tool = tool.with_output_prefix(Some(prefix));
+		}
 		tool.agent_name = Some(agent_name.clone());
 		if let Some(catalog) = self.agent_catalog()
 			&& let Some(definition) = catalog.get(&agent_name)
@@ -1714,7 +1721,7 @@ impl Supervisor {
 					.and_then(|record| record.output_id.clone())
 			});
 			let output_id = self.output_ids.allocate(
-				self.child_session_root().as_deref(),
+				self.agent_output_root().as_deref(),
 				spawn.name,
 				parent_output_id.as_deref(),
 			);
@@ -1821,10 +1828,57 @@ impl Supervisor {
 			.and_then(|record| record.output_id.clone())
 	}
 
+	/// Shared producer artifacts root for saved `agent://` outputs.
+	///
+	/// This is the owning `UrlScope` artifact binding (root session scope:
+	/// `local`; child scope: the producer root pinned as `artifact`), never
+	/// `child_session_root` (`<producer>/subagents`), where only child JSONL
+	/// transcripts live.
+	#[must_use]
+	pub fn agent_output_root(&self) -> Option<PathBuf> {
+		let scope = self
+			.url_scope
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner());
+		scope
+			.local_roots
+			.get(ARTIFACT_SCHEME)
+			.or_else(|| scope.local_roots.get(LOCAL_SCHEME))
+			.cloned()
+	}
+
+	/// Remember the saved-output prefix for a revived child absent from
+	/// `state.records`, so eval-owned nested children still allocate
+	/// `Parent.Child` rather than a root id.
+	pub fn set_revived_output_prefix(&self, owner: &str, output_id: &str) {
+		if agent_output::valid_output_id(output_id) {
+			self.revived_output_prefixes
+				.lock()
+				.unwrap_or_else(|poison| poison.into_inner())
+				.insert(owner.to_string(), output_id.to_string());
+		}
+	}
+
+	/// Drop a revived prefix when its actor ends; safe to call repeatedly.
+	pub fn clear_revived_output_prefix(&self, owner: &str) {
+		self.revived_output_prefixes
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner())
+			.remove(owner);
+	}
+
+	fn revived_output_prefix(&self, owner: &str) -> Option<String> {
+		self.revived_output_prefixes
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner())
+			.get(owner)
+			.cloned()
+	}
+
 	/// Allocate a unique `agent://` output id without changing the child's
 	/// lifecycle identity. `prefix` nests under a parent output id.
 	pub fn allocate_output_id(&self, requested: &str, prefix: Option<&str>) -> String {
-		let root = self.child_session_root();
+		let root = self.agent_output_root();
 		self
 			.output_ids
 			.allocate(root.as_deref(), requested, prefix)
@@ -1851,7 +1905,7 @@ impl Supervisor {
 	/// candidate; an existing file is never replaced. Returns the id actually
 	/// published, or `None` when this session has no artifacts directory.
 	pub fn save_agent_output(&self, id: &str, requested: &str, body: &str) -> Option<String> {
-		let root = self.child_session_root()?;
+		let root = self.agent_output_root()?;
 		let mut output_id = self.child_output_id(id)?;
 		for _ in 0..64 {
 			match agent_output::publish_agent_output(&root, &output_id, body) {

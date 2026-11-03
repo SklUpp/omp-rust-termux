@@ -218,6 +218,33 @@ fn last_message_text(body: &str) -> String {
 /// stage first, because `child_finished` is a substring of `grandchild_finished`
 /// and tool results echo the child task text they ran.
 fn route_response(latest: &str) -> Value {
+	// Nested output-id regression: grandchild -> child -> root files all live in
+	// the producer artifacts root with dot-separated names.
+	if latest.contains("nested_done") {
+		return tool_call_response(
+			"yield",
+			&json!({ "result": { "data": "child_done" } }),
+		);
+	}
+	if latest.contains("NESTED_GRAND") {
+		return tool_call_response(
+			"yield",
+			&json!({ "result": { "data": "nested_done" } }),
+		);
+	}
+	if latest.contains("NESTED_CHILD") {
+		return tool_call_response(
+			"task",
+			&json!({ "name": "NestedGrand", "task": "NESTED_GRAND" }),
+		);
+	}
+	if latest.contains("NESTED_PARENT") {
+		return tool_call_response(
+			"task",
+			&json!({ "name": "NestedChild", "task": "NESTED_CHILD" }),
+		);
+	}
+
 	// T9: child runs a long shell command that the parent future abandons.
 	if latest.contains("BASH_DROP") {
 		return tool_call_response(
@@ -476,6 +503,8 @@ async fn saved_child_output_survives_restart_and_resolves_via_agent_uri() {
 		OpenAiCompatibleProvider::new(&server.base_url, "fake-key", "test-model").unwrap(),
 	);
 	let root = saved_output_root("restart");
+	let subagents = root.join("subagents");
+	std::fs::create_dir_all(&subagents).expect("subagents dir");
 
 	let supervisor = Supervisor::new(
 		ToolRegistry::new(),
@@ -483,7 +512,11 @@ async fn saved_child_output_survives_restart_and_resolves_via_agent_uri() {
 		None,
 		DelegationLimits::default(),
 	);
-	supervisor.set_child_session_root(Some(root.clone()));
+	supervisor.set_child_session_root(Some(subagents.clone()));
+	let mut root_scope = UrlScope::default();
+	root_scope.session_file = Some(root.join("main.jsonl"));
+	root_scope.local_roots.insert("local".to_string(), root.clone());
+	supervisor.set_url_scope(Arc::new(root_scope));
 	let tool = TaskTool::new(supervisor.clone(), 0);
 	let ctx = AgentContext::new(root.clone());
 	let result = tool
@@ -498,6 +531,14 @@ async fn saved_child_output_survives_restart_and_resolves_via_agent_uri() {
 	let path = root.join(format!("{output_id}.md"));
 	let body = std::fs::read_to_string(&path).expect("saved markdown");
 	assert!(body.contains("result_val"), "unexpected body: {body}");
+	assert!(
+		subagents.join(format!("{}.jsonl", saved.id)).is_file(),
+		"child transcript stays under <producer>/subagents"
+	);
+	assert!(
+		!subagents.join(format!("{output_id}.md")).exists(),
+		"saved output must not be written into the transcript directory"
+	);
 
 	let hub = HubTool::root(supervisor.clone());
 	let jobs = hub.execute(&json!({ "op": "jobs" }), &ctx).await.expect("jobs");
@@ -532,7 +573,11 @@ async fn saved_child_output_survives_restart_and_resolves_via_agent_uri() {
 		None,
 		DelegationLimits::default(),
 	);
-	restarted.set_child_session_root(Some(root.clone()));
+	restarted.set_child_session_root(Some(subagents.clone()));
+	let mut restarted_scope = UrlScope::default();
+	restarted_scope.session_file = Some(root.join("main.jsonl"));
+	restarted_scope.local_roots.insert("local".to_string(), root.clone());
+	restarted.set_url_scope(Arc::new(restarted_scope));
 	let restarted_tool = TaskTool::new(restarted, 0);
 	let second = restarted_tool
 		.execute(&json!({ "name": "Saved", "task": "T1_CHILD_WORK" }), &ctx)
@@ -556,6 +601,73 @@ async fn saved_child_output_survives_restart_and_resolves_via_agent_uri() {
 	assert!(aborted_body.contains("\"aborted\": true"), "unexpected: {aborted_body}");
 	assert!(aborted_body.contains("boom"), "unexpected: {aborted_body}");
 
+	std::fs::remove_dir_all(&root).ok();
+}
+
+#[tokio::test]
+async fn nested_spawn_writes_dotted_outputs_in_the_producer_root() {
+	let (server, _) = spawn_mock_server(None).await;
+	let provider = Arc::new(
+		OpenAiCompatibleProvider::new(&server.base_url, "fake-key", "test-model").unwrap(),
+	);
+	let root = saved_output_root("nested");
+	let subagents = root.join("subagents");
+	std::fs::create_dir_all(&subagents).expect("subagents dir");
+	let supervisor = Supervisor::new(
+		ToolRegistry::new(),
+		provider,
+		None,
+		DelegationLimits::default(),
+	);
+	supervisor.set_child_session_root(Some(subagents.clone()));
+	let mut scope = UrlScope::default();
+	scope.session_file = Some(root.join("main.jsonl"));
+	scope.local_roots.insert("local".to_string(), root.clone());
+	supervisor.set_url_scope(Arc::new(scope));
+	let tool = TaskTool::new(supervisor, 0);
+	let ctx = AgentContext::new(root.clone());
+	let result = tool
+		.execute(&json!({ "name": "NestedParent", "task": "NESTED_PARENT" }), &ctx)
+		.await
+		.expect("nested task result");
+	let details: TaskToolDetails = serde_json::from_str(&result.content).expect("details");
+	let parent_id = details.results[0]
+		.output_id
+		.clone()
+		.expect("parent output id");
+	assert_eq!(parent_id, "NestedParent");
+	for id in [
+		"NestedParent.NestedChild",
+		"NestedParent.NestedChild.NestedGrand",
+	] {
+		let path = root.join(format!("{id}.md"));
+		assert!(path.is_file(), "missing nested artifact {}", path.display());
+		assert!(
+			!subagents.join(format!("{id}.md")).exists(),
+			"nested artifact must not live in subagents"
+		);
+	}
+	let child_body = std::fs::read_to_string(root.join("NestedParent.NestedChild.md"))
+		.expect("child artifact");
+	assert!(child_body.contains("child_done"), "unexpected: {child_body}");
+
+	let mut read_scope = UrlScope::default();
+	read_scope.session_file = Some(root.join("main.jsonl"));
+	read_scope
+		.local_roots
+		.insert("local".to_string(), root.clone());
+	let router = InternalUrlRouter::new();
+	let resource = router
+		.resolve(
+			"agent://NestedParent/NestedChild",
+			&read_scope.resolve_context(
+				std::path::Path::new("."),
+				&pi_agent::CancellationToken::new(),
+			),
+		)
+		.await
+		.expect("nested resolver");
+	assert!(resource.content.contains("child_done"), "{}", resource.content);
 	std::fs::remove_dir_all(&root).ok();
 }
 

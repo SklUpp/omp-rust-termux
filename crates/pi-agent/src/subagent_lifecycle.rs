@@ -663,7 +663,12 @@ async fn run_actor(
 	cancel: tokio_util::sync::CancellationToken,
 	epoch: u64,
 ) {
-	let RevivedChild { agent_loop, mut state } = revived;
+	let RevivedChild {
+		agent_loop,
+		mut state,
+		agent,
+		contract,
+	} = revived;
 	// Buffered mail addressed to this agent is drained at the first turn
 	// boundary by the loop's peer inbox; it stays queued here until then.
 	while let Some(text) = receiver.recv().await {
@@ -677,7 +682,7 @@ async fn run_actor(
 		let before = state.messages.len();
 		let had_system = state.messages.first().is_some_and(|m| m.role == Role::System);
 		let request = Message::user(text);
-		if let Err(error) = agent_loop
+		let turn_result = agent_loop
 			.run_dialog_message_with_cancel(
 				request.clone(),
 				&mut state,
@@ -685,8 +690,30 @@ async fn run_actor(
 				None,
 				cancel.child_token(),
 			)
-			.await
+			.await;
+		// TS `runSubagentFollowUpTurn`: a follow-up turn rewrites the same
+		// `<outputId>.md` only when it produced a real yield. A hub wake with no
+		// yield leaves the last completion artifact untouched (issue #9518).
+		if let Ok(turns) = &turn_result
+			&& let Some(agent) = agent.as_ref()
+			&& let Some(output_id) = contract.output_id.as_deref()
+			&& let Some(root) = manager
+				.supervisor
+				.upgrade()
+				.and_then(|supervisor| supervisor.agent_output_root())
+			&& let Some(body) =
+				crate::tools::task::follow_up_output(&contract, agent, turns)
+			&& let Err(error) = crate::tools::agent_output::publish_agent_output_replace(
+				&root,
+				output_id,
+				&body,
+			)
 		{
+			eprintln!(
+				"warning: cannot rewrite follow-up agent output {output_id}: {error}"
+			);
+		}
+		if let Err(error) = turn_result {
 			// The hub receipt already reported this session as `revived`.
 			// A failed turn is real information, not a silent success: report
 			// it instead of dropping the error. Drop the partial turn too (it
@@ -719,6 +746,9 @@ async fn run_actor(
 		manager.note_idle(&id, epoch, queue_empty);
 	}
 	if let Some(manager) = manager.upgrade() {
+		if let Some(supervisor) = manager.supervisor.upgrade() {
+			supervisor.clear_revived_output_prefix(&id);
+		}
 		manager.finish_actor(&id, epoch);
 	}
 }

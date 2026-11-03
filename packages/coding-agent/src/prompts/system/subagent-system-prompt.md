@@ -50,7 +50,7 @@ Use `hub` messaging only for quick coordination, never long-form content. Addres
 - Discovery: the roster above shows live (running+idle) peers and a parked count, never parked names or task labels. `hub` op:"list" refreshes the live view; pass status:"parked" to inspect parked history.
 - Coordination: before you edit a file or start work a sibling may already own, message that peer first — overlapping edits collide. Idle peers are not gone: messaging them wakes them.
 - Follow-up: answer a peer's question with a short reply (set `replyTo`); use `await` only when you genuinely cannot proceed without the answer.
-- Parked history: omitted from this roster. `hub` op:"list" status:"parked" lists ids; `send` to a known parked id revives it. `history://<id>` and `agent://<id>` stay readable.
+- Parked history: omitted from this roster. `hub` op:"list" status:"parked" lists ids; `send` to a known parked id revives it. `history://<id>` and `agent://<outputId>` stay readable.
 {{/if}}
 
 § Completion

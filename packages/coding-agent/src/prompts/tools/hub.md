@@ -1,5 +1,5 @@
 Agent coordination: peer messaging, background-job control, and supervised long-running processes. Main agent is `Main`; subagents inherit task ID.
-Use `op: "list"` to discover live peers. Default is running+idle plus running/idle/parked/shown/truncated counts — never an unbounded parked name dump. Pass `status: "parked"` for parked archaeology; optional `limit` bounds rows (default 32, max 100). Address peers by exact roster ID — NEVER invent names. `send` to a known parked id still revives it; `history://<id>` and `agent://<id>` stay readable.
+Use `op: "list"` to discover live peers. Default is running+idle plus running/idle/parked/shown/truncated counts — never an unbounded parked name dump. Pass `status: "parked"` for parked archaeology; optional `limit` bounds rows (default 32, max 100). Address peers by exact roster ID — NEVER invent names. `send` to a known parked id still revives it; `history://<id>` and `agent://<outputId>` stay readable.
 
 # Messaging & Jobs
 
@@ -13,7 +13,7 @@ Background jobs auto-deliver when they finish. You NEVER need to poll; if `jobs`
 - **`inbox`**: drain queued messages without blocking.
 - **`cancel`**: kill background jobs by `ids` when they have hung, stalled, or are no longer needed. Returns immediately.
 - **`jobs`**: status snapshot of every job without waiting. A settled row consumes auto-delivery. Also names running subagents with no job entry — coordinate with those via `send`.
-- Job rows are process-local and expire roughly five minutes after settlement. Afterward, use the agent ID with `send`, `agent://<id>`, or `history://<id>`.
+- Job rows are process-local and expire roughly five minutes after settlement. Afterward, use the agent ID with `send`, `agent://<outputId>`, or `history://<id>`.
 - `completed` means successful yield/job exit, not artifact acceptance. Verify claimed changes.
 - NEVER use shell tools, grep, or read other sessions' files to figure out what a peer is doing. Message them directly.
 - NEVER use hub messaging for something a tool can answer (e.g., grepping codebase, running a build).

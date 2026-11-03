@@ -14,16 +14,17 @@
 //! - `agent://<id>/<path>` — JSON extraction (jq-like path form)
 //! - `agent://<id>?q=<query>` — JSON extraction (explicit query form)
 //!
-//! Roots come only from the immutable per-call [`ResolveContext`]: the
-//! caller's own session artifacts directory first, then the `artifact://` and
-//! `local://` roots bound for that same session tree. There is no
+//! Roots come only from the immutable per-call [`ResolveContext`]: the owning
+//! producer artifacts root, bound as `artifact://` for a child scope and as
+//! `local://` for a root scope. `session_file` is deliberately not used: child
+//! transcripts live under `<producer>/subagents`, while every saved output is
+//! in the shared `<producer>/<outputId>.md` namespace. There is no
 //! process-global session scan, so one session cannot read another session's
 //! outputs by guessing an id.
 
 use std::{
 	fs,
 	io::Read,
-	path::{Path, PathBuf},
 };
 
 use async_trait::async_trait;
@@ -40,31 +41,21 @@ use super::{
 /// Scheme for saved subagent outputs.
 pub const AGENT_SCHEME: &str = "agent";
 
-/// Root directories this call may search, deduped, caller-first.
+/// The single owning producer artifacts root for this call.
+///
+/// A root scope binds it as `local`; a child scope pins the same producer root
+/// as `artifact` while its own `local` is the transcript-only
+/// `<producer>/subagents` directory. Never fall back to `session_file`: that
+/// would resolve against the child transcript directory.
 #[must_use]
 pub fn agent_roots(context: &ResolveContext) -> Vec<PathBuf> {
-	let mut roots: Vec<PathBuf> = Vec::new();
-	if let Some(session_file) = &context.session_file
-		&& let Some(preferred) = session_artifact_dir(session_file)
-		&& !roots.iter().any(|known| known == &preferred)
-	{
-		roots.push(preferred);
-	}
-	for scheme in [ARTIFACT_SCHEME, LOCAL_SCHEME] {
-		if let Some(root) = context.local_roots.get(scheme)
-			&& !roots.iter().any(|known| known == root)
-		{
-			roots.push(root.clone());
-		}
-	}
-	roots
-}
-
-/// TS `rootSessionFile.slice(0, -6)`: the session file minus `.jsonl` names
-/// the session's artifacts directory.
-fn session_artifact_dir(session_file: &Path) -> Option<PathBuf> {
-	let text = session_file.to_string_lossy();
-	text.strip_suffix(".jsonl").map(PathBuf::from)
+	context
+		.local_roots
+		.get(ARTIFACT_SCHEME)
+		.or_else(|| context.local_roots.get(LOCAL_SCHEME))
+		.cloned()
+		.into_iter()
+		.collect()
 }
 
 /// Parsed `agent://` target, split the same way `parseInternalUrl` plus
@@ -129,7 +120,15 @@ fn parse_target(url: &InternalUrl) -> Result<AgentTarget, String> {
 		};
 		if query_first {
 			let at = question.expect("checked");
-			let tail = format!("{}{}", &host[at + 1..], path);
+			let after_question = &host[at + 1..];
+			// If the fragment starts in the authority, the slash-split `path`
+			// is fragment text too; appending it would extend the query past
+			// `#` (URLSearchParams sees only the query before the fragment).
+			let tail = if after_question.contains('#') {
+				after_question.to_string()
+			} else {
+				format!("{after_question}{path}")
+			};
 			raw_query = Some(
 				tail
 					.split('#')
@@ -144,17 +143,25 @@ fn parse_target(url: &InternalUrl) -> Result<AgentTarget, String> {
 			host = &host[..at];
 			path = "";
 		}
-	} else if let Some(at) = path.find('?') {
-		raw_query = Some(
-			path[at + 1..]
-				.split('#')
-				.next()
-				.unwrap_or_default()
-				.to_string(),
-		);
-		path = &path[..at];
-	} else if let Some(at) = path.find('#') {
-		path = &path[..at];
+	} else {
+		// URL fragment precedence: the first `#` starts the fragment, so a
+		// later `?` inside it is not a query.
+		let question = path.find('?');
+		let hash = path.find('#');
+		match (question, hash) {
+			(Some(question), Some(hash)) if question < hash => {
+				raw_query = Some(path[question + 1..hash].to_string());
+				path = &path[..question];
+			},
+			(Some(question), None) => {
+				raw_query = Some(path[question + 1..].to_string());
+				path = &path[..question];
+			},
+			(_, Some(hash)) => {
+				path = &path[..hash];
+			},
+			(None, None) => {},
+		}
 	}
 
 	let output_id = percent_decode(host).unwrap_or_else(|| host.to_string());
@@ -229,11 +236,7 @@ impl ProtocolHandler for AgentUrlHandler {
 			let (content, note) = extract_json(&scan.content, &scan.matched_id, &query)?;
 			(content, "application/json".to_string(), note)
 		} else {
-			(
-				"text/markdown".to_string(),
-				scan.content,
-				None,
-			)
+			(scan.content, "text/markdown".to_string(), None)
 		};
 		let mut resource = InternalResource::text(&url.href, content);
 		resource.content_type = content_type;
@@ -366,7 +369,9 @@ fn extract_json(
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum QueryToken {
 	Key(String),
-	Index(usize),
+	/// `None` is a syntactically numeric bracket that exceeds `usize`; TS
+	/// `Number` indexes no real array, so the extraction is missing.
+	Index(Option<usize>),
 }
 
 /// Parse the documented jq-like subset: `.foo`, `[0]`, `["special-key"]`,
@@ -400,10 +405,7 @@ fn parse_query(query: &str) -> Result<Vec<QueryToken>, String> {
 					let inner = raw.get(1..raw.len().saturating_sub(1)).unwrap_or("");
 					tokens.push(QueryToken::Key(unescape_quoted(inner)));
 				} else if raw.bytes().all(|byte| byte.is_ascii_digit()) {
-					match raw.parse::<usize>() {
-						Ok(number) => tokens.push(QueryToken::Index(number)),
-						Err(_) => tokens.push(QueryToken::Key(raw.to_string())),
-					}
+					tokens.push(QueryToken::Index(raw.parse::<usize>().ok()));
 				} else {
 					tokens.push(QueryToken::Key(raw.to_string()));
 				}
@@ -461,7 +463,9 @@ fn apply_query<'a>(data: &'a Value, query: &str) -> Result<Option<&'a Value>, St
 			return Ok(None);
 		}
 		current = match token {
-			QueryToken::Index(index) => value.as_array().and_then(|array| array.get(index)),
+			QueryToken::Index(index) => {
+				index.and_then(|index| value.as_array().and_then(|array| array.get(index)))
+			},
 			QueryToken::Key(key) => match value {
 				Value::Object(object) => object.get(&key),
 				Value::Array(array) => key
@@ -656,6 +660,65 @@ mod tests {
 	}
 
 	#[test]
+	fn numeric_bracket_uses_ts_number_semantics_on_objects_and_overflow() {
+		let root = TempRoot::new("numeric-brackets");
+		fs::write(
+			root.0.join("Saved.md"),
+			r#"{"0":"zero","foo bar":"x","arr":[1]}"#,
+		)
+		.expect("json");
+		assert_eq!(
+			resolve("agent://Saved?q=%5B%220%22%5D", &scope(&root.0))
+				.expect("quoted numeric key")
+				.content,
+			"\"zero\"",
+			"a quoted numeric bracket is an object key"
+		);
+		assert_eq!(
+			resolve("agent://Saved?q=%5Bfoo%20bar%5D", &scope(&root.0))
+				.expect("bare key")
+				.content,
+			"\"x\""
+		);
+		assert_eq!(
+			resolve("agent://Saved?q=%5B0%5D", &scope(&root.0))
+				.expect("number token on object")
+				.content,
+			"null",
+			"TS number tokens index arrays only, never object properties"
+		);
+		assert_eq!(
+			resolve("agent://Saved?q=%5B999999999999999999999%5D", &scope(&root.0))
+				.expect("overflow number token")
+				.content,
+			"null"
+		);
+	}
+
+	#[test]
+	fn fragment_precedes_a_later_question_mark() {
+		let root = TempRoot::new("fragment");
+		fs::write(root.0.join("Saved.md"), r#"{"foo":1,"Child":2}"#).expect("json");
+		let full = resolve("agent://Saved#frag?q=.foo", &scope(&root.0)).expect("fragment");
+		assert_eq!(full.content, r#"{"foo":1,"Child":2}"#);
+		assert_eq!(full.content_type, "text/markdown");
+		assert_eq!(
+			resolve("agent://Saved?q=.foo#frag", &scope(&root.0))
+				.expect("query before fragment")
+				.content,
+			"1"
+		);
+		// The `/path` after `#` is fragment text, not query text: do not append
+		// it to `q` just because `InternalUrl` split at the slash.
+		assert_eq!(
+			resolve("agent://Saved?q=.foo#frag/path", &scope(&root.0))
+				.expect("query before fragment with slash")
+				.content,
+			"1"
+		);
+	}
+
+	#[test]
 	fn path_and_query_extraction_are_mutually_exclusive() {
 		let root = TempRoot::new("conflict");
 		fs::write(root.0.join("Saved.md"), "{}").expect("json");
@@ -677,21 +740,23 @@ mod tests {
 	}
 
 	#[test]
-	fn caller_session_root_wins_over_another_bound_root() {
-		let caller = TempRoot::new("caller");
-		let other = TempRoot::new("other");
-		fs::write(caller.0.join("Main.md"), "caller output").expect("caller");
-		fs::write(other.0.join("Main.md"), "other output").expect("other");
+	fn producer_artifact_root_wins_over_the_child_session_directory() {
+		let child = TempRoot::new("child-local");
+		let producer = TempRoot::new("producer");
+		let subagents = child.0.join("subagents");
+		fs::create_dir_all(&subagents).expect("subagents dir");
+		fs::write(subagents.join("Main.md"), "wrong child output").expect("child copy");
+		fs::write(producer.0.join("Main.md"), "producer output").expect("producer");
 		let context = ResolveContext {
-			session_file: Some(caller.0.join("session.jsonl")),
-			local_roots: BTreeMap::from([(
-				ARTIFACT_SCHEME.to_string(),
-				other.0.clone(),
-			)]),
+			session_file: Some(subagents.join("task-1.jsonl")),
+			local_roots: BTreeMap::from([
+				(ARTIFACT_SCHEME.to_string(), producer.0.clone()),
+				(LOCAL_SCHEME.to_string(), subagents.clone()),
+			]),
 			..ResolveContext::default()
 		};
 		let resource = resolve("agent://Main", &context).expect("resolve");
-		assert_eq!(resource.content, "caller output");
+		assert_eq!(resource.content, "producer output");
 	}
 
 	#[test]

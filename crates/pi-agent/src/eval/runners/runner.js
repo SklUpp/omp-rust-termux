@@ -492,8 +492,8 @@ const helpers = {
 		const parsed = data !== undefined ? data : Object.prototype.hasOwnProperty.call(options, "schema") ? JSON.parse(text) : text;
 		if (!options.handle) return parsed;
 		const details = value && typeof value === "object" ? value.details : undefined;
-		if (!details || details.id == null) return { text, output: text, handle: null, id: null, agent: null };
-		const node = { text, output: text, handle: `agent://${details.id}`, id: details.id, agent: details.agent ?? null };
+		if (!details || details.outputId == null) return { text, output: text, handle: null, id: null, agent: null };
+		const node = { text, output: text, handle: `agent://${details.outputId}`, id: details.id, outputId: details.outputId, agent: details.agent ?? null };
 		if (parsed !== text) node.data = parsed;
 		return node;
 	},

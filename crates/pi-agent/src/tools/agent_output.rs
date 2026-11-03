@@ -13,11 +13,12 @@
 //! identity and from `result_key`: those keep their existing sequencing and
 //! accounting meaning. `output_id` is the stable `agent://` handle.
 //!
-//! Publication is no-clobber: the initial run for an id owns the name, and a
-//! competing writer must choose another candidate rather than replace bytes.
-//! A TypeScript follow-up turn intentionally re-writes its own `<id>.md` with
-//! `replaceFileAtomically`; Rust revived turns currently do not write output
-//! artifacts, so no replace path is exposed here.
+//! Publication is no-clobber for the initial run for an id: it owns the name,
+//! and a competing writer must choose another candidate rather than replace
+//! bytes. A follow-up turn that produced a real `yield` deliberately replaces
+//! its own `<id>.md` through [`publish_agent_output_replace`], matching the TS
+//! `replaceFileAtomically` path; a yield-less wake leaves the completed
+//! artifact untouched.
 
 use std::{
 	collections::HashSet,
@@ -181,6 +182,19 @@ pub(crate) fn publish_agent_output(
 		let _ = fs::set_permissions(root, fs::Permissions::from_mode(0o700));
 	}
 
+	let staged = stage_body(root, body)?;
+	let final_path = root.join(format!("{output_id}.md"));
+	let published = publish_staged_file(&staged, &final_path);
+	let _ = fs::remove_file(&staged);
+	match published {
+		Ok(true) => Ok(Some(final_path)),
+		Ok(false) => Ok(None),
+		Err(error) => Err(format!("publish {}: {error}", final_path.display())),
+	}
+}
+
+/// Stage and verify one complete payload under an exclusive private name.
+fn stage_body(root: &Path, body: &str) -> Result<PathBuf, String> {
 	let (staged, mut file) = create_stage(root)?;
 	let bytes = body.as_bytes();
 	let written = (|| -> std::io::Result<()> {
@@ -194,29 +208,67 @@ pub(crate) fn publish_agent_output(
 		return Err(format!("stage {}: {error}", staged.display()));
 	}
 	match fs::metadata(&staged) {
-		Ok(metadata) if metadata.len() == bytes.len() as u64 => {},
+		Ok(metadata) if metadata.len() == bytes.len() as u64 => Ok(staged),
 		Ok(metadata) => {
 			let _ = fs::remove_file(&staged);
-			return Err(format!(
+			Err(format!(
 				"stage {}: wrote {} of {} bytes",
 				staged.display(),
 				metadata.len(),
 				bytes.len()
-			));
+			))
 		},
 		Err(error) => {
 			let _ = fs::remove_file(&staged);
-			return Err(format!("verify {}: {error}", staged.display()));
+			Err(format!("verify {}: {error}", staged.display()))
 		},
 	}
+}
 
+/// Replace an existing saved output for a **follow-up turn that produced a
+/// real yield**. TS follow-up semantics (`executor.ts:2266`) intentionally
+/// overwrite the same `<id>.md` through `replaceFileAtomically`; the initial
+/// publication path above remains no-clobber.
+///
+/// The root must be the owning `UrlScope` producer root. The final name is
+/// validated; a symlink at the target is refused so an atomic rename cannot
+/// swap a link or redirect the write through it.
+pub(crate) fn publish_agent_output_replace(
+	root: &Path,
+	output_id: &str,
+	body: &str,
+) -> Result<PathBuf, String> {
+	if !valid_output_id(output_id) {
+		return Err(format!("invalid agent output id: {output_id:?}"));
+	}
+	fs::create_dir_all(root)
+		.map_err(|error| format!("artifacts directory {}: {error}", root.display()))?;
+	let root = fs::canonicalize(root)
+		.map_err(|error| format!("artifacts directory {}: {error}", root.display()))?;
 	let final_path = root.join(format!("{output_id}.md"));
-	let published = publish_staged_file(&staged, &final_path);
-	let _ = fs::remove_file(&staged);
-	match published {
-		Ok(true) => Ok(Some(final_path)),
-		Ok(false) => Ok(None),
-		Err(error) => Err(format!("publish {}: {error}", final_path.display())),
+	match fs::symlink_metadata(&final_path) {
+		Ok(metadata) if metadata.file_type().is_symlink() => {
+			return Err(format!("refusing to replace symlink {}", final_path.display()));
+		},
+		Ok(metadata) if metadata.is_dir() => {
+			return Err(format!("output target is a directory: {}", final_path.display()));
+		},
+		Ok(_) => {},
+		Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+		Err(error) => {
+			return Err(format!("inspect {}: {error}", final_path.display()));
+		},
+	}
+	let staged = stage_body(&root, body)?;
+	// `rename` replaces the directory entry atomically; the symlink check above
+	// guarantees it replaces a regular file (or creates the first one), never a
+	// link target.
+	match fs::rename(&staged, &final_path) {
+		Ok(()) => Ok(final_path),
+		Err(error) => {
+			let _ = fs::remove_file(&staged);
+			Err(format!("replace {}: {error}", final_path.display()))
+		},
 	}
 }
 
@@ -368,6 +420,28 @@ mod tests {
 			.expect("publish")
 			.expect("path");
 		assert_eq!(fs::read_to_string(path).expect("read"), "");
+	}
+
+	#[test]
+	fn followup_replace_updates_existing_regular_output() {
+		let root = TempRoot::new("followup-replace");
+		publish_agent_output(&root.0, "Saved", "initial").expect("initial");
+		let path = publish_agent_output_replace(&root.0, "Saved", "follow-up")
+			.expect("replace");
+		assert_eq!(fs::read_to_string(path).expect("read"), "follow-up");
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn followup_replace_refuses_a_symlink_target() {
+		let root = TempRoot::new("followup-symlink");
+		let outside = root.0.join("outside");
+		fs::write(&outside, "keep").expect("outside");
+		std::os::unix::fs::symlink(&outside, root.0.join("Saved.md")).expect("symlink");
+		let error = publish_agent_output_replace(&root.0, "Saved", "follow-up")
+			.expect_err("symlink target");
+		assert!(error.contains("refusing to replace symlink"), "{error}");
+		assert_eq!(fs::read_to_string(&outside).expect("outside intact"), "keep");
 	}
 
 	#[test]

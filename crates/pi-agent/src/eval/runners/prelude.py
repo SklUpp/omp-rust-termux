@@ -551,7 +551,7 @@ if "__omp_prelude_loaded__" not in globals():
         if not handle:
             return parsed
         details = res.get("details") if isinstance(res, dict) else None
-        if not isinstance(details, dict) or details.get("id") is None:
+        if not isinstance(details, dict) or details.get("outputId") is None:
             return {
                 "text": text,
                 "output": text,
@@ -562,8 +562,9 @@ if "__omp_prelude_loaded__" not in globals():
         node = {
             "text": text,
             "output": text,
-            "handle": f"agent://{details['id']}",
+            "handle": f"agent://{details['outputId']}",
             "id": details["id"],
+            "outputId": details["outputId"],
             "agent": details.get("agent"),
         }
         if has_data or schema is not None:

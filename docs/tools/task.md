@@ -210,10 +210,12 @@ call through `pi_agent::Supervisor`; there is no background job manager.
   `SingleResult.outputId`, `ChildRecord.outputId`, eval-agent details, the
   background `<task-result output="agent://…">` pointer, and `hub jobs`
   snapshots expose it; `id` and `resultKey` keep their existing meaning.
-- Every initial child with a session root publishes the full pre-cap result as
-  `<outputId>.md` through the shared atomic no-clobber primitive (`hard_link`,
-  falling back to `renameat2(RENAME_NOREPLACE)`), after the child settles but
-  before its terminal status is published. Completed, failed, and aborted runs
+- Every initial child publishes the full pre-cap result as
+  `<outputId>.md` in the owning `UrlScope` producer artifacts root (root
+  `local://` or child `artifact://`, never `<producer>/subagents`), through the
+  shared atomic no-clobber primitive (`hard_link`, falling back to
+  `renameat2(RENAME_NOREPLACE)`), after the child settles but before its
+  terminal status is published. Completed, failed, and aborted runs
   all produce the artifact; a hard abort with no captured text is an empty file,
   matching the TS initial-run behavior. A collision allocates the next id
   without touching the existing file. Rust revived turns currently do not

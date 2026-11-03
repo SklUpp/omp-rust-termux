@@ -449,14 +449,15 @@ unless defined?($__omp_prelude_loaded) && $__omp_prelude_loaded
     parsed = has_data ? res["data"] : (schema.nil? ? text : JSON.parse(text))
     return parsed unless handle
     details = res.is_a?(Hash) ? res["details"] : nil
-    if !details.is_a?(Hash) || details["id"].nil?
+    if !details.is_a?(Hash) || details["outputId"].nil?
       return { "text" => text, "output" => text, "handle" => nil, "id" => nil, "agent" => nil }
     end
     node = {
       "text" => text,
       "output" => text,
-      "handle" => "agent://#{details["id"]}",
+      "handle" => "agent://#{details["outputId"]}",
       "id" => details["id"],
+      "outputId" => details["outputId"],
       "agent" => details["agent"],
     }
     node["data"] = parsed if has_data || !schema.nil?

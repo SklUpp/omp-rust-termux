@@ -6,7 +6,7 @@ Agents marked BLOCKING run inline — results return in this call; non-blocking 
 
 # Async Job Contract
 - Results auto-deliver. A settled `hub jobs`/`hub wait` snapshot is the delivery; no duplicate `async-result` follows.
-- Job IDs are process-local and expire roughly five minutes after settlement. Afterward, use the agent ID with `hub send`, `agent://<id>`, or `history://<id>`.
+- Job IDs are process-local and expire roughly five minutes after settlement. Afterward, use the agent ID with `hub send`, `agent://<outputId>`, or `history://<id>`.
 - `completed` means successful yield/job exit, not artifact acceptance. Verify claimed changes.
 {{/if}}
 

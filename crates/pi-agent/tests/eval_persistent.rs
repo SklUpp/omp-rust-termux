@@ -81,13 +81,21 @@ impl EvalHost for TestHost {
 		Ok(json!({"text": "completion-ok"}))
 	}
 
-	async fn agent(&self, _args: Value, _ctx: &AgentContext) -> Result<Value, String> {
+	async fn agent(&self, args: Value, _ctx: &AgentContext) -> Result<Value, String> {
 		*self.agent_calls.lock().unwrap_or_else(|poison| poison.into_inner()) += 1;
 		let delay = *self.agent_delay.lock().unwrap_or_else(|poison| poison.into_inner());
 		if !delay.is_zero() {
 			tokio::time::sleep(delay).await;
 		}
-		Ok(json!({"text": "agent-ok"}))
+		let mut value = json!({"text": "agent-ok"});
+		if args.get("handle").and_then(Value::as_bool).unwrap_or(false) {
+			value["details"] = json!({
+				"id": "task-1",
+				"outputId": "Saved",
+				"agent": "task",
+			});
+		}
+		Ok(value)
 	}
 
 	async fn budget(&self, _args: Value, _ctx: &AgentContext) -> Result<Value, String> {
@@ -1169,6 +1177,76 @@ async fn cancelled_background_job_delivers_its_error() {
 	}
 	let delivered = delivered.expect("cancelled background delivery");
 	assert!(delivered.contains("Command aborted"), "{}", delivered);
+	teardown(&runtime, cwd).await;
+}
+
+#[tokio::test]
+async fn js_agent_handle_uses_output_id_not_lifecycle_id() {
+	if js_path().is_none() {
+		eprintln!("skipping JS regression: bun is not installed");
+		return;
+	}
+	let Some((tool, runtime, ctx, cwd)) = harness_with(
+		one_language(EvalLanguage::Js),
+		Interpreters::default(),
+		test_session(),
+		Arc::new(TestHost::default()),
+		|settings| settings,
+	)
+	.await
+	else {
+		return;
+	};
+	let result = tool
+		.execute(
+			&json!({
+				"language": "js",
+				"code": "const node = await agent('x', { handle: true }); console.log(JSON.stringify(node));"
+			}),
+			&ctx,
+		)
+		.await
+		.expect("js agent handle cell");
+	assert!(!result.is_error, "{}", result.content);
+	assert!(
+		result.content.contains("\"handle\":\"agent://Saved\""),
+		"handle must use outputId, not task-1: {}",
+		result.content
+	);
+	assert!(result.content.contains("\"id\":\"task-1\""), "{}", result.content);
+	assert!(
+		result.content.contains("\"outputId\":\"Saved\""),
+		"{}",
+		result.content
+	);
+	teardown(&runtime, cwd).await;
+}
+
+#[tokio::test]
+async fn py_agent_handle_uses_output_id_not_lifecycle_id() {
+	let Some((tool, runtime, ctx, cwd, _host)) = py_harness(4096).await else { return };
+	let result = tool
+		.execute(
+			&json!({
+				"language": "py",
+				"code": "import json\nnode = agent('x', handle=True)\nprint(json.dumps(node))"
+			}),
+			&ctx,
+		)
+		.await
+		.expect("py agent handle cell");
+	assert!(!result.is_error, "{}", result.content);
+	assert!(
+		result.content.contains("\"handle\": \"agent://Saved\""),
+		"{}",
+		result.content
+	);
+	assert!(result.content.contains("\"id\": \"task-1\""), "{}", result.content);
+	assert!(
+		result.content.contains("\"outputId\": \"Saved\""),
+		"{}",
+		result.content
+	);
 	teardown(&runtime, cwd).await;
 }
 

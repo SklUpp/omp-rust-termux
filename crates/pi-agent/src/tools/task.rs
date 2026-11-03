@@ -1,7 +1,7 @@
 use std::{
 	collections::{BTreeSet, HashMap},
 	future::Future,
-	sync::Arc,
+	sync::{Arc, Mutex},
 	time::Instant,
 };
 
@@ -249,6 +249,11 @@ impl TaskTool {
 	}
 
 	/// Restore the parent output prefix for a cold-revived nested tool.
+	#[cfg(test)]
+	pub(crate) fn output_prefix_for_test(&self) -> Option<&str> {
+		self.output_prefix.as_deref()
+	}
+
 	#[must_use]
 	pub fn with_output_prefix(mut self, prefix: Option<String>) -> Self {
 		self.output_prefix = prefix.filter(|id| super::agent_output::valid_output_id(id));
@@ -747,7 +752,13 @@ impl TaskTool {
 
 		let child_cancel_for_loop = child_cancel.clone();
 		let (event_tx, event_rx) = tokio::sync::mpsc::channel(256);
-		let events = forward_child_events(self.supervisor.clone(), child_id.clone(), event_rx);
+		let salvage = Arc::new(Mutex::new(ChildSalvage::default()));
+		let events = forward_child_events(
+			self.supervisor.clone(),
+			child_id.clone(),
+			event_rx,
+			Arc::clone(&salvage),
+		);
 		let child_plan = ctx.plan.clone();
 		let mut task_handle = tokio::spawn(async move {
 			let child_loop = match child_approver {
@@ -852,6 +863,10 @@ impl TaskTool {
 		};
 
 		let _ = events.await;
+		let salvage = salvage
+			.lock()
+			.unwrap_or_else(std::sync::PoisonError::into_inner)
+			.clone();
 
 		let duration_ms = start.elapsed().as_millis() as u64;
 		let outstanding_id = child_id.clone();
@@ -988,7 +1003,7 @@ impl TaskTool {
 				}
 			},
 			Err(AgentError::Interrupted) => {
-				artifact_body = Some(String::new());
+				artifact_body = Some(salvage.cancelled_output());
 				terminal_mark = Some(TerminalMark::Aborted("aborted by parent".to_string()));
 				SingleResult {
 					index,
@@ -1020,7 +1035,7 @@ impl TaskTool {
 				}
 			},
 			Err(err) => {
-				artifact_body = Some(String::new());
+				artifact_body = Some(salvage.raw_output());
 				let err_msg = err.to_string();
 				terminal_mark = Some(TerminalMark::Failed(err_msg.clone()));
 				SingleResult {
@@ -1204,6 +1219,7 @@ impl TaskTool {
 			task_id.clone(),
 			spawn_result_key.clone(),
 		);
+		let background_salvage = Arc::new(Mutex::new(ChildSalvage::default()));
 
 		let handle = tokio::spawn(async move {
 			// Wait until the reservation is registered as active, so an early
@@ -1238,6 +1254,7 @@ impl TaskTool {
 				cancel.clone(),
 				child_ctx,
 				plan,
+				Arc::clone(&background_salvage),
 			)
 			.await;
 			supervisor.unregister_active_child(&task_id);
@@ -1249,6 +1266,7 @@ impl TaskTool {
 				outcome,
 				item_for_settle,
 				spawn_result_key,
+				background_salvage,
 			);
 			supervisor.dispose_eval_owner(&eval_owner).await;
 			lifecycle.disarm();
@@ -1497,6 +1515,96 @@ struct BackgroundOutcome {
 	cancelled: bool,
 }
 
+/// Streamed assistant output captured from the child event channel.
+///
+/// Mirrors the TS monitor: `rawOutput()` joins text from `message_end`
+/// assistant blocks (or `agent_end` final messages), and the last assistant
+/// text is salvage for an aborted run that produced no completed chunk. Usage
+/// is captured only for the `[cancelled after …]` label and is never merged
+/// into `observed_usage`, so accounting cannot double count.
+#[derive(Clone, Default)]
+struct ChildSalvage {
+	chunks:         Vec<String>,
+	requests:       u64,
+	tokens:         u64,
+	last_assistant: Option<String>,
+}
+
+impl ChildSalvage {
+	fn capture_message(&mut self, message: &Message) {
+		if message.role != crate::state::Role::Assistant {
+			return;
+		}
+		self.requests = self.requests.saturating_add(1);
+		if let Some(usage) = message.usage.as_ref() {
+			let computed = usage
+				.input
+				.saturating_add(usage.output)
+				.saturating_add(usage.cache_write);
+			self.tokens = self
+				.tokens
+				.saturating_add(if computed > 0 { computed } else { usage.total_tokens });
+		}
+		let text = message_text(message);
+		if !text.trim().is_empty() {
+			self.last_assistant = Some(text.clone());
+		}
+		if !text.is_empty() {
+			self.chunks.push(text);
+		}
+	}
+
+	fn raw_output(&self) -> String {
+		self.chunks.concat()
+	}
+
+	/// TS cancelled/no-output fallback: only when no streamed chunk survived.
+	fn cancelled_output(&self) -> String {
+		let raw = self.raw_output();
+		if !raw.trim().is_empty() {
+			return raw;
+		}
+		let Some(text) = self.last_assistant.as_deref() else {
+			return String::new();
+		};
+		format!(
+			"[cancelled after {} req, {} tok — last activity: \"{}\"]",
+			self.requests,
+			self.tokens,
+			format_salvage_snippet(text)
+		)
+	}
+}
+
+fn message_text(message: &Message) -> String {
+	let parts: String = message
+		.parts
+		.iter()
+		.filter_map(|part| match part {
+			crate::state::ContentPart::Text { text } => Some(text.as_str()),
+			_ => None,
+		})
+		.collect::<Vec<_>>()
+		.join("\n");
+	if parts.is_empty() {
+		message.content.clone()
+	} else {
+		parts
+	}
+}
+
+/// TS `formatSalvageSnippet`: flatten whitespace, cap at 500 with `…`.
+fn format_salvage_snippet(text: &str) -> String {
+	let flattened = text.split_whitespace().collect::<Vec<_>>().join(" ");
+	if flattened.chars().count() > 500 {
+		let mut truncated: String = flattened.chars().take(499).collect();
+		truncated.push('…');
+		truncated
+	} else {
+		flattened
+	}
+}
+
 enum TerminalMark {
 	Completed(String),
 	Failed(String),
@@ -1515,6 +1623,7 @@ async fn run_background_child(
 	cancel: CancellationToken,
 	child_ctx: ChildContext,
 	plan: Option<Arc<dyn crate::state::PlanModeGuard>>,
+	salvage: Arc<Mutex<ChildSalvage>>,
 ) -> Result<BackgroundOutcome, AgentError> {
 	let child_model = child_ctx
 		.resolve_model(&item.agent, item.effort.as_deref())
@@ -1607,7 +1716,12 @@ async fn run_background_child(
 		.with_background_results(supervisor.owner_results_sink(Some(&child_id)))
 		.with_peer_inbox(supervisor.mailbox(), child_id.clone());
 	let (event_tx, event_rx) = tokio::sync::mpsc::channel(256);
-	let events = forward_child_events(Arc::clone(&supervisor), child_id.clone(), event_rx);
+	let events = forward_child_events(
+		Arc::clone(&supervisor),
+		child_id.clone(),
+		event_rx,
+		salvage,
+	);
 	let mut child_state = AgentState::default();
 	let cancel_for_finalize = cancel.clone();
 	let outcome = child_loop
@@ -1661,9 +1775,16 @@ fn forward_child_events(
 	supervisor: Arc<Supervisor>,
 	child_id: String,
 	mut events: tokio::sync::mpsc::Receiver<AgentEvent>,
+	salvage: Arc<Mutex<ChildSalvage>>,
 ) -> tokio::task::JoinHandle<()> {
 	tokio::spawn(async move {
 		while let Some(event) = events.recv().await {
+			if let AgentEvent::MessageEnd { message, .. } = &event {
+				salvage
+					.lock()
+					.unwrap_or_else(std::sync::PoisonError::into_inner)
+					.capture_message(message);
+			}
 			if !supervisor.report_event(&child_id, event) {
 				break;
 			}
@@ -1720,6 +1841,7 @@ fn settle_background_result(
 	outcome: Result<BackgroundOutcome, AgentError>,
 	item: TaskItemSpec,
 	result_key: Option<String>,
+	salvage: Arc<Mutex<ChildSalvage>>,
 ) {
 	let duration_ms = start.elapsed().as_millis() as u64;
 	let agent = item.agent.name.clone();
@@ -1731,6 +1853,10 @@ fn settle_background_result(
 			supervisor.fill_aborted_usage(&id, key, usage);
 		}
 	};
+	let salvage = salvage
+		.lock()
+		.unwrap_or_else(std::sync::PoisonError::into_inner)
+		.clone();
 	match outcome {
 		Ok(BackgroundOutcome {
 			turns,
@@ -1744,6 +1870,8 @@ fn settle_background_result(
 			let finalized = finalize_output(&item, &turns, &base, aborted);
 			let artifact = if aborted {
 				aborted_output(reason.as_deref())
+			} else if cancelled {
+				salvage.cancelled_output()
 			} else {
 				finalized.output.clone()
 			};
@@ -1810,7 +1938,7 @@ fn settle_background_result(
 			// The loop discarded its turns on cancellation, but every request it
 			// completed was charged: `observed` carries exactly those counters,
 			// and stays `None` when nothing completed (unknown, never zero).
-			supervisor.save_agent_output(&id, &item.name, "");
+			supervisor.save_agent_output(&id, &item.name, &salvage.cancelled_output());
 			supervisor.mark_aborted(&id, "aborted");
 			tombstone_aborted_child(&supervisor, &id, "aborted");
 			fill(observed);
@@ -1819,7 +1947,8 @@ fn settle_background_result(
 			let message = error.to_string();
 			// Requests that already completed were charged even though the loop
 			// never returned their turns.
-			let output_id = supervisor.save_agent_output(&id, &item.name, "");
+			let output_id =
+				supervisor.save_agent_output(&id, &item.name, &salvage.raw_output());
 			let envelope = task_result_envelope(
 				&id,
 				&agent,
@@ -2433,6 +2562,48 @@ fn render_assembled(assembled: &AssembledYield, fallback: &str) -> String {
 		},
 		None => fallback.to_string(),
 	}
+}
+
+/// Follow-up artifact body for a revived/completed child.
+///
+/// TS `finalizeRunResult` with `followUpTurn:true` rewrites the same `<id>.md`
+/// only when the turn produced a real `yield` result (issue #9518). A wake that
+/// simply answers a message must leave the last completion artifact intact.
+/// Returns `None` for that no-yield case; the caller then leaves the file alone.
+pub(crate) fn follow_up_output(
+	contract: &PersistedChildSession,
+	agent: &AgentDefinition,
+	turns: &[TurnResult],
+) -> Option<String> {
+	if collect_yields(turns).is_empty() {
+		return None;
+	}
+	let schema_mode = contract
+		.output_schema_mode
+		.as_deref()
+		.and_then(SchemaMode::parse)
+		.unwrap_or_default();
+	let item = TaskItemSpec {
+		name: contract
+			.display_name
+			.clone()
+			.unwrap_or_else(|| contract.id.clone()),
+		agent: agent.clone(),
+		task: contract.task.clone(),
+		context: None,
+		output_schema: contract.output_schema.clone(),
+		schema_mode,
+		schema_error: None,
+		effort: None,
+		isolation: IsolationRequest::default(),
+	};
+	let (base, aborted, reason) = summarize_turns(turns);
+	if aborted {
+		// TS `finalizeSubprocessOutput` replaces a follow-up aborted yield with
+		// the pretty `{aborted, error?}` body before writing the artifact.
+		return Some(aborted_output(reason.as_deref()));
+	}
+	Some(finalize_output(&item, turns, &base, false).output)
 }
 
 fn finalize_output(
@@ -3204,6 +3375,131 @@ mod tests {
 		assert_eq!(aborted_output(None), "{\n  \"aborted\": true\n}");
 	}
 
+	/// Follow-up artifacts are yield-only: a wake that merely answers a message
+	/// must leave the last completion artifact untouched (TS issue #9518).
+	#[test]
+	fn follow_up_output_requires_a_terminal_yield() {
+		let contract = PersistedChildSession {
+			id: "task-1".to_string(),
+			agent: Some("task".to_string()),
+			task: "work".to_string(),
+			system_prompt: "system".to_string(),
+			tools: Vec::new(),
+			model_role: None,
+			resolved_model: None,
+			output_schema: None,
+			output_schema_mode: None,
+			restrict_tool_names: Some(true),
+			spawns: Some("*".to_string()),
+			read_summarize: None,
+			advisor: None,
+			read_only: None,
+			cwd: std::path::PathBuf::from("."),
+			depth: 1,
+			max_turns: 20,
+			context_limit: 128_000,
+			display_name: Some("Saved".to_string()),
+			parent_id: None,
+			output_id: Some("Saved".to_string()),
+		};
+		let agent = model_agent();
+		let no_yield = vec![TurnResult {
+			message: Message::assistant("just talking"),
+			tool_results: Vec::new(),
+			is_completed: true,
+		}];
+		assert!(
+			follow_up_output(&contract, &agent, &no_yield).is_none(),
+			"a yield-less follow-up must not touch the existing artifact"
+		);
+
+		let message = Message::assistant_with_tools(
+			"",
+			vec![crate::state::ToolCall {
+				id: "call-1".to_string(),
+				name: "yield".to_string(),
+				arguments: json!({}),
+			}],
+		);
+		let result = crate::state::ToolResult {
+			tool_call_id: "call-1".to_string(),
+			content: r#"{"status":"success","data":{"key":"value"}}"#.to_string(),
+			is_error: false,
+			terminate: true,
+			details: None,
+		};
+		let with_yield = vec![TurnResult {
+			message,
+			tool_results: vec![result],
+			is_completed: true,
+		}];
+		let body = follow_up_output(&contract, &agent, &with_yield)
+			.expect("yielded follow-up rewrites the artifact");
+		assert!(body.contains("\"key\": \"value\""), "unexpected: {body}");
+
+		let aborted_yield = vec![TurnResult {
+			message: Message::assistant_with_tools(
+				"",
+				vec![crate::state::ToolCall {
+					id: "call-2".to_string(),
+					name: "yield".to_string(),
+					arguments: json!({}),
+				}],
+			),
+			tool_results: vec![crate::state::ToolResult {
+				tool_call_id: "call-2".to_string(),
+				content: r#"{"status":"aborted","error":"boom"}"#.to_string(),
+				is_error: false,
+				terminate: true,
+				details: None,
+			}],
+			is_completed: true,
+		}];
+		let aborted = follow_up_output(&contract, &agent, &aborted_yield)
+			.expect("aborted yield rewrites the artifact");
+		assert_eq!(aborted, aborted_output(Some("boom")));
+	}
+
+	#[test]
+	fn abort_partial_stream_is_preserved_and_empty_abort_uses_exact_salvage() {
+		let mut salvage = ChildSalvage::default();
+		let mut message = Message::assistant("partial answer");
+		message.usage = Some(TokenUsage {
+			input: 10,
+			output: 4,
+			cache_write: 1,
+			total_tokens: 15,
+			..TokenUsage::default()
+		});
+		salvage.capture_message(&message);
+		assert_eq!(salvage.raw_output(), "partial answer");
+		assert_eq!(
+			salvage.cancelled_output(),
+			"partial answer",
+			"streamed chunks win before salvage formatting"
+		);
+
+		let empty = ChildSalvage {
+			last_assistant: Some("last  activity\nseen".to_string()),
+			requests: 2,
+			tokens: 15,
+			..ChildSalvage::default()
+		};
+		assert_eq!(
+			empty.cancelled_output(),
+			"[cancelled after 2 req, 15 tok — last activity: \"last activity seen\"]"
+		);
+	}
+
+	#[test]
+	fn salvage_snippet_flattens_and_caps_at_ts_500() {
+		assert_eq!(format_salvage_snippet("a\n b\t c"), "a b c");
+		let long = "x".repeat(600);
+		let snippet = format_salvage_snippet(&long);
+		assert_eq!(snippet.chars().count(), 500);
+		assert!(snippet.ends_with('…'));
+	}
+
 	/// Child usage aggregation: reported totals sum once, unreported children
 	/// stay absent (no zero-filled stand-in), and turns that completed before a
 	/// later failure keep contributing.
@@ -3388,6 +3684,23 @@ mod tests {
 	/// factory snapshot taken at spawn; a fresh root spawn uses the new factory.
 	/// The catalog (definitions + policy) is shared, so this pins the capture
 	/// boundary between stable definitions and the per-turn model resolver.
+	#[test]
+	fn revived_eval_task_tool_inherits_the_saved_output_prefix() {
+		let supervisor = Supervisor::with_selection(
+			ToolRegistry::new(),
+			Arc::new(NullProvider),
+			None,
+			DelegationLimits::default(),
+			true,
+			false,
+		);
+		supervisor.set_revived_output_prefix("task-1", "Saved");
+		let tool = supervisor.eval_task_tool(Some("task-1"), None);
+		assert_eq!(tool.output_prefix_for_test(), Some("Saved"));
+		supervisor.clear_revived_output_prefix("task-1");
+		assert!(supervisor.eval_task_tool(Some("task-1"), None).output_prefix_for_test().is_none());
+	}
+
 	#[test]
 	fn grandchild_keeps_spawn_factory_after_root_model_update() {
 		let supervisor = Supervisor::with_selection(
@@ -3781,6 +4094,7 @@ mod tests {
 			Err(AgentError::Interrupted),
 			item,
 			Some(key.clone()),
+			Arc::new(Mutex::new(ChildSalvage::default())),
 		);
 
 		let entries = supervisor.take_accounting();
@@ -3875,6 +4189,7 @@ mod tests {
 			tokio_util::sync::CancellationToken::new(),
 			tool.child_context(),
 			None,
+			Arc::new(Mutex::new(ChildSalvage::default())),
 		)
 		.await;
 

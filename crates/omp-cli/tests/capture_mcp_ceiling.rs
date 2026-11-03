@@ -142,6 +142,7 @@ for line in sys.stdin:
         result = {"tools": [{"name": "echo", "description": "echo", "inputSchema": {"type": "object", "properties": {}}}]}
     else:
         continue
+    open(sys.argv[1], "a").write(method + "\n")
     sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result}) + "\n")
     sys.stdout.flush()
 "#,
@@ -236,7 +237,7 @@ for line in sys.stdin:
 		.stdin(Stdio::null())
 		.args(["--cwd", project.to_str().unwrap()])
 		.args(["--session-dir", sessions.to_str().unwrap()])
-		.args(["--no-session", "--tools", "read,learn,manage_skill", "--yolo"])
+		.args(["--no-session", "--tools", "read,learn,manage_skill,mcp__mock_echo", "--yolo"])
 		.args(["--max-time", "30s", "--mode", "text", "-p"])
 		.args(["TOOL first"])
 		.output()
@@ -265,9 +266,12 @@ for line in sys.stdin:
 	);
 	assert!(capture.iter().any(|name| name == "learn"), "{capture:?}");
 	let started = fs::read_to_string(&marker).unwrap_or_default();
+	let lines: Vec<&str> = started.lines().collect();
 	assert_eq!(
-		started.lines().count(),
+		lines.iter().filter(|line| **line == "started").count(),
 		1,
 		"capture must not spawn a second MCP server: {started}"
 	);
+	assert!(lines.contains(&"initialize"), "MCP initialize was not observed: {started}");
+	assert!(lines.contains(&"tools/list"), "MCP tools/list was not observed: {started}");
 }

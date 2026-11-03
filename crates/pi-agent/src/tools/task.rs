@@ -746,9 +746,17 @@ impl TaskTool {
 			item.task.clone()
 		};
 		let full_prompt = format!("Complete assignment thoroughly:\n\n{assignment}");
+		let initial_message = Message::user(full_prompt.clone());
 		self
 			.supervisor
-			.append_child_transcript(&child_id, &[&Message::user(full_prompt.clone())]);
+			.append_child_transcript(&child_id, &[&initial_message]);
+		if let Some(manager) = crate::subagent_lifecycle::lookup(&self.supervisor) {
+			manager.seed_live(&child_id, initial_message);
+		}
+		let _live_history = LiveHistoryScope {
+			supervisor: Arc::clone(&self.supervisor),
+			id:         child_id.clone(),
+		};
 
 		let child_cancel_for_loop = child_cancel.clone();
 		let (event_tx, event_rx) = tokio::sync::mpsc::channel(256);
@@ -760,6 +768,8 @@ impl TaskTool {
 			Arc::clone(&salvage),
 		);
 		let child_plan = ctx.plan.clone();
+		let final_messages = Arc::new(Mutex::new(None::<Vec<Message>>));
+		let final_messages_task = Arc::clone(&final_messages);
 		let mut task_handle = tokio::spawn(async move {
 			let child_loop = match child_approver {
 				Some(approver) => AgentLoop::with_approver(
@@ -772,7 +782,7 @@ impl TaskTool {
 			}
 			.with_plan(child_plan);
 			let mut child_state = AgentState::default();
-			child_loop
+			let outcome = child_loop
 				.run_dialog_message_with_cancel(
 					Message::user(full_prompt),
 					&mut child_state,
@@ -780,7 +790,13 @@ impl TaskTool {
 					Some(event_tx),
 					child_cancel_for_loop,
 				)
-				.await
+				.await;
+			// Hand the final authoritative state back for the post-drain
+			// reconcile (successful or rolled back).
+			*final_messages_task
+				.lock()
+				.unwrap_or_else(std::sync::PoisonError::into_inner) = Some(child_state.messages.clone());
+			outcome
 		});
 
 		if !self.supervisor.register_active_child(
@@ -863,6 +879,14 @@ impl TaskTool {
 		};
 
 		let _ = events.await;
+		if let Some(manager) = crate::subagent_lifecycle::lookup(&self.supervisor)
+			&& let Some(messages) = final_messages
+				.lock()
+				.unwrap_or_else(std::sync::PoisonError::into_inner)
+				.take()
+		{
+			manager.replace_live(&child_id, messages);
+		}
 		let salvage = salvage
 			.lock()
 			.unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1733,7 +1757,15 @@ async fn run_background_child(
 		item.task.clone()
 	};
 	let full_prompt = format!("Complete assignment thoroughly:\n\n{assignment}");
-	supervisor.append_child_transcript(&child_id, &[&Message::user(full_prompt.clone())]);
+	let initial_message = Message::user(full_prompt.clone());
+	supervisor.append_child_transcript(&child_id, &[&initial_message]);
+	if let Some(manager) = crate::subagent_lifecycle::lookup(&supervisor) {
+		manager.seed_live(&child_id, initial_message);
+	}
+	let _live_history = LiveHistoryScope {
+		supervisor: Arc::clone(&supervisor),
+		id:         child_id.clone(),
+	};
 	let child_loop = match child_approver {
 		Some(approver) => {
 			AgentLoop::with_approver(child_config, child_provider, child_registry, approver)
@@ -1765,6 +1797,9 @@ async fn run_background_child(
 	// Drain the forwarder before the caller settles the record, so no event is
 	// emitted after the terminal lifecycle frame.
 	let _ = events.await;
+	if let Some(manager) = crate::subagent_lifecycle::lookup(&supervisor) {
+		manager.replace_live(&child_id, child_state.messages.clone());
+	}
 	let turns = outcome?;
 	let (base, aborted, _) = summarize_turns(&turns);
 	let succeeded = !aborted && !finalize_output(&item, &turns, &base, false).failed;
@@ -1806,6 +1841,7 @@ fn forward_child_events(
 	mut events: tokio::sync::mpsc::Receiver<AgentEvent>,
 	salvage: Arc<Mutex<ChildSalvage>>,
 ) -> tokio::task::JoinHandle<()> {
+	let manager = crate::subagent_lifecycle::lookup(&supervisor);
 	tokio::spawn(async move {
 		while let Some(event) = events.recv().await {
 			if let AgentEvent::MessageEnd { message, status } = &event {
@@ -1814,11 +1850,30 @@ fn forward_child_events(
 					.unwrap_or_else(std::sync::PoisonError::into_inner)
 					.capture_message(message, status);
 			}
+			// Live `history://` sees the event exactly as emitted; accounting
+			// still observes it once through `report_event` below.
+			if let Some(manager) = manager.as_ref() {
+				manager.apply_live_event(&child_id, &event);
+			}
 			if !supervisor.report_event(&child_id, event) {
 				break;
 			}
 		}
 	})
+}
+
+/// Drops the live history snapshot when this spawn stops owning the child.
+struct LiveHistoryScope {
+	supervisor: Arc<Supervisor>,
+	id:         String,
+}
+
+impl Drop for LiveHistoryScope {
+	fn drop(&mut self) {
+		if let Some(manager) = crate::subagent_lifecycle::lookup(&self.supervisor) {
+			manager.drop_live(&self.id);
+		}
+	}
 }
 
 /// TS `finalizeSubprocessOutput` abort body: `{aborted:true, error?}` pretty

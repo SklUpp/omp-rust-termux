@@ -1223,6 +1223,18 @@ impl TimerGuard {
 }
 
 impl PiAgentRunner {
+	fn advisor_diag_enabled() -> bool {
+		std::env::var_os("OMP_ADVISOR_DIAGNOSTIC").is_some()
+	}
+
+	fn advisor_diag_scope(session_id: Option<&str>, session_file: Option<&std::path::Path>) -> String {
+		format!(
+			"session={} file={}",
+			session_id.filter(|id| !id.is_empty()).unwrap_or("-"),
+			session_file.is_some()
+		)
+	}
+
 	fn advisor_for_scope(
 		&self,
 		session_id: Option<&str>,
@@ -1256,7 +1268,19 @@ impl PiAgentRunner {
 			.advisor
 			.lock()
 			.unwrap_or_else(|poison| poison.into_inner());
+		let diag = Self::advisor_diag_enabled();
+		let scope = Self::advisor_diag_scope(request.session_id.as_deref(), request.session_file.as_deref());
+		if diag {
+			eprintln!(
+				"[advisor-diag] ensure begin {scope} enabled={} existing={}",
+				request.config.advisor.enabled(),
+				slot.is_some()
+			);
+		}
 		if !request.config.advisor.enabled() {
+			if diag {
+				eprintln!("[advisor-diag] ensure skip-disabled {scope}");
+			}
 			if let Some(existing) = slot.take() {
 				existing.dispose();
 			}
@@ -1276,6 +1300,10 @@ impl PiAgentRunner {
 		} else {
 			discovered.advisors
 		};
+		let roster_len = roster.len();
+		if diag {
+			eprintln!("[advisor-diag] ensure roster {scope} roster={roster_len}");
+		}
 		let context_prompt = advisor_context_prompt(&request.context_files);
 		let watchdog_docs =
 			crate::advisor_config::discover_watchdog_docs(&request.cwd, Some(agent_dir.as_path()));
@@ -1324,10 +1352,22 @@ impl PiAgentRunner {
 		// its in-flight context); a changed one replaces it.
 		if let Some(existing) = slot.as_ref() {
 			if existing.signature() == manager.signature() {
+				if diag {
+					eprintln!(
+						"[advisor-diag] ensure reuse {scope} {}",
+						existing.diagnostic_state()
+					);
+				}
 				manager.dispose();
 				return Some(Arc::clone(existing));
 			}
 			existing.dispose();
+		}
+		if diag {
+			eprintln!(
+				"[advisor-diag] ensure created {scope} {}",
+				manager.diagnostic_state()
+			);
 		}
 		*slot = Some(Arc::clone(&manager));
 		Some(manager)
@@ -2357,7 +2397,18 @@ impl AgentRunner for PiAgentRunner {
 		session_id: Option<&str>,
 		session_file: Option<&std::path::Path>,
 	) {
-		if let Some(manager) = self.advisor_for_scope(session_id, session_file) {
+		let manager = self.advisor_for_scope(session_id, session_file);
+		if Self::advisor_diag_enabled() {
+			eprintln!(
+				"[advisor-diag] drain prepare {} manager={} {}",
+				Self::advisor_diag_scope(session_id, session_file),
+				manager.is_some(),
+				manager
+					.as_ref()
+					.map_or_else(|| "-".to_string(), |manager| manager.diagnostic_state())
+			);
+		}
+		if let Some(manager) = manager {
 			manager.prepare_headless_drain();
 		}
 	}
@@ -2368,10 +2419,30 @@ impl AgentRunner for PiAgentRunner {
 		session_file: Option<&std::path::Path>,
 		timeout: std::time::Duration,
 	) -> bool {
-		match self.advisor_for_scope(session_id, session_file) {
+		let manager = self.advisor_for_scope(session_id, session_file);
+		let diag = Self::advisor_diag_enabled();
+		if diag {
+			eprintln!(
+				"[advisor-diag] drain wait {} manager={} {}",
+				Self::advisor_diag_scope(session_id, session_file),
+				manager.is_some(),
+				manager
+					.as_ref()
+					.map_or_else(|| "-".to_string(), |manager| manager.diagnostic_state())
+			);
+		}
+		match manager {
 			Some(manager) => {
 				let caught_up = manager.wait_for_catchup(timeout);
 				manager.flush_asides();
+				if diag {
+					eprintln!(
+						"[advisor-diag] drain waited {} caught_up={} {}",
+						Self::advisor_diag_scope(session_id, session_file),
+						caught_up,
+						manager.diagnostic_state()
+					);
+				}
 				caught_up
 			},
 			None => true,

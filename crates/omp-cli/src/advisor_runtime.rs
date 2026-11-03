@@ -982,6 +982,46 @@ impl AdvisorManager {
 			.sum()
 	}
 
+	/// Env-gated diagnostic snapshot: slot count, pending deltas, backlog, seed
+	/// flag, and per-slot status/route. No prompts, credentials, or file paths.
+	#[must_use]
+	pub fn diagnostic_state(&self) -> String {
+		let pending: usize = self
+			.slots
+			.iter()
+			.map(|slot| {
+				slot.state
+					.lock()
+					.unwrap_or_else(|poison| poison.into_inner())
+					.pending
+					.len()
+			})
+			.sum();
+		let slots: Vec<String> = self
+			.slots
+			.iter()
+			.map(|slot| {
+				let status = slot
+					.status
+					.lock()
+					.unwrap_or_else(|poison| poison.into_inner());
+				let route = slot
+					.route
+					.as_ref()
+					.map_or_else(|| "-".to_string(), |route| format!("{}/{}", route.provider, route.model));
+				format!("{}={status:?}:{route}", slot.slug)
+			})
+			.collect();
+		format!(
+			"slots={} pending={} backlog={} needs_seed={} [{}]",
+			self.slots.len(),
+			pending,
+			self.backlog(),
+			self.inner.needs_seed.load(Ordering::SeqCst),
+			slots.join(",")
+		)
+	}
+
 	/// Take the next aside batch for the primary request, without announcing it
 	/// again. Returns the already-announced text when present.
 	pub fn take_pending_aside_content(&self) -> Option<String> {

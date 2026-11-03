@@ -2134,8 +2134,11 @@ mod tests {
 		manager.begin_primary_run(&[]);
 		manager.push_user(&Message::user("fix it"));
 		manager.push_turn(&Message::assistant("done"), &[]);
-		// A failing/quota advisor must not park the primary.
-		assert!(manager.wait_for_catchup(Duration::from_secs(5)));
+		// A failing/quota advisor must not park the primary: incomplete wait.
+		assert!(
+			!manager.wait_for_catchup(Duration::from_secs(5)),
+			"quota with backlog must return incomplete, not caught up"
+		);
 		assert_eq!(
 			manager.status_overview()[0].1,
 			RuntimeStatus::QuotaExhausted
@@ -2149,7 +2152,10 @@ mod tests {
 		manager.begin_primary_run(&[]);
 		manager.push_user(&Message::user("fresh"));
 		manager.push_turn(&Message::assistant("done"), &[]);
-		assert!(manager.wait_for_catchup(Duration::from_secs(5)));
+		assert!(
+			!manager.wait_for_catchup(Duration::from_secs(5)),
+			"quota with backlog must still return incomplete after reset"
+		);
 		assert_eq!(executor.calls.lock().expect("calls").len(), 2);
 		manager.dispose();
 	}

@@ -738,9 +738,10 @@ impl AdvisorManager {
 				.context_window(&route.provider, &route.model)
 				.unwrap_or(crate::runtime::DEFAULT_CONTEXT_LIMIT);
 			slot.advise.begin_update(wip);
-			let mut guard = slot.guard.lock().unwrap_or_else(|poison| poison.into_inner());
-			guard.begin_update();
-			drop(guard);
+			{
+				let mut guard = slot.guard.lock().unwrap_or_else(|poison| poison.into_inner());
+				guard.begin_update();
+			}
 			let mut transcript = {
 				let mut state = slot.state.lock().unwrap_or_else(|poison| poison.into_inner());
 				std::mem::replace(&mut state.transcript, AdvisorTranscript::new())
@@ -882,6 +883,7 @@ impl AdvisorManager {
 					state.transcript.abandon_turn();
 					drop(state);
 					self.notify();
+					drop(_epoch_guard);
 					tokio::time::sleep(Duration::from_millis(1000)).await;
 				},
 			}

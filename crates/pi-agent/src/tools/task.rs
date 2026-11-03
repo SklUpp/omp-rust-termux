@@ -4755,6 +4755,77 @@ mod tests {
 		);
 	}
 
+	#[derive(Default)]
+	struct EndHook {
+		aborted: Mutex<Vec<bool>>,
+	}
+
+	#[async_trait::async_trait]
+	impl crate::subagent_advisor::ChildAdvisorHook for EndHook {
+		async fn on_child_end(
+			&self,
+			_child: &crate::subagent_advisor::ChildAdvisorContext<'_>,
+			aborted: bool,
+		) {
+			self.aborted.lock().expect("hook").push(aborted);
+		}
+	}
+
+	#[tokio::test]
+	async fn child_provider_failure_is_not_reported_as_abort() {
+		let root: Arc<dyn ModelProvider> = Arc::new(NullProvider);
+		let child: Arc<dyn ModelProvider> = Arc::new(NullProvider);
+		let supervisor = Supervisor::with_selection(
+			ToolRegistry::new(),
+			Arc::clone(&root),
+			None,
+			DelegationLimits::default(),
+			true,
+			false,
+		);
+		let hook = Arc::new(EndHook::default());
+		supervisor.set_child_advisor_hook(Some(hook.clone()));
+		let catalog = Arc::new(
+			AgentCatalog::new(vec![model_agent()], None)
+				.with_model_factory(Arc::new(SharedFactory(Arc::clone(&child)))),
+		);
+		let tool = TaskTool::new(Arc::clone(&supervisor), 0).with_catalog(catalog);
+		let item = TaskItemSpec {
+			name: "task-bg".to_string(),
+			agent: model_agent(),
+			task: "work".to_string(),
+			context: None,
+			output_schema: None,
+			schema_mode: SchemaMode::default(),
+			schema_error: None,
+			effort: None,
+			isolation: IsolationRequest::default(),
+		};
+		let (steering_tx, steering_rx) = tokio::sync::mpsc::channel(1);
+		let _ = tokio::time::timeout(
+			std::time::Duration::from_secs(5),
+			run_background_child(
+				Arc::clone(&supervisor),
+				"task-bg".to_string(),
+				item,
+				std::path::PathBuf::from("."),
+				steering_rx,
+				steering_tx,
+				tokio_util::sync::CancellationToken::new(),
+				tool.child_context(),
+				None,
+				Arc::new(Mutex::new(ChildSalvage::default())),
+			),
+		)
+		.await
+		.expect("child settled");
+		assert_eq!(
+			hook.aborted.lock().expect("hook").clone(),
+			vec![false],
+			"provider failure must still drain the advisor"
+		);
+	}
+
 	/// The detached background path builds its own registry after the spawn
 	/// future, so it needs the same provider rebind as the foreground path.
 	/// Assert through the binder seam rather than the child loop's request.

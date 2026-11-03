@@ -3557,7 +3557,6 @@ async fn run_advisor_call(
 		history.remove(0);
 	}
 	let mut state = AgentState { messages: history, total_turns: 0 };
-	let agent = AgentLoop::with_approver(config, provider, registry, approvals);
 	let available: std::collections::BTreeSet<String> = names
 		.iter()
 		.cloned()
@@ -3580,6 +3579,7 @@ async fn run_advisor_call(
 		source_text: source_text.clone(),
 		available: available.clone(),
 	});
+	let agent = AgentLoop::with_approver(config, provider, registry, approvals);
 	let loop_config = spec.config.tool_call_loop_guard.clone();
 	let (steer_tx, steer_rx) = tokio::sync::mpsc::channel(16);
 	let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(256);

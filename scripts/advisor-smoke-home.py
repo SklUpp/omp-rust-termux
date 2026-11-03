@@ -309,11 +309,42 @@ ENV_ARTIFACT_KEYS = (
 def dump_env(base: Path, agent_dir: Path, cwd: Path, sessions: Path, binary: str) -> None:
     """Record which profile/agent dir the fixture process really selected."""
     env = omp_env(agent_dir)
+    watchdog_candidates: list[dict] = []
+    current = cwd
+    while True:
+        for parent in (current / ".omp", current):
+            for name in ("WATCHDOG.yml", "WATCHDOG.yaml"):
+                path = parent / name
+                if path.is_file():
+                    watchdog_candidates.append(
+                        {"path": str(path), "bytes": path.stat().st_size}
+                    )
+        if current == Path(env["HOME"]):
+            break
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+    for name in ("WATCHDOG.yml", "WATCHDOG.yaml"):
+        path = agent_dir / name
+        if path.is_file():
+            watchdog_candidates.append({"path": str(path), "bytes": path.stat().st_size})
     artifact = {
         "binary": binary,
         "agent_dir": str(agent_dir),
         "cwd": str(cwd),
         "sessions": str(sessions),
+        "cli_text_args": [
+            binary,
+            "--cwd", str(cwd),
+            "--session-dir", str(sessions),
+            "--no-tools",
+            "--no-title",
+            "--mode", "text",
+            "--advisor",
+            "say hi",
+        ],
+        "watchdog_candidates": watchdog_candidates,
         "env": {key: env.get(key) for key in ENV_ARTIFACT_KEYS},
     }
     (base / "fixture-env.json").write_text(json.dumps(artifact, indent=2) + "\n")
@@ -326,8 +357,14 @@ def diagnose_cli_failure(
     sessions: Path,
     base: Path,
 ) -> None:
-    """Read-only RPC status on the same env/config; never prompts the model."""
-    report: dict = {"error": None, "ready": False, "status": None, "frames": []}
+    """Probe the same env/config: status before and after the same prompt."""
+    report: dict = {
+        "error": None,
+        "ready": False,
+        "pre_prompt_status": None,
+        "status": None,
+        "frames": [],
+    }
     proc = None
     try:
         proc, lines = spawn_with_reader(
@@ -348,6 +385,39 @@ def diagnose_cli_failure(
         report["ready"] = any(frame.get("type") == "ready" for frame in ready)
         if report["ready"]:
             send(proc, {"id": "diag-1", "type": "get_advisor_status"})
+            pre = read_lines(
+                proc,
+                lines,
+                30,
+                lambda frame: frame.get("type") == "response"
+                and frame.get("command") == "get_advisor_status",
+            )
+            report["frames"].extend(pre)
+            report["pre_prompt_status"] = next(
+                (
+                    frame
+                    for frame in pre
+                    if frame.get("type") == "response"
+                    and frame.get("command") == "get_advisor_status"
+                ),
+                None,
+            )
+            # The manager is lazy: status before a prompt only reports the empty
+            # slot, never the config. Run the same prompt so `configured`,
+            # `status`, and the resolved route describe the real create path.
+            send(proc, {"id": "diag-2", "type": "prompt", "message": "say hi"})
+            turn = read_lines(
+                proc,
+                lines,
+                TIMEOUT,
+                lambda frame: frame.get("type") == "turn_end"
+                or (
+                    frame.get("type") == "response"
+                    and frame.get("command") == "prompt"
+                ),
+            )
+            report["frames"].extend(turn)
+            send(proc, {"id": "diag-3", "type": "get_advisor_status"})
             status = read_lines(
                 proc,
                 lines,
@@ -456,6 +526,9 @@ def phase_cli_text(binary: str, mock: MockModel, base: Path) -> Path:
     mock.dump(base / "mock-requests.json")
     if out.returncode != 0:
         diagnose_cli_failure(binary, agent_dir, cwd, sessions, base)
+        (base / "mock-requests-after-diagnostic.json").write_text(
+            json.dumps(mock.requests, indent=2) + "\n"
+        )
         fail(f"CLI text exited {out.returncode}: {out.stderr}")
     if "advisor:" not in out.stderr or "write target deleted" not in out.stderr:
         systems = [
@@ -463,6 +536,9 @@ def phase_cli_text(binary: str, mock: MockModel, base: Path) -> Path:
             for request in mock.requests
         ]
         diagnose_cli_failure(binary, agent_dir, cwd, sessions, base)
+        (base / "mock-requests-after-diagnostic.json").write_text(
+            json.dumps(mock.requests, indent=2) + "\n"
+        )
         fail(
             f"CLI text must show the card on stderr: {out.stderr!r}; "
             f"provider requests={len(systems)} {systems}"

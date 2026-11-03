@@ -25,6 +25,7 @@
 use std::{
 	fs,
 	io::Read,
+	path::PathBuf,
 };
 
 use async_trait::async_trait;

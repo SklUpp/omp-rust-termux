@@ -696,7 +696,7 @@ async fn run_actor(
 		// yield leaves the last completion artifact untouched (issue #9518).
 		if let Ok(turns) = &turn_result
 			&& let Some(agent) = agent.as_ref()
-			&& let Some(output_id) = contract.output_id.as_deref()
+			&& let Some(output_id) = contract.published_output_id()
 			&& let Some(root) = manager
 				.supervisor
 				.upgrade()

@@ -151,14 +151,32 @@ pub struct PersistedChildSession {
 	/// Roster-only parent agent id.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub parent_id: Option<String>,
-	/// Stable saved-output identity (`agent://<output_id>`). New contracts
-	/// record it so a revived nested child can keep allocating its own
-	/// children under the same prefix; older contracts simply omit it.
+	/// Stable saved-output identity (`agent://<output_id>`). Written only with
+	/// [`Self::output_published`] after the artifact is confirmed, so a revived
+	/// nested child keeps its prefix without gaining replacement authority from
+	/// a spawn-time allocation. Older contracts omit it.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub output_id: Option<String>,
+	/// Set only after `<output_id>.md` was actually published by this child.
+	/// Spawn-time allocation and contracts written before confirmed
+	/// publication (including older files with no field) are not authority to
+	/// replace an existing artifact on a follow-up turn.
+	#[serde(default)]
+	pub output_published: bool,
 }
 
 impl PersistedChildSession {
+	/// Published saved-output identity, if this contract owns one.
+	#[must_use]
+	pub fn published_output_id(&self) -> Option<&str> {
+		if !self.output_published {
+			return None;
+		}
+		self.output_id
+			.as_deref()
+			.filter(|id| crate::tools::agent_output::valid_output_id(id))
+	}
+
 	/// Write the contract next to the child transcript.
 	pub fn write(&self, root: &Path) -> Result<PathBuf, String> {
 		if !valid_id(&self.id) {
@@ -460,7 +478,7 @@ fn revived_child_registry(
 	supervisor: &Arc<Supervisor>,
 	contract: &PersistedChildSession,
 ) -> ToolRegistry {
-	if let Some(output_id) = contract.output_id.as_deref() {
+	if let Some(output_id) = contract.published_output_id() {
 		supervisor.set_revived_output_prefix(&contract.id, output_id);
 	}
 	let mut registry = supervisor.child_registry_unbound(contract.depth, Some(contract.id.as_str()));
@@ -481,7 +499,7 @@ fn revived_child_registry(
 				spawns_from_contract(contract.spawns.as_deref()),
 				tools,
 			)
-			.with_output_prefix(contract.output_id.clone()),
+			.with_output_prefix(contract.published_output_id().map(str::to_string)),
 		));
 	}
 	registry

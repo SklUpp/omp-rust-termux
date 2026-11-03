@@ -153,6 +153,7 @@ fn adoptable_child(supervisor: &Arc<Supervisor>, root: &PathBuf) -> (String, Per
 		display_name: Some("kept".to_string()),
 		parent_id: None,
 		output_id: None,
+		output_published: false,
 	};
 	contract.write(root).expect("write contract");
 	supervisor.mark_completed(&id, 7, "prior-answer");
@@ -418,6 +419,7 @@ fn contract_for(
 		display_name: Some(id.to_string()),
 		parent_id: Some("Main".to_string()),
 		output_id: None,
+		output_published: false,
 	}
 }
 

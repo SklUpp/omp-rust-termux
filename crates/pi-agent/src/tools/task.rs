@@ -1115,9 +1115,11 @@ impl TaskTool {
 			}
 		}
 		if let Some(body) = artifact_body {
-			result.output_id = self
+			let published = self
 				.supervisor
 				.save_agent_output(&outstanding_id, &item.name, &body);
+			persist_child_output_id(&self.supervisor, &outstanding_id, published.as_deref());
+			result.output_id = published;
 		}
 		if let Some(mark) = terminal_mark {
 			match mark {
@@ -1876,6 +1878,7 @@ fn settle_background_result(
 				finalized.output.clone()
 			};
 			let output_id = supervisor.save_agent_output(&id, &item.name, &artifact);
+			persist_child_output_id(&supervisor, &id, output_id.as_deref());
 			if cancelled {
 				supervisor.mark_aborted(&id, "cancelled during isolation finalize");
 				tombstone_aborted_child(&supervisor, &id, "cancelled during isolation finalize");
@@ -2394,11 +2397,36 @@ fn persist_child_contract(
 		context_limit:    config.context_limit,
 		display_name:     Some(display_name.to_string()),
 		parent_id,
-		output_id:        supervisor.child_output_id(child_id),
+		// Publication confirmation is written after `save_agent_output`; a
+		// spawn-time allocation is not authority to replace an existing file.
+		output_id:        None,
+		output_published: false,
 	};
 	if let Err(error) = contract.write(&root) {
 		eprintln!(
 			"warning: cannot persist child session contract for {child_id}: {error}"
+		);
+	}
+}
+
+/// Persist the confirmed published output id before adoption. `None` clears
+/// replacement authority after a failed publication, so a later revive cannot
+/// overwrite a file this child never wrote.
+fn persist_child_output_id(supervisor: &Arc<Supervisor>, child_id: &str, output_id: Option<&str>) {
+	let Some(root) = supervisor
+		.child_session_file(child_id)
+		.and_then(|path| path.parent().map(std::path::Path::to_path_buf))
+	else {
+		return;
+	};
+	let Some(mut contract) = PersistedChildSession::load(&root, child_id) else {
+		return;
+	};
+	contract.output_id = output_id.map(str::to_string);
+	contract.output_published = output_id.is_some();
+	if let Err(error) = contract.write(&root) {
+		eprintln!(
+			"warning: cannot persist published output id for {child_id}: {error}"
 		);
 	}
 }
@@ -3401,6 +3429,7 @@ mod tests {
 			display_name: Some("Saved".to_string()),
 			parent_id: None,
 			output_id: Some("Saved".to_string()),
+			output_published: true,
 		};
 		let agent = model_agent();
 		let no_yield = vec![TurnResult {
@@ -3458,6 +3487,131 @@ mod tests {
 		let aborted = follow_up_output(&contract, &agent, &aborted_yield)
 			.expect("aborted yield rewrites the artifact");
 		assert_eq!(aborted, aborted_output(Some("boom")));
+	}
+
+	#[test]
+	fn collision_publishes_saved_2_and_follow_up_preserves_foreign_bytes() {
+		let nanos = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.map(|duration| duration.as_nanos())
+			.unwrap_or_default();
+		let home = std::env::var_os("HOME")
+			.map(std::path::PathBuf::from)
+			.expect("HOME must be set");
+		let root = home.join(format!(
+			".omp-agent-authority-{}-{nanos}",
+			std::process::id()
+		));
+		let subagents = root.join("subagents");
+		std::fs::create_dir_all(&subagents).expect("subagents");
+		let supervisor = Supervisor::with_selection(
+			ToolRegistry::with_builtins(),
+			Arc::new(NullProvider),
+			None,
+			DelegationLimits::default(),
+			true,
+			false,
+		);
+		supervisor.set_child_session_root(Some(subagents.clone()));
+		let mut scope = crate::tools::internal_urls::UrlScope::default();
+		scope
+			.local_roots
+			.insert("local".to_string(), root.clone());
+		supervisor.set_url_scope(Arc::new(scope));
+		let (id, _cancel) = supervisor
+			.reserve_child_full(ChildSpawn {
+				name:                "Saved",
+				index:               1,
+				agent:               "task",
+				agent_source:        "builtin",
+				task:                "work",
+				parent_id:           None,
+				parent_tool_call_id: None,
+				detached:            false,
+				output_prefix:       None,
+			})
+			.expect("reserve child");
+		supervisor.append_child_transcript(&id, &[&Message::user("work")]);
+		let mut contract = PersistedChildSession {
+			id: id.clone(),
+			agent: Some("task".to_string()),
+			task: "work".to_string(),
+			system_prompt: "system".to_string(),
+			tools: vec!["yield".to_string()],
+			model_role: None,
+			resolved_model: None,
+			output_schema: None,
+			output_schema_mode: None,
+			restrict_tool_names: Some(true),
+			spawns: Some("*".to_string()),
+			read_summarize: None,
+			advisor: None,
+			read_only: None,
+			cwd: root.clone(),
+			depth: 1,
+			max_turns: 20,
+			context_limit: 100_000,
+			display_name: Some("Saved".to_string()),
+			parent_id: None,
+			output_id: None,
+			output_published: false,
+		};
+		contract.write(&subagents).expect("contract");
+		let foreign = root.join("Saved.md");
+		std::fs::write(&foreign, "foreign").expect("foreign artifact");
+
+		let published = supervisor
+			.save_agent_output(&id, "Saved", "mine")
+			.expect("published output");
+		assert_eq!(published, "Saved-2");
+		persist_child_output_id(&supervisor, &id, Some(&published));
+		let contract = PersistedChildSession::load(&subagents, &id).expect("reloaded contract");
+		assert_eq!(contract.published_output_id(), Some("Saved-2"));
+		assert_eq!(std::fs::read_to_string(&foreign).expect("foreign"), "foreign");
+
+		let agent = model_agent();
+		let turns = vec![TurnResult {
+			message: Message::assistant_with_tools(
+				"",
+				vec![crate::state::ToolCall {
+					id: "call-1".to_string(),
+					name: "yield".to_string(),
+					arguments: json!({}),
+				}],
+			),
+			tool_results: vec![crate::state::ToolResult {
+				tool_call_id: "call-1".to_string(),
+				content: r#"{"status":"success","data":{"key":"value"}}"#.to_string(),
+				is_error: false,
+				terminate: true,
+				details: None,
+			}],
+			is_completed: true,
+		}];
+		let body = follow_up_output(&contract, &agent, &turns).expect("follow-up body");
+		crate::tools::agent_output::publish_agent_output_replace(
+			&root,
+			contract.published_output_id().expect("owned id"),
+			&body,
+		)
+		.expect("rewrite owned artifact");
+		assert_eq!(std::fs::read_to_string(&foreign).expect("foreign"), "foreign");
+		assert_eq!(
+			std::fs::read_to_string(root.join("Saved-2.md")).expect("owned artifact"),
+			body
+		);
+
+		// A stale/old contract carrying only the spawn-time id has no authority.
+		contract.output_id = Some("Saved".to_string());
+		contract.output_published = false;
+		contract.write(&subagents).expect("stale contract");
+		assert_eq!(contract.published_output_id(), None);
+		persist_child_output_id(&supervisor, &id, None);
+		let contract = PersistedChildSession::load(&subagents, &id).expect("cleared contract");
+		assert_eq!(contract.published_output_id(), None);
+		assert_eq!(contract.output_id, None);
+		assert_eq!(std::fs::read_to_string(&foreign).expect("foreign"), "foreign");
+		std::fs::remove_dir_all(&root).ok();
 	}
 
 	#[test]

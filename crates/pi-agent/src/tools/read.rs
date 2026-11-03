@@ -484,11 +484,10 @@ impl Tool for ReadTool {
 						Err(message) => return Ok(tool_result(message, true)),
 					};
 					let mut details = Some(json!({}));
-					if let Some(path) = &resource.source_path {
-						details
-							.as_object_mut()
-							.expect("details object")
-							.insert("resolvedPath".into(), json!(path.display().to_string()));
+					if let Some(path) = &resource.source_path
+						&& let Some(object) = details.as_mut().and_then(Value::as_object_mut)
+					{
+						object.insert("resolvedPath".into(), json!(path.display().to_string()));
 					}
 					attach_internal_resource(&mut details, &resource);
 					let mut result = tool_result(String::new(), false);

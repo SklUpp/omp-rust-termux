@@ -1753,6 +1753,7 @@ pub(crate) fn loop_guard_step(
 mod tests {
 	use super::*;
 	use std::sync::Mutex as StdMutex;
+	use pi_agent::TokenUsage;
 
 	struct FakeExecutor {
 		calls:  StdMutex<Vec<AdvisorCallSpec>>,

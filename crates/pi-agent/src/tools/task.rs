@@ -4826,6 +4826,101 @@ mod tests {
 		);
 	}
 
+	struct GatedProvider {
+		started: Arc<tokio::sync::Notify>,
+	}
+
+	#[async_trait]
+	impl ModelProvider for GatedProvider {
+		async fn complete(
+			&self,
+			_messages: &[Message],
+			_tools: &[serde_json::Value],
+			_tool_choice: &ToolChoice,
+		) -> std::result::Result<Message, ProviderError> {
+			Err(ProviderError::Network("cancelled child".to_string()))
+		}
+
+		async fn stream(
+			&self,
+			_messages: &[Message],
+			_tools: &[serde_json::Value],
+			_tool_choice: &ToolChoice,
+		) -> std::result::Result<ChunkStream, ProviderError> {
+			self.started.notify_one();
+			Ok(Box::pin(futures::stream::pending()))
+		}
+	}
+
+	#[tokio::test]
+	async fn child_cancellation_is_reported_as_abort_to_the_end_hook() {
+		let started = Arc::new(tokio::sync::Notify::new());
+		let root: Arc<dyn ModelProvider> = Arc::new(NullProvider);
+		let child: Arc<dyn ModelProvider> = Arc::new(GatedProvider {
+			started: Arc::clone(&started),
+		});
+		let supervisor = Supervisor::with_selection(
+			ToolRegistry::new(),
+			Arc::clone(&root),
+			None,
+			DelegationLimits::default(),
+			true,
+			false,
+		);
+		let hook = Arc::new(EndHook::default());
+		supervisor.set_child_advisor_hook(Some(hook.clone()));
+		let catalog = Arc::new(
+			AgentCatalog::new(vec![model_agent()], None)
+				.with_model_factory(Arc::new(SharedFactory(Arc::clone(&child)))),
+		);
+		let tool = TaskTool::new(Arc::clone(&supervisor), 0).with_catalog(catalog);
+		let item = TaskItemSpec {
+			name: "task-bg".to_string(),
+			agent: model_agent(),
+			task: "work".to_string(),
+			context: None,
+			output_schema: None,
+			schema_mode: SchemaMode::default(),
+			schema_error: None,
+			effort: None,
+			isolation: IsolationRequest::default(),
+		};
+		let (steering_tx, steering_rx) = tokio::sync::mpsc::channel(1);
+		let cancel = tokio_util::sync::CancellationToken::new();
+		let cancel_for_test = cancel.clone();
+		let mut child_future = Box::pin(run_background_child(
+			Arc::clone(&supervisor),
+			"task-bg".to_string(),
+			item,
+			std::path::PathBuf::from("."),
+			steering_rx,
+			steering_tx,
+			cancel,
+			tool.child_context(),
+			None,
+			Arc::new(Mutex::new(ChildSalvage::default())),
+		));
+		tokio::select! {
+			() = started.notified() => {}
+			settled = &mut child_future => {
+				drop(settled);
+				panic!("child settled before its model stream was polled");
+			}
+		}
+		cancel_for_test.cancel();
+		let _ = tokio::time::timeout(
+			std::time::Duration::from_secs(5),
+			child_future,
+		)
+		.await
+		.expect("cancelled child settles");
+		assert_eq!(
+			hook.aborted.lock().expect("hook").clone(),
+			vec![true],
+			"cancellation must skip the advisor drain"
+		);
+	}
+
 	/// The detached background path builds its own registry after the spawn
 	/// future, so it needs the same provider rebind as the foreground path.
 	/// Assert through the binder seam rather than the child loop's request.

@@ -784,7 +784,6 @@ impl AdvisorManager {
 				None => {
 					{
 						let mut state = slot.state.lock().unwrap_or_else(|poison| poison.into_inner());
-						state.history = result.history;
 						state.seen_context = seen_after;
 						state.failures = 0;
 						state.failing = false;
@@ -810,6 +809,7 @@ impl AdvisorManager {
 									&route.model,
 								);
 						}
+						state.history = result.history;
 					}
 					let mut cost = slot.cost.lock().unwrap_or_else(|poison| poison.into_inner());
 					for message in &result.assistant_messages {

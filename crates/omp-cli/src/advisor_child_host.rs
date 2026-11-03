@@ -263,12 +263,14 @@ impl ChildAdvisorHook for ChildAdvisorHost {
 		// TS `onPrimaryTurnEnd`: feed the turn, then wait for the backlog before
 		// delivering. Waiting on the blocking pool keeps the async child loop
 		// responsive instead of blocking its Tokio worker.
-		if let Some(threshold) = self
-			.config
-			.lock()
-			.unwrap_or_else(|poison| poison.into_inner())
-			.advisor
-			.sync_backlog()
+		let threshold = {
+			let config = self
+				.config
+				.lock()
+				.unwrap_or_else(|poison| poison.into_inner());
+			config.advisor.sync_backlog()
+		};
+		if let Some(threshold) = threshold
 			&& manager.backlog() >= threshold
 		{
 			let waiting = Arc::clone(&manager);

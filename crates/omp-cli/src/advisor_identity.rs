@@ -35,8 +35,8 @@ pub fn uuid_v7() -> String {
 			COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
 			&random
 		);
-		let a = xxhash_rust::xxh64::xxh64(seed.as_bytes()).to_be_bytes();
-		let b = xxhash_rust::xxh64::xxh64(&a).to_be_bytes();
+		let a = xxhash_rust::xxh64::xxh64(seed.as_bytes(), 0).to_be_bytes();
+		let b = xxhash_rust::xxh64::xxh64(&a, 0).to_be_bytes();
 		tail[..8].copy_from_slice(&a);
 		tail[8..].copy_from_slice(&b[..2]);
 		random = tail;

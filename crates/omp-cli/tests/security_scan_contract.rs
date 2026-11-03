@@ -154,6 +154,7 @@ struct TestHost {
 	model: Option<SecurityModelRef>,
 	config: Value,
 	behavior: Behavior,
+	execution_roots: Mutex<Vec<PathBuf>>,
 }
 
 impl TestHost {
@@ -162,7 +163,7 @@ impl TestHost {
 		root: &Path,
 		model: Option<SecurityModelRef>,
 		behavior: Behavior,
-	) -> Arc<dyn SecurityHost> {
+	) -> Arc<Self> {
 		let auth_db = root.join("agent.db");
 		if !auth_db.exists() {
 			seed_oauth(&auth_db, 1);
@@ -175,10 +176,11 @@ impl TestHost {
 			model,
 			config: json!({"securityEnabled": true}),
 			behavior,
+			execution_roots: Mutex::new(Vec::new()),
 		})
 	}
 
-	fn disabled(cwd: &Path, root: &Path) -> Arc<dyn SecurityHost> {
+	fn disabled(cwd: &Path, root: &Path) -> Arc<Self> {
 		let auth_db = root.join("agent.db");
 		if !auth_db.exists() {
 			seed_oauth(&auth_db, 1);
@@ -191,6 +193,7 @@ impl TestHost {
 			model: Some(model()),
 			config: json!({"securityEnabled": false}),
 			behavior: Behavior::Partial,
+			execution_roots: Mutex::new(Vec::new()),
 		})
 	}
 }
@@ -250,6 +253,10 @@ impl SecurityHost for TestHost {
 		&self,
 		request: SecurityScanRequest,
 	) -> Result<Arc<dyn SecurityScanSession>, String> {
+		self.execution_roots
+			.lock()
+			.unwrap_or_else(std::sync::PoisonError::into_inner)
+			.push(request.execution_root.clone());
 		Ok(Arc::new(FakeSession {
 			request,
 			behavior: self.behavior.clone(),
@@ -938,7 +945,11 @@ async fn validate_updates_finding_and_rejects_unknown_ids() {
 	.expect_err("blank summary");
 	assert!(error.contains("validation_summary"), "unexpected: {error}");
 
-	let error = call(
+	let before = store
+		.get_finding(&snapshot.scan_id, &finding_id)
+		.expect("read finding")
+		.expect("finding");
+	call(
 		&tool,
 		json!({
 			"action": "validate",
@@ -950,8 +961,15 @@ async fn validate_updates_finding_and_rejects_unknown_ids() {
 		&repo,
 	)
 	.await
-	.expect_err("unknown scan");
-	assert!(error.contains("Unknown security scan"), "unexpected: {error}");
+	.expect_err("unknown scan id");
+	let after = store
+		.get_finding(&snapshot.scan_id, &finding_id)
+		.expect("read finding")
+		.expect("finding");
+	assert_eq!(
+		after.validation, before.validation,
+		"a rejected validate must not mutate the finding"
+	);
 
 	let error = call(
 		&tool,
@@ -1080,6 +1098,55 @@ async fn repository_subdirectory_shares_one_security_store() {
 }
 
 // ---------------------------------------------------------------------------
+// Starting from a subdirectory runs the scan at the repository root
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn start_from_subdirectory_uses_the_repository_root() {
+	let root = TempRoot::new("subdir-start");
+	let repo = git_fixture(root.path());
+	let canonical_repo = fs::canonicalize(&repo).expect("canonical repository");
+	let host = TestHost::new(
+		&repo.join("src"),
+		root.path(),
+		Some(model()),
+		Behavior::Publish(publish_params()),
+	);
+	let output = root.path().join("security-output");
+	let (coordinator, _tool) = tool(Arc::clone(&host));
+
+	let plan = coordinator
+		.preflight(preflight_input(&output))
+		.expect("preflight");
+	assert_eq!(
+		fs::canonicalize(&plan.repository_root).expect("canonical plan root"),
+		canonical_repo,
+		"the plan is anchored at the repository root"
+	);
+	let operation = coordinator.start(&plan.id).expect("start");
+	let snapshot = coordinator.wait(&operation.operation_id).expect("wait");
+	assert_eq!(snapshot.phase, "completed", "{snapshot:?}");
+
+	let roots = host
+		.execution_roots
+		.lock()
+		.unwrap_or_else(std::sync::PoisonError::into_inner)
+		.clone();
+	assert_eq!(roots.len(), 1, "exactly one session was created");
+	assert_eq!(
+		fs::canonicalize(&roots[0]).expect("canonical execution root"),
+		canonical_repo,
+		"the restricted session runs at the repository root, not the caller cwd"
+	);
+
+	let findings = fs::read_to_string(output.join("findings.json")).expect("findings");
+	assert!(
+		findings.contains("\"path\": \"src/lib.rs\""),
+		"evidence paths stay repository-relative: {findings}"
+	);
+}
+
+// ---------------------------------------------------------------------------
 // `security://` namespace
 // ---------------------------------------------------------------------------
 
@@ -1176,6 +1243,30 @@ fn exact_oauth_selector_refuses_ambiguous_and_foreign_accounts() {
 		error.to_string().contains("Multiple OAuth accounts"),
 		"unexpected: {error}"
 	);
+
+	// This backend records no session→credential pin: a session id must not pick
+	// an account, so the ambiguity error stands with one supplied.
+	let error = select_security_account(
+		&backend,
+		"openai-codex",
+		None,
+		Some("security-contract-session"),
+	)
+	.expect_err("a session id is not a credential pin");
+	assert!(
+		error.to_string().contains("Multiple OAuth accounts"),
+		"unexpected: {error}"
+	);
+
+	// An explicit credential id still pins even with a session id present.
+	let pinned = select_security_account(
+		&backend,
+		"openai-codex",
+		Some(2),
+		Some("security-contract-session"),
+	)
+	.expect("explicit credential id pins");
+	assert_eq!(pinned.credential_id, 2);
 
 	let second = select_security_account(&backend, "openai-codex", Some(2), None)
 		.expect("explicit credential id");

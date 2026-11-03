@@ -344,8 +344,63 @@ fn format_finding(finding: &super::types::SecurityFinding) -> String {
 	.join("\n")
 }
 
+/// TS `sanitizeText`: drop ANSI escapes, keep `\t` and `\n`, and remove the
+/// remaining C0 / DEL / C1 controls (`/[\x00-\x08\x0B-\x1F\x7F-\x9F]/`).
+/// Markdown and JSON bodies stay multiline; only invisible controls go away.
 fn sanitize(text: &str) -> String {
-	text.chars().filter(|ch| *ch != '\u{1b}' && !ch.is_control()).collect()
+	strip_ansi_escapes(text)
+		.chars()
+		.filter(|ch| {
+			let code = u32::from(*ch);
+			matches!(code, 0x09 | 0x0A)
+				|| !((0x00..=0x08).contains(&code)
+					|| (0x0B..=0x1F).contains(&code)
+					|| (0x7F..=0x9F).contains(&code))
+		})
+		.collect()
+}
+
+/// Remove CSI (`ESC [ … final`), OSC (`ESC ] … BEL|ST`) and two-byte escapes.
+/// The remaining ESC bytes fall to the control filter above.
+fn strip_ansi_escapes(text: &str) -> String {
+	if !text.contains('\u{1b}') {
+		return text.to_string();
+	}
+	let mut out = String::with_capacity(text.len());
+	let mut chars = text.chars().peekable();
+	while let Some(ch) = chars.next() {
+		if ch != '\u{1b}' {
+			out.push(ch);
+			continue;
+		}
+		match chars.peek().copied() {
+			Some('[') => {
+				chars.next();
+				for next in chars.by_ref() {
+					if ('\u{40}'..='\u{7e}').contains(&next) {
+						break;
+					}
+				}
+			},
+			Some(']') => {
+				chars.next();
+				while let Some(next) = chars.next() {
+					if next == '\u{7}' {
+						break;
+					}
+					if next == '\u{1b}' && chars.peek() == Some(&'\\') {
+						chars.next();
+						break;
+					}
+				}
+			},
+			Some(next) if ('\u{20}'..='\u{7e}').contains(&next) => {
+				chars.next();
+			},
+			_ => {},
+		}
+	}
+	out
 }
 
 fn bounded_resource(url: &str, content: String, content_type: &str, is_directory: bool) -> InternalResource {
@@ -390,5 +445,34 @@ fn bounded_resource(url: &str, content: String, content_type: &str, is_directory
 		immutable: true,
 		is_directory,
 		writable: false,
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn sanitize_keeps_newlines_and_tabs_and_drops_controls_and_ansi() {
+		let text = "line one\n\tindented\u{1b}[31m red\u{1b}[0m\r\u{7f}tail";
+		assert_eq!(sanitize(text), "line one\n\tindented redtail");
+		assert_eq!(sanitize("plain"), "plain");
+	}
+
+	#[test]
+	fn bounded_resource_keeps_multiline_bodies_and_bounds_lines() {
+		let body = (0..MAX_LINES + 5)
+			.map(|index| format!("line {index}"))
+			.collect::<Vec<_>>()
+			.join("\n");
+		let resource = bounded_resource("security://scans", body, "text/markdown", true);
+		assert!(resource.content.lines().count() <= MAX_LINES);
+		assert!(resource.content.contains("line 0\nline 1"));
+		assert!(resource.notes.is_some(), "line bound must be reported");
+
+		let wide = "x".repeat(MAX_BYTES + 64);
+		let resource = bounded_resource("security://scans", wide, "text/markdown", true);
+		assert!(resource.size <= MAX_BYTES);
+		assert!(resource.notes.is_some(), "byte bound must be reported");
 	}
 }

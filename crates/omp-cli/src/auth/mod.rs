@@ -447,12 +447,6 @@ impl AuthBackend {
 		&self.store
 	}
 
-	/// Selection state owned by this backend (session stickiness only; the
-	/// security path never rotates).
-	pub(crate) fn selection_state(&self) -> &SelectionState {
-		&self.selection
-	}
-
 	/// Resolve one exact OAuth row for a security scan.
 	///
 	/// `force_refresh` asks the provider even when the token is still fresh

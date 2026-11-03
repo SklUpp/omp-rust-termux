@@ -53,7 +53,7 @@ trap cleanup EXIT
 # ---------------------------------------------------------------------------
 # Deterministic localhost provider + auth fixture
 # ---------------------------------------------------------------------------
-python3 - "$PORT_FILE" "$AGENT_DIR/agent.db" "$OUTPUT" >"$SERVER_LOG" 2>&1 <<'PY' &
+python3 - "$PORT_FILE" "$AGENT_DIR/agent.db" "$OUTPUT" "$ROOT/tools.log" >"$SERVER_LOG" 2>&1 <<'PY' &
 import json
 import os
 import re
@@ -62,7 +62,7 @@ import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-port_file, auth_db, output_root = sys.argv[1], sys.argv[2], sys.argv[3]
+port_file, auth_db, output_root, tools_log = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 seed_lock = threading.Lock()
 seeded = False
 
@@ -196,6 +196,8 @@ FINDING = re.compile(r"secf_[0-9a-zA-Z]+")
 def root_reply(messages, body):
     last = messages[-1] if messages else {}
     if last.get("role") == "user":
+        if "NO_TOOLS_TASK" in message_text(last):
+            return text("NO_TOOLS_OK")
         return tool_call("security_scan", {
             "action": "preflight",
             "target_kind": "repository",
@@ -308,7 +310,12 @@ class Handler(BaseHTTPRequestHandler):
         if "security_scan" in names:
             payload = root_reply(messages, body)
         elif "security_publish" in names:
+            with open(tools_log, "a", encoding="utf-8") as handle:
+                handle.write(",".join(names) + "\n")
             payload = scan_reply(messages)
+        elif message_text(messages[-1] if messages else {}).find("NO_TOOLS_TASK") >= 0:
+            # `--no-tools`: the request carries no tool definitions at all.
+            payload = text("NO_TOOLS_OK")
         else:
             payload = text("SECURITY_SMOKE_FAIL_UNEXPECTED_SESSION:" + ",".join(names))
         if payload is None:
@@ -370,7 +377,9 @@ providers:
     api: openai-completions
     apiKey: harness-placeholder
 tools:
-  approvalMode: yolo
+  approvalMode: always-ask
+lsp:
+  enabled: false
 security:
   enabled: true
 YAML
@@ -391,7 +400,7 @@ YAML
 # ---------------------------------------------------------------------------
 set +e
 HOME="$ROOT" PI_CODING_AGENT_DIR="$AGENT_DIR" \
-	"$OMP_BIN" --cwd "$PROJECT" --session-dir "$SESSIONS" --yolo -p SECURITY_ROOT_TASK \
+	"$OMP_BIN" --cwd "$PROJECT" --session-dir "$SESSIONS" --mode json -p SECURITY_ROOT_TASK \
 	>"$RUN_OUT" 2>"$RUN_ERR"
 STATUS=$?
 set -e
@@ -421,6 +430,49 @@ check "sarif has a result" grep -q '"version": "2.1.0"' "$OUTPUT/results.sarif"
 check "provenance has no email" bash -c "! grep -q 'user1@example.test' '$OUTPUT/provenance.json'"
 check "provenance has no token" bash -c "! grep -q 'access-1' '$OUTPUT/provenance.json'"
 check "store committed the scan" bash -c "find '$ROOT' -path '*security*/scans/*/scan.json' -print -quit | grep -q ."
+JOURNAL="$(find "$ROOT" -path '*security*/sessions/*.jsonl' -print -quit)"
+check "worker journal persisted" test -n "$JOURNAL"
+check "journal has assistant turn" bash -c "grep -q '\"role\": \"assistant\"' '$JOURNAL'"
+check "journal has tool result" bash -c "grep -q '\"role\": \"tool\"' '$JOURNAL'"
+# The coordinator publishes the journal path through the tool's structured
+# details; compare that API value with the file on disk (never the other way).
+PUBLISHED_SESSION_FILE="$(grep -o '"sessionFile":"[^"]*"' "$RUN_OUT" | tail -1 | sed 's/^"sessionFile":"//;s/"$//')"
+check "published sessionFile present" test -n "$PUBLISHED_SESSION_FILE"
+check "published sessionFile equals journal" test "$PUBLISHED_SESSION_FILE" = "$JOURNAL"
+SCAN_ID_FROM_JOURNAL="$(basename "$JOURNAL" .jsonl)"
+SCAN_ID_FROM_OUTPUT="$(grep -o 'secscan_[0-9a-zA-Z]*' "$RUN_OUT" | head -1)"
+check "journal is named after the scan" test "$SCAN_ID_FROM_JOURNAL" = "$SCAN_ID_FROM_OUTPUT"
+check "scan session kept lsp despite parent off" grep -q 'lsp' "$ROOT/tools.log"
+check "scan session had publication tool" grep -q 'security_publish' "$ROOT/tools.log"
+
+# ---------------------------------------------------------------------------
+# Negatives: `--no-tools` never mounts the coordinator; an explicit selection
+# with `security.enabled: false` must fail before any provider call.
+# ---------------------------------------------------------------------------
+NO_TOOLS_OUT="$ROOT/no-tools.out"
+set +e
+HOME="$ROOT" PI_CODING_AGENT_DIR="$AGENT_DIR" \
+	"$OMP_BIN" --cwd "$PROJECT" --session-dir "$SESSIONS" --mode json --no-tools \
+	-p NO_TOOLS_TASK >"$NO_TOOLS_OUT" 2>"$ROOT/no-tools.err"
+NO_TOOLS_STATUS=$?
+set -e
+check "no-tools run exited 0" test "$NO_TOOLS_STATUS" -eq 0
+check "no-tools mock answered" grep -q "NO_TOOLS_OK" "$NO_TOOLS_OUT"
+check "no-tools did not mount security_scan" bash -c "! grep -q '\"toolName\":\"security_scan\"' '$NO_TOOLS_OUT'"
+
+DISABLED_AGENT="$ROOT/agent-disabled"
+mkdir -p "$DISABLED_AGENT"
+cp "$AGENT_DIR/models.yml" "$DISABLED_AGENT/models.yml"
+sed 's/^  enabled: true$/  enabled: false/' "$AGENT_DIR/config.yml" >"$DISABLED_AGENT/config.yml"
+set +e
+HOME="$ROOT" PI_CODING_AGENT_DIR="$DISABLED_AGENT" \
+	"$OMP_BIN" --cwd "$PROJECT" --session-dir "$SESSIONS" --tools security_scan \
+	-p DISABLED_TASK >"$ROOT/disabled.out" 2>"$ROOT/disabled.err"
+DISABLED_STATUS=$?
+set -e
+check "disabled scan selection exited non-zero" test "$DISABLED_STATUS" -ne 0
+check "disabled scan selection named the setting" \
+	bash -c "grep -q 'requires \`security.enabled: true\`' '$ROOT/disabled.err' '$ROOT/disabled.out'"
 
 echo "harness root: $ROOT"
 if [[ "$FAILED" -ne 0 ]]; then

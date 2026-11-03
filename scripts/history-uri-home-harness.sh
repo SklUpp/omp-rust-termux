@@ -50,10 +50,14 @@ port_file = sys.argv[1]
 sessions = sys.argv[2]
 release_child = threading.Event()
 
-# Exact fixture transcript under the harness-owned sessions root. No HOME scan.
-MARKER_PROBE = f'''set -- {shlex.quote(sessions)}/*/subagents/task-1.jsonl
-if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then echo MARKER_PROBE_BAD_COUNT; exit 0; fi
-if grep -qs 'live-child-answer' "$1"; then echo MARKER_JOURNALED; else echo MARKER_ABSENT; fi'''
+# Exact ID journal under the harness-owned sessions root. No glob expansion and
+# no HOME scan: the shell used by tools may not expand globs. A missing file is
+# valid ("not journaled yet"); multiple exact-ID files are ambiguous.
+MARKER_PROBE = f'''matches=$(find {shlex.quote(sessions)} -maxdepth 3 -type f -path '*/subagents/task-1.jsonl' -print) || {{ echo MARKER_PROBE_FIND_FAILED; exit 0; }}
+lines=$(printf '%s\n' "$matches" | grep -c . || true)
+if [ "$lines" -eq 0 ]; then echo MARKER_ABSENT_NO_JOURNAL; exit 0; fi
+if [ "$lines" -ne 1 ]; then echo MARKER_PROBE_BAD_COUNT; exit 0; fi
+if grep -qs 'live-child-answer' "$matches"; then echo MARKER_JOURNALED; else echo MARKER_ABSENT; fi'''
 
 
 def sse(chunks):

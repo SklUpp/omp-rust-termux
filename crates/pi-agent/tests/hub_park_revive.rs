@@ -429,7 +429,7 @@ fn scout_definition() -> AgentDefinition {
 #[tokio::test]
 async fn actor_rewrites_only_yielding_follow_up_artifacts() {
 	let root = home_session_root("actor-artifact");
-	let provider = Arc::new(ScriptProvider::new(vec![
+	let provider = ScriptProvider::new(vec![
 		Message::assistant_with_tools(
 			"",
 			vec![ToolCall {
@@ -439,7 +439,7 @@ async fn actor_rewrites_only_yielding_follow_up_artifacts() {
 			}],
 		),
 		Message::assistant("plain reply"),
-	]));
+	]);
 	let supervisor = one_turn(provider.clone(), 2);
 	supervisor.set_child_session_root(Some(root.clone()));
 	let mut scope = UrlScope::default();

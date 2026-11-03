@@ -1792,8 +1792,7 @@ impl Session<'_> {
 			return (false, false);
 		}
 		let manage = self.tool_selected(autolearn::MANAGE_SKILL_TOOL_NAME);
-		let learn = manage
-			&& matches!(self.config.memory_backend(), MemoryBackend::Local)
+		let learn = matches!(self.config.memory_backend(), MemoryBackend::Local)
 			&& self.tool_selected(autolearn::LEARN_TOOL_NAME);
 		(manage, learn)
 	}

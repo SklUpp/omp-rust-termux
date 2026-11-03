@@ -568,7 +568,7 @@ fn local_autolearn_tools_validate_only_when_mounted() {
 	}
 	setup_agent_dir(&agent_dir, server.port);
 
-	let run = |tools: &str| {
+	let run = |tools: &str, prompt: &str| {
 		ProcCommand::new(env!("CARGO_BIN_EXE_omp"))
 			.env("PI_CODING_AGENT_DIR", &agent_dir)
 			.env("PI_CONFIG_DIR", &config_dir)
@@ -578,24 +578,41 @@ fn local_autolearn_tools_validate_only_when_mounted() {
 			.args(["--cwd", cwd.to_str().unwrap()])
 			.args(["--session-dir", sessions.to_str().unwrap()])
 			.args(["--no-session", "--tools", tools, "--yolo"])
-			.args(["--max-time", "20s", "--mode", "text", "-p", "hello"])
+			.args(["--max-time", "20s", "--mode", "text", "-p", prompt])
 			.output()
 			.expect("run omp")
 	};
 
-	let valid = run("read,learn,manage_skill");
+	let valid = run("read,learn,manage_skill", "hello");
 	assert_eq!(
 		valid.status.code(),
 		Some(0),
 		"{}",
 		String::from_utf8_lossy(&valid.stderr)
 	);
-	let standalone = run("read,learn");
+	let standalone = run("read,learn", "CAPTURE now");
 	assert_eq!(
 		standalone.status.code(),
 		Some(0),
 		"learn mounts without manage_skill upstream: {}",
 		String::from_utf8_lossy(&standalone.stderr)
+	);
+	let requests = server.requests.lock().expect("requests").clone();
+	let standalone_tools = tool_names(requests.last().expect("standalone request"));
+	assert!(
+		standalone_tools.iter().any(|name| name == "learn"),
+		"standalone learn must be mounted: {standalone_tools:?}"
+	);
+	assert!(
+		!standalone_tools.iter().any(|name| name == "manage_skill"),
+		"manage_skill was not selected: {standalone_tools:?}"
+	);
+	let learned = find_file(&agent_dir, "learned.md").expect("standalone learn wrote learned.md");
+	assert!(
+		fs::read_to_string(learned)
+			.expect("learned")
+			.contains("Always run the formatter before committing"),
+		"standalone learn call must persist the lesson"
 	);
 
 	let config = fs::read_to_string(agent_dir.join("config.yml")).expect("config");
@@ -604,12 +621,12 @@ fn local_autolearn_tools_validate_only_when_mounted() {
 		config.replace("backend: local", "backend: off"),
 	)
 	.expect("disable memory");
-	let disabled = run("read,learn,manage_skill");
+	let disabled = run("read,learn,manage_skill", "hello");
 	assert_ne!(disabled.status.code(), Some(0), "learn must not run without local memory");
 	let stderr = String::from_utf8_lossy(&disabled.stderr);
 	assert!(stderr.contains("learn"), "{stderr}");
 	assert!(stderr.contains("memory backend"), "{stderr}");
-	let manage_only = run("read,manage_skill");
+	let manage_only = run("read,manage_skill", "hello");
 	assert_eq!(
 		manage_only.status.code(),
 		Some(0),
@@ -623,7 +640,7 @@ fn local_autolearn_tools_validate_only_when_mounted() {
 		config.replace("autolearn:\n  enabled: true", "autolearn:\n  enabled: false"),
 	)
 	.expect("disable autolearn");
-	let no_autolearn = run("read,manage_skill");
+	let no_autolearn = run("read,manage_skill", "hello");
 	assert_ne!(
 		no_autolearn.status.code(),
 		Some(0),

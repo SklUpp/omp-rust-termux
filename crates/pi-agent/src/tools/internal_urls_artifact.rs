@@ -298,7 +298,7 @@ impl ProtocolHandler for ArtifactUrlHandler {
 		let signal = context.signal.clone();
 		let content = tokio::task::spawn_blocking(move || artifact.read_text(&href, &signal))
 			.await
-			.map_err(|error| format!("{href}: artifact read task failed: {error}"))??;
+			.map_err(|error| format!("{}: artifact read task failed: {error}", url.href))??;
 		let mut resource = InternalResource::text(&url.href, content);
 		resource.size = usize::try_from(size).unwrap_or(usize::MAX);
 		resource.source_path = Some(path);

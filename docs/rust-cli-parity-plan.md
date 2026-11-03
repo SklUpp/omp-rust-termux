@@ -1,8 +1,8 @@
 # Rust CLI parity plan
 
-Cold-start handoff: [`rust-cli-project-context.md`](rust-cli-project-context.md) — goal, verified state, authorizations, agent/worktree rules, runtime anchors, FIX subset. This plan remains the authoritative inventory; do not duplicate its per-ID tables there.
+Architecture: [`rust-cli-project-context.md`](rust-cli-project-context.md). Verification and integration: [`provider-checkpoint.md`](provider-checkpoint.md).
 
-Status (2026-10-30): objective is full plan completion; the historical FIX-only queue is not the scope limit. Accepted local slices now include task isolation, RPC/URI/auth integration, continue selectors, explicit bounded LSP/DAP/eval teardown, full headless/RPC Goal Mode + turn budgets (`+Nk[!]`, background child usage dedup, 53/53 actual CLI/RPC acceptance + 2/2 eval hard-budget unit regressions), and `omp acp` stdio transport + session adapter + reverse bridge (42/42 unit regressions + `acp_accept.py` E2E OK; pi-agent plan write-guard/propose policy slice remains open). CI workflow now also runs `pi-iso`, `pi-ast`, `pi-walker`, and `pi-shell`. Target remains a separate Rust artifact on Termux/aarch64 Bionic; installed Bun-based CLI remains unchanged.
+The C1–C8 requirements below remain open unless a specific acceptance is recorded. The per-ID inventory is a historical 2026-10-30 snapshot, not current source truth: later implementation can supersede a “missing” row. Verify each current caller and its runtime evidence before closing it.
 
 ## Baseline and axis facts (2026-10-29 run snapshot; source axes corrected 2026-10-30)
 
@@ -175,6 +175,8 @@ Counts are split by axis. "Present" means registered and dispatchable, not accep
 | Positional operands | 2 categories (`PROMPT`, `@FILE`) | 2 implemented | runtime re-check open |
 
 *Counts:* `__complete` is a TypeScript registry entry (`packages/coding-agent/src/cli-commands.ts:70`); the presence recount is 10 present canonical / 25 missing canonical (27 missing tokens) / 6 excluded for these 41 rows. Provenance: read-only source audit of the published code basis `abe3d8c274`; later commits are `088367d8b9` (unregistered `inspect_image` loader) and `260a314843` (FixOwnerClearRace owner-clear fix, regression unrun). Neither changes presence counts, and in-flight slice edits are excluded. Behavior per present ID stays unknown unless a recorded run says otherwise. Current-state correction (2026-10-30): Goal Mode, ACP, task isolation and SQLite read selectors are now integrated and verified only at the scopes recorded elsewhere in this file; they do not change the registry presence counts above, and they close no per-ID behavior cell.
+
+The inventory below is retained as the 2026-10-30 discovery baseline. Its per-ID states and line anchors may be stale; current implementation and the continuation queue take precedence. Do not use a historical “missing” label as an instruction to reimplement an accepted slice.
 
 ### CLI subcommands (41)
 

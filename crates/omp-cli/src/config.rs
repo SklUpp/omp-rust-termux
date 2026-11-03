@@ -3224,8 +3224,16 @@ mod tests {
 	fn advisor_flag_overrides_a_disabled_file_layer() {
 		use clap::Parser;
 		let mut config = parse_config("advisor:\n  enabled: false\n").expect("config");
-		let cli = crate::args::Cli::try_parse_from(["omp", "--advisor"])
-			.expect("cli");
+		let cli = crate::args::Cli::try_parse_from([
+			"omp",
+			"--no-tools",
+			"--no-title",
+			"--mode",
+			"text",
+			"--advisor",
+			"say hi",
+		])
+		.expect("cli");
 		config.apply_runtime(&cli);
 		assert!(config.advisor.enabled());
 	}

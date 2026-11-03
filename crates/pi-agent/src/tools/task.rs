@@ -750,9 +750,6 @@ impl TaskTool {
 		self
 			.supervisor
 			.append_child_transcript(&child_id, &[&initial_message]);
-		if let Some(manager) = crate::subagent_lifecycle::lookup(&self.supervisor) {
-			manager.seed_live(&child_id, initial_message);
-		}
 		let _live_history = LiveHistoryScope {
 			supervisor: Arc::clone(&self.supervisor),
 			id:         child_id.clone(),
@@ -771,6 +768,9 @@ impl TaskTool {
 				Some(steering_tx.clone()),
 			);
 			hook.on_child_start(&context, &initial_message).await;
+		}
+		if let Some(manager) = crate::subagent_lifecycle::lookup(&self.supervisor) {
+			manager.seed_live(&child_id, initial_message);
 		}
 		let events = forward_child_events(
 			self.supervisor.clone(),
@@ -1308,6 +1308,7 @@ impl TaskTool {
 		);
 		let background_salvage = Arc::new(Mutex::new(ChildSalvage::default()));
 
+		let steering_for_child = steering_tx.clone();
 		let handle = tokio::spawn(async move {
 			// Wait until the reservation is registered as active, so an early
 			// cancel can abort this task before it ever reaches the model.
@@ -1338,7 +1339,7 @@ impl TaskTool {
 				item,
 				cwd,
 				steering_rx,
-				steering_tx.clone(),
+				steering_for_child,
 				cancel.clone(),
 				child_ctx,
 				plan,
@@ -1798,9 +1799,6 @@ async fn run_background_child(
 	let full_prompt = format!("Complete assignment thoroughly:\n\n{assignment}");
 	let initial_message = Message::user(full_prompt.clone());
 	supervisor.append_child_transcript(&child_id, &[&initial_message]);
-	if let Some(manager) = crate::subagent_lifecycle::lookup(&supervisor) {
-		manager.seed_live(&child_id, initial_message);
-	}
 	let _live_history = LiveHistoryScope {
 		supervisor: Arc::clone(&supervisor),
 		id:         child_id.clone(),
@@ -1826,6 +1824,9 @@ async fn run_background_child(
 			Some(steering_tx.clone()),
 		);
 		hook.on_child_start(&context, &initial_message).await;
+	}
+	if let Some(manager) = crate::subagent_lifecycle::lookup(&supervisor) {
+		manager.seed_live(&child_id, initial_message);
 	}
 	let events = forward_child_events(
 		Arc::clone(&supervisor),
@@ -1904,7 +1905,7 @@ async fn run_background_child(
 fn child_advisor_context<'a>(
 	child_id: &'a str,
 	agent: Option<&'a str>,
-	definition: Option<&HandoffTarget>,
+	definition: Option<&'a HandoffTarget>,
 	session_file: Option<&'a std::path::Path>,
 	steer: Option<tokio::sync::mpsc::Sender<SteeringEvent>>,
 ) -> crate::subagent_advisor::ChildAdvisorContext<'a> {

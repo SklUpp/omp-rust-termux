@@ -836,6 +836,28 @@ def phase_acp(binary: str, mock: MockModel, base: Path) -> None:
         )
         or frame.get("id") == 3,
     )
+    (base / "acp" / "acp-frames.json").write_text(
+        json.dumps(updates, indent=2) + "\n"
+    )
+    if not any(
+        acp_update_has_advisor(frame)
+        for frame in updates
+        if frame.get("method") == "session/update"
+    ):
+        # The prompt response can precede the asynchronously persisted advisor
+        # card. Wait past that response before failing or cancelling.
+        late = read_lines(
+            proc,
+            lines,
+            TIMEOUT,
+            lambda frame: frame.get("method") == "session/update"
+            and acp_update_has_advisor(frame),
+        )
+        updates += late
+        (base / "acp" / "acp-frames.json").write_text(
+            json.dumps(updates, indent=2) + "\n"
+        )
+    mock.dump(base / "acp" / "acp-mock-requests.json")
     if not any(
         acp_update_has_advisor(frame)
         for frame in updates

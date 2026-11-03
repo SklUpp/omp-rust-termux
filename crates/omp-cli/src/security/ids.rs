@@ -141,17 +141,29 @@ pub fn create_security_operation_id(uuid: &str) -> String {
 }
 
 /// Readable trailing slug plus 12 hex characters of the canonical root hash.
+///
+/// Mirrors TS `encodeSecurityProjectKey`: backslashes become `/`, exactly one
+/// trailing `/` is dropped, a single leading `/` is stripped, each run of
+/// characters outside `[A-Za-z0-9._-]` collapses to one `-`, surrounding `-`
+/// are trimmed and only the last 80 characters of the slug survive. `project`
+/// stands in for an empty slug, and the hash covers the normalized path.
 #[must_use]
 pub fn encode_security_project_key(repository_root: &str) -> String {
-	let normalized = repository_root
-		.replace('\\', "/")
-		.trim_end_matches('/')
-		.to_string();
-	let readable_raw = normalized.trim_start_matches('/').replace(
-		|ch: char| !(ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-')),
-		"-",
-	);
-	let readable = readable_raw.trim_matches('-');
+	let slashed = repository_root.replace('\\', "/");
+	let normalized = slashed.strip_suffix('/').unwrap_or(&slashed);
+	let slug = normalized.strip_prefix('/').unwrap_or(normalized);
+	let mut collapsed = String::with_capacity(slug.len());
+	let mut in_run = false;
+	for ch in slug.chars() {
+		if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
+			collapsed.push(ch);
+			in_run = false;
+		} else if !in_run {
+			collapsed.push('-');
+			in_run = true;
+		}
+	}
+	let readable = collapsed.trim_matches('-');
 	let readable: String = if readable.chars().count() > 80 {
 		readable.chars().rev().take(80).collect::<String>().chars().rev().collect()
 	} else {
@@ -193,11 +205,30 @@ mod tests {
 
 	#[test]
 	fn project_key_keeps_a_bounded_readable_suffix() {
+		// TS `encodeSecurityProjectKey`: separators collapse to `-`, one trailing
+		// `/` is dropped, and the suffix is 12 hex characters of that path's hash.
 		let key = encode_security_project_key("/data/data/home/work/myrepo/");
-		assert_eq!(&key[key.len() - 13..key.len() - 12], "-");
-		assert_eq!(key.len(), "myrepo".len() + 13);
-		let root = encode_security_project_key("/");
-		assert_eq!(root, format!("project-{}", &sha256_hex(b"/")[..12]));
+		let digest = &sha256_hex(b"/data/data/home/work/myrepo")[..12];
+		assert_eq!(key, format!("data-data-home-work-myrepo-{digest}"));
+
+		// One leading `/` is stripped and surrounding `-` are trimmed.
+		assert_eq!(
+			encode_security_project_key("//data//home//"),
+			format!("data-home-{}", &sha256_hex(b"//data//home/")[..12])
+		);
+
+		// Only the last 80 characters of the slug survive.
+		let deep = format!("/{}", "segment/".repeat(12));
+		let key = encode_security_project_key(&deep);
+		let slug = key.rsplit_once('-').expect("slug and digest").0;
+		assert_eq!(slug.chars().count(), 80);
+		assert!(slug.ends_with("segment-segment-segment"), "{slug}");
+
+		// Root has no readable part.
+		assert_eq!(
+			encode_security_project_key("/"),
+			format!("project-{}", &sha256_hex(b"")[..12])
+		);
 	}
 
 	#[test]

@@ -3082,10 +3082,11 @@ fn run_wal_gc(
 	paths: &GcPaths,
 	apply: bool,
 ) -> std::result::Result<Value, String> {
-	let databases = vec![
-		checkpoint_wal(&paths.history_db, apply)?,
-		checkpoint_wal(&paths.models_db, apply)?,
-	];
+	// Match TS `Promise.all`: attempt both databases, then propagate the first
+	// failure, so a busy history WAL never hides the models WAL.
+	let history = checkpoint_wal(&paths.history_db, apply);
+	let models = checkpoint_wal(&paths.models_db, apply);
+	let databases = vec![history?, models?];
 	let wal_bytes: u64 = databases
 		.iter()
 		.filter_map(|database| database["walBytes"].as_u64())
@@ -3120,27 +3121,57 @@ fn gc_temp_path(destination: &Path) -> PathBuf {
 	))
 }
 
-/// Create the destination parent and refuse to leave the archive root through
-/// a symlinked directory.
+/// Create missing destination parents while refusing to leave the archive root.
+///
+/// The configured archive root is trusted (it may be a symlink), but every
+/// descendant is opened with `O_NOFOLLOW` and missing directories are created
+/// with `mkdirat`, so an escaping symlink is rejected before any foreign
+/// directory is created.
 fn ensure_destination_parent(
 	archive_root: &Path,
 	destination: &Path,
 ) -> std::result::Result<(), String> {
+	use std::ffi::CString;
+	use std::os::unix::ffi::OsStrExt;
+	use std::os::unix::io::{AsRawFd, FromRawFd};
+
 	let parent = destination
 		.parent()
 		.ok_or_else(|| format!("invalid archive destination: {}", destination.display()))?;
+	let escape = || format!("archive destination escapes root: {}", destination.display());
+	let relative = parent.strip_prefix(archive_root).map_err(|_| escape())?;
 	fs::create_dir_all(archive_root)
-		.and_then(|()| fs::create_dir_all(parent))
-		.map_err(|error| format!("{}: {error}", parent.display()))?;
-	let root = fs::canonicalize(archive_root)
 		.map_err(|error| format!("{}: {error}", archive_root.display()))?;
-	let resolved = fs::canonicalize(parent)
-		.map_err(|error| format!("{}: {error}", parent.display()))?;
-	if !resolved.starts_with(&root) {
-		return Err(format!(
-			"archive destination escapes root: {}",
-			destination.display()
-		));
+	let mut directory = fs::File::open(archive_root)
+		.map_err(|error| format!("{}: {error}", archive_root.display()))?;
+	for component in relative.components() {
+		let Component::Normal(name) = component else {
+			return Err(escape());
+		};
+		let name = CString::new(name.as_bytes()).map_err(|_| escape())?;
+		let open_child = |directory: &fs::File| unsafe {
+			libc::openat(
+				directory.as_raw_fd(),
+				name.as_ptr(),
+				libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+			)
+		};
+		let mut fd = open_child(&directory);
+		if fd < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT) {
+			let created = unsafe { libc::mkdirat(directory.as_raw_fd(), name.as_ptr(), 0o777) };
+			if created != 0 {
+				let error = io::Error::last_os_error();
+				if error.kind() != io::ErrorKind::AlreadyExists {
+					return Err(format!("{}: {error}", parent.display()));
+				}
+			}
+			fd = open_child(&directory);
+		}
+		if fd < 0 {
+			return Err(escape());
+		}
+		// SAFETY: `fd` was returned by `openat` and is owned from here on.
+		directory = unsafe { fs::File::from_raw_fd(fd) };
 	}
 	Ok(())
 }
@@ -3160,29 +3191,6 @@ fn ensure_source_within(
 		.map_err(|error| format!("{}: {error}", source.display()))?;
 	if !resolved.starts_with(&root) {
 		return Err(format!("source escapes sessions root: {}", source.display()));
-	}
-	Ok(())
-}
-
-fn copy_new_file(
-	source: &Path,
-	destination: &Path,
-) -> std::result::Result<(), String> {
-	let mut input = fs::File::open(source)
-		.map_err(|error| format!("{}: {error}", source.display()))?;
-	let mut output = OpenOptions::new()
-		.write(true)
-		.create_new(true)
-		.mode(0o600)
-		.open(destination)
-		.map_err(|error| format!("{}: {error}", destination.display()))?;
-	let copied = io::copy(&mut input, &mut output)
-		.and_then(|_| output.sync_all())
-		.map_err(|error| format!("{}: {error}", destination.display()));
-	drop(output);
-	if let Err(error) = copied {
-		let _ = fs::remove_file(destination);
-		return Err(error);
 	}
 	Ok(())
 }
@@ -3217,23 +3225,19 @@ fn gzip_session_file(
 		let _ = fs::remove_file(&temp);
 		return Err(format!("{}: {error}", source.display()));
 	}
-	match fs::hard_link(&temp, destination) {
-		Ok(()) => {},
-		Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-			let _ = fs::remove_file(&temp);
-			return Err(format!(
-				"archive destination exists: {}",
-				destination.display()
-			));
-		},
-		Err(_) => {
-			if let Err(error) = copy_new_file(&temp, destination) {
-				let _ = fs::remove_file(&temp);
-				return Err(error);
-			}
-		},
-	}
+	// The staging file is complete and synced; publish it atomically without
+	// ever exposing a partial archive or replacing a foreign destination. On
+	// Android `hard_link` can fail with EACCES, so the native
+	// `renameat2(RENAME_NOREPLACE)` fallback is a normal platform path.
+	let published = pi_agent::tools::atomic_publish::publish_staged_file(&temp, destination)
+		.map_err(|error| format!("{}: {error}", destination.display()))?;
 	let _ = fs::remove_file(&temp);
+	if !published {
+		return Err(format!(
+			"archive destination exists: {}",
+			destination.display()
+		));
+	}
 	if let Err(error) = fs::remove_file(source) {
 		let _ = fs::remove_file(destination);
 		return Err(format!("{}: {error}", source.display()));
@@ -3269,10 +3273,101 @@ fn restore_gzip_session_file(
 	fs::remove_file(source).map_err(|error| format!("{}: {error}", source.display()))
 }
 
-fn copy_tree_no_replace(
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+fn path_cstring(path: &Path) -> io::Result<std::ffi::CString> {
+	use std::os::unix::ffi::OsStrExt;
+	std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+		io::Error::new(
+			io::ErrorKind::InvalidInput,
+			format!("path contains a NUL: {}", path.display()),
+		)
+	})
+}
+
+/// Atomically rename `from` onto `to` only when `to` does not exist.
+///
+/// `Ok(false)` means another writer owns the destination. Linux and Android
+/// implement this natively as `renameat2(..., RENAME_NOREPLACE)`; macOS uses
+/// `renamex_np(RENAME_EXCL)`. The fallback copies only when the filesystem
+/// reports `EXDEV`.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn rename_noreplace_native(from: &Path, to: &Path) -> io::Result<bool> {
+	let from = path_cstring(from)?;
+	let to = path_cstring(to)?;
+	// SAFETY: both C strings are NUL-terminated and outlive the call; the
+	// variadic arguments are the `renameat2` signature with LP64-wide integers.
+	let result = unsafe {
+		libc::syscall(
+			libc::SYS_renameat2,
+			libc::AT_FDCWD as libc::c_long,
+			from.as_ptr(),
+			libc::AT_FDCWD as libc::c_long,
+			to.as_ptr(),
+			libc::RENAME_NOREPLACE as libc::c_long,
+		)
+	};
+	if result == 0 {
+		return Ok(true);
+	}
+	let error = io::Error::last_os_error();
+	match error.raw_os_error() {
+		Some(libc::EEXIST) => Ok(false),
+		_ => Err(error),
+	}
+}
+
+#[cfg(target_os = "macos")]
+fn rename_noreplace_native(from: &Path, to: &Path) -> io::Result<bool> {
+	let from = path_cstring(from)?;
+	let to = path_cstring(to)?;
+	// SAFETY: both C strings are NUL-terminated and outlive the call.
+	let result = unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) };
+	if result == 0 {
+		return Ok(true);
+	}
+	let error = io::Error::last_os_error();
+	match error.raw_os_error() {
+		Some(libc::EEXIST) => Ok(false),
+		_ => Err(error),
+	}
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+fn rename_noreplace_native(from: &Path, to: &Path) -> io::Result<bool> {
+	match fs::symlink_metadata(from) {
+		Ok(meta) if !meta.is_dir() => {},
+		_ => {
+			return Err(io::Error::new(
+				io::ErrorKind::Unsupported,
+				"atomic no-replace move needs renameat2 on this platform",
+			));
+		},
+	}
+	match fs::hard_link(from, to) {
+		Ok(()) => {
+			fs::remove_file(from)?;
+			Ok(true)
+		},
+		Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+		Err(error) => Err(error),
+	}
+}
+
+struct MovedEntry {
+	path:   PathBuf,
+	stat:   LockStat,
+	is_dir: bool,
+}
+
+/// Cross-device fallback: copy the snapshot, recording each source identity,
+/// then delete only entries that still match the copied snapshot. Entries that
+/// were created or modified concurrently stay in place; nothing is ever
+/// removed based on a stale copy.
+fn copy_tree_for_move(
 	source: &Path,
 	destination: &Path,
 	created: &mut Vec<(PathBuf, bool)>,
+	moved: &mut Vec<MovedEntry>,
 ) -> std::result::Result<(), String> {
 	let meta = fs::symlink_metadata(source)
 		.map_err(|error| format!("{}: {error}", source.display()))?;
@@ -3283,14 +3378,20 @@ fn copy_tree_no_replace(
 		fs::create_dir(destination)
 			.map_err(|error| format!("{}: {error}", destination.display()))?;
 		created.push((destination.to_path_buf(), true));
+		moved.push(MovedEntry {
+			path:   source.to_path_buf(),
+			stat:   lock_stat(&meta),
+			is_dir: true,
+		});
 		let entries = fs::read_dir(source)
 			.map_err(|error| format!("{}: {error}", source.display()))?;
 		for entry in entries {
 			let entry = entry.map_err(|error| format!("{}: {error}", source.display()))?;
-			copy_tree_no_replace(
+			copy_tree_for_move(
 				&entry.path(),
 				&destination.join(entry.file_name()),
 				created,
+				moved,
 			)?;
 		}
 		return Ok(());
@@ -3308,6 +3409,20 @@ fn copy_tree_no_replace(
 		io::copy(&mut input, &mut output)
 			.and_then(|_| output.sync_all())
 			.map_err(|error| format!("{}: {error}", destination.display()))?;
+		drop(output);
+		let after = fs::symlink_metadata(source)
+			.map_err(|error| format!("{}: {error}", source.display()))?;
+		if lock_stat(&after) != lock_stat(&meta) {
+			return Err(format!(
+				"{} changed during archive move",
+				source.display()
+			));
+		}
+		moved.push(MovedEntry {
+			path:   source.to_path_buf(),
+			stat:   lock_stat(&after),
+			is_dir: false,
+		});
 		return Ok(());
 	}
 	Err(format!(
@@ -3326,22 +3441,62 @@ fn cleanup_created(created: &mut Vec<(PathBuf, bool)>) {
 	}
 }
 
+fn prune_moved_source(moved: &[MovedEntry]) -> std::result::Result<(), String> {
+	for entry in moved.iter().rev() {
+		if entry.is_dir {
+			match fs::remove_dir(&entry.path) {
+				Ok(()) => {},
+				Err(error)
+					if error.kind() == io::ErrorKind::NotFound
+						|| error.raw_os_error() == Some(libc::ENOTEMPTY)
+						|| error.raw_os_error() == Some(libc::EEXIST) => {},
+				Err(error) => return Err(format!("{}: {error}", entry.path.display())),
+			}
+			continue;
+		}
+		let meta = match fs::symlink_metadata(&entry.path) {
+			Ok(meta) => meta,
+			Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+			Err(error) => return Err(format!("{}: {error}", entry.path.display())),
+		};
+		if lock_stat(&meta) != entry.stat {
+			continue;
+		}
+		match fs::remove_file(&entry.path) {
+			Ok(()) => {},
+			Err(error) if error.kind() == io::ErrorKind::NotFound => {},
+			Err(error) => return Err(format!("{}: {error}", entry.path.display())),
+		}
+	}
+	Ok(())
+}
+
 fn move_tree_no_replace(
 	source: &Path,
 	destination: &Path,
 ) -> std::result::Result<(), String> {
-	if path_exists_checked(destination)? {
-		return Err(format!(
+	let exists = || {
+		format!(
 			"archive artifacts destination exists: {}",
 			destination.display()
-		));
+		)
+	};
+	if path_exists_checked(destination)? {
+		return Err(exists());
+	}
+	match rename_noreplace_native(source, destination) {
+		Ok(true) => return Ok(()),
+		Ok(false) => return Err(exists()),
+		Err(error) if error.raw_os_error() == Some(libc::EXDEV) => {},
+		Err(error) => return Err(format!("{}: {error}", source.display())),
 	}
 	let mut created = Vec::new();
-	if let Err(error) = copy_tree_no_replace(source, destination, &mut created) {
+	let mut moved = Vec::new();
+	if let Err(error) = copy_tree_for_move(source, destination, &mut created, &mut moved) {
 		cleanup_created(&mut created);
 		return Err(error);
 	}
-	fs::remove_dir_all(source).map_err(|error| format!("{}: {error}", source.display()))
+	prune_moved_source(&moved)
 }
 
 fn rollback_moves(moves: &[(PathBuf, PathBuf, bool)]) {
@@ -4485,7 +4640,8 @@ fn should_break_gc_lock(text: &str, stat: LockStat) -> bool {
 		.map(str::trim)
 		.and_then(crate::foreign_session::parse_iso_timestamp_ms);
 	let created_at = created_at.unwrap_or_else(|| {
-		let millis = stat.4.max(0) as u64;
+		// `LockStat.4` is nanoseconds; lock timestamps are compared in millis.
+		let millis = stat.4.max(0) as u64 / 1_000_000;
 		(stat.3.max(0) as u64)
 			.saturating_mul(1_000)
 			.saturating_add(millis)
@@ -4514,9 +4670,30 @@ fn remove_stale_gc_lock(lock_path: &Path) -> std::result::Result<bool, String> {
 	if !gc_lock_snapshot_still_current(lock_path, &snapshot)? {
 		return Ok(false);
 	}
-	match fs::remove_file(lock_path) {
+	// Move the observed inode aside atomically instead of snapshot-then-unlink:
+	// a concurrent recoverer may already have replaced the path with a live
+	// owner, which must never be unlinked.
+	let trash = gc_temp_path(lock_path);
+	match rename_noreplace_native(lock_path, &trash) {
+		Ok(true) => {},
+		Ok(false) => return Ok(false),
+		Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+		Err(error) => return Err(error.to_string()),
+	}
+	let moved = match fs::metadata(&trash) {
+		Ok(meta) => meta,
+		Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
+		Err(error) => return Err(error.to_string()),
+	};
+	if (moved.dev(), moved.ino()) != (snapshot.0, snapshot.1) {
+		// The path changed hands between snapshot and rename. Restore the live
+		// owner's inode (no-replace, so a newer owner still wins) and back off.
+		let _ = rename_noreplace_native(&trash, lock_path);
+		return Ok(false);
+	}
+	match fs::remove_file(&trash) {
 		Ok(()) => Ok(true),
-		Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+		Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
 		Err(error) => Err(error.to_string()),
 	}
 }
@@ -4548,8 +4725,16 @@ fn write_gc_lock_owner(file: &mut fs::File) -> std::result::Result<(), String> {
 }
 
 fn release_lock_file(lock_path: &Path, file: fs::File) {
+	let identity = file.metadata().ok().map(|meta| (meta.dev(), meta.ino()));
 	drop(file);
-	let _ = fs::remove_file(lock_path);
+	let Some(identity) = identity else {
+		return;
+	};
+	if let Ok(meta) = fs::metadata(lock_path) {
+		if (meta.dev(), meta.ino()) == identity {
+			let _ = fs::remove_file(lock_path);
+		}
+	}
 }
 
 fn open_gc_breaker_lock(
@@ -4600,9 +4785,8 @@ struct GcLock {
 impl Drop for GcLock {
 	fn drop(&mut self) {
 		if let Some(file) = self._file.take() {
-			drop(file);
+			release_lock_file(&self.path, file);
 		}
-		let _ = fs::remove_file(&self.path);
 	}
 }
 
@@ -4610,12 +4794,26 @@ fn acquire_gc_lock(agent_dir: &Path) -> std::result::Result<GcLock, String> {
 	fs::create_dir_all(agent_dir)
 		.map_err(|error| format!("{}: {error}", agent_dir.display()))?;
 	let lock_path = agent_dir.join("gc.lock");
-	let mut file = open_gc_lock(&lock_path)?;
-	if let Err(error) = write_gc_lock_owner(&mut file) {
+	for _ in 0..4 {
+		let mut file = open_gc_lock(&lock_path)?;
+		if let Err(error) = write_gc_lock_owner(&mut file) {
+			release_lock_file(&lock_path, file);
+			return Err(error);
+		}
+		// A stale-breaker takeover may have moved this inode off the lock path
+		// between creation and owner write; only run while the path is still ours.
+		let owned = match (file.metadata(), fs::metadata(&lock_path)) {
+			(Ok(mine), Ok(current)) => {
+				(mine.dev(), mine.ino()) == (current.dev(), current.ino())
+			},
+			_ => false,
+		};
+		if owned {
+			return Ok(GcLock { path: lock_path, _file: Some(file) });
+		}
 		release_lock_file(&lock_path, file);
-		return Err(error);
 	}
-	Ok(GcLock { path: lock_path, _file: Some(file) })
+	Err(format!("GC already running: {}", lock_path.display()))
 }
 
 fn cleanup_stats_rows_for_archived_sessions(

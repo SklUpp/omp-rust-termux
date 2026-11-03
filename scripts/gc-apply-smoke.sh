@@ -14,7 +14,12 @@ if [ -z "$OMP_BIN" ] || [ ! -x "$OMP_BIN" ]; then
 fi
 
 SMOKE_ROOT=$(mktemp -d "$HOME/gc-apply-smoke.XXXXXX")
-trap 'rm -rf "$SMOKE_ROOT"' EXIT HUP INT TERM
+cleanup() {
+	case ${SMOKE_ROOT:-} in
+	"$HOME"/gc-apply-smoke.*) find "$SMOKE_ROOT" -depth -delete 2>/dev/null || true ;;
+	esac
+}
+trap cleanup EXIT HUP INT TERM
 
 AGENT="$SMOKE_ROOT/agent"
 BLOBS="$AGENT/blobs"

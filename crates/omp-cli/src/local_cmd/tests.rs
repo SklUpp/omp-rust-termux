@@ -732,6 +732,248 @@ fn gc_wal_apply_busy_checkpoint_is_nonzero_and_releases_lock() {
 }
 
 #[test]
+fn gc_archive_exdev_fallback_preserves_concurrent_artifact_writes() {
+	let dir = TempDir::new("gc-exdev-copy");
+	let source = dir.path().join("source");
+	let destination = dir.path().join("destination");
+	fs::create_dir_all(source.join("nested")).expect("source tree");
+	fs::write(source.join("stable.txt"), "stable").expect("stable");
+	fs::write(source.join("changed.txt"), "before").expect("changed");
+	fs::write(source.join("nested/old.txt"), "old").expect("nested");
+	let mut created = Vec::new();
+	let mut moved = Vec::new();
+	copy_tree_for_move(&source, &destination, &mut created, &mut moved).expect("cross-device copy");
+	fs::write(source.join("changed.txt"), "after").expect("concurrent write");
+	fs::write(source.join("new.txt"), "new").expect("concurrent create");
+	fs::write(source.join("nested/late.txt"), "late").expect("concurrent nested create");
+	prune_moved_source(&moved).expect("snapshot prune");
+	assert!(!source.join("stable.txt").exists(), "unchanged copied entry must be removed");
+	assert!(!source.join("nested/old.txt").exists());
+	assert_eq!(
+		fs::read_to_string(source.join("changed.txt")).expect("changed source"),
+		"after"
+	);
+	assert_eq!(
+		fs::read_to_string(source.join("new.txt")).expect("new source"),
+		"new"
+	);
+	assert_eq!(
+		fs::read_to_string(source.join("nested/late.txt")).expect("late source"),
+		"late"
+	);
+	assert!(source.exists(), "directory with concurrent entries must survive");
+	assert_eq!(
+		fs::read_to_string(destination.join("changed.txt")).expect("copied snapshot"),
+		"before"
+	);
+}
+
+#[test]
+fn gc_archive_rollback_restores_gzip_source_after_move_failure() {
+	let dir = TempDir::new("gc-rollback");
+	let source = dir.path().join("sessions/project/s1.jsonl");
+	let destination = dir.path().join("archive/sessions/project/s1.jsonl.gz");
+	fs::create_dir_all(destination.parent().expect("archive parent")).expect("archive dir");
+	let content = "{\"type\":\"session\",\"id\":\"s1\"}\n";
+	write_gzip(&destination, content);
+	rollback_moves(&[(source.clone(), destination.clone(), true)]);
+	assert_eq!(fs::read_to_string(&source).expect("restored source"), content);
+	assert!(!destination.exists(), "rollback must remove the published archive");
+
+	// An artifact rollback must never overwrite a concurrent source entry.
+	let artifacts_source = dir.path().join("sessions/project/s1");
+	let artifacts_destination = dir.path().join("archive/sessions/project/s1");
+	fs::create_dir_all(&artifacts_source).expect("source artifacts");
+	fs::create_dir_all(&artifacts_destination).expect("archive artifacts");
+	fs::write(artifacts_source.join("live.txt"), "live").expect("concurrent artifact");
+	fs::write(artifacts_destination.join("old.txt"), "old").expect("archived artifact");
+	rollback_moves(&[(artifacts_source.clone(), artifacts_destination.clone(), false)]);
+	assert_eq!(
+		fs::read_to_string(artifacts_source.join("live.txt")).expect("live artifact"),
+		"live"
+	);
+	assert!(
+		artifacts_destination.join("old.txt").exists(),
+		"refused rollback must leave the archive intact"
+	);
+}
+
+#[test]
+fn gc_archive_apply_rejects_escaping_descendant_before_creating_dirs() {
+	use std::os::unix::fs::symlink;
+
+	let dir = TempDir::new("gc-escape");
+	let agent = dir.path().join("agent");
+	let session = dir.write(
+		"agent/sessions/project/sub/s1.jsonl",
+		"{\"type\":\"session\",\"id\":\"s1\"}\n{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"stopReason\":\"stop\",\"content\":[]}}\n",
+	);
+	set_old_mtime(&session, Duration::from_secs(60 * 86_400));
+	let foreign = dir.path().join("foreign");
+	fs::create_dir_all(&foreign).expect("foreign dir");
+	fs::create_dir_all(agent.join("archive/sessions")).expect("archive dir");
+	symlink(&foreign, agent.join("archive/sessions/project")).expect("escaping symlink");
+	let opts = gc_apply_options(agent.clone(), false, true, false);
+	let (code, value, stderr) = gc_json(&opts, dir.path());
+	assert_eq!(code, 1, "{stderr}");
+	assert!(stderr.contains("escapes root"), "{stderr}");
+	assert_eq!(value["archive"]["archived"], 0);
+	assert!(session.exists(), "source must survive containment refusal");
+	assert!(
+		!foreign.join("sub").exists(),
+		"must not create a directory outside the archive root"
+	);
+}
+
+#[test]
+fn gc_native_no_replace_rename_publishes_completed_file_and_refuses_collision() {
+	let dir = TempDir::new("gc-rename");
+	let source = dir.write("source.bin", "payload");
+	let destination = dir.path().join("published.bin");
+	assert!(rename_noreplace_native(&source, &destination).expect("native rename"));
+	assert!(!source.exists(), "rename must move, not copy");
+	assert_eq!(fs::read_to_string(&destination).expect("published"), "payload");
+
+	let again = dir.write("source.bin", "other");
+	assert!(!rename_noreplace_native(&again, &destination).expect("collision"));
+	assert_eq!(fs::read_to_string(&destination).expect("published"), "payload");
+	assert_eq!(fs::read_to_string(&again).expect("source"), "other");
+}
+
+#[test]
+fn gc_gzip_publication_is_complete_before_rename_and_cleans_staging() {
+	let dir = TempDir::new("gc-gzip-publish");
+	let archive_root = dir.path().join("archive");
+	let content = "{\"type\":\"session\",\"id\":\"s1\"}\n";
+	let source = dir.write("sessions/project/s1.jsonl", content);
+	let destination = archive_root.join("project/s1.jsonl.gz");
+	gzip_session_file(&source, &destination, &archive_root).expect("gzip publish");
+	assert!(!source.exists(), "published session source must be removed");
+	assert_eq!(read_gzip_text(&destination), content);
+	let leftovers: Vec<PathBuf> = fs::read_dir(destination.parent().expect("archive parent"))
+		.expect("archive dir")
+		.filter_map(|entry| entry.ok())
+		.map(|entry| entry.path())
+		.filter(|path| path.to_string_lossy().contains(".tmp"))
+		.collect();
+	assert!(leftovers.is_empty(), "staging files must not survive publication");
+}
+
+#[test]
+fn gc_torn_empty_stale_lock_uses_mtime_milliseconds() {
+	let dir = TempDir::new("gc-torn-lock");
+	let agent = dir.path().join("agent");
+	dir.write("agent/blobs/.keep", "");
+	let lock = dir.write("agent/gc.lock", "");
+	set_old_mtime(&lock, Duration::from_secs(3600));
+	let opts = gc_apply_options(agent.clone(), true, false, false);
+	let (code, value, stderr) = gc_json(&opts, dir.path());
+	assert_eq!(code, 0, "{stderr}");
+	assert_eq!(value["blobs"]["wouldDelete"], 0);
+	assert!(!lock.exists(), "torn stale lock must be recovered");
+}
+
+#[test]
+fn gc_simultaneous_stale_breaker_recovery_keeps_exclusive_lock() {
+	use std::sync::{Arc, Barrier};
+	use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+	let dir = TempDir::new("gc-breaker-race");
+	let agent = dir.path().join("agent");
+	fs::create_dir_all(&agent).expect("agent dir");
+	fs::write(agent.join("gc.lock"), "2147483647\n2026-01-01T00:00:00.000Z\n").expect("stale lock");
+	fs::write(
+		agent.join("gc.lock.break"),
+		"2147483647\n2026-01-01T00:00:00.000Z\n",
+	)
+	.expect("stale breaker");
+	let barrier = Arc::new(Barrier::new(8));
+	let holders = Arc::new(AtomicUsize::new(0));
+	let peak = Arc::new(AtomicUsize::new(0));
+	let acquisitions = Arc::new(AtomicUsize::new(0));
+	let mut handles = Vec::new();
+	for _ in 0..8 {
+		let agent = agent.clone();
+		let barrier = Arc::clone(&barrier);
+		let holders = Arc::clone(&holders);
+		let peak = Arc::clone(&peak);
+		let acquisitions = Arc::clone(&acquisitions);
+		handles.push(std::thread::spawn(move || {
+			barrier.wait();
+			for _ in 0..4 {
+				if let Ok(lock) = acquire_gc_lock(&agent) {
+					acquisitions.fetch_add(1, AtomicOrdering::SeqCst);
+					let active = holders.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+					peak.fetch_max(active, AtomicOrdering::SeqCst);
+					std::thread::sleep(Duration::from_millis(10));
+					holders.fetch_sub(1, AtomicOrdering::SeqCst);
+					drop(lock);
+				}
+			}
+		}));
+	}
+	for handle in handles {
+		handle.join().expect("lock contender");
+	}
+	assert!(
+		acquisitions.load(AtomicOrdering::SeqCst) > 0,
+		"at least one contender must recover the stale lock"
+	);
+	assert_eq!(
+		peak.load(AtomicOrdering::SeqCst),
+		1,
+		"stale-breaker recovery must stay exclusive"
+	);
+	assert!(!agent.join("gc.lock").exists(), "lock must be released");
+}
+
+#[test]
+fn gc_wal_attempts_models_when_history_checkpoint_is_busy() {
+	let dir = TempDir::new("gc-wal-both");
+	let agent = dir.path().join("agent");
+	fs::create_dir_all(&agent).expect("agent dir");
+	let history = rusqlite::Connection::open(agent.join("history.db")).expect("history db");
+	history
+		.execute_batch(
+			"PRAGMA journal_mode=WAL;\
+			 PRAGMA wal_autocheckpoint=0;\
+			 CREATE TABLE t (x INTEGER);\
+			 INSERT INTO t VALUES (1);\
+			 BEGIN IMMEDIATE;\
+			 INSERT INTO t VALUES (2);",
+		)
+		.expect("history writer");
+	let models = rusqlite::Connection::open(agent.join("models.db")).expect("models db");
+	models
+		.execute_batch(
+			"PRAGMA journal_mode=WAL;\
+			 PRAGMA wal_autocheckpoint=0;\
+			 CREATE TABLE t (x INTEGER);\
+			 INSERT INTO t VALUES (1);",
+		)
+		.expect("models wal");
+	let models_wal = PathBuf::from(format!("{}-wal", agent.join("models.db").display()));
+	assert!(
+		fs::metadata(&models_wal).expect("models wal file").len() > 0,
+		"fixture needs uncheckpointed models frames"
+	);
+
+	let opts = gc_apply_options(agent.clone(), false, false, true);
+	let mut out = Vec::new();
+	let mut err = Vec::new();
+	let error = run_gc(&opts, dir.path(), &mut out, &mut err).expect_err("busy history checkpoint");
+	assert!(error.to_string().contains("history.db"), "{error}");
+	assert_eq!(
+		fs::metadata(&models_wal).map(|meta| meta.len()).unwrap_or(0),
+		0,
+		"models WAL must be attempted despite the history failure"
+	);
+	assert!(!agent.join("gc.lock").exists(), "lock must be released");
+	drop(history);
+	drop(models);
+}
+
+#[test]
 fn setup_component_errors_are_exact() {
 	let dir = TempDir::new("setup-errors");
 	let mut out = Vec::new();

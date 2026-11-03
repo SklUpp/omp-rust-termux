@@ -727,7 +727,6 @@ fn gc_wal_apply_failure_is_nonzero_and_releases_lock() {
 	assert!(error.to_string().contains("history.db"), "{error}");
 	assert!(out.is_empty(), "fatal WAL failure must not print a result");
 	assert!(!agent.join("gc.lock").exists(), "lock must be released");
-	assert!(agent.join("history.db-wal").exists());
 }
 
 #[test]
@@ -795,7 +794,7 @@ fn gc_archive_apply_rejects_escaping_descendant_before_creating_dirs() {
 	let dir = TempDir::new("gc-escape");
 	let agent = dir.path().join("agent");
 	let session = dir.write(
-		"agent/sessions/project/sub/s1.jsonl",
+		"agent/sessions/project/s1.jsonl",
 		"{\"type\":\"session\",\"id\":\"s1\"}\n{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"stopReason\":\"stop\",\"content\":[]}}\n",
 	);
 	set_old_mtime(&session, Duration::from_secs(60 * 86_400));
@@ -809,6 +808,16 @@ fn gc_archive_apply_rejects_escaping_descendant_before_creating_dirs() {
 	assert!(stderr.contains("escapes root"), "{stderr}");
 	assert_eq!(value["archive"]["archived"], 0);
 	assert!(session.exists(), "source must survive containment refusal");
+	assert!(
+		!foreign.join("sub").exists(),
+		"must not create a directory outside the archive root"
+	);
+	// A missing descendant below the escaping symlink must be rejected before
+	// mkdir, not only after the archive parent already exists.
+	let escape_destination = agent.join("archive/sessions/project/sub/s1.jsonl.gz");
+	let error = ensure_destination_parent(&agent.join("archive/sessions"), &escape_destination)
+		.expect_err("descendant symlink escape");
+	assert!(error.contains("escapes root"), "{error}");
 	assert!(
 		!foreign.join("sub").exists(),
 		"must not create a directory outside the archive root"

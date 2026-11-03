@@ -403,38 +403,61 @@ def diagnose_cli_failure(
                 None,
             )
             # The manager is lazy: status before a prompt only reports the empty
-            # slot, never the config. Run the same prompt so `configured`,
-            # `status`, and the resolved route describe the real create path.
+            # slot, never the config. Run the same prompt and probe status after
+            # `agent_start` but before the terminal `turn_end`; the manager is
+            # created before the first provider call.
             send(proc, {"id": "diag-2", "type": "prompt", "message": "say hi"})
+            started = read_lines(
+                proc,
+                lines,
+                20,
+                lambda frame: frame.get("type") == "agent_start",
+            )
+            report["frames"].extend(started)
+            send(proc, {"id": "diag-active", "type": "get_advisor_status"})
             turn = read_lines(
                 proc,
                 lines,
                 TIMEOUT,
-                lambda frame: frame.get("type") == "turn_end"
-                or (
-                    frame.get("type") == "response"
-                    and frame.get("command") == "prompt"
-                ),
+                lambda frame: frame.get("type") == "turn_end",
             )
             report["frames"].extend(turn)
-            send(proc, {"id": "diag-3", "type": "get_advisor_status"})
-            status = read_lines(
-                proc,
-                lines,
-                30,
-                lambda frame: frame.get("type") == "response"
-                and frame.get("command") == "get_advisor_status",
-            )
-            report["frames"].extend(status)
-            report["status"] = next(
+            report["active_status"] = next(
                 (
                     frame
-                    for frame in status
+                    for frame in turn
                     if frame.get("type") == "response"
-                    and frame.get("command") == "get_advisor_status"
+                    and frame.get("id") == "diag-active"
                 ),
                 None,
             )
+            report["terminal_turn_end"] = any(
+                frame.get("type") == "turn_end" for frame in turn
+            )
+            if not report["terminal_turn_end"]:
+                report["error"] = (
+                    "diagnostic prompt ended without a terminal turn_end "
+                    "(timeout or EOF); post-prompt status was not sampled"
+                )
+            else:
+                send(proc, {"id": "diag-3", "type": "get_advisor_status"})
+                status = read_lines(
+                    proc,
+                    lines,
+                    30,
+                    lambda frame: frame.get("type") == "response"
+                    and frame.get("command") == "get_advisor_status",
+                )
+                report["frames"].extend(status)
+                report["status"] = next(
+                    (
+                        frame
+                        for frame in status
+                        if frame.get("type") == "response"
+                        and frame.get("command") == "get_advisor_status"
+                    ),
+                    None,
+                )
     except (OSError, subprocess.SubprocessError, AssertionError) as error:
         report["error"] = f"{type(error).__name__}: {error}"
     finally:

@@ -32,7 +32,10 @@ use std::{
 };
 
 use async_trait::async_trait;
-use pi_agent::{CancellationToken, state::ContentPart as AgentContentPart};
+use pi_agent::{
+	CancellationToken,
+	state::{ContentPart as AgentContentPart, StopReason},
+};
 use serde_json::{Value, json};
 
 use crate::{
@@ -540,10 +543,13 @@ fn plan_is_active(gate: &PlanGate) -> bool {
 	gate.state.as_ref().is_some_and(|state| state.enabled)
 }
 
-/// TS reads `stopReason` from the last assistant message; a local cancel is
-/// not the only abort signal.
-fn stopped_aborted(stop_reason: Option<&str>) -> bool {
-	stop_reason == Some("aborted")
+/// TS reads `stopReason` from the last assistant message; the typed message
+/// reason wins, and the event's wire string is only the fallback.
+fn assistant_aborted(reason: Option<StopReason>, event: Option<&str>) -> bool {
+	reason
+		.map(|reason| reason == StopReason::Aborted)
+		.or_else(|| event.map(|value| value == "aborted"))
+		.unwrap_or(false)
 }
 
 impl AcpSession {
@@ -1181,7 +1187,7 @@ impl AcpSession {
 		let mut stream_error: Option<String> = None;
 		let mut capture_tool_calls = 0usize;
 		let turn_started_in_goal = session.goal.has_goal();
-		let mut last_assistant_stop: Option<String> = None;
+		let mut last_assistant_aborted = false;
 		let runner = Arc::clone(&self.runtime.recipe.runner);
 		match runner.run(&request) {
 			Ok(stream) => {
@@ -1192,8 +1198,8 @@ impl AcpSession {
 							match &event {
 								AgentEvent::MessageEnd { message, stop_reason, .. } => {
 									if message.role == pi_agent::state::Role::Assistant {
-										last_assistant_stop =
-											message.stop_reason.clone().or(stop_reason.clone());
+										last_assistant_aborted =
+											assistant_aborted(message.stop_reason, stop_reason.as_deref());
 									}
 									if stop_reason.is_some() {
 										last_stop = stop_reason.clone().unwrap_or_default();
@@ -1338,8 +1344,7 @@ impl AcpSession {
 			let (manage, learn) = session.autolearn_tool_presence();
 			let goal_now = session.goal.has_goal();
 			let plan_active = self.plan_active();
-			let aborted =
-				cancelled || stopped_aborted(last_assistant_stop.as_deref());
+			let aborted = cancelled || last_assistant_aborted;
 			crate::autolearn::should_capture_turn(
 				&session.config,
 				capture_tool_calls,
@@ -3789,7 +3794,9 @@ impl AcpSession {
 mod tests {
 	use std::sync::Arc;
 
-	use super::{PromptGate, ReserveOpen, SessionManager, plan_is_active, stopped_aborted};
+	use super::{
+		PromptGate, ReserveOpen, SessionManager, assistant_aborted, plan_is_active,
+	};
 
 	#[test]
 	fn capture_gate_uses_active_plan_state_not_the_feature_flag() {
@@ -3829,13 +3836,19 @@ mod tests {
 	#[test]
 	fn capture_gate_skips_cancelled_aborted_and_completed_goal_turns() {
 		use crate::autolearn::should_capture_turn;
+		use pi_agent::state::StopReason;
 
 		let mut config = crate::config::Config::default();
 		config.autolearn.enabled = Some(true);
 		config.autolearn.auto_continue = Some(true);
 		config.autolearn.min_tool_calls = Some(1);
-		assert!(stopped_aborted(Some("aborted")));
-		assert!(!stopped_aborted(Some("endTurn")));
+		assert!(assistant_aborted(Some(StopReason::Aborted), None));
+		assert!(assistant_aborted(None, Some("aborted")));
+		assert!(
+			!assistant_aborted(Some(StopReason::Stop), Some("aborted")),
+			"the typed message reason wins over the event string"
+		);
+		assert!(!assistant_aborted(Some(StopReason::Stop), Some("end_turn")));
 		assert!(!should_capture_turn(&config, 1, true, false, false, false, true));
 		assert!(!should_capture_turn(&config, 1, false, false, true, false, true));
 		assert!(should_capture_turn(&config, 1, false, false, false, false, true));

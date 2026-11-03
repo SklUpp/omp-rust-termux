@@ -39,18 +39,19 @@ cleanup() {
 }
 trap cleanup EXIT
 
-python3 - "$PORT_FILE" >"$SERVER_LOG" 2>&1 <<'PY' &
+python3 - "$PORT_FILE" "$SESSIONS" >"$SERVER_LOG" 2>&1 <<'PY' &
 import json
+import shlex
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 port_file = sys.argv[1]
+sessions = sys.argv[2]
 release_child = threading.Event()
 
 # Exact fixture transcript under the harness-owned sessions root. No HOME scan.
-MARKER_PROBE = r'''root="${OMP_HARNESS_SESSIONS:-$HOME/sessions}"
-set -- "$root"/*/subagents/task-1.jsonl
+MARKER_PROBE = f'''set -- {shlex.quote(sessions)}/*/subagents/task-1.jsonl
 if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then echo MARKER_PROBE_BAD_COUNT; exit 0; fi
 if grep -qs 'live-child-answer' "$1"; then echo MARKER_JOURNALED; else echo MARKER_ABSENT; fi'''
 
@@ -314,7 +315,7 @@ providers:
 YAML
 
 run_cli() {
-	HOME="$ROOT" PI_CODING_AGENT_DIR="$AGENT_DIR" OMP_HARNESS_SESSIONS="$SESSIONS" \
+	HOME="$ROOT" PI_CODING_AGENT_DIR="$AGENT_DIR" \
 		"$OMP_BIN" --cwd "$PROJECT" --session-dir "$SESSIONS" --yolo "$@"
 }
 

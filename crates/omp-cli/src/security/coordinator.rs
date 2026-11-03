@@ -779,7 +779,7 @@ fn run_operation(
 			prepare_security_output_directory(&plan.output, &scan_id)
 				.map_err(crate::Error::new)?;
 			record.update("preparing", None, now_iso);
-			host.ensure_model(&plan.model)?;
+			host.ensure_model(&plan.model).map_err(crate::Error::new)?;
 			let target = prepare_execution_target(adapter.as_ref(), &store, &plan, &scan_id)
 			.map_err(crate::Error::new)?;
 			let execution_root = target.cwd.clone();
@@ -830,8 +830,7 @@ fn run_operation(
 				published = Some(bundle);
 				let mut bundle = published.take().expect("published");
 				bundle.scan.metrics = Some(metrics_from(started_ms, stats));
-				write_security_bundle_to_directory(Path::new(&plan.output.root), &bundle)
-					.map_err(crate::Error::new)?;
+				write_security_bundle_to_directory(Path::new(&plan.output.root), &bundle)?;
 				store.put_bundle(&bundle)?;
 				published = Some(bundle);
 			}

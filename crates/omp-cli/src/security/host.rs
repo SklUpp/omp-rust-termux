@@ -87,7 +87,7 @@ impl fmt::Debug for SecurityHostHandle {
 }
 
 impl AsRef<dyn SecurityHost> for SecurityHostHandle {
-	fn as_ref(&self) -> &dyn SecurityHost {
+	fn as_ref(&self) -> &(dyn SecurityHost + 'static) {
 		self.0.as_ref()
 	}
 }

@@ -167,10 +167,22 @@ pub fn resolve_security_oauth_access(
 /// Model request credential: initial call and retries both target the pinned
 /// row; the retry `lastChance` step returns `None` so the transport fails the
 /// scan rather than rotating to a sibling account.
-#[derive(Debug)]
 pub struct ExactSecurityOAuthResolver {
 	backend: std::sync::Arc<std::sync::Mutex<AuthBackend>>,
 	pinned: SecurityOAuthAccount,
+}
+
+/// Opaque: the auth backend is not `Debug` and must not be exposed through a
+/// formatter; only the pinned, plan-visible identity is reported.
+impl std::fmt::Debug for ExactSecurityOAuthResolver {
+	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		formatter
+			.debug_struct("ExactSecurityOAuthResolver")
+			.field("provider", &self.pinned.provider)
+			.field("credential_id", &self.pinned.credential_id)
+			.field("backend", &"<pinned auth backend>")
+			.finish()
+	}
 }
 
 impl ExactSecurityOAuthResolver {

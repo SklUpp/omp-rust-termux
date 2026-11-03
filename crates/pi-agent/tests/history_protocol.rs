@@ -1,0 +1,976 @@
+//! Consumer-level `history://` regressions: index, live/parked/tombstoned/disk
+//! readers, caller isolation, exact errors, cancellation, and read-tool
+//! behavior. Fixtures live under `$HOME`, never a shared system temp dir.
+
+use std::{
+	collections::{BTreeMap, HashSet},
+	fs,
+	io::Write,
+	path::{Path, PathBuf},
+	sync::Arc,
+	time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
+use async_trait::async_trait;
+use pi_agent::{
+	CancellationToken,
+	loop_module::AgentEvent,
+	provider::{ChunkStream, ModelProvider, ProviderError, ToolChoice},
+	state::{AgentContext, ContentPart, Message, ToolCall, TurnStatus},
+	subagent_lifecycle::{
+		attach, DeliveryOutcome, LifecycleStatus, SubagentLifecycleManager,
+	},
+	supervisor::{ChildSpawn, DelegationLimits, Supervisor},
+	task_persisted_revive::{
+		append_messages, DefaultPersistedReviverFactory, PersistedChildSession, transcript_path,
+	},
+	tools::{
+		hub_park,
+		internal_urls::{InternalUrlRouter, UrlScope},
+		registry::ToolRegistry,
+		read::ReadTool,
+		Tool,
+	},
+};
+use serde_json::json;
+use tokio::sync::{Notify, Semaphore};
+
+struct TempRoot {
+	path: PathBuf,
+}
+
+impl TempRoot {
+	fn new(label: &str) -> Self {
+		let nanos = SystemTime::now()
+			.duration_since(UNIX_EPOCH)
+			.map(|duration| duration.as_nanos())
+			.unwrap_or_default();
+		let home = std::env::var_os("HOME").expect("HOME must be set for history tests");
+		let path = PathBuf::from(home).join(format!(
+			".omp-history-{label}-{}-{nanos}",
+			std::process::id()
+		));
+		fs::create_dir_all(path.join("session").join("subagents")).expect("fixture root");
+		Self { path }
+	}
+
+	fn session_file(&self) -> PathBuf {
+		self.path.join("session.jsonl")
+	}
+
+	fn artifacts(&self) -> PathBuf {
+		self.path.join("session")
+	}
+
+	fn subagents(&self) -> PathBuf {
+		self.artifacts().join("subagents")
+	}
+
+	fn scope(&self) -> UrlScope {
+		UrlScope {
+			session_file: Some(self.session_file()),
+			local_roots:  BTreeMap::from([("local".to_string(), self.artifacts())]),
+		}
+	}
+}
+
+impl Drop for TempRoot {
+	fn drop(&mut self) {
+		let _ = fs::remove_dir_all(&self.path);
+	}
+}
+
+struct NoopProvider;
+
+#[async_trait]
+impl ModelProvider for NoopProvider {
+	async fn complete(
+		&self,
+		_messages: &[Message],
+		_tools: &[serde_json::Value],
+		_tool_choice: &ToolChoice,
+	) -> Result<Message, ProviderError> {
+		Err(ProviderError::Protocol(
+			"history tests never revive a child".to_string(),
+		))
+	}
+
+	async fn stream(
+		&self,
+		_messages: &[Message],
+		_tools: &[serde_json::Value],
+		_tool_choice: &ToolChoice,
+	) -> Result<ChunkStream, ProviderError> {
+		Err(ProviderError::Protocol(
+			"history tests never revive a child".to_string(),
+		))
+	}
+}
+
+/// Provider that blocks its single reply until the test releases it, so a
+/// history read can observe the live snapshot before the transcript flush.
+struct GatedProvider {
+	reply:   String,
+	entered: Arc<Notify>,
+	gate:    Arc<Semaphore>,
+}
+
+#[async_trait]
+impl ModelProvider for GatedProvider {
+	async fn complete(
+		&self,
+		_messages: &[Message],
+		_tools: &[serde_json::Value],
+		_tool_choice: &ToolChoice,
+	) -> Result<Message, ProviderError> {
+		self.entered.notify_one();
+		let _permit = self
+			.gate
+			.acquire()
+			.await
+			.map_err(|_| ProviderError::Protocol("gate closed".to_string()))?;
+		Ok(Message::assistant(self.reply.clone()))
+	}
+
+	async fn stream(
+		&self,
+		_messages: &[Message],
+		_tools: &[serde_json::Value],
+		_tool_choice: &ToolChoice,
+	) -> Result<ChunkStream, ProviderError> {
+		Err(ProviderError::Protocol(
+			"revived runs use complete".to_string(),
+		))
+	}
+}
+
+fn gated_provider(reply: &str) -> Arc<GatedProvider> {
+	Arc::new(GatedProvider {
+		reply:   reply.to_string(),
+		entered: Arc::new(Notify::new()),
+		gate:    Arc::new(Semaphore::new(0)),
+	})
+}
+
+fn gated_manager(supervisor: &Arc<Supervisor>, provider: Arc<GatedProvider>) -> Arc<SubagentLifecycleManager> {
+	let provider: Arc<dyn ModelProvider> = provider;
+	attach(
+		supervisor,
+		0,
+		Arc::new(DefaultPersistedReviverFactory::new(
+			provider,
+			ToolRegistry::with_builtins(),
+		)),
+	)
+}
+
+fn supervisor(root: &TempRoot) -> Arc<Supervisor> {
+	let provider: Arc<dyn ModelProvider> = Arc::new(NoopProvider);
+	let supervisor = Supervisor::new(
+		ToolRegistry::with_builtins(),
+		provider,
+		None,
+		DelegationLimits::default(),
+	);
+	supervisor.set_child_session_root(Some(root.subagents()));
+	supervisor
+}
+
+fn manager(supervisor: &Arc<Supervisor>) -> Arc<SubagentLifecycleManager> {
+	let provider: Arc<dyn ModelProvider> = Arc::new(NoopProvider);
+	attach(
+		supervisor,
+		0,
+		Arc::new(DefaultPersistedReviverFactory::new(
+			provider,
+			ToolRegistry::with_builtins(),
+		)),
+	)
+}
+
+fn reserve(supervisor: &Arc<Supervisor>, name: &str) -> String {
+	let (id, _token) = supervisor
+		.reserve_child_full(ChildSpawn {
+			name,
+			index: 1,
+			agent: "scout",
+			agent_source: "builtin",
+			task: "investigate",
+			parent_id: None,
+			parent_tool_call_id: None,
+			detached: false,
+			output_prefix: None,
+		})
+		.expect("reserve child");
+	id
+}
+
+fn append(supervisor: &Arc<Supervisor>, id: &str, messages: &[Message]) {
+	let refs: Vec<&Message> = messages.iter().collect();
+	supervisor.append_child_transcript(id, &refs);
+}
+
+fn contract(id: &str, root: &Path) -> PersistedChildSession {
+	PersistedChildSession {
+		id: id.to_string(),
+		agent: Some("scout".to_string()),
+		task: "investigate".to_string(),
+		system_prompt: "child system prompt".to_string(),
+		tools: vec!["read".to_string()],
+		model_role: None,
+		resolved_model: None,
+		output_schema: None,
+		output_schema_mode: None,
+		restrict_tool_names: Some(true),
+		spawns: Some("*".to_string()),
+		read_summarize: None,
+		advisor: None,
+		read_only: None,
+		cwd: root.to_path_buf(),
+		depth: 1,
+		max_turns: 20,
+		context_limit: 100_000,
+		display_name: Some(id.to_string()),
+		parent_id: None,
+		output_id: None,
+		output_published: false,
+	}
+}
+
+fn router(manager: &Arc<SubagentLifecycleManager>) -> Arc<InternalUrlRouter> {
+	let router = Arc::new(InternalUrlRouter::new());
+	hub_park::register_history(&router, Arc::clone(manager)).expect("history handler");
+	router
+}
+
+async fn read(
+	router: &InternalUrlRouter,
+	root: &TempRoot,
+	uri: &str,
+) -> Result<pi_agent::tools::InternalResource, String> {
+	router
+		.resolve(uri, &root.scope().resolve_context(&root.path, &CancellationToken::new()))
+		.await
+}
+
+struct HostHistory;
+
+#[async_trait]
+impl pi_agent::tools::ProtocolHandler for HostHistory {
+	fn scheme(&self) -> &str {
+		"history"
+	}
+
+	async fn resolve(
+		&self,
+		_url: &pi_agent::tools::InternalUrl,
+		_context: &pi_agent::tools::ResolveContext,
+	) -> Result<pi_agent::tools::InternalResource, String> {
+		Ok(pi_agent::tools::InternalResource::text("history://x", "shadow".to_string()))
+	}
+}
+
+#[tokio::test]
+async fn index_lists_live_parked_tombstoned_and_disk_rows_without_advisors() {
+	let root = TempRoot::new("index");
+	let supervisor = supervisor(&root);
+	let manager = manager(&supervisor);
+	let router = router(&manager);
+
+	let live = reserve(&supervisor, "live");
+	append(&supervisor, &live, &[Message::user("live row")]);
+
+	let parked = reserve(&supervisor, "parked");
+	append(&supervisor, &parked, &[Message::user("parked row")]);
+	manager
+		.adopt(&parked, Some(contract(&parked, &root.path)))
+		.expect("adopt");
+	manager.park(&parked);
+
+	let tombstoned = reserve(&supervisor, "tombstoned");
+	append(&supervisor, &tombstoned, &[Message::user("tombstone row")]);
+	assert!(manager.tombstone(&tombstoned, "hard kill"));
+
+	append_messages(&root.subagents().join("Ghost.jsonl"), &[&Message::user("disk row")]);
+	let nested = root.subagents().join("Parent");
+	fs::create_dir_all(&nested).expect("nested dir");
+	append_messages(
+		&nested.join("Parent.Child.jsonl"),
+		&[&Message::user("nested row")],
+	);
+	append_messages(
+		&root.subagents().join("__advisor.jsonl"),
+		&[&Message::user("advisor row")],
+	);
+
+	let index = read(&router, &root, "history://").await.expect("index");
+	assert_eq!(index.content_type, "text/markdown");
+	assert!(index.content.starts_with("# Agents"));
+	assert!(index.content.contains("| id | status | kind | parent | last activity |"));
+	for id in [&live, &parked, &tombstoned] {
+		assert!(index.content.contains(id), "{id} missing:\n{}", index.content);
+	}
+	assert!(index.content.contains("| parked |"), "{}", index.content);
+	assert!(index.content.contains("| tombstoned |"), "{}", index.content);
+	assert!(index.content.contains("| running |"), "{}", index.content);
+	assert!(index.content.contains("Ghost"), "{}", index.content);
+	assert!(index.content.contains("Parent.Child"), "{}", index.content);
+	assert!(!index.content.contains("__advisor"), "{}", index.content);
+	assert!(index.content.contains("Read a transcript with `read history://<id>`."));
+}
+
+#[tokio::test]
+async fn live_transcript_reads_appends_without_claiming_an_in_memory_session() {
+	let root = TempRoot::new("live-append");
+	let supervisor = supervisor(&root);
+	let manager = manager(&supervisor);
+	let router = router(&manager);
+	let id = reserve(&supervisor, "live");
+	append(&supervisor, &id, &[Message::user("first-answer")]);
+
+	let first = read(&router, &root, &format!("history://{id}"))
+		.await
+		.expect("live read");
+	assert_eq!(first.content_type, "text/markdown");
+	assert!(!first.content.starts_with('{'), "raw JSONL leaked: {}", first.content);
+	assert!(first.content.starts_with(&format!("# {id} (running)")));
+	assert!(first.content.contains("first-answer"));
+	assert!(!first.immutable, "a live transcript snapshot may refresh");
+	assert_eq!(
+		first.source_path.as_deref(),
+		Some(transcript_path(&root.subagents(), &id).as_path())
+	);
+	let notes = first.notes.expect("source note");
+	assert!(
+		notes.iter().any(|note| note == "Source: transcript file (read-only, running)"),
+		"{notes:?}"
+	);
+
+	append(&supervisor, &id, &[Message::assistant("second-answer")]);
+	let second = read(&router, &root, &format!("history://{id}"))
+		.await
+		.expect("live reread");
+	assert!(second.content.contains("first-answer"));
+	assert!(second.content.contains("second-answer"));
+
+	// Closing the live session keeps the transcript readable; it is the same
+	// reader, only the reported status changes.
+	manager
+		.adopt(&id, Some(contract(&id, &root.path)))
+		.expect("adopt live row");
+	assert!(manager.park(&id));
+	let closed = read(&router, &root, &format!("history://{id}"))
+		.await
+		.expect("closed live read");
+	assert!(closed.content.starts_with(&format!("# {id} (parked)")));
+	assert!(closed.content.contains("second-answer"));
+}
+
+#[tokio::test]
+async fn parked_and_tombstoned_transcripts_stay_readable() {
+	let root = TempRoot::new("parked");
+	let supervisor = supervisor(&root);
+	let manager = manager(&supervisor);
+	let router = router(&manager);
+
+	let parked = reserve(&supervisor, "parked");
+	append(&supervisor, &parked, &[Message::user("parked-prior-answer")]);
+	manager
+		.adopt(&parked, Some(contract(&parked, &root.path)))
+		.expect("adopt");
+	manager.park(&parked);
+	let parked_read = read(&router, &root, &format!("history://{parked}"))
+		.await
+		.expect("parked read");
+	assert!(parked_read.content.starts_with(&format!("# {parked} (parked)")));
+	assert!(parked_read.content.contains("parked-prior-answer"));
+	assert_eq!(
+		parked_read.notes.expect("notes"),
+		vec!["Source: session file (read-only, parked)".to_string()]
+	);
+
+	let tombstoned = reserve(&supervisor, "tombstoned");
+	append(
+		&supervisor,
+		&tombstoned,
+		&[Message::user("tombstoned-prior-answer")],
+	);
+	assert!(manager.tombstone(&tombstoned, "hard kill"));
+	let tombstoned_read = read(&router, &root, &format!("history://{tombstoned}"))
+		.await
+		.expect("tombstoned read");
+	assert!(tombstoned_read
+		.content
+		.starts_with(&format!("# {tombstoned} (tombstoned)")));
+	assert!(tombstoned_read.content.contains("tombstoned-prior-answer"));
+	assert_eq!(
+		tombstoned_read.notes.expect("notes"),
+		vec!["Source: session file (read-only, tombstoned)".to_string()]
+	);
+
+	// A parked/closed live session never removes the file reader.
+	manager.park(&tombstoned);
+	let still_readable = read(&router, &root, &format!("history://{tombstoned}"))
+		.await
+		.expect("closed live read");
+	assert!(still_readable.content.contains("tombstoned-prior-answer"));
+}
+
+#[tokio::test]
+async fn malformed_tail_is_tolerated_and_never_persisted_back() {
+	let root = TempRoot::new("malformed");
+	let supervisor = supervisor(&root);
+	let manager = manager(&supervisor);
+	let router = router(&manager);
+	let id = reserve(&supervisor, "malformed");
+	append(
+		&supervisor,
+		&id,
+		&[Message::user("before-tail"), Message::assistant("also-before")],
+	);
+	let path = transcript_path(&root.subagents(), &id);
+	let mut file = fs::OpenOptions::new()
+		.append(true)
+		.open(&path)
+		.expect("open transcript");
+	file.write_all(b"{\"type\":\"message\",\"message\":\n\nnot-json\n")
+		.expect("append malformed tail");
+	drop(file);
+	let before = fs::read(&path).expect("transcript bytes");
+
+	let resource = read(&router, &root, &format!("history://{id}"))
+		.await
+		.expect("tolerant read");
+	assert!(resource.content.contains("before-tail"));
+	assert!(resource.content.contains("also-before"));
+	assert!(!resource.content.contains("not-json"));
+	let after = fs::read(&path).expect("transcript bytes after read");
+	assert_eq!(before, after, "history reads must never rewrite the transcript");
+}
+
+#[tokio::test]
+async fn unknown_and_missing_transcript_errors_stay_distinct() {
+	let root = TempRoot::new("errors");
+	let supervisor = supervisor(&root);
+	let manager = manager(&supervisor);
+	let router = router(&manager);
+	let known = reserve(&supervisor, "known");
+	append(&supervisor, &known, &[Message::user("known-body")]);
+
+	let unknown = read(&router, &root, "history://Nope")
+		.await
+		.expect_err("unknown agent");
+	assert_eq!(
+		unknown,
+		format!(
+			"Unknown agent: Nope\nKnown agents: {known}\nList all with history://"
+		)
+	);
+
+	let missing = reserve(&supervisor, "missing");
+	let missing_path = transcript_path(&root.subagents(), &missing);
+	fs::remove_file(&missing_path).expect("remove transcript");
+	let error = read(&router, &root, &format!("history://{missing}"))
+		.await
+		.expect_err("missing transcript");
+	assert_eq!(
+		error,
+		format!(
+			"Agent {missing} has no transcript: session is gone and no session file was retained"
+		)
+	);
+}
+
+#[tokio::test]
+async fn cancelled_reads_abort_before_touching_the_transcript() {
+	let root = TempRoot::new("cancel");
+	let supervisor = supervisor(&root);
+	let manager = manager(&supervisor);
+	let router = router(&manager);
+	let id = reserve(&supervisor, "cancel");
+	append(&supervisor, &id, &[Message::user("body")]);
+
+	let signal = CancellationToken::new();
+	signal.cancel();
+	let error = router
+		.resolve(
+			&format!("history://{id}"),
+			&root.scope().resolve_context(&root.path, &signal),
+		)
+		.await
+		.expect_err("pre-cancelled resolve");
+	assert_eq!(error, "aborted");
+
+	let tool = ReadTool::new().with_internal_urls(
+		Arc::clone(&router),
+		Arc::new(root.scope()),
+	);
+	let cancelled = AgentContext::with_cancellation(root.path.clone(), {
+		let signal = CancellationToken::new();
+		signal.cancel();
+		signal
+	});
+	let result = tool
+		.execute(&json!({ "path": format!("history://{id}") }), &cancelled)
+		.await
+		.expect("read executes");
+	assert!(result.is_error);
+	assert_eq!(result.content, "Read cancelled");
+}
+
+#[tokio::test]
+async fn advisor_transcripts_are_hidden_from_index_and_lookup() {
+	let root = TempRoot::new("advisor");
+	let supervisor = supervisor(&root);
+	let manager = manager(&supervisor);
+	let router = router(&manager);
+	let visible = reserve(&supervisor, "visible");
+	append(&supervisor, &visible, &[Message::user("visible-body")]);
+	append_messages(
+		&root.subagents().join("__advisor.jsonl"),
+		&[&Message::user("advisor-secret")],
+	);
+
+	let index = read(&router, &root, "history://").await.expect("index");
+	assert!(index.content.contains(&visible));
+	assert!(!index.content.contains("__advisor"));
+	assert!(!index.content.contains("advisor-secret"));
+
+	let error = read(&router, &root, "history://__advisor")
+		.await
+		.expect_err("advisor hidden");
+	assert!(error.starts_with("Unknown agent: __advisor"), "{error}");
+	assert!(!error.contains("advisor-secret"));
+}
+
+#[tokio::test]
+async fn caller_scope_isolates_two_sessions_sharing_an_agent_id() {
+	let root_a = TempRoot::new("iso-a");
+	let root_b = TempRoot::new("iso-b");
+	let supervisor_a = supervisor(&root_a);
+	let supervisor_b = supervisor(&root_b);
+	let manager_b = manager(&supervisor_b);
+	let id_a = reserve(&supervisor_a, "same");
+	let id_b = reserve(&supervisor_b, "same");
+	assert_eq!(id_a, id_b, "both sessions restart their own task ids");
+	append(&supervisor_a, &id_a, &[Message::user("alpha-body")]);
+	let second_b = reserve(&supervisor_b, "other");
+	append(&supervisor_b, &id_b, &[Message::user("beta-body")]);
+	append(&supervisor_b, &second_b, &[Message::user("gamma-body")]);
+
+	// A shared router keeps only the newest manager: session A must still read
+	// its own transcript and never session B's.
+	let shared = router(&manager_b);
+	let from_a = read(&shared, &root_a, &format!("history://{id_a}"))
+		.await
+		.expect("caller A read");
+	assert!(from_a.content.contains("alpha-body"));
+	assert!(!from_a.content.contains("beta-body"));
+
+	let from_b = read(&shared, &root_b, &format!("history://{id_b}"))
+		.await
+		.expect("caller B read");
+	assert!(from_b.content.contains("beta-body"));
+	assert!(!from_b.content.contains("alpha-body"));
+
+	let index_a = read(&shared, &root_a, "history://").await.expect("index A");
+	assert!(index_a.content.contains(&id_a));
+	assert!(
+		!index_a.content.contains(&second_b),
+		"session A must not list session B's ids:\n{}",
+		index_a.content
+	);
+	let index_b = read(&shared, &root_b, "history://").await.expect("index B");
+	assert!(index_b.content.contains(&second_b));
+
+	// The bound manager still serves its own caller, proving the fallback above
+	// came from caller scope rather than from the newest manager.
+	let visible = read(&shared, &root_b, &format!("history://{second_b}"))
+		.await
+		.expect("manager B row");
+	assert!(visible.content.contains("gamma-body"));
+}
+
+#[tokio::test]
+async fn case_insensitive_and_nested_disk_ids_resolve() {
+	let root = TempRoot::new("nested");
+	let supervisor = supervisor(&root);
+	let manager = manager(&supervisor);
+	let router = router(&manager);
+	let id = reserve(&supervisor, "Case");
+	append(&supervisor, &id, &[Message::user("case-body")]);
+
+	let upper = id.to_uppercase();
+	let from_case = read(&router, &root, &format!("history://{upper}"))
+		.await
+		.expect("case-insensitive read");
+	assert!(from_case.content.contains("case-body"));
+
+	let nested = root.subagents().join("Parent");
+	fs::create_dir_all(&nested).expect("nested dir");
+	append_messages(
+		&nested.join("Parent.Child.jsonl"),
+		&[&Message::user("nested-body")],
+	);
+	let from_nested = read(&router, &root, "history://parent.child")
+		.await
+		.expect("nested case-insensitive read");
+	assert!(from_nested.content.contains("nested-body"));
+	assert!(from_nested.content.starts_with("# Parent.Child (on disk)"));
+}
+
+#[tokio::test]
+async fn transcript_markdown_collapses_tool_pairs_and_elides_thinking() {
+	let root = TempRoot::new("markdown");
+	let supervisor = supervisor(&root);
+	let manager = manager(&supervisor);
+	let router = router(&manager);
+	let id = reserve(&supervisor, "markdown");
+
+	let mut assistant = Message::assistant_with_tools(
+		"final answer",
+		vec![ToolCall {
+			id:     "call-1".to_string(),
+			name:   "read".to_string(),
+			arguments: json!({ "path": "src/lib.rs", "i": "checking" }),
+		}],
+	);
+	assistant.parts = vec![
+		ContentPart::thinking("private-reasoning"),
+		ContentPart::redacted_thinking("opaque-reasoning"),
+		ContentPart::text("final answer"),
+	];
+	let mut result = Message::tool("call-1", "one\ntwo\nthree");
+	result.name = Some("read".to_string());
+	append(
+		&supervisor,
+		&id,
+		&[Message::user("please check"), assistant, result],
+	);
+
+	let resource = read(&router, &root, &format!("history://{id}"))
+		.await
+		.expect("markdown read");
+	assert!(resource.content.contains("## user\n\nplease check"));
+	assert!(resource.content.contains("## assistant\n\nfinal answer"));
+	assert!(
+		resource
+			.content
+			.contains("→ read(src/lib.rs) ⇒ ok · 3 lines"),
+		"{}",
+		resource.content
+	);
+	assert_eq!(resource.content.matches("→ read(").count(), 1);
+	assert!(!resource.content.contains("private-reasoning"));
+	assert!(!resource.content.contains("opaque-reasoning"));
+	assert!(!resource.content.contains("## tool"));
+}
+
+#[tokio::test]
+async fn read_tool_pages_history_and_rejects_writes_anchors_and_overrides() {
+	let root = TempRoot::new("read");
+	let supervisor = supervisor(&root);
+	let manager = manager(&supervisor);
+	let router = router(&manager);
+	let id = reserve(&supervisor, "paged");
+	append(
+		&supervisor,
+		&id,
+		&[Message::user("alpha\nbeta\ngamma\ndelta")],
+	);
+
+	let tool = ReadTool::new().with_internal_urls(
+		Arc::clone(&router),
+		Arc::new(root.scope()),
+	);
+	let ranged = tool
+		.execute(
+			&json!({ "path": format!("history://{id}:5-6") }),
+			&AgentContext::new(root.path.clone()),
+		)
+		.await
+		.expect("read executes");
+	assert!(!ranged.is_error, "{}", ranged.content);
+	assert!(ranged.content.contains("5|alpha"), "{}", ranged.content);
+	assert!(ranged.content.contains("6|beta"), "{}", ranged.content);
+	let details = ranged.details.expect("details");
+	assert_eq!(details["internalUrl"]["contentType"], json!("text/markdown"));
+	assert_eq!(details["internalUrl"]["immutable"], json!(false));
+	assert_eq!(details["internalUrl"]["writable"], json!(false));
+
+	let raw = tool
+		.execute(
+			&json!({ "path": format!("history://{id}:raw") }),
+			&AgentContext::new(root.path.clone()),
+		)
+		.await
+		.expect("read executes");
+	assert!(!raw.is_error, "{}", raw.content);
+	assert!(raw.content.starts_with(&format!("# {id} (running)")));
+	assert!(!raw.content.contains("1|"), "{}", raw.content);
+
+	let scope = root.scope();
+	let write_context = scope.write_context(&root.path, &CancellationToken::new());
+	let write_error = router
+		.write(&format!("history://{id}"), "mutate", &write_context)
+		.await
+		.expect_err("history is read-only");
+	assert_eq!(
+		write_error,
+		"history:// URLs are read-only for write; use the protocol-specific tool for mutations."
+	);
+
+	let fresh = InternalUrlRouter::new();
+	let error = fresh
+		.register(Arc::new(HostHistory))
+		.err()
+		.expect("reserved scheme");
+	assert_eq!(error, "history:// is reserved for built-in handlers");
+	assert!(!fresh.can_handle("history://x"));
+}
+
+
+#[tokio::test]
+async fn live_snapshot_precedes_flush_and_handles_steer_tool_pending_and_rollback() {
+	let root = TempRoot::new("live-events");
+	let supervisor = supervisor(&root);
+	let manager = manager(&supervisor);
+	let router = router(&manager);
+	let id = reserve(&supervisor, "live-events");
+	let path = transcript_path(&root.subagents(), &id);
+
+	// Real producer sequence: owned initial prompt, accepted steering, assistant
+	// MessageEnd, then its ToolEnd. TurnEnd repeats the pair and must be ignored.
+	manager.seed_live(&id, Message::user("initial owned prompt"));
+	manager.apply_live_event(
+		&id,
+		&AgentEvent::UserSteer {
+			parts: vec![ContentPart::text("steered-live")],
+		},
+	);
+	let assistant = Message::assistant_with_tools(
+		"live answer",
+		vec![ToolCall {
+			id:     "call-live".to_string(),
+			name:   "read".to_string(),
+			arguments: json!({ "path": "src/live.rs" }),
+		}],
+	);
+	manager.apply_live_event(
+		&id,
+		&AgentEvent::MessageEnd {
+			message: assistant.clone(),
+			status:  TurnStatus::ToolUse,
+		},
+	);
+	manager.apply_live_event(
+		&id,
+		&AgentEvent::ToolEnd {
+			id:      "call-live".to_string(),
+			name:    "read".to_string(),
+			result:  "one\ntwo".to_string(),
+			is_error: false,
+			images:  Vec::new(),
+			details: None,
+		},
+	);
+	manager.apply_live_event(
+		&id,
+		&AgentEvent::TurnEnd {
+			message:      assistant,
+			tool_results: Vec::new(),
+			status:       TurnStatus::ToolUse,
+		},
+	);
+
+	// The producer has emitted nothing to the JSONL yet.
+	assert_eq!(
+		fs::read_to_string(&path).unwrap_or_default(),
+		"",
+		"fixture must prove the live view is not the transcript file"
+	);
+	let live = read(&router, &root, &format!("history://{id}"))
+		.await
+		.expect("live snapshot read");
+	assert!(live.content.contains("initial owned prompt"));
+	assert!(live.content.contains("steered-live"));
+	assert!(live.content.contains("live answer"));
+	assert!(
+		live.content.contains("→ read(src/live.rs) ⇒ ok · 2 lines"),
+		"{}",
+		live.content
+	);
+	assert_eq!(live.content.matches("## assistant").count(), 1, "{}", live.content);
+	assert_eq!(
+		live.notes.expect("notes"),
+		vec!["Source: live session (read-only, running)".to_string()]
+	);
+
+	// Read-tool selectors operate on the live snapshot too.
+	let tool = ReadTool::new().with_internal_urls(
+		Arc::clone(&router),
+		Arc::new(root.scope()),
+	);
+	let raw = tool
+		.execute(
+			&json!({ "path": format!("history://{id}:raw") }),
+			&AgentContext::new(root.path.clone()),
+		)
+		.await
+		.expect("read executes");
+	assert!(!raw.is_error, "{}", raw.content);
+	assert!(raw.content.contains("live answer"));
+
+	// A cancelled turn shows its pending call; the error rollback replaces the
+	// partial turn with the authoritative state before the request.
+	manager.replace_live(&id, vec![Message::user("pending prompt")]);
+	manager.apply_live_event(
+		&id,
+		&AgentEvent::MessageEnd {
+			message: Message::assistant_with_tools(
+				"",
+				vec![ToolCall {
+					id:     "call-pending".to_string(),
+					name:   "bash".to_string(),
+					arguments: json!({ "command": "sleep 5" }),
+				}],
+			),
+			status:  TurnStatus::ToolUse,
+		},
+	);
+	let pending = read(&router, &root, &format!("history://{id}"))
+		.await
+		.expect("pending read");
+	assert!(
+		pending
+			.content
+			.contains("→ bash(sleep 5) ⇒ pending"),
+		"{}",
+		pending.content
+	);
+	manager.replace_live(&id, vec![Message::user("pending prompt")]);
+	let rolled_back = read(&router, &root, &format!("history://{id}"))
+		.await
+		.expect("rollback read");
+	assert!(!rolled_back.content.contains("sleep 5"));
+
+	// Live ownership end falls back to the persisted file, never a stale view.
+	manager.drop_live(&id);
+	let file_fallback = read(&router, &root, &format!("history://{id}"))
+		.await
+		.expect("file fallback");
+	assert!(!file_fallback.content.contains("initial owned prompt"));
+	assert_eq!(
+		file_fallback.notes.expect("notes"),
+		vec!["Source: transcript file (read-only, running)".to_string()]
+	);
+}
+
+#[tokio::test]
+async fn revived_live_snapshot_precedes_flush_and_survives_idle_until_park() {
+	let root = TempRoot::new("revived-live");
+	let supervisor = supervisor(&root);
+	let provider = gated_provider("gated-answer");
+	let manager = gated_manager(&supervisor, Arc::clone(&provider));
+	let router = router(&manager);
+	let id = reserve(&supervisor, "revived-live");
+	append(
+		&supervisor,
+		&id,
+		&[Message::user("prior-question"), Message::assistant("prior-answer")],
+	);
+	manager
+		.adopt(&id, Some(contract(&id, &root.path)))
+		.expect("adopt");
+
+	let outcome = manager
+		.send(&id, "resume-prompt".to_string())
+		.expect("revive");
+	assert_eq!(outcome, DeliveryOutcome::Revived);
+	tokio::time::timeout(Duration::from_secs(5), provider.entered.notified())
+		.await
+		.expect("provider entered");
+
+	let transcript = transcript_path(&root.subagents(), &id);
+	assert!(
+		!fs::read_to_string(&transcript)
+			.unwrap_or_default()
+			.contains("gated-answer"),
+		"the reply has not been flushed yet"
+	);
+	let before = read(&router, &root, &format!("history://{id}"))
+		.await
+		.expect("live before flush");
+	assert!(before.content.contains("prior-answer"));
+	assert!(before.content.contains("resume-prompt"));
+	assert!(
+		!before.content.contains("gated-answer"),
+		"the provider has not answered yet"
+	);
+	assert_eq!(
+		before.notes.expect("notes"),
+		vec!["Source: live session (read-only, running)".to_string()]
+	);
+
+	provider.gate.add_permits(1);
+	let mut answered = false;
+	for _ in 0..500 {
+		if manager.status(&id) == Some(LifecycleStatus::Idle)
+			&& manager
+				.live_messages(&id)
+				.is_some_and(|messages| messages.iter().any(|m| m.content.contains("gated-answer")))
+		{
+			answered = true;
+			break;
+		}
+		tokio::time::sleep(Duration::from_millis(10)).await;
+	}
+	assert!(answered, "live snapshot must receive the turn result");
+
+	let idle = read(&router, &root, &format!("history://{id}"))
+		.await
+		.expect("live idle read");
+	assert!(idle.content.contains("gated-answer"));
+	assert_eq!(
+		idle.notes.expect("notes"),
+		vec!["Source: live session (read-only, idle)".to_string()]
+	);
+
+	let tool = ReadTool::new().with_internal_urls(
+		Arc::clone(&router),
+		Arc::new(root.scope()),
+	);
+	let raw = tool
+		.execute(
+			&json!({ "path": format!("history://{id}:raw") }),
+			&AgentContext::new(root.path.clone()),
+		)
+		.await
+		.expect("read executes");
+	assert!(!raw.is_error, "{}", raw.content);
+	assert!(raw.content.contains("gated-answer"));
+
+	manager.park(&id);
+	assert!(manager.live_messages(&id).is_none());
+	let parked = read(&router, &root, &format!("history://{id}"))
+		.await
+		.expect("parked file read");
+	assert!(parked.content.contains("gated-answer"));
+	assert_eq!(
+		parked.notes.expect("notes"),
+		vec!["Source: session file (read-only, parked)".to_string()]
+	);
+}
+
+/// The caller isolation test must not accidentally pass because the two
+/// supervisors picked the same instance key.
+#[test]
+fn distinct_supervisors_have_distinct_instance_keys() {
+	let root = TempRoot::new("keys");
+	let first = supervisor(&root);
+	let second = supervisor(&root);
+	let mut keys = HashSet::new();
+	keys.insert(first.instance_key().to_string());
+	keys.insert(second.instance_key().to_string());
+	assert_eq!(keys.len(), 2);
+}

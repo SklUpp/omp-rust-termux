@@ -2553,7 +2553,7 @@ fn advisor_card_is_published_by_the_rpc_pump_before_eof() {
 	launch.config.advisor.enabled = Some(true);
 	launch.config.model_roles.insert("advisor".to_string(), "local/advisor".to_string());
 	launch.config.model_roles.insert("slow".to_string(), "local/advisor".to_string());
-	let mut models = std::collections::HashMap::new();
+	let mut models = std::collections::BTreeMap::new();
 	for id in ["mock-model", "advisor"] {
 		models.insert(
 			id.to_string(),

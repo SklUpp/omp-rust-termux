@@ -506,6 +506,10 @@ pub struct Supervisor {
 	/// result has nowhere to go, so the task tool falls back to synchronous
 	/// execution (same fallback the TypeScript manager logs when it is absent).
 	result_sink_attached: AtomicBool,
+	/// Session-scoped `autoloadSkills` resolver. Captured by TaskTool instances
+	/// when they are built, so a background child keeps the resolver it spawned
+	/// with even if a later root turn updates this slot.
+	autoload: Mutex<Option<Arc<dyn crate::tools::task::AutoloadSkillResolver>>>,
 	/// Root session spawn permits, shared by every root `TaskTool` instance so
 	/// the `task.maxConcurrency` bound survives REPL turns. Each child registry
 	/// creates its own semaphore, matching the TypeScript one-per-session
@@ -680,6 +684,7 @@ impl Supervisor {
 			async_enabled: AtomicBool::new(true),
 			external_thinking: AtomicBool::new(false),
 			result_sink_attached: AtomicBool::new(false),
+			autoload: Mutex::new(None),
 			root_permits: Arc::new(Semaphore::new(permits)),
 			mailbox: Arc::new(Mailbox::default()),
 			edit_options: Mutex::new(hashline::edit::EditToolOptions::default()),
@@ -773,6 +778,28 @@ impl Supervisor {
 			.internal_urls
 			.lock()
 			.unwrap_or_else(|poison| poison.into_inner()) = router;
+	}
+
+	/// Install the session-scoped `autoloadSkills` resolver. `TaskTool`
+	/// instances snapshot it when constructed, so a running background child is
+	/// unaffected by a later root turn replacing it.
+	pub fn set_autoload_resolver(
+		&self,
+		resolver: Option<Arc<dyn crate::tools::task::AutoloadSkillResolver>>,
+	) {
+		*self
+			.autoload
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner()) = resolver;
+	}
+
+	#[must_use]
+	pub fn autoload_resolver(&self) -> Option<Arc<dyn crate::tools::task::AutoloadSkillResolver>> {
+		self
+			.autoload
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner())
+			.clone()
 	}
 
 	/// Install the root session scope (session file + artifacts dir) that every

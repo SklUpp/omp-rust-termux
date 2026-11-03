@@ -101,6 +101,59 @@ pub fn auto_learn_nudge() -> &'static str {
 	AUTOLEARN_NUDGE_AUTOCONTINUE.trim()
 }
 
+/// TS `AutoLearnController#onAgentEnd` gate for the auto-continue capture.
+///
+/// `goal_mode` covers both halves of the upstream rule: the turn started in
+/// goal mode, or goal mode is still active when the turn ends. Capture tools
+/// must exist for the run (`manage_skill`/`learn` mounted); otherwise the
+/// capture request would have nothing to do.
+#[must_use]
+pub fn should_auto_capture(
+	config: &crate::config::Config,
+	tool_calls: usize,
+	aborted: bool,
+	plan_enabled: bool,
+	goal_mode: bool,
+	has_capture_tools: bool,
+) -> bool {
+	if aborted
+		|| !has_capture_tools
+		|| !config.autolearn.enabled()
+		|| !config.autolearn.auto_continue()
+	{
+		return false;
+	}
+	if tool_calls < config.autolearn.min_tool_calls() {
+		return false;
+	}
+	!plan_enabled && !goal_mode
+}
+
+/// Turn-level gate shared by CLI, RPC, and ACP.
+///
+/// `started_in_goal` is snapshotted before the turn starts; `goal_now` covers a
+/// turn that completed the goal. Either blocks capture, matching
+/// `controller.ts` (`startedInGoalMode || getGoalModeState().enabled`).
+#[must_use]
+pub fn should_capture_turn(
+	config: &crate::config::Config,
+	tool_calls: usize,
+	aborted: bool,
+	plan_active: bool,
+	started_in_goal: bool,
+	goal_now: bool,
+	has_capture_tools: bool,
+) -> bool {
+	should_auto_capture(
+		config,
+		tool_calls,
+		aborted,
+		plan_active,
+		started_in_goal || goal_now,
+		has_capture_tools,
+	)
+}
+
 fn learn_schema() -> Value {
 	json!({
 		"type": "object",
@@ -160,7 +213,6 @@ fn manage_skill_schema() -> Value {
 /// `learn` with the local (file) memory backend.
 pub struct LocalLearnTool {
 	agent_dir: PathBuf,
-	cwd:       PathBuf,
 	snapshot:  SkillSnapshot,
 	options:   LoadOptions,
 }
@@ -182,7 +234,7 @@ impl LocalLearnTool {
 			return None;
 		}
 		let agent_dir = options.agent_dir.clone().unwrap_or_else(dirs::agent_dir);
-		Some(Self { agent_dir, cwd: options.cwd.clone(), snapshot, options })
+		Some(Self { agent_dir, snapshot, options })
 	}
 
 	#[must_use]
@@ -217,7 +269,7 @@ impl Tool for LocalLearnTool {
 		let cancel = || ctx.cancellation_token.is_cancelled();
 		let result = local_memory::save_learned_lesson(
 			&self.agent_dir,
-			&self.cwd,
+			&ctx.cwd,
 			&SaveInput { content: memory, context },
 			Some(&cancel),
 		)
@@ -650,6 +702,43 @@ mod tests {
 		let deleted = tool.execute(&json!({ "action": "delete", "name": "deploy" }), &ctx()).await.expect("delete");
 		assert_eq!(deleted.content, "Deleted managed skill \"deploy\".");
 		assert!(snapshot.find("deploy").is_none());
+	}
+
+	#[test]
+	fn auto_continue_gate_requires_enabled_auto_continue_and_threshold() {
+		let mut config = crate::config::Config::default();
+		assert!(!should_auto_capture(&config, 99, false, false, false, true));
+		config.autolearn.enabled = Some(true);
+		assert!(!should_auto_capture(&config, 99, false, false, false, true));
+		config.autolearn.auto_continue = Some(true);
+		assert!(!should_auto_capture(&config, 4, false, false, false, true));
+		assert!(should_auto_capture(&config, 5, false, false, false, true));
+		assert!(!should_auto_capture(&config, 5, true, false, false, true));
+		assert!(!should_auto_capture(&config, 5, false, true, false, true));
+		assert!(!should_auto_capture(&config, 5, false, false, true, true));
+		assert!(!should_auto_capture(&config, 5, false, false, false, false));
+		config.autolearn.min_tool_calls = Some(1);
+		assert!(should_auto_capture(&config, 1, false, false, false, true));
+	}
+
+	#[test]
+	fn turn_gate_allows_idle_plan_but_blocks_cancel_active_plan_and_goals() {
+		let mut config = crate::config::Config::default();
+		assert!(config.plan.enabled(), "default PlanGate feature is enabled");
+		config.autolearn.enabled = Some(true);
+		config.autolearn.auto_continue = Some(true);
+		config.autolearn.min_tool_calls = Some(1);
+		assert!(
+			should_capture_turn(&config, 1, false, false, false, false, true),
+			"feature enabled with no active plan must capture"
+		);
+		assert!(!should_capture_turn(&config, 1, true, false, false, false, true));
+		assert!(!should_capture_turn(&config, 1, false, true, false, false, true));
+		assert!(
+			!should_capture_turn(&config, 1, false, false, true, false, true),
+			"a turn that started in goal mode blocks capture even after completing it"
+		);
+		assert!(!should_capture_turn(&config, 1, false, false, false, true, true));
 	}
 
 	#[tokio::test]

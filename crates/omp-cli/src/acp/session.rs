@@ -32,7 +32,10 @@ use std::{
 };
 
 use async_trait::async_trait;
-use pi_agent::{CancellationToken, state::ContentPart as AgentContentPart};
+use pi_agent::{
+	CancellationToken,
+	state::{ContentPart as AgentContentPart, StopReason},
+};
 use serde_json::{Value, json};
 
 use crate::{
@@ -52,7 +55,7 @@ use crate::{
 	},
 	runtime,
 	session::{self as session_store, SessionHeader, SessionOptions, compute_default_session_dir},
-	skills::Skill,
+	skills::{self, LoadOptions, SkillSnapshot},
 };
 
 use super::{
@@ -115,7 +118,6 @@ pub struct AcpRecipe {
 	pub runner: Arc<dyn AgentRunner>,
 	pub config: Config,
 	pub prompts: Prompts,
-	pub skills: Vec<Skill>,
 	pub catalog: Arc<Catalog>,
 	pub resolver: Arc<dyn CredentialResolver>,
 	pub approval_mode: ApprovalMode,
@@ -147,7 +149,6 @@ impl AcpRecipe {
 		runner: Arc<dyn AgentRunner>,
 		config: Config,
 		prompts: Prompts,
-		skills: Vec<Skill>,
 		catalog: Arc<Catalog>,
 		resolver: Arc<dyn CredentialResolver>,
 	) -> Self {
@@ -155,7 +156,6 @@ impl AcpRecipe {
 			runner,
 			config,
 			prompts,
-			skills,
 			catalog,
 			resolver,
 			approval_mode: ApprovalMode::AlwaysAsk,
@@ -296,12 +296,23 @@ impl AcpRuntime {
 			no_title: false,
 			parent_session: None,
 		};
+		// One snapshot per ACP top-level session, discovered for this session's
+		// cwd; `skill://` and the auto-learn tools share this instance only.
+		let skill_options = LoadOptions::from_config(&self.recipe.config, &cwd, false, &[]);
+		let skill_snapshot = SkillSnapshot::new();
+		let loaded = skills::load_with(&skill_options)
+			.map_err(|error| RequestError::new(INTERNAL_ERROR, error.to_string()))?;
+		for warning in &loaded.warnings {
+			eprintln!("warning: {}", warning.message);
+		}
+		skill_snapshot.set(loaded.entries);
 		let launch = RpcLaunch {
 			runner: Arc::clone(&self.recipe.runner),
 			config: self.recipe.config.clone(),
 			cwd: cwd.clone(),
 			prompts: self.recipe.prompts.clone(),
-			skills: self.recipe.skills.clone(),
+			skill_snapshot,
+			skill_options,
 			catalog: Arc::clone(&self.recipe.catalog),
 			agent_db: PathBuf::new(),
 			// ACP hosts toggle tiers over the RPC protocol; there is no launch flag.
@@ -523,10 +534,29 @@ pub(crate) type CloseHook = Arc<dyn Fn(&str) + Send + Sync>;
 struct TurnDone {
 	stop_reason: String,
 	usage: Option<Value>,
-	error: Option<RequestError>,
+	pub error: Option<RequestError>,
+}
+
+/// Active plan mode, not the `plan.enabled` feature flag: an idle session with
+/// the feature on must still allow auto-learn capture.
+fn plan_is_active(gate: &PlanGate) -> bool {
+	gate.state.as_ref().is_some_and(|state| state.enabled)
+}
+
+/// TS reads `stopReason` from the last assistant message; the typed message
+/// reason wins, and the event's wire string is only the fallback.
+fn assistant_aborted(reason: Option<StopReason>, event: Option<&str>) -> bool {
+	reason
+		.map(|reason| reason == StopReason::Aborted)
+		.or_else(|| event.map(|value| value == "aborted"))
+		.unwrap_or(false)
 }
 
 impl AcpSession {
+	fn plan_active(&self) -> bool {
+		plan_is_active(&self.lock_plan())
+	}
+
 	#[must_use]
 	pub fn id(&self) -> &str {
 		&self.id
@@ -849,7 +879,13 @@ impl AcpSession {
 			}
 		}
 		let (text, images) = convert_prompt_blocks(prompt)?;
-		let mut text = text;
+		let mut text = match self.lock().expand_skill_command(&text) {
+			Ok(text) => text,
+			Err(error) => {
+				eprintln!("warning: {error}");
+				text
+			},
+		};
 		let ordinary_plan = self.runtime.recipe.tools_enabled
 			&& self.plan_yolo.as_ref().is_none_or(|shared| {
 				shared.is_completed() || shared.is_abandoned()
@@ -1149,6 +1185,9 @@ impl AcpSession {
 		let mut last_stop = String::new();
 		let mut last_calls: Vec<PlanToolCall> = Vec::new();
 		let mut stream_error: Option<String> = None;
+		let mut capture_tool_calls = 0usize;
+		let turn_started_in_goal = session.goal.has_goal();
+		let mut last_assistant_aborted = false;
 		let runner = Arc::clone(&self.runtime.recipe.runner);
 		match runner.run(&request) {
 			Ok(stream) => {
@@ -1158,6 +1197,10 @@ impl AcpSession {
 							session.observe_event(&mut prepared, &event);
 							match &event {
 								AgentEvent::MessageEnd { message, stop_reason, .. } => {
+									if message.role == pi_agent::state::Role::Assistant {
+										last_assistant_aborted =
+											assistant_aborted(message.stop_reason, stop_reason.as_deref());
+									}
 									if stop_reason.is_some() {
 										last_stop = stop_reason.clone().unwrap_or_default();
 									}
@@ -1178,6 +1221,7 @@ impl AcpSession {
 									last_stop = stop_reason.clone();
 								},
 								AgentEvent::ToolEnd { id, tool, .. } => {
+									capture_tool_calls += 1;
 									let args = map.tool_args.get(id);
 									let mut plan = self.lock_plan();
 									plan::observe_tool_end(&mut plan.settle, tool, args);
@@ -1280,7 +1324,7 @@ impl AcpSession {
 			"title": title,
 			"updatedAt": output::iso8601(SystemTime::now()),
 		}));
-		TurnDone {
+		let done = TurnDone {
 			stop_reason,
 			usage,
 			error: outcome
@@ -1291,7 +1335,43 @@ impl AcpSession {
 						.map(|message| RequestError::new(INTERNAL_ERROR, message))
 				})
 				.or(plan_error),
+		};
+		// TS `AutoLearnController` (autoContinue): ACP goes through the same SDK
+		// session, so a substantive successful turn gets one isolated capture
+		// turn. Build the request under the session lock, then release it before
+		// the provider call so host commands are not blocked by capture.
+		let capture = if done.error.is_none() {
+			let (manage, learn) = session.autolearn_tool_presence();
+			let goal_now = session.goal.has_goal();
+			let plan_active = self.plan_active();
+			let aborted = cancelled || last_assistant_aborted;
+			crate::autolearn::should_capture_turn(
+				&session.config,
+				capture_tool_calls,
+				aborted,
+				plan_active,
+				turn_started_in_goal,
+				goal_now,
+				manage || learn,
+			)
+			.then(|| session.autolearn_capture_request())
+		} else {
+			None
+		};
+		drop(session);
+		if let Some(result) = capture {
+			let result = result.and_then(|request| {
+				let stream = runner.run(&request)?;
+				for event in stream {
+					event?;
+				}
+				Ok(())
+			});
+			if let Err(error) = result {
+				eprintln!("warning: auto-learn capture failed: {error}");
+			}
 		}
+		done
 	}
 
 	/// Exact reverse-call surface for the pi-agent tool composition slice.
@@ -3714,7 +3794,65 @@ impl AcpSession {
 mod tests {
 	use std::sync::Arc;
 
-	use super::{PromptGate, ReserveOpen, SessionManager};
+	use super::{
+		PromptGate, ReserveOpen, SessionManager, assistant_aborted, plan_is_active,
+	};
+
+	#[test]
+	fn capture_gate_uses_active_plan_state_not_the_feature_flag() {
+		use crate::acp::plan::{AcpPlanState, PlanGate};
+		use crate::autolearn::should_capture_turn;
+
+		let mut config = crate::config::Config::default();
+		assert!(config.plan.enabled(), "plan feature defaults to enabled");
+		config.autolearn.enabled = Some(true);
+		config.autolearn.auto_continue = Some(true);
+		config.autolearn.min_tool_calls = Some(1);
+
+		let mut gate = PlanGate::new(true);
+		assert!(!plan_is_active(&gate), "feature enabled, plan idle");
+		assert!(should_capture_turn(
+			&config,
+			1,
+			false,
+			plan_is_active(&gate),
+			false,
+			false,
+			true
+		));
+		gate.state = Some(AcpPlanState::enter(None));
+		assert!(plan_is_active(&gate));
+		assert!(!should_capture_turn(
+			&config,
+			1,
+			false,
+			plan_is_active(&gate),
+			false,
+			false,
+			true
+		));
+	}
+
+	#[test]
+	fn capture_gate_skips_cancelled_aborted_and_completed_goal_turns() {
+		use crate::autolearn::should_capture_turn;
+		use pi_agent::state::StopReason;
+
+		let mut config = crate::config::Config::default();
+		config.autolearn.enabled = Some(true);
+		config.autolearn.auto_continue = Some(true);
+		config.autolearn.min_tool_calls = Some(1);
+		assert!(assistant_aborted(Some(StopReason::Aborted), None));
+		assert!(assistant_aborted(None, Some("aborted")));
+		assert!(
+			!assistant_aborted(Some(StopReason::Stop), Some("aborted")),
+			"the typed message reason wins over the event string"
+		);
+		assert!(!assistant_aborted(Some(StopReason::Stop), Some("end_turn")));
+		assert!(!should_capture_turn(&config, 1, true, false, false, false, true));
+		assert!(!should_capture_turn(&config, 1, false, false, true, false, true));
+		assert!(should_capture_turn(&config, 1, false, false, false, false, true));
+	}
 
 	#[test]
 	fn reservation_blocks_duplicate_open_until_dropped() {

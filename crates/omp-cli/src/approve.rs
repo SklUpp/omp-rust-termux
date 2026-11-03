@@ -168,6 +168,10 @@ pub fn classify_tool(name: &str, args: &serde_json::Value) -> ToolTier {
 				ToolTier::Exec
 			}
 		},
+		// Auto-learn mutates durable memory and the managed-skill library.
+		// Upstream `learn` is write-tier for a skill payload or the local
+		// backend (the only backend wired here); `manage_skill` is always write.
+		"learn" | "manage_skill" => ToolTier::Write,
 		// MCP tools and unknown tools default to conservative Exec
 		_ => ToolTier::Exec,
 	}

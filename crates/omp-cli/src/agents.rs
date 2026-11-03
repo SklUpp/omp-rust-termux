@@ -513,7 +513,8 @@ pub fn print_unpack(summary: &UnpackSummary, json: bool) -> Result<()> {
 /// writes. Every field `parse_agent` populates is written back, including
 /// explicit empty `tools`/`spawns` allowlists and the `readSummarize`,
 /// `prewalk`, `advisor`, `autoloadSkills` metadata. The runtime still rejects
-/// the unsupported hand-off/skill capabilities at spawn time.
+/// unsupported hand-offs (advisor) at spawn time; `autoloadSkills` resolves
+/// through the session snapshot.
 pub fn serialize_agent(agent: &AgentDefinition) -> String {
 	let mut frontmatter = String::new();
 	yaml_scalar(&mut frontmatter, "name", &agent.name);

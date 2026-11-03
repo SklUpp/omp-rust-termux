@@ -24,6 +24,7 @@ use omp_cli::{
 	catalog::{Catalog, ModelInfo},
 	config::{Config, ProviderConfig},
 	prompts::Prompts,
+	skills::{LoadOptions, SkillSnapshot},
 	rpc::{
 		auth::LOGIN_IN_PROGRESS,
 		frame::{MAX_RPC_FRAME_BYTES, RpcFrameDecoder, RpcFrameEncoder},
@@ -645,7 +646,8 @@ fn launch(port: u16, model: &str, provider: &str) -> RpcLaunch {
 		config,
 		cwd: cwd.clone(),
 		prompts: Prompts::default(),
-		skills: Vec::new(),
+		skill_snapshot: SkillSnapshot::new(),
+		skill_options: LoadOptions::new(cwd.clone()),
 		catalog: Arc::new(Catalog::default()),
 		agent_db: agent_db_path(),
 		service_tier_explicit: false,

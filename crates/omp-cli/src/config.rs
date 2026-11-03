@@ -21,6 +21,7 @@ use pi_agent::tools::web_search::SearxngConfig;
 use crate::{
 	Error, Result,
 	approve::ApprovalMode,
+	autolearn::MemoryBackend,
 	dirs,
 	yaml::{self, Value},
 };
@@ -539,6 +540,167 @@ impl EvalConfig {
 	}
 }
 
+/// `autolearn.*`: the experimental post-stop capture surface.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AutolearnConfig {
+	/// `autolearn.enabled`; absent means off.
+	pub enabled:        Option<bool>,
+	/// `autolearn.autoContinue`; absent means passive guidance only.
+	pub auto_continue:  Option<bool>,
+	/// `autolearn.minToolCalls`; absent means [`DEFAULT_MIN_TOOL_CALLS`].
+	pub min_tool_calls: Option<usize>,
+}
+
+/// TS `DEFAULT_MIN_TOOL_CALLS` (`autolearn/controller.ts:21`).
+pub const DEFAULT_MIN_TOOL_CALLS: usize = 5;
+
+impl AutolearnConfig {
+	#[must_use]
+	pub fn enabled(&self) -> bool {
+		self.enabled == Some(true)
+	}
+
+	#[must_use]
+	pub fn auto_continue(&self) -> bool {
+		self.auto_continue == Some(true)
+	}
+
+	#[must_use]
+	pub fn min_tool_calls(&self) -> usize {
+		self.min_tool_calls.unwrap_or(DEFAULT_MIN_TOOL_CALLS)
+	}
+
+	fn merge(&mut self, overlay: Self) {
+		if overlay.enabled.is_some() {
+			self.enabled = overlay.enabled;
+		}
+		if overlay.auto_continue.is_some() {
+			self.auto_continue = overlay.auto_continue;
+		}
+		if overlay.min_tool_calls.is_some() {
+			self.min_tool_calls = overlay.min_tool_calls;
+		}
+	}
+}
+
+/// `skills.*`: discovery toggles, custom roots and name filters.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SkillsConfig {
+	pub enabled:                 Option<bool>,
+	pub enable_skill_commands:   Option<bool>,
+	pub enable_codex_user:       Option<bool>,
+	pub enable_claude_user:      Option<bool>,
+	pub enable_claude_project:   Option<bool>,
+	pub enable_pi_user:          Option<bool>,
+	pub enable_pi_project:       Option<bool>,
+	pub enable_agents_user:      Option<bool>,
+	pub enable_agents_project:   Option<bool>,
+	pub custom_directories:      Option<Vec<PathBuf>>,
+	pub ignored_skills:          Option<Vec<String>>,
+	pub include_skills:          Option<Vec<String>>,
+}
+
+impl SkillsConfig {
+	#[must_use]
+	pub fn enabled(&self) -> bool {
+		self.enabled.unwrap_or(true)
+	}
+
+	#[must_use]
+	pub fn enable_skill_commands(&self) -> bool {
+		self.enable_skill_commands.unwrap_or(true)
+	}
+
+	#[must_use]
+	pub fn enable_codex_user(&self) -> bool {
+		self.enable_codex_user.unwrap_or(true)
+	}
+
+	#[must_use]
+	pub fn enable_claude_user(&self) -> bool {
+		self.enable_claude_user.unwrap_or(true)
+	}
+
+	#[must_use]
+	pub fn enable_claude_project(&self) -> bool {
+		self.enable_claude_project.unwrap_or(true)
+	}
+
+	#[must_use]
+	pub fn enable_pi_user(&self) -> bool {
+		self.enable_pi_user.unwrap_or(true)
+	}
+
+	#[must_use]
+	pub fn enable_pi_project(&self) -> bool {
+		self.enable_pi_project.unwrap_or(true)
+	}
+
+	#[must_use]
+	pub fn enable_agents_user(&self) -> bool {
+		self.enable_agents_user.unwrap_or(true)
+	}
+
+	#[must_use]
+	pub fn enable_agents_project(&self) -> bool {
+		self.enable_agents_project.unwrap_or(true)
+	}
+
+	#[must_use]
+	pub fn custom_directories(&self) -> &[PathBuf] {
+		self.custom_directories.as_deref().unwrap_or_default()
+	}
+
+	#[must_use]
+	pub fn ignored_skills(&self) -> &[String] {
+		self.ignored_skills.as_deref().unwrap_or_default()
+	}
+
+	#[must_use]
+	pub fn include_skills(&self) -> &[String] {
+		self.include_skills.as_deref().unwrap_or_default()
+	}
+
+	fn merge(&mut self, overlay: Self) {
+		if overlay.enabled.is_some() {
+			self.enabled = overlay.enabled;
+		}
+		if overlay.enable_skill_commands.is_some() {
+			self.enable_skill_commands = overlay.enable_skill_commands;
+		}
+		if overlay.enable_codex_user.is_some() {
+			self.enable_codex_user = overlay.enable_codex_user;
+		}
+		if overlay.enable_claude_user.is_some() {
+			self.enable_claude_user = overlay.enable_claude_user;
+		}
+		if overlay.enable_claude_project.is_some() {
+			self.enable_claude_project = overlay.enable_claude_project;
+		}
+		if overlay.enable_pi_user.is_some() {
+			self.enable_pi_user = overlay.enable_pi_user;
+		}
+		if overlay.enable_pi_project.is_some() {
+			self.enable_pi_project = overlay.enable_pi_project;
+		}
+		if overlay.enable_agents_user.is_some() {
+			self.enable_agents_user = overlay.enable_agents_user;
+		}
+		if overlay.enable_agents_project.is_some() {
+			self.enable_agents_project = overlay.enable_agents_project;
+		}
+		if overlay.custom_directories.is_some() {
+			self.custom_directories = overlay.custom_directories;
+		}
+		if overlay.ignored_skills.is_some() {
+			self.ignored_skills = overlay.ignored_skills;
+		}
+		if overlay.include_skills.is_some() {
+			self.include_skills = overlay.include_skills;
+		}
+	}
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Config {
 	pub default_model:        Option<String>,
@@ -559,6 +721,16 @@ pub struct Config {
 	pub goal:                 GoalConfig,
 	/// `plan.*`: ACP plan-mode enablement.
 	pub plan:                 PlanConfig,
+	/// `memory.backend`; `None` falls back to the legacy `memories.enabled`.
+	pub memory_backend:       Option<MemoryBackend>,
+	/// Legacy `memories.enabled`, migrated to `memory.backend` by TS settings.
+	pub memories_enabled:     Option<bool>,
+	/// `memories.summaryInjectionTokenLimit`; absent means 5000.
+	pub memories_summary_injection_token_limit: Option<usize>,
+	/// `autolearn.*`: post-stop capture settings.
+	pub autolearn:            AutolearnConfig,
+	/// `skills.*`: discovery toggles and filters.
+	pub skills:               SkillsConfig,
 	/// `prewalk.*`: one-way model switch for fresh sessions.
 	pub prewalk:              PrewalkConfig,
 	/// `security.enabled` (flat leaf; nested group for a typed home).
@@ -592,6 +764,9 @@ pub struct Config {
 	/// `disabledProviders`; path-scoped groups resolve against the run cwd in
 	/// [`Config::disabled_providers`].
 	pub disabled_providers:   Option<Vec<DisabledProviderEntry>>,
+	/// Top-level `disabledExtensions`; `skill:<name>` ids disable skills for
+	/// every surface that reads the session snapshot.
+	pub disabled_extensions:  Option<Vec<String>>,
 	/// `task.agentModelOverrides` (string or list per agent).
 	pub agent_model_overrides: BTreeMap<String, Vec<String>>,
 	/// `task.maxRecursionDepth`.
@@ -625,6 +800,28 @@ pub struct Config {
 }
 
 impl Config {
+	/// Effective memory backend. An explicit `memory.backend` wins; otherwise
+	/// the legacy `memories.enabled` boolean maps exactly like the TS settings
+	/// migration (`config/settings.ts:1934-1945`): `true` -> `local`, `false`
+	/// -> `off`. Unset everywhere means `off`.
+	#[must_use]
+	pub fn memory_backend(&self) -> MemoryBackend {
+		self.memory_backend
+			.or_else(|| {
+				self.memories_enabled
+					.map(|enabled| if enabled { MemoryBackend::Local } else { MemoryBackend::Off })
+			})
+			.unwrap_or(MemoryBackend::Off)
+	}
+
+	/// `memories.summaryInjectionTokenLimit`, default 5000.
+	#[must_use]
+	pub fn summary_injection_token_limit(&self) -> usize {
+		self
+			.memories_summary_injection_token_limit
+			.unwrap_or(crate::local_memory::DEFAULT_SUMMARY_INJECTION_TOKEN_LIMIT)
+	}
+
 	pub fn merge(&mut self, overlay: Self) {
 		if overlay.default_model.is_some() {
 			self.default_model = overlay.default_model;
@@ -652,6 +849,18 @@ impl Config {
 		self.checkpoint.merge(overlay.checkpoint);
 		self.goal.merge(overlay.goal);
 		self.plan.merge(overlay.plan);
+		self.autolearn.merge(overlay.autolearn);
+		self.skills.merge(overlay.skills);
+		if overlay.memory_backend.is_some() {
+			self.memory_backend = overlay.memory_backend;
+		}
+		if overlay.memories_enabled.is_some() {
+			self.memories_enabled = overlay.memories_enabled;
+		}
+		if overlay.memories_summary_injection_token_limit.is_some() {
+			self.memories_summary_injection_token_limit =
+				overlay.memories_summary_injection_token_limit;
+		}
 		self.prewalk.merge(overlay.prewalk);
 		self.security.merge(overlay.security);
 		self.eval_config.merge(overlay.eval_config);
@@ -705,6 +914,9 @@ impl Config {
 		}
 		if overlay.disabled_providers.is_some() {
 			self.disabled_providers = overlay.disabled_providers;
+		}
+		if overlay.disabled_extensions.is_some() {
+			self.disabled_extensions = overlay.disabled_extensions;
 		}
 		for (agent, patterns) in overlay.agent_model_overrides {
 			self.agent_model_overrides.insert(agent, patterns);
@@ -1008,6 +1220,12 @@ impl Config {
 		ids
 	}
 
+	/// Top-level `disabledExtensions`, defaulting to empty.
+	#[must_use]
+	pub fn disabled_extensions(&self) -> &[String] {
+		self.disabled_extensions.as_deref().unwrap_or_default()
+	}
+
 	/// Apply dedicated CLI flags after the layered load. Runtime overrides are
 	/// the highest settings layer (`docs/settings.md` order 1) and are never
 	/// persisted: flags replace the file value even when the file set one.
@@ -1127,6 +1345,13 @@ fn apply_nested_settings(config: &mut Config, value: &Value, path: &Path) -> Res
 	if let Some(disabled) = value.get("disabledProviders") {
 		config.disabled_providers = Some(parse_disabled_providers(disabled, path)?);
 	}
+	if let Some(disabled) = value.get("disabledExtensions") {
+		config.disabled_extensions = Some(expect_list_of_text(
+			disabled,
+			"disabledExtensions",
+			path,
+		)?);
+	}
 	if let Some(roles) = value.get("modelRoles").and_then(Value::as_map) {
 		for (role, pattern) in roles {
 			let Some(pattern) = expect_text(pattern, &format!("modelRoles.{role}"), path)? else {
@@ -1136,6 +1361,94 @@ fn apply_nested_settings(config: &mut Config, value: &Value, path: &Path) -> Res
 				config.default_model = Some(pattern.clone());
 			}
 			config.model_roles.insert(role.clone(), pattern);
+		}
+	}
+	if let Some(backend) = settings_leaf(value, "memory", "backend", "memory.backend") {
+		// `mnemosyne` is the pre-rename spelling the TS settings migration
+		// rewrites to `mnemopi`; accept it so an unmigrated file still works.
+		config.memory_backend = match expect_text(backend, "memory.backend", path)? {
+			Some(raw) if raw == "mnemosyne" => Some(MemoryBackend::Mnemopi),
+			Some(raw) => Some(MemoryBackend::parse(&raw).ok_or_else(|| {
+				invalid(path, "memory.backend", "expected off, local, hindsight or mnemopi")
+			})?),
+			None => None,
+		};
+	}
+	if let Some(enabled) = settings_leaf(value, "memories", "enabled", "memories.enabled") {
+		config.memories_enabled = expect_bool(enabled, "memories.enabled", path)?;
+	}
+	if let Some(limit) = settings_leaf(
+		value,
+		"memories",
+		"summaryInjectionTokenLimit",
+		"memories.summaryInjectionTokenLimit",
+	) {
+		config.memories_summary_injection_token_limit =
+			expect_usize(limit, "memories.summaryInjectionTokenLimit", path)?;
+	}
+	for (leaf, dotted) in [
+		("enabled", "autolearn.enabled"),
+		("autoContinue", "autolearn.autoContinue"),
+		("minToolCalls", "autolearn.minToolCalls"),
+	] {
+		let Some(item) = settings_leaf(value, "autolearn", leaf, dotted) else {
+			continue;
+		};
+		match leaf {
+			"enabled" => config.autolearn.enabled = expect_bool(item, dotted, path)?,
+			"autoContinue" => config.autolearn.auto_continue = expect_bool(item, dotted, path)?,
+			"minToolCalls" => config.autolearn.min_tool_calls = expect_usize(item, dotted, path)?,
+			_ => {},
+		}
+	}
+	for (leaf, dotted) in [
+		("enabled", "skills.enabled"),
+		("enableSkillCommands", "skills.enableSkillCommands"),
+		("enableCodexUser", "skills.enableCodexUser"),
+		("enableClaudeUser", "skills.enableClaudeUser"),
+		("enableClaudeProject", "skills.enableClaudeProject"),
+		("enablePiUser", "skills.enablePiUser"),
+		("enablePiProject", "skills.enablePiProject"),
+		("enableAgentsUser", "skills.enableAgentsUser"),
+		("enableAgentsProject", "skills.enableAgentsProject"),
+	] {
+		let Some(item) = settings_leaf(value, "skills", leaf, dotted) else {
+			continue;
+		};
+		let parsed = expect_bool(item, dotted, path)?;
+		match leaf {
+			"enabled" => config.skills.enabled = parsed,
+			"enableSkillCommands" => config.skills.enable_skill_commands = parsed,
+			"enableCodexUser" => config.skills.enable_codex_user = parsed,
+			"enableClaudeUser" => config.skills.enable_claude_user = parsed,
+			"enableClaudeProject" => config.skills.enable_claude_project = parsed,
+			"enablePiUser" => config.skills.enable_pi_user = parsed,
+			"enablePiProject" => config.skills.enable_pi_project = parsed,
+			"enableAgentsUser" => config.skills.enable_agents_user = parsed,
+			"enableAgentsProject" => config.skills.enable_agents_project = parsed,
+			_ => {},
+		}
+	}
+	if let Some(item) = settings_leaf(value, "skills", "customDirectories", "skills.customDirectories") {
+		config.skills.custom_directories = Some(
+			expect_list_of_text(item, "skills.customDirectories", path)?
+				.into_iter()
+				.map(PathBuf::from)
+				.collect(),
+		);
+	}
+	for (leaf, dotted) in [
+		("ignoredSkills", "skills.ignoredSkills"),
+		("includeSkills", "skills.includeSkills"),
+	] {
+		let Some(item) = settings_leaf(value, "skills", leaf, dotted) else {
+			continue;
+		};
+		let parsed = Some(expect_list_of_text(item, dotted, path)?);
+		match leaf {
+			"ignoredSkills" => config.skills.ignored_skills = parsed,
+			"includeSkills" => config.skills.include_skills = parsed,
+			_ => {},
 		}
 	}
 	if let Some(task) = value.get("task").and_then(Value::as_map) {
@@ -2412,6 +2725,69 @@ mod tests {
 		let overlay = parse_config("ask:\n  timeout: 0\n").expect("overlay");
 		base.merge(overlay);
 		assert_eq!(base.ask.timeout(), None, "explicit 0 must disable a lower layer");
+	}
+
+	#[test]
+	fn memory_autolearn_and_skills_settings_parse_like_ts() {
+		let defaults = Config::default();
+		assert_eq!(defaults.memory_backend(), MemoryBackend::Off);
+		assert!(!defaults.autolearn.enabled());
+		assert!(!defaults.autolearn.auto_continue());
+		assert_eq!(defaults.autolearn.min_tool_calls(), DEFAULT_MIN_TOOL_CALLS);
+		assert!(defaults.skills.enabled());
+		assert!(defaults.skills.enable_skill_commands());
+		assert!(defaults.skills.enable_pi_project());
+		assert!(defaults.skills.custom_directories().is_empty());
+
+		let explicit = parse_config(
+			"memory:\n  backend: local\nautolearn:\n  enabled: true\n  autoContinue: true\n  \
+			 minToolCalls: 2\nskills:\n  enabled: false\n  enableClaudeProject: false\n  \
+			 customDirectories: [~/shared/skills]\n  ignoredSkills: [draft]\n  \
+			 includeSkills: [rev*]\n",
+		)
+		.expect("settings");
+		assert_eq!(explicit.memory_backend(), MemoryBackend::Local);
+		assert!(explicit.autolearn.enabled());
+		assert!(explicit.autolearn.auto_continue());
+		assert_eq!(explicit.autolearn.min_tool_calls(), 2);
+		assert!(!explicit.skills.enabled());
+		assert!(!explicit.skills.enable_claude_project());
+		assert!(explicit.skills.enable_claude_user());
+		assert_eq!(explicit.skills.custom_directories(), [PathBuf::from("~/shared/skills")]);
+		assert_eq!(explicit.skills.ignored_skills(), ["draft"]);
+		assert_eq!(explicit.skills.include_skills(), ["rev*"]);
+
+		// Dotted settings keys (settings.json style) resolve like nested maps.
+		let dotted = parse_config(
+			"memory.backend: off\nautolearn.enabled: true\nskills.enableSkillCommands: false\n",
+		)
+		.expect("dotted settings");
+		assert_eq!(dotted.memory_backend(), MemoryBackend::Off);
+		assert!(dotted.autolearn.enabled());
+		assert!(!dotted.skills.enable_skill_commands());
+
+		// Legacy `memories.enabled` maps exactly like the TS migration, and an
+		// explicit backend always wins over it.
+		let legacy_on = parse_config("memories:\n  enabled: true\n").expect("legacy on");
+		assert_eq!(legacy_on.memory_backend(), MemoryBackend::Local);
+		let legacy_off = parse_config("memories:\n  enabled: false\n").expect("legacy off");
+		assert_eq!(legacy_off.memory_backend(), MemoryBackend::Off);
+		let explicit_wins =
+			parse_config("memory:\n  backend: off\nmemories:\n  enabled: true\n").expect("wins");
+		assert_eq!(explicit_wins.memory_backend(), MemoryBackend::Off);
+		// `mnemosyne` is the pre-rename spelling the TS migration rewrites.
+		let renamed = parse_config("memory:\n  backend: mnemosyne\n").expect("renamed");
+		assert_eq!(renamed.memory_backend(), MemoryBackend::Mnemopi);
+		assert!(parse_config("memory:\n  backend: nope\n").is_err());
+
+		// Overlays replace only the leaves they set.
+		let mut base = parse_config("autolearn:\n  enabled: true\n  minToolCalls: 9\n")
+			.expect("base");
+		let overlay = parse_config("autolearn:\n  autoContinue: true\n").expect("overlay");
+		base.merge(overlay);
+		assert!(base.autolearn.enabled());
+		assert!(base.autolearn.auto_continue());
+		assert_eq!(base.autolearn.min_tool_calls(), 9);
 	}
 
 	#[test]

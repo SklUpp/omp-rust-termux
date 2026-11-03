@@ -48,6 +48,9 @@ pub struct TaskTool {
 	pub spawns: Option<Spawns>,
 	/// Effective tool allowlist inherited by descendants (privilege ceiling).
 	pub parent_tools: Option<BTreeSet<String>>,
+	/// `autoloadSkills` resolver captured at construction time, so a running
+	/// child's resolver does not change under a later root turn.
+	pub autoload: Option<Arc<dyn AutoloadSkillResolver>>,
 	/// Factory snapshot captured when this tool was created as a nested child;
 	/// `None` for a root tool, which reads the current per-turn snapshot.
 	pub model_factory: Option<Arc<dyn ChildModelFactory>>,
@@ -194,6 +197,7 @@ impl TaskTool {
 		let output_prefix = parent_id
 			.as_deref()
 			.and_then(|parent| supervisor.child_output_id(parent));
+		let autoload = supervisor.autoload_resolver();
 		Self {
 			supervisor,
 			depth,
@@ -203,12 +207,14 @@ impl TaskTool {
 			agent_name: None,
 			spawns: None,
 			parent_tools: None,
+			autoload,
 			model_factory: None,
 			output_prefix,
 		}
 	}
 
 	pub fn with_semaphore(supervisor: Arc<Supervisor>, depth: i32, semaphore: Arc<Semaphore>) -> Self {
+		let autoload = supervisor.autoload_resolver();
 		Self {
 			supervisor,
 			depth,
@@ -218,6 +224,7 @@ impl TaskTool {
 			agent_name: None,
 			spawns: None,
 			parent_tools: None,
+			autoload,
 			model_factory: None,
 			output_prefix: None,
 		}
@@ -718,6 +725,31 @@ impl TaskTool {
 			system_prompt: child_system_prompt(&item.agent, prompt_schema.as_ref()),
 			cwd: child_cwd,
 		};
+		// `autoloadSkills` resolve through this tool's captured session resolver.
+		// Unknown names are skipped; read/containment/cancel errors fail the
+		// spawn instead of silently shrinking the child's context.
+		let autoload_msgs = match autoload_messages(self.autoload.as_deref(), &item.agent) {
+			Ok(messages) => messages,
+			Err(message) => {
+				reservation.disarm();
+				self.supervisor
+					.mark_failed(&child_id, start.elapsed().as_millis() as u64, &message);
+				self.supervisor.unregister_active_child(&child_id);
+				self.supervisor.release_outstanding(&child_id);
+				return single_failure(
+					index,
+					child_id,
+					child_name,
+					agent_name,
+					agent_source,
+					item.task,
+					message,
+					start.elapsed().as_millis() as u64,
+					None,
+					None,
+				);
+			},
+		};
 		// The eval bridge (`run_eval_agent`) spawns with `invocation_task = false`
 		// and must not leave revivable contracts: TS disables keep-alive there.
 		// An isolated child is merged and its worktree dies with the run, so a
@@ -747,9 +779,15 @@ impl TaskTool {
 		};
 		let full_prompt = format!("Complete assignment thoroughly:\n\n{assignment}");
 		let initial_message = Message::user(full_prompt.clone());
-		self
-			.supervisor
-			.append_child_transcript(&child_id, &[&initial_message]);
+		// Persist the autoload messages once, before the assignment; TS stores
+		// them as hidden custom messages rather than user turns.
+		{
+			let mut transcript_messages: Vec<&Message> = autoload_msgs.iter().collect();
+			transcript_messages.push(&initial_message);
+			self
+				.supervisor
+				.append_child_transcript(&child_id, &transcript_messages);
+		}
 		if let Some(manager) = crate::subagent_lifecycle::lookup(&self.supervisor) {
 			manager.seed_live(&child_id, initial_message);
 		}
@@ -781,7 +819,7 @@ impl TaskTool {
 				None => AgentLoop::new(child_config, child_provider, child_registry),
 			}
 			.with_plan(child_plan);
-			let mut child_state = AgentState::default();
+			let mut child_state = AgentState { messages: autoload_msgs, total_turns: 0 };
 			let outcome = child_loop
 				.run_dialog_message_with_cancel(
 					Message::user(full_prompt),
@@ -1256,6 +1294,9 @@ impl TaskTool {
 		// fill must prove it addresses this exact record, never a later one.
 		let spawn_result_key = self.supervisor.capture_result_key(&child_id);
 		let supervisor = self.supervisor.clone();
+		// Capture the resolver with the spawn, like the foreground path: a later
+		// root turn must not change a background child's autoload view.
+		let autoload = self.autoload.clone();
 		// Per-`TaskTool` (per-session) permits: nested spawns use their own
 		// semaphore, so a parent holding a permit while waiting for descendants
 		// cannot deadlock when every parent permit is occupied.
@@ -1297,6 +1338,7 @@ impl TaskTool {
 			}
 			let outcome = run_background_child(
 				supervisor.clone(),
+				autoload,
 				task_id.clone(),
 				item,
 				cwd,
@@ -1669,6 +1711,7 @@ enum TerminalMark {
 /// a background job.
 async fn run_background_child(
 	supervisor: Arc<Supervisor>,
+	autoload: Option<Arc<dyn AutoloadSkillResolver>>,
 	child_id: String,
 	item: TaskItemSpec,
 	cwd: std::path::PathBuf,
@@ -1734,6 +1777,8 @@ async fn run_background_child(
 		system_prompt: child_system_prompt(&item.agent, prompt_schema.as_ref()),
 		cwd: child_cwd,
 	};
+	let autoload_msgs = autoload_messages(autoload.as_deref(), &item.agent)
+		.map_err(AgentError::Internal)?;
 	// An isolated child is merged and its worktree is deleted after finalize,
 	// so a revivable contract would restore it into a stale workspace.
 	if isolation.is_none() {
@@ -1758,7 +1803,11 @@ async fn run_background_child(
 	};
 	let full_prompt = format!("Complete assignment thoroughly:\n\n{assignment}");
 	let initial_message = Message::user(full_prompt.clone());
-	supervisor.append_child_transcript(&child_id, &[&initial_message]);
+	{
+		let mut transcript_messages: Vec<&Message> = autoload_msgs.iter().collect();
+		transcript_messages.push(&initial_message);
+		supervisor.append_child_transcript(&child_id, &transcript_messages);
+	}
 	if let Some(manager) = crate::subagent_lifecycle::lookup(&supervisor) {
 		manager.seed_live(&child_id, initial_message);
 	}
@@ -1783,7 +1832,7 @@ async fn run_background_child(
 		event_rx,
 		salvage,
 	);
-	let mut child_state = AgentState::default();
+	let mut child_state = AgentState { messages: autoload_msgs, total_turns: 0 };
 	let cancel_for_finalize = cancel.clone();
 	let outcome = child_loop
 		.run_dialog_message_with_cancel(
@@ -2428,6 +2477,36 @@ fn validate_name(name: &str) -> Result<(), ToolError> {
 	}
 }
 
+/// Session-scoped `autoloadSkills` resolver.
+///
+/// Implemented by the host over its session skill snapshot. `Ok(None)` means
+/// the name is unknown and is skipped (TS `filter(skill !== undefined)`);
+/// read/containment/cancellation failures must surface as `Err` instead of
+/// masquerading as an unknown skill.
+pub trait AutoloadSkillResolver: Send + Sync {
+	fn autoload_message(&self, name: &str) -> Result<Option<String>, String>;
+}
+
+/// Render every `autoloadSkills` entry of one agent in declaration order.
+fn autoload_messages(
+	resolver: Option<&dyn AutoloadSkillResolver>,
+	agent: &AgentDefinition,
+) -> Result<Vec<Message>, String> {
+	let Some(resolver) = resolver else {
+		return Ok(Vec::new());
+	};
+	let mut messages = Vec::new();
+	for name in &agent.autoload_skills {
+		match resolver.autoload_message(name)? {
+			Some(message) if !message.is_empty() => {
+				messages.push(Message::guidance("skill-prompt", message));
+			},
+			_ => {},
+		}
+	}
+	Ok(messages)
+}
+
 fn synthetic_task_agent() -> AgentDefinition {
 	AgentDefinition {
 		name: "task".to_string(),
@@ -2458,12 +2537,6 @@ fn check_agent_capabilities(agent: &AgentDefinition) -> Result<(), ToolError> {
 	if agent.advisor.is_some() {
 		return Err(ToolError::InvalidArguments(format!(
 			"Agent '{}' requests an advisor model, which this build does not implement",
-			agent.name
-		)));
-	}
-	if !agent.autoload_skills.is_empty() {
-		return Err(ToolError::InvalidArguments(format!(
-			"Agent '{}' requests autoloadSkills, which this build does not implement",
 			agent.name
 		)));
 	}
@@ -4685,6 +4758,7 @@ mod tests {
 		let (_steering_tx, steering_rx) = tokio::sync::mpsc::channel(1);
 		let _ = run_background_child(
 			Arc::clone(&supervisor),
+			None,
 			"task-bg".to_string(),
 			item,
 			std::path::PathBuf::from("."),
@@ -4705,5 +4779,82 @@ mod tests {
 			!recorded.iter().any(|provider| Arc::ptr_eq(provider, &root)),
 			"background child eval must never fall back to the root provider"
 		);
+	}
+
+	struct FixedAutoload(&'static str);
+
+	impl AutoloadSkillResolver for FixedAutoload {
+		fn autoload_message(&self, _name: &str) -> std::result::Result<Option<String>, String> {
+			Ok(Some(self.0.to_string()))
+		}
+	}
+
+	struct FailingAutoload;
+
+	impl AutoloadSkillResolver for FailingAutoload {
+		fn autoload_message(&self, _name: &str) -> std::result::Result<Option<String>, String> {
+			Err("captured sentinel".to_string())
+		}
+	}
+
+	/// A background spawn must resolve `autoloadSkills` through the resolver it
+	/// captured, not through a later root-turn resolver on the supervisor.
+	#[tokio::test]
+	async fn background_child_uses_the_resolver_captured_at_spawn() {
+		let root: Arc<dyn ModelProvider> = Arc::new(NullProvider);
+		let child: Arc<dyn ModelProvider> = Arc::new(NullProvider);
+		let supervisor = Supervisor::with_selection(
+			ToolRegistry::new(),
+			Arc::clone(&root),
+			None,
+			DelegationLimits::default(),
+			true,
+			false,
+		);
+		supervisor.set_autoload_resolver(Some(Arc::new(FixedAutoload("SUPERVISOR"))));
+		let catalog = Arc::new(
+			AgentCatalog::new(vec![model_agent()], None)
+				.with_model_factory(Arc::new(SharedFactory(child))),
+		);
+		let tool = TaskTool::new(Arc::clone(&supervisor), 0).with_catalog(catalog);
+		let mut agent = model_agent();
+		agent.autoload_skills = vec!["needed".to_string()];
+		let item = TaskItemSpec {
+			name: "task-bg".to_string(),
+			agent,
+			task: "work".to_string(),
+			context: None,
+			output_schema: None,
+			schema_mode: SchemaMode::default(),
+			schema_error: None,
+			effort: None,
+			isolation: IsolationRequest::default(),
+		};
+		let (_steering_tx, steering_rx) = tokio::sync::mpsc::channel(1);
+		let result = run_background_child(
+			Arc::clone(&supervisor),
+			Some(Arc::new(FailingAutoload)),
+			"task-bg".to_string(),
+			item,
+			std::path::PathBuf::from("."),
+			steering_rx,
+			tokio_util::sync::CancellationToken::new(),
+			tool.child_context(),
+			None,
+			Arc::new(Mutex::new(ChildSalvage::default())),
+		)
+		.await;
+		match result {
+			Err(AgentError::Internal(message)) => assert!(
+				message.contains("captured sentinel"),
+				"background child must use the captured resolver, got {message}"
+			),
+			Err(_) => panic!(
+				"expected the captured resolver to fail the spawn with its sentinel, got another error"
+			),
+			Ok(_) => panic!(
+				"expected the captured resolver to fail the spawn, got a background outcome"
+			),
+		}
 	}
 }

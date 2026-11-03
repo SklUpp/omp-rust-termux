@@ -13,6 +13,7 @@ use omp_cli::{
 	agents,
 	approve::{ApprovalMode, Approvals},
 	args::{Cli, Command, normalize_continue_session_args, parse_cli, refused_verb_message},
+	autolearn::{self, LocalLearnTool, ManageSkillTool, MemoryBackend},
 	catalog::Catalog,
 	completions,
 	config::Config,
@@ -25,7 +26,9 @@ use omp_cli::{
 	goal::{self, GoalMode, GoalModeState, GoalPersist, GoalRuntime, RestorePlan, TokenCounters},
 	goal_tool::{GOAL_TOOL_NAME, GoalTool},
 	local_cmd,
+	local_memory,
 	local_models,
+	memory_protocol::MemoryUrlHandler,
 	output::{self, OutputMode, Reporter, session_id},
 	plan_yolo,
 	prewalk,
@@ -40,7 +43,8 @@ use omp_cli::{
 		SessionOptions, SessionStore, TurnBuilder, TurnRecord,
 	},
 	session_checkpoint::CheckpointHost,
-	skills::{self, Skill},
+	skill_protocol::SkillUrlHandler,
+	skills::{self, LoadOptions, SkillSnapshot},
 	tool_commands,
 	worktree_cmd,
 };
@@ -696,8 +700,29 @@ fn run() -> std::result::Result<(), CliError> {
 			.files
 			.retain(|file| file.path.file_name().and_then(|name| name.to_str()) != Some("RULES.md"));
 	}
-	let skills_filter = (cli.no_skills, cli.skills.clone());
-	let loaded_skills = skills::load(&cwd, skills_filter.0, &skills_filter.1)?;
+	let skill_options = LoadOptions::from_config(&config, &cwd, cli.no_skills, &cli.skills);
+	let skill_snapshot = SkillSnapshot::new();
+	let loaded_skills = skills::load_with(&skill_options)?;
+	for warning in &loaded_skills.warnings {
+		eprintln!("warning: {}", warning.message);
+	}
+	skill_snapshot.set(loaded_skills.entries);
+	// One router per top-level session: the `skill://` handler resolves against
+	// this session's snapshot only, never a process-global skill registry.
+	let internal_urls = Arc::new(pi_agent::tools::internal_urls::InternalUrlRouter::new());
+	let _ = internal_urls
+		.register(Arc::new(SkillUrlHandler::new(skill_snapshot.clone())))
+		.map_err(Error::new)?;
+	let memory_agent_dir = skill_options
+		.agent_dir
+		.clone()
+		.unwrap_or_else(dirs::agent_dir);
+	let _ = internal_urls
+		.register(Arc::new(MemoryUrlHandler::new(
+			memory_agent_dir,
+			config.memory_backend(),
+		)))
+		.map_err(Error::new)?;
 	let catalog = Arc::new(Catalog::load(&cwd)?);
 	let approvals = Approvals::new(
 		config.approval_mode.unwrap_or_default(),
@@ -926,7 +951,9 @@ fn run() -> std::result::Result<(), CliError> {
 		config,
 		cwd: cwd.clone(),
 		prompts: loaded_prompts,
-		skills: loaded_skills,
+		skill_snapshot,
+		skill_options,
+		internal_urls,
 		catalog,
 		approvals,
 		model: None,
@@ -942,7 +969,6 @@ fn run() -> std::result::Result<(), CliError> {
 		max_turns: runtime::DEFAULT_MAX_TURNS,
 		tools_enabled: !cli.no_tools,
 		prompt_inputs,
-		skills_filter,
 		store: SessionStore::default(),
 		// Resolved once below, after the session store is opened.
 		service_tier_by_family: std::collections::BTreeMap::new(),
@@ -950,6 +976,8 @@ fn run() -> std::result::Result<(), CliError> {
 		service_tier_recorded: false,
 		history: Vec::new(),
 		checkpoint_host: CheckpointHost::new(),
+		turn_tool_calls: 0,
+		turn_started_in_goal: false,
 		in_memory_messages: None,
 		session_dir: session_dir.clone(),
 		goal: Arc::new(GoalRuntime::new()),
@@ -1034,7 +1062,6 @@ fn run() -> std::result::Result<(), CliError> {
 			runner,
 			session.config.clone(),
 			session.prompts.clone(),
-			session.skills.clone(),
 			Arc::clone(&session.catalog),
 			auth.resolver(),
 		);
@@ -1131,7 +1158,8 @@ fn run() -> std::result::Result<(), CliError> {
 			config: session.config.clone(),
 			cwd: session.cwd.clone(),
 			prompts: session.prompts.clone(),
-			skills: session.skills.clone(),
+			skill_snapshot: session.skill_snapshot.clone(),
+			skill_options: session.skill_options.clone(),
 			catalog: Arc::clone(&session.catalog),
 			// One store for the whole process; the auth bridge opens it before the
 			// session exists and fails startup when it cannot.
@@ -1327,6 +1355,13 @@ fn run() -> std::result::Result<(), CliError> {
 	}
 
 	for (ctx, prompt, parts) in prompts_to_run {
+		let prompt = match session.expand_skill_command(&prompt) {
+			Ok(prompt) => prompt,
+			Err(error) => {
+				eprintln!("warning: {error}");
+				prompt
+			},
+		};
 		if let Err(error) = session.turn(ctx, prompt, parts, mode, &mut reporter) {
 			reporter.finish().ok();
 			session.finish(&native_runner);
@@ -1339,6 +1374,7 @@ fn run() -> std::result::Result<(), CliError> {
 			session.finish(&native_runner);
 			return Err(CliError::from(error));
 		}
+		session.drive_autolearn_capture(mode);
 	}
 	// Last chance for a child that settled after the final turn boundary.
 	session.finish(&native_runner);
@@ -1421,6 +1457,13 @@ fn run_repl<W: Write, E: Write>(
 			},
 			repl::ReplCommand::Cwd(None) => eprintln!("cwd: {}", session.cwd.display()),
 			repl::ReplCommand::Prompt(text) => {
+				let text = match session.expand_skill_command(&text) {
+					Ok(text) => text,
+					Err(error) => {
+						eprintln!("warning: {error}");
+						text
+					},
+				};
 				if let Err(error) = session.turn(None, text, Vec::new(), mode, reporter) {
 					reporter.finish().ok();
 					eprintln!("{error}");
@@ -1432,6 +1475,7 @@ fn run_repl<W: Write, E: Write>(
 					eprintln!("{error}");
 					continue;
 				}
+				session.drive_autolearn_capture(mode);
 				// Text mode buffers the final assistant message until `finish`:
 				// flush it per turn so REPL output is visible immediately instead
 				// of only when `/exit` ends the session.
@@ -1516,7 +1560,11 @@ struct Session<'a> {
 	config: Config,
 	cwd: PathBuf,
 	prompts: Prompts,
-	skills: Vec<Skill>,
+	/// One snapshot per top-level session; tools and `skill://` share it.
+	skill_snapshot: SkillSnapshot,
+	skill_options: LoadOptions,
+	/// Session internal URL router with `skill://` already mounted.
+	internal_urls: Arc<pi_agent::tools::internal_urls::InternalUrlRouter>,
 	catalog: Arc<Catalog>,
 	approvals: Approvals,
 	model: Option<String>,
@@ -1542,7 +1590,6 @@ struct Session<'a> {
 	/// Raw `--system-prompt` / `--append-system-prompt` inputs, kept so a REPL
 	/// `/cwd` re-resolves the project files for the new directory.
 	prompt_inputs: (Option<String>, Option<String>),
-	skills_filter: (bool, Vec<String>),
 	store: SessionStore,
 	/// TS `ServiceTierByFamily`: restored live selection, kept in memory even
 	/// when `--no-session` disables persistence so a downgrade sticks across
@@ -1556,6 +1603,12 @@ struct Session<'a> {
 	service_tier_recorded: bool,
 	history: Vec<TurnRecord>,
 	checkpoint_host: CheckpointHost,
+	/// Tool results in the just-finished turn (TS `tool_execution_end` count),
+	/// consumed by the `autolearn.minToolCalls` gate.
+	turn_tool_calls: usize,
+	/// Goal mode when the just-finished turn started; capture skips the turn
+	/// even if a goal tool completed it.
+	turn_started_in_goal: bool,
 	/// Live branch conversation for `--no-session` runs (no leading system
 	/// message). Rewinds rewrite it; each later request replays it verbatim.
 	in_memory_messages: Option<Vec<pi_agent::Message>>,
@@ -1691,7 +1744,12 @@ impl Session<'_> {
 			self.prompt_inputs.1.as_deref(),
 			&self.cwd,
 		)?;
-		self.skills = skills::load(&self.cwd, self.skills_filter.0, &self.skills_filter.1)?;
+		self.skill_options.cwd = self.cwd.clone();
+		let reloaded = skills::load_with(&self.skill_options)?;
+		for warning in &reloaded.warnings {
+			eprintln!("warning: {}", warning.message);
+		}
+		self.skill_snapshot.set(reloaded.entries);
 		Ok(())
 	}
 
@@ -1719,6 +1777,65 @@ impl Session<'_> {
 		let tool: Arc<dyn pi_agent::tools::Tool> =
 			Arc::new(GoalTool::new(Arc::clone(&self.goal)));
 		vec![ExtraTool::from(tool)]
+	}
+
+	fn agent_dir(&self) -> PathBuf {
+		self.skill_options.agent_dir.clone().unwrap_or_else(dirs::agent_dir)
+	}
+
+	/// Whether this run mounts each auto-learn tool, mirroring TS `isToolAllowed`
+	/// plus the top-level registry gate: `manage_skill` follows
+	/// `autolearn.enabled`, `learn` additionally needs a backend. Only the local
+	/// backend exists in this port, so Mnemopi/Hindsight mount nothing.
+	fn autolearn_tool_presence(&self) -> (bool, bool) {
+		if !self.tools_enabled || !self.config.autolearn.enabled() {
+			return (false, false);
+		}
+		let manage = self.tool_selected(autolearn::MANAGE_SKILL_TOOL_NAME);
+		let learn = matches!(self.config.memory_backend(), MemoryBackend::Local)
+			&& self.tool_selected(autolearn::LEARN_TOOL_NAME);
+		(manage, learn)
+	}
+
+	fn autolearn_extra_tools(&self) -> Vec<ExtraTool> {
+		let (manage, learn) = self.autolearn_tool_presence();
+		let mut tools = Vec::new();
+		if manage && let Some(tool) =
+			ManageSkillTool::create_if(true, self.skill_options.clone(), self.skill_snapshot.clone())
+		{
+			let tool: Arc<dyn pi_agent::tools::Tool> = Arc::new(tool);
+			tools.push(ExtraTool::from(tool));
+		}
+		if learn && let Some(tool) = LocalLearnTool::create_if(
+			true,
+			MemoryBackend::Local,
+			self.skill_options.clone(),
+			self.skill_snapshot.clone(),
+		) {
+			let tool: Arc<dyn pi_agent::tools::Tool> = Arc::new(tool);
+			tools.push(ExtraTool::from(tool));
+		}
+		tools
+	}
+
+	/// TS `appendPrompt` suffixes for a top-level run: the configured append,
+	/// memory guidance, then the auto-learn guidance driven by mounted tools.
+	fn runtime_append_prompt(&self) -> Option<String> {
+		let memory = matches!(self.config.memory_backend(), MemoryBackend::Local)
+			.then(|| {
+				local_memory::build_memory_instructions(
+					&self.agent_dir(),
+					&self.cwd,
+					self.config.summary_injection_token_limit(),
+				)
+			})
+			.flatten();
+		let (manage, learn) = self.autolearn_tool_presence();
+		let autolearn = autolearn::build_auto_learn_instructions(manage, learn);
+		let mut parts: Vec<String> = self.prompts.append.iter().cloned().collect();
+		parts.extend(memory);
+		parts.extend(autolearn);
+		(!parts.is_empty()).then(|| parts.join("\n\n"))
 	}
 
 	/// Session usage at turn start: the goal accounting baseline and budget seed.
@@ -1836,6 +1953,74 @@ impl Session<'_> {
 			)?;
 		}
 		Ok(())
+	}
+
+	/// `/skill:<name>` expansion for the CLI prompt entry points. Unknown names
+	/// and disabled skill commands leave the text untouched.
+	fn expand_skill_command(&self, text: &str) -> Result<String> {
+		if !self.skill_options.enable_skill_commands {
+			return Ok(text.to_string());
+		}
+		Ok(skills::expand_skill_invocation(&self.skill_snapshot, text)?
+			.unwrap_or_else(|| text.to_string()))
+	}
+
+	/// TS `AutoLearnController` auto-continue arm: run one isolated capture pass
+	/// after a substantive turn. The capture reuses this conversation prefix and
+	/// model but mounts only `manage_skill`/`learn`, drops goal/plan context and
+	/// never writes to this session's journal.
+	fn drive_autolearn_capture(&mut self, mode: OutputMode) {
+		let (manage, learn) = self.autolearn_tool_presence();
+		let goal_now = self.goal.has_goal();
+		let plan_active = self
+			.plan_yolo
+			.as_ref()
+			.is_some_and(|shared| shared.is_armed());
+		if !autolearn::should_capture_turn(
+			&self.config,
+			self.turn_tool_calls,
+			false,
+			plan_active,
+			self.turn_started_in_goal,
+			goal_now,
+			manage || learn,
+		) {
+			return;
+		}
+		let result = (|| -> Result<()> {
+			let mut request =
+				self.request(autolearn::auto_learn_nudge().to_string(), Vec::new(), mode)?;
+			request.session_persisted = false;
+			request.session_file = None;
+			request.session_id = None;
+			request.child_session_root = None;
+			request.checkpoint_controller = None;
+			request.turn_ack = None;
+			request.goal = None;
+			request.goal_context = None;
+			request.plan_context = None;
+			request.todo_phases = Vec::new();
+			request.acp_bridge = None;
+			request.extra_mcp_servers = Vec::new();
+			request.config.tools = Some(Vec::new());
+			request.extra_tools = self.autolearn_extra_tools();
+			// Plan hooks stay off: plan mode is gated out above and a capture
+			// must never stage or approve plan writes.
+			request.plan_mode = agent::PlanModeHooks::default();
+			// Capability ceiling: no MCP, no extension/eval bridge for capture.
+			request.tool_ceiling = Some(agent::ToolCeiling {
+				exclude_mcp:             true,
+				exclude_extension_tools: true,
+			});
+			let stream = self.runner.run(&request)?;
+			for event in stream {
+				event?;
+			}
+			Ok(())
+		})();
+		if let Err(error) = result {
+			eprintln!("warning: auto-learn capture failed: {error}");
+		}
 	}
 
 	fn plan_artifacts(&self) -> Option<PathBuf> {
@@ -1964,9 +2149,9 @@ impl Session<'_> {
 			provider_session_id: self.provider_session_id.clone(),
 			prompt_cache_key: self.prompt_cache_key.clone(),
 			system_prompt: self.prompts.system.clone(),
-			append_system_prompt: self.prompts.append.clone(),
+			append_system_prompt: self.runtime_append_prompt(),
 			context_files: self.prompts.files.clone(),
-			skills: self.skills.clone(),
+			skills: self.skill_snapshot.prompt_skills(),
 			history: self.history.clone(),
 			history_messages,
 			checkpoint_controller,
@@ -1982,10 +2167,14 @@ impl Session<'_> {
 			max_turns: self.max_turns,
 			tools_enabled: self.tools_enabled,
 			cancellation_token: None,
-			extra_tools: self.goal_extra_tools(),
+			extra_tools: {
+				let mut tools = self.goal_extra_tools();
+				tools.extend(self.autolearn_extra_tools());
+				tools
+			},
 			acp_bridge: None,
 			extra_mcp_servers: Vec::new(),
-			internal_urls: Some(Arc::new(pi_agent::tools::InternalUrlRouter::new())),
+			internal_urls: Some(Arc::clone(&self.internal_urls)),
 			url_scope: Some(Arc::new(url_scope)),
 			subagent_observer: None,
 			child_session_root,
@@ -1993,6 +2182,10 @@ impl Session<'_> {
 			goal_context,
 			credential_resolver: None,
 			plan_mode,
+			tool_ceiling: None,
+			skill_autoload: agent::AutoloadHandle(Some(Arc::new(
+				skills::SnapshotAutoloadResolver::new(self.skill_snapshot.clone()),
+			))),
 			continuation: false,
 			plan_context,
 			service_tier_by_family,
@@ -2182,6 +2375,8 @@ impl Session<'_> {
 		let mut current_parent_id = Some(user_id);
 		let mut tool_name_by_id: std::collections::HashMap<String, String> =
 			std::collections::HashMap::new();
+		let mut turn_tool_calls = 0usize;
+		let turn_started_in_goal = self.goal.has_goal();
 
 		let cancel_token = pi_agent::CancellationToken::new();
 		if !self.store.enabled() {
@@ -2888,6 +3083,9 @@ impl Session<'_> {
 			|| started.elapsed(),
 			|event| {
 				builder.observe(event);
+				if matches!(event, agent::Event::ToolEnd { .. }) {
+					turn_tool_calls += 1;
+				}
 				handle_event(
 					event,
 					&mut self.store,
@@ -2945,6 +3143,8 @@ impl Session<'_> {
 			}
 		}
 		drop(handle_event);
+		self.turn_tool_calls = turn_tool_calls;
+		self.turn_started_in_goal = turn_started_in_goal;
 		if priority_downgraded
 			&& self.service_tier_by_family.get("anthropic").map(String::as_str)
 				== Some("priority")

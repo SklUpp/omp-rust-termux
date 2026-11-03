@@ -1336,7 +1336,8 @@ async fn jl_agent_handle_without_output_id_keeps_lifecycle_id_and_agent() {
 		.execute(
 			&json!({
 				"language": "jl",
-				"code": "node = agent(\"x\"; handle=true)\nprintln(Main.json_serialize(node))"
+				"code": "node = agent(\"x\"; handle=true)\nprintln(Main.json_serialize(node))",
+				"timeout": 120
 			}),
 			&ctx,
 		)

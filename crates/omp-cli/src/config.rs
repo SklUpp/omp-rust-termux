@@ -608,6 +608,41 @@ impl AdvisorSettings {
 	}
 }
 
+/// `model.toolCallLoopGuard.*`: same knobs as the primary loop, applied to
+/// each advisor's own loop.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ToolCallLoopGuardConfig {
+	pub enabled:      Option<bool>,
+	pub threshold:    Option<usize>,
+	pub exempt_tools: Option<Vec<String>>,
+}
+
+impl ToolCallLoopGuardConfig {
+	#[must_use]
+	pub fn enabled(&self) -> bool {
+		self.enabled.unwrap_or(true)
+	}
+
+	#[must_use]
+	pub fn threshold(&self) -> usize {
+		self.threshold.unwrap_or(5).max(2)
+	}
+
+	#[must_use]
+	pub fn exempt(&self, tool: &str) -> bool {
+		match self.exempt_tools.as_deref() {
+			Some(list) => list.iter().any(|name| name == tool),
+			None => tool == "hub",
+		}
+	}
+
+	fn merge(&mut self, overlay: Self) {
+		if overlay.enabled.is_some() { self.enabled = overlay.enabled; }
+		if overlay.threshold.is_some() { self.threshold = overlay.threshold; }
+		if overlay.exempt_tools.is_some() { self.exempt_tools = overlay.exempt_tools; }
+	}
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Config {
 	pub default_model:        Option<String>,
@@ -632,6 +667,8 @@ pub struct Config {
 	pub prewalk:              PrewalkConfig,
 	/// `advisor.*`, `tier.advisor`, `task.agentAdvisor`.
 	pub advisor:              AdvisorSettings,
+	/// `model.toolCallLoopGuard.*`.
+	pub tool_call_loop_guard: ToolCallLoopGuardConfig,
 	/// `eval.*` backend enablement and interpreter groups.
 	pub eval_config:          EvalConfig,
 	/// `searxng.*`: the web-search endpoint and its credentials.
@@ -723,6 +760,7 @@ impl Config {
 		self.plan.merge(overlay.plan);
 		self.prewalk.merge(overlay.prewalk);
 		self.advisor.merge(overlay.advisor);
+		self.tool_call_loop_guard.merge(overlay.tool_call_loop_guard);
 		self.eval_config.merge(overlay.eval_config);
 		// `searxng.*` merges per leaf so an explicit host overlay can add
 		// credentials to a globally configured endpoint (and vice versa).
@@ -1358,6 +1396,61 @@ fn apply_nested_settings(config: &mut Config, value: &Value, path: &Path) -> Res
 	}
 	if let Some(enabled) = settings_leaf(value, "advisor", "enabled", "advisor.enabled") {
 		config.advisor.enabled = expect_bool(enabled, "advisor.enabled", path)?;
+	}
+	if let Some(enabled) = settings_nested_leaf(
+		value,
+		"model",
+		"toolCallLoopGuard",
+		"enabled",
+		"model.toolCallLoopGuard.enabled",
+	) {
+		config.tool_call_loop_guard.enabled =
+			expect_bool(enabled, "model.toolCallLoopGuard.enabled", path)?;
+	}
+	if let Some(threshold) = settings_nested_leaf(
+		value,
+		"model",
+		"toolCallLoopGuard",
+		"threshold",
+		"model.toolCallLoopGuard.threshold",
+	) {
+		match threshold {
+			Value::Int(value) if *value >= 2 => {
+				config.tool_call_loop_guard.threshold = Some(*value as usize);
+			},
+			_ => {
+				eprintln!(
+					"warning: {}: model.toolCallLoopGuard.threshold must be an integer >= 2; ignoring",
+					path.display()
+				);
+			},
+		}
+	}
+	if let Some(exempt) = settings_nested_leaf(
+		value,
+		"model",
+		"toolCallLoopGuard",
+		"exemptTools",
+		"model.toolCallLoopGuard.exemptTools",
+	) {
+		match exempt {
+			Value::Array(items) => {
+				config.tool_call_loop_guard.exempt_tools = Some(
+					items
+						.iter()
+						.filter_map(Value::as_str)
+						.filter(|name| !name.is_empty())
+						.map(str::to_string)
+						.collect(),
+				);
+			},
+			_ => {
+				eprintln!(
+					"warning: {}: model.toolCallLoopGuard.exemptTools must be an array of tool names; ignoring",
+					path.display()
+				);
+			},
+		}
 	}
 	if let Some(sync) = settings_leaf(value, "advisor", "syncBacklog", "advisor.syncBacklog") {
 		match sync.to_text().as_deref() {

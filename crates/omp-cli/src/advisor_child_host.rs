@@ -29,14 +29,14 @@ use crate::runtime::CliAdvisorExecutor;
 
 /// One advisor runtime per live child session, owned by the root run.
 pub struct ChildAdvisorHost {
-	config:      Config,
-	catalog:     Arc<Catalog>,
-	approvals:   crate::approve::Approvals,
+	config:      Mutex<Config>,
+	catalog:     Mutex<Arc<Catalog>>,
+	approvals:   Mutex<crate::approve::Approvals>,
 	identities:  Arc<AdvisorIdentities>,
 	cwd:         PathBuf,
 	agent_dir:   PathBuf,
-	card_sink:   Option<CardSink>,
-	service_tier: BTreeMap<String, String>,
+	card_sink:   Mutex<Option<CardSink>>,
+	service_tier: Mutex<BTreeMap<String, String>>,
 	handle:      tokio::runtime::Handle,
 	children:    Mutex<HashMap<String, Arc<AdvisorManager>>>,
 }
@@ -48,33 +48,48 @@ impl ChildAdvisorHost {
 		identities: Arc<AdvisorIdentities>,
 	) -> Self {
 		Self {
-			config: request.config.clone(),
-			catalog: Arc::clone(&request.catalog),
-			approvals: request.approvals.clone(),
+			config: Mutex::new(request.config.clone()),
+			catalog: Mutex::new(Arc::clone(&request.catalog)),
+			approvals: Mutex::new(request.approvals.clone()),
 			identities,
 			cwd: request.cwd.clone(),
 			agent_dir: crate::dirs::agent_dir(),
-			card_sink: request
-				.advisor_card_sink
-				.as_ref()
-				.map(|sink| Arc::clone(&sink.0)),
-			service_tier: crate::advisor_identity::service_tier_map(
+			card_sink: Mutex::new(
+				request.advisor_card_sink.as_ref().map(|sink| Arc::clone(&sink.0)),
+			),
+			service_tier: Mutex::new(crate::advisor_identity::service_tier_map(
 				Some(request.config.advisor.tier_setting()),
 				&request.service_tier_by_family,
-			),
+			)),
 			handle,
 			children: Mutex::new(HashMap::new()),
 		}
 	}
 
+	/// Refresh host-owned state for a new root turn without replacing the host,
+	/// so children spawned by earlier turns keep their managers and sinks.
+	pub fn refresh(&self, request: &RunRequest) {
+		*self.config.lock().unwrap_or_else(|poison| poison.into_inner()) =
+			request.config.clone();
+		*self.catalog.lock().unwrap_or_else(|poison| poison.into_inner()) =
+			Arc::clone(&request.catalog);
+		*self.approvals.lock().unwrap_or_else(|poison| poison.into_inner()) =
+			request.approvals.clone();
+		*self.card_sink.lock().unwrap_or_else(|poison| poison.into_inner()) =
+			request.advisor_card_sink.as_ref().map(|sink| Arc::clone(&sink.0));
+		*self.service_tier.lock().unwrap_or_else(|poison| poison.into_inner()) =
+			crate::advisor_identity::service_tier_map(
+				Some(request.config.advisor.tier_setting()),
+				&request.service_tier_by_family,
+			);
+	}
+
 	/// Build the child roster on first use. Absent opt-in returns `None`; no
 	/// provider is contacted and no hidden work starts.
 	fn manager_for(&self, child: &ChildAdvisorContext<'_>) -> Option<Arc<AdvisorManager>> {
-		// TS `subagentAdvisorEnabled` requires `advisor.enabled` before the
-		// per-agent opt-in is even consulted.
-		if !self.config.advisor.enabled() {
-			return None;
-		}
+		// TS `createSubagentSettings` builds isolated child settings: a child
+		// selection turns `advisor.enabled` on for that child regardless of the
+		// root setting, so the root gate must not be consulted here.
 		let mut children = self
 			.children
 			.lock()
@@ -95,14 +110,22 @@ impl ChildAdvisorHost {
 		let selection = resolve_agent_advisor(
 			self
 				.config
+				.lock()
+				.unwrap_or_else(|poison| poison.into_inner())
 				.advisor
 				.agent_advisor_for(child.agent.unwrap_or("")),
 			definition.as_ref(),
 		)?;
-		let mut config = self.config.clone();
+		let mut config = self
+			.config
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner())
+			.clone();
 		apply_to_config(&mut config, &selection);
 		let pattern_override = selection.model.clone();
-		let catalog = Arc::clone(&self.catalog);
+		let catalog = Arc::clone(
+			&self.catalog.lock().unwrap_or_else(|poison| poison.into_inner()),
+		);
 		let resolver_config = config.clone();
 		let resolver: RouteResolver = Arc::new(move |pattern| {
 			let pattern = if pattern == "@advisor" {
@@ -143,15 +166,25 @@ impl ChildAdvisorHost {
 			cwd: self.cwd.clone(),
 			agent_dir: Some(self.agent_dir.clone()),
 			config: config.clone(),
-			catalog: Arc::clone(&self.catalog),
-			approvals: self.approvals.clone(),
+			catalog: Arc::clone(
+				&self.catalog.lock().unwrap_or_else(|poison| poison.into_inner()),
+			),
+			approvals: self
+				.approvals
+				.lock()
+				.unwrap_or_else(|poison| poison.into_inner())
+				.clone(),
 			primary_session_id: session_file
 				.as_ref()
 				.map(|path| path.display().to_string())
 				.or_else(|| Some(child.child_id.to_string())),
 			primary_cache_key: None,
 			session_file,
-			service_tier: self.service_tier.clone(),
+			service_tier: self
+				.service_tier
+				.lock()
+				.unwrap_or_else(|poison| poison.into_inner())
+				.clone(),
 			context_prompt: None,
 			watchdog_prompt: (!watchdog_docs.is_empty()).then(|| watchdog_docs.join("\n\n")),
 			shared_instructions: discovered.shared_instructions,
@@ -167,7 +200,11 @@ impl ChildAdvisorHost {
 			child
 				.session_file
 				.map(std::path::Path::to_path_buf),
-			self.card_sink.clone(),
+			self
+				.card_sink
+				.lock()
+				.unwrap_or_else(|poison| poison.into_inner())
+				.clone(),
 			None,
 		);
 		children.insert(child.child_id.to_string(), Arc::clone(&manager));
@@ -175,15 +212,38 @@ impl ChildAdvisorHost {
 	}
 }
 
+fn child_steer_sink(child: &ChildAdvisorContext<'_>) -> Option<crate::advisor_runtime::SteerSink> {
+	child.steer.as_ref().map(|sender| {
+		let sender = sender.clone();
+		Arc::new(move |text: &str| {
+			sender
+				.try_send(pi_agent::SteeringEvent::InjectMessage(Message::user(text).parts))
+				.is_ok()
+		}) as crate::advisor_runtime::SteerSink
+	})
+}
+
+#[async_trait::async_trait]
 impl ChildAdvisorHook for ChildAdvisorHost {
-	fn on_child_start(&self, child: &ChildAdvisorContext<'_>, initial: &Message) {
+	async fn on_child_start(&self, child: &ChildAdvisorContext<'_>, initial: &Message) {
 		if let Some(manager) = self.manager_for(child) {
+			manager.configure_run(
+				Some(child.child_id.to_string()),
+				None,
+				child.session_file.map(std::path::Path::to_path_buf),
+				self
+					.card_sink
+					.lock()
+					.unwrap_or_else(|poison| poison.into_inner())
+					.clone(),
+				child_steer_sink(child),
+			);
 			manager.begin_primary_run(&[]);
 			manager.push_user(initial);
 		}
 	}
 
-	fn on_child_turn(
+	async fn on_child_turn(
 		&self,
 		child: &ChildAdvisorContext<'_>,
 		message: &Message,
@@ -200,24 +260,56 @@ impl ChildAdvisorHook for ChildAdvisorHost {
 			return;
 		};
 		manager.push_turn(message, tool_results);
-		// TS `onPrimaryTurnEnd` waits for the backlog after feeding the turn
-		// (30s). The hook contract is synchronous, so the wait runs inline and
-		// bounded; it starts no detached task that could outlive the child.
-		if let Some(threshold) = self.config.advisor.sync_backlog() {
-			if manager.backlog() >= threshold {
-				manager.sync_backlog(threshold, std::time::Duration::from_secs(30));
-			}
+		// TS `onPrimaryTurnEnd`: feed the turn, then wait for the backlog before
+		// delivering. Waiting on the blocking pool keeps the async child loop
+		// responsive instead of blocking its Tokio worker.
+		if let Some(threshold) = self
+			.config
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner())
+			.advisor
+			.sync_backlog()
+			&& manager.backlog() >= threshold
+		{
+			let waiting = Arc::clone(&manager);
+			let _ = tokio::task::spawn_blocking(move || {
+				waiting.sync_backlog(threshold, std::time::Duration::from_secs(30));
+				waiting.wait_for_catchup(std::time::Duration::from_secs(30));
+			})
+			.await;
+		}
+		// Announce after the review settled, then hand the same text to the
+		// child's next request. A failed `try_send` leaves the emitted card as
+		// the delivery, so no note is silently dropped.
+		manager.flush_asides();
+		if let Some(content) = manager.take_pending_aside_content()
+			&& let Some(steer) = child_steer_sink(child)
+		{
+			steer(&content);
 		}
 	}
 
-	fn on_child_end(&self, child: &ChildAdvisorContext<'_>) {
-		if let Some(manager) = self
+	async fn on_child_end(&self, child: &ChildAdvisorContext<'_>, aborted: bool) {
+		let Some(manager) = self
 			.children
 			.lock()
 			.unwrap_or_else(|poison| poison.into_inner())
 			.remove(child.child_id)
-		{
-			manager.dispose();
+		else {
+			return;
+		};
+		if !aborted {
+			// Final review drain: preserve cards, wait bounded for the last
+			// review, emit everything, then dispose. TS does not re-prompt the
+			// child after it settled.
+			manager.prepare_headless_drain();
+			let waiting = Arc::clone(&manager);
+			let _ = tokio::task::spawn_blocking(move || {
+				waiting.wait_for_catchup(std::time::Duration::from_secs(30));
+			})
+			.await;
+			manager.flush_asides();
 		}
+		manager.dispose();
 	}
 }

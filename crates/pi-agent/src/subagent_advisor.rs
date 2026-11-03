@@ -15,6 +15,8 @@
 
 use std::path::Path;
 
+use async_trait::async_trait;
+
 use crate::{Message, ToolResult};
 
 /// Identity of the child session owning one advisor runtime.
@@ -29,17 +31,22 @@ pub struct ChildAdvisorContext<'a> {
 	pub definition_advisor: bool,
 	/// Explicit frontmatter model pattern, when one was given.
 	pub definition_pattern: Option<&'a str>,
+	/// Live steering channel for this child; successful `try_send` is the only
+	/// evidence that advice reached the next child request.
+	pub steer: Option<tokio::sync::mpsc::Sender<crate::SteeringEvent>>,
 }
 
 /// One host-owned callback set. Errors are the host's to log; a failing hook
-/// never fails the child.
+/// never fails the child. Async because the end hook must join its bounded
+/// review drain before the host disposes the runtime.
+#[async_trait]
 pub trait ChildAdvisorHook: Send + Sync {
 	/// The child conversation opened with this first user message.
-	fn on_child_start(&self, child: &ChildAdvisorContext<'_>, initial: &Message) {}
+	async fn on_child_start(&self, child: &ChildAdvisorContext<'_>, initial: &Message) {}
 
 	/// One settled child turn, after its tool results resolved. `will_continue`
 	/// is the TS `context.willContinue` equivalent.
-	fn on_child_turn(
+	async fn on_child_turn(
 		&self,
 		child: &ChildAdvisorContext<'_>,
 		message: &Message,
@@ -48,7 +55,7 @@ pub trait ChildAdvisorHook: Send + Sync {
 	) {
 	}
 
-	/// The child session settled (success, failure, cancellation, or park):
-	/// flush late advice without starting a new turn.
-	fn on_child_end(&self, child: &ChildAdvisorContext<'_>) {}
+	/// The child session settled. `aborted` skips the review drain; every
+	/// terminal path (success, failure, cancellation) must call this.
+	async fn on_child_end(&self, child: &ChildAdvisorContext<'_>, aborted: bool) {}
 }

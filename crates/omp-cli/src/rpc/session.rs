@@ -351,6 +351,9 @@ pub struct RpcSession {
 	/// them, persists one `custom_message`, and emits the wire frames.
 	pub(crate) advisor_cards_tx: std::sync::mpsc::Sender<(String, serde_json::Value)>,
 	pub(crate) advisor_cards_rx: std::sync::mpsc::Receiver<(String, serde_json::Value)>,
+	/// Wakes the RPC card pump so an idle session publishes a settled card
+	/// immediately instead of waiting for the next turn boundary.
+	pub(crate) advisor_wake: Option<std::sync::mpsc::Sender<()>>,
 }
 
 impl RpcSession {
@@ -526,6 +529,7 @@ impl RpcSession {
 			plan_yolo_commit_error: None,
 			advisor_cards_tx,
 			advisor_cards_rx,
+			advisor_wake: None,
 		};
 		if let Some(arm) = plan_yolo {
 			// Explicit `--plan-yolo` is the grant: TS `armPlanYoloIfNeeded`
@@ -1120,8 +1124,13 @@ impl RpcSession {
 		cards
 	}
 
+	/// Install the wake sender used by the RPC card pump before any turn.
+	pub fn set_advisor_wake(&mut self, wake: std::sync::mpsc::Sender<()>) {
+		self.advisor_wake = Some(wake);
+	}
+
 	/// Scope tuple the runner keys advisor state by.
-	fn advisor_scope(&self) -> (Option<String>, Option<PathBuf>) {
+	pub(crate) fn advisor_scope(&self) -> (Option<String>, Option<PathBuf>) {
 		(
 			self.store.enabled().then(|| self.store.id().to_string()),
 			self.store.file().map(Path::to_path_buf),
@@ -2093,10 +2102,14 @@ impl RpcSession {
 		// Advisor cards cross the transport as one sink call per card; the turn
 		// loop drains them, persists one `custom_message`, then emits frames.
 		let advisor_cards = Arc::new(std::sync::Mutex::new(self.advisor_cards_tx.clone()));
+		let advisor_wake = self.advisor_wake.clone();
 		let advisor_card_sink: crate::advisor_runtime::CardSink =
 			Arc::new(move |content: &str, details: &serde_json::Value| {
 				if let Ok(tx) = advisor_cards.lock() {
 					let _ = tx.send((content.to_string(), details.clone()));
+				}
+				if let Some(wake) = &advisor_wake {
+					let _ = wake.send(());
 				}
 			});
 		Ok(RunRequest {

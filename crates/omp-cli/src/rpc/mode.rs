@@ -10,7 +10,7 @@ use std::{
 	os::unix::process::CommandExt,
 	path::Path,
 	process::{Command, Stdio},
-	sync::{Arc, Mutex, MutexGuard},
+	sync::{Arc, Mutex, MutexGuard, atomic::{AtomicBool, Ordering}},
 	thread,
 	time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -742,7 +742,50 @@ impl RpcMode {
 			registry,
 			observer,
 		};
-		let read_error = mode.event_loop(&mut reader);
+		let read_error = {
+			let (wake_tx, wake_rx) = std::sync::mpsc::channel();
+			{
+				let mut session = mode.lock_session();
+				session.set_advisor_wake(wake_tx);
+			}
+			let pump_stop = Arc::new(AtomicBool::new(false));
+			let pump_stop_thread = Arc::clone(&pump_stop);
+			let pump_session = Arc::clone(&mode.session);
+			let pump_sink = Arc::clone(&sink);
+			let pump = thread::spawn(move || {
+				loop {
+					match wake_rx.recv_timeout(Duration::from_millis(250)) {
+						Ok(()) => {},
+						Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+							if pump_stop_thread.load(Ordering::SeqCst) {
+								break;
+							}
+							continue;
+						},
+						Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+					}
+					let cards = {
+						let mut session = pump_session
+							.lock()
+							.unwrap_or_else(std::sync::PoisonError::into_inner);
+						session.take_advisor_cards()
+					};
+					for (content, details) in cards {
+						for frame in event_wire::advisor_card_frames(
+							&content,
+							&details,
+							event_wire::now_ms(),
+						) {
+							pump_sink.send(frame);
+						}
+					}
+				}
+			});
+			let error = mode.event_loop(&mut reader);
+			pump_stop.store(true, Ordering::SeqCst);
+			let _ = pump.join();
+			error
+		};
 		mode.finish();
 		let flush_error = output.finish();
 		read_error
@@ -845,6 +888,40 @@ impl RpcMode {
 			session.is_streaming = false;
 		}
 		self.shutdown.drain();
+		// Advisor settle at EOF: all turns are joined above, so wait once for the
+		// final review, publish every late card through the normal wire format,
+		// then dispose. No card may be lost to transport exit.
+		let (runner, scope) = {
+			let session = self.lock_session();
+			(
+				Arc::clone(&session.runner),
+				session.advisor_scope(),
+			)
+		};
+		let (session_id, session_file) = scope;
+		runner.advisor_prepare_headless_drain(
+			session_id.as_deref(),
+			session_file.as_deref(),
+		);
+		runner.advisor_wait_catchup(
+			session_id.as_deref(),
+			session_file.as_deref(),
+			Duration::from_secs(30),
+		);
+		let cards = {
+			let mut session = self.lock_session();
+			session.take_advisor_cards()
+		};
+		for (content, details) in cards {
+			for frame in event_wire::advisor_card_frames(
+				&content,
+				&details,
+				event_wire::now_ms(),
+			) {
+				self.sink.send(frame);
+			}
+		}
+		runner.advisor_dispose(session_id.as_deref(), session_file.as_deref());
 	}
 
 	fn lock_session(&self) -> MutexGuard<'_, RpcSession> {

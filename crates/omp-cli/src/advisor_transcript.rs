@@ -42,13 +42,15 @@ pub fn is_advisor_transcript_name(name: &str) -> bool {
 		|| (name.starts_with(&format!("{ADVISOR_TRANSCRIPT_STEM}.")) && name.ends_with(JSONL_SUFFIX))
 }
 
-/// `<session dir>/<filename>` for the owning primary session log.
+/// `<session stem dir>/<filename>` for the owning session log: TS keeps
+/// advisor transcripts inside `<session>/` (the `.jsonl` becomes a directory),
+/// so two sessions never share advisor files or spend.
 #[must_use]
 pub fn transcript_path(session_file: &Path, slug: &str) -> Option<PathBuf> {
 	if !session_file.to_string_lossy().ends_with(JSONL_SUFFIX) {
 		return None;
 	}
-	let directory = session_file.parent()?;
+	let directory = session_file.with_extension("");
 	Some(directory.join(advisor_transcript_filename(slug)))
 }
 
@@ -242,18 +244,16 @@ fn hash_text(text: &str) -> u64 {
 	hash
 }
 
-/// Sum advisor spend already persisted beside `session_file`, keyed by slug.
-/// Only the session's own top-level advisors count; subagent advisors write to
-/// `<session>/<SubId>/__advisor.jsonl` and belong to the child.
+/// Sum advisor spend already persisted in the session's stem directory, keyed
+/// by slug. Subagent advisors write under `<session>/<SubId>/` and belong to
+/// the child, so they can never contaminate the parent's reported spend.
 #[must_use]
 pub fn load_costs(session_file: Option<&Path>) -> BTreeMap<String, f64> {
 	let Some(session_file) = session_file else {
 		return BTreeMap::new();
 	};
-	let Some(directory) = session_file.parent() else {
-		return BTreeMap::new();
-	};
-	let Ok(entries) = std::fs::read_dir(directory) else {
+	let directory = session_file.with_extension("");
+	let Ok(entries) = std::fs::read_dir(&directory) else {
 		return BTreeMap::new();
 	};
 	let mut costs = BTreeMap::new();
@@ -402,20 +402,22 @@ mod tests {
 			"id": "m1",
 			"message": { "role": "assistant", "usage": { "cost": { "total": 0.25 } } }
 		});
+		let stem = session_file.with_extension("");
+		std::fs::create_dir_all(&stem).expect("stem dir");
 		std::fs::write(
-			dir.join("__advisor.jsonl"),
+			stem.join("__advisor.jsonl"),
 			format!("{}\n{}\n", serde_json::json!({"type":"session","id":"x"}), line),
 		)
 		.expect("default transcript");
 		std::fs::write(
-			dir.join("__advisor.reviewer.jsonl"),
+			stem.join("__advisor.reviewer.jsonl"),
 			format!("{}\n{}\n", serde_json::json!({"type":"session","id":"y"}), line),
 		)
 		.expect("named transcript");
 		// A subagent's transcript below the top level must not count here.
-		std::fs::create_dir_all(dir.join("sub")).expect("sub dir");
+		std::fs::create_dir_all(stem.join("sub")).expect("sub dir");
 		std::fs::write(
-			dir.join("sub").join("__advisor.jsonl"),
+			stem.join("sub").join("__advisor.jsonl"),
 			format!("{}\n{}\n", serde_json::json!({"type":"session","id":"z"}), line),
 		)
 		.expect("sub transcript");
@@ -424,5 +426,29 @@ mod tests {
 		assert_eq!(costs.get("").copied(), Some(0.25));
 		assert_eq!(costs.get("reviewer").copied(), Some(0.25));
 		assert_eq!(costs.len(), 2);
+	}
+
+	#[test]
+	fn two_sessions_never_share_advisor_transcripts_or_spend() {
+		let dir = temp_dir("two-sessions");
+		let first = dir.join("first.jsonl");
+		let second = dir.join("second.jsonl");
+		std::fs::write(&first, "{}\n").expect("first log");
+		std::fs::write(&second, "{}\n").expect("second log");
+		let line = serde_json::json!({
+			"type": "message",
+			"id": "m1",
+			"message": { "role": "assistant", "usage": { "cost": { "total": 0.25 } } }
+		});
+		let first_stem = first.with_extension("");
+		std::fs::create_dir_all(&first_stem).expect("first stem");
+		std::fs::write(
+			first_stem.join("__advisor.jsonl"),
+			format!("{}\n{}\n", serde_json::json!({"type":"session","id":"a"}), line),
+		)
+		.expect("first transcript");
+		let costs = load_costs(Some(&second));
+		assert!(costs.is_empty(), "second session must not see first spend");
+		assert_eq!(load_costs(Some(&first)).get("").copied(), Some(0.25));
 	}
 }

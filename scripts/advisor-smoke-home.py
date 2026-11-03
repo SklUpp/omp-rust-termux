@@ -271,7 +271,7 @@ def phase_cli_text(binary: str, mock: MockModel, base: Path) -> Path:
     log = logs[0].read_text()
     if '"customType":"advisor"' not in log or "write target deleted" not in log:
         fail("CLI text must persist the card as a custom_message")
-    transcript = logs[0].parent / "__advisor.reviewer.jsonl"
+    transcript = logs[0].with_suffix("") / "__advisor.reviewer.jsonl"
     if not transcript.is_file():
         fail(f"advisor transcript missing: {transcript}")
     if mock.count() != 3:

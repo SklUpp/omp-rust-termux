@@ -152,6 +152,10 @@ struct SessionResources {
 	/// Stable `(primary, slug) -> UUIDv7` identities; survives manager rebuilds
 	/// so an advisor keeps its provider session across config edits.
 	advisor_identities: Arc<crate::advisor_identity::AdvisorIdentities>,
+	/// Session-scoped child advisor host. Reused across root turns and
+	/// refreshed per turn instead of replaced, so background children keep
+	/// their managers and card sinks; scope teardown drops it.
+	advisor_child_host: Mutex<Option<Arc<crate::advisor_child_host::ChildAdvisorHost>>>,
 }
 
 /// Closed scopes stay as tombstones so a late or stale run cannot recreate
@@ -602,6 +606,7 @@ impl PiAgentRunner {
 						advisor_identities: Arc::new(
 							crate::advisor_identity::AdvisorIdentities::new(),
 						),
+						advisor_child_host: Mutex::new(None),
 					});
 					lifecycle.slots.insert(
 						scope.clone(),
@@ -1800,13 +1805,30 @@ impl AgentRunner for PiAgentRunner {
 			}
 			supervisor.set_async_enabled(request.config.async_config.enabled());
 			supervisor.set_external_thinking(request.config.external_thinking);
-			supervisor.set_child_advisor_hook(Some(Arc::new(
-				crate::advisor_child_host::ChildAdvisorHost::new(
-					request,
-					self.runtime.handle().clone(),
-					Arc::clone(&resources.advisor_identities),
-				),
-			)));
+			supervisor.set_child_advisor_hook(Some({
+				let mut slot = resources
+					.advisor_child_host
+					.lock()
+					.unwrap_or_else(|poison| poison.into_inner());
+				let host = match slot.as_ref() {
+					Some(host) => {
+						host.refresh(request);
+						Arc::clone(host)
+					},
+					None => {
+						let host = Arc::new(
+							crate::advisor_child_host::ChildAdvisorHost::new(
+								request,
+								self.runtime.handle().clone(),
+								Arc::clone(&resources.advisor_identities),
+							),
+						);
+						*slot = Some(Arc::clone(&host));
+						host
+					},
+				};
+				host as Arc<dyn pi_agent::subagent_advisor::ChildAdvisorHook>
+			}));
 			root_sink = Some(supervisor.owner_results_sink(None));
 			root_supervisor = Some(Arc::clone(&supervisor));
 			supervisor.root_registry()
@@ -2347,7 +2369,11 @@ impl AgentRunner for PiAgentRunner {
 		timeout: std::time::Duration,
 	) -> bool {
 		match self.advisor_for_scope(session_id, session_file) {
-			Some(manager) => manager.wait_for_catchup(timeout),
+			Some(manager) => {
+				let caught_up = manager.wait_for_catchup(timeout);
+				manager.flush_asides();
+				caught_up
+			},
 			None => true,
 		}
 	}
@@ -3468,22 +3494,110 @@ async fn run_advisor_call(
 	}
 	let mut state = AgentState { messages: history, total_turns: 0 };
 	let agent = AgentLoop::with_approver(config, provider, registry, approvals);
+	let available: std::collections::BTreeSet<String> = names.iter().cloned().collect();
+	let source_text = {
+		let mut text = String::new();
+		for message in &spec.history {
+			text.push_str(&message.content);
+			text.push('\n');
+		}
+		text.push_str(&spec.prompt);
+		text
+	};
+	let loop_config = spec.config.tool_call_loop_guard.clone();
+	let (steer_tx, steer_rx) = tokio::sync::mpsc::channel(16);
+	let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(256);
+	let guard_cancel = spec.cancel.clone();
+	let guard = tokio::spawn(async move {
+		let mut last: Option<String> = None;
+		let mut count = 0usize;
+		let mut redirected = false;
+		while let Some(event) = event_rx.recv().await {
+			let pi_agent::AgentEvent::TurnEnd { message, .. } = event else {
+				continue;
+			};
+			for call in &message.tool_calls {
+				if loop_config.exempt(&call.name) {
+					last = None;
+					count = 0;
+					continue;
+				}
+				let fingerprint = format!(
+					"{}\u{1}{}",
+					call.name,
+					serde_json::to_string(&call.arguments).unwrap_or_default()
+				);
+				if last.as_deref() == Some(fingerprint.as_str()) {
+					count += 1;
+				} else {
+					last = Some(fingerprint);
+					count = 1;
+				}
+				if count >= loop_config.threshold() {
+					if redirected {
+						// The corrective was ignored: stop this advisor update
+						// instead of letting it loop forever.
+						guard_cancel.cancel();
+						break;
+					}
+					redirected = true;
+					let text = format!(
+						"You repeated the same `{}` tool call {} times with identical arguments. Change approach: inspect the result, adjust the arguments, or explain the blocker instead of reissuing it.",
+						call.name, count
+					);
+					let _ = steer_tx.try_send(pi_agent::SteeringEvent::InjectMessage(
+						pi_agent::Message::user(text).parts,
+					));
+					last = None;
+					count = 0;
+				}
+			}
+		}
+	});
 	let turns = agent
 		.run_dialog_message_with_cancel(
 			pi_agent::Message::user(spec.prompt.clone()),
 			&mut state,
-			None,
-			None,
+			Some(steer_rx),
+			Some(event_tx),
 			spec.cancel.clone(),
 		)
 		.await
 		.map_err(|error| error.to_string())?;
+	let _ = guard.await;
 	let mut history = state.messages;
 	while history
 		.first()
 		.is_some_and(|message| message.role == pi_agent::Role::System)
 	{
 		history.remove(0);
+	}
+	// TS `quarantineAdvisorUnsafeOutput`: unavailable tool requests and
+	// output-only destructive directives replace the assistant turn before it
+	// can seed the next advisor request or its transcript.
+	for message in &mut history {
+		if message.role != pi_agent::Role::Assistant {
+			continue;
+		}
+		let mut generated = message.content.clone();
+		let mut unavailable = Vec::new();
+		for call in &message.tool_calls {
+			if !available.contains(&call.name) {
+				unavailable.push(call.name.clone());
+			}
+			if call.name == "advise"
+				&& let Some(note) = call.arguments.get("note").and_then(serde_json::Value::as_str)
+			{
+				generated.push('\n');
+				generated.push_str(note);
+			}
+		}
+		if let Some(quarantined) =
+			crate::advisor_runtime::quarantine_turn_text(&generated, &source_text, &unavailable)
+		{
+			message.content = quarantined;
+			message.tool_calls.clear();
+		}
 	}
 	if turns.is_empty() {
 		return Err("advisor returned no assistant turn".to_string());

@@ -768,8 +768,9 @@ impl TaskTool {
 				Some(&item.agent.name),
 				item.agent.advisor.as_ref(),
 				session_file.as_deref(),
+				Some(steering_tx.clone()),
 			);
-			hook.on_child_start(&context, &initial_message);
+			hook.on_child_start(&context, &initial_message).await;
 		}
 		let events = forward_child_events(
 			self.supervisor.clone(),
@@ -778,6 +779,7 @@ impl TaskTool {
 			item.agent.advisor.clone(),
 			event_rx,
 			Arc::clone(&salvage),
+			steering_tx.clone(),
 		);
 		let child_plan = ctx.plan.clone();
 		let final_messages = Arc::new(Mutex::new(None::<Vec<Message>>));
@@ -824,6 +826,17 @@ impl TaskTool {
 			let _ = task_handle.await;
 			self.supervisor.mark_aborted(&child_id, "cancelled by hub");
 			self.supervisor.unregister_active_child(&child_id);
+			if let Some(hook) = self.supervisor.child_advisor_hook() {
+				let session_file = self.supervisor.child_session_file(&child_id);
+				let context = child_advisor_context(
+					&child_id,
+					Some(&item.agent.name),
+					item.agent.advisor.as_ref(),
+					session_file.as_deref(),
+					Some(steering_tx.clone()),
+				);
+				hook.on_child_end(&context, true).await;
+			}
 			return SingleResult {
 				index,
 				id: child_id,
@@ -891,6 +904,18 @@ impl TaskTool {
 		};
 
 		let _ = events.await;
+		let child_aborted = outcome.as_ref().is_err() || child_cancel.is_cancelled();
+		if let Some(hook) = self.supervisor.child_advisor_hook() {
+			let session_file = self.supervisor.child_session_file(&child_id);
+			let context = child_advisor_context(
+				&child_id,
+				Some(&item.agent.name),
+				item.agent.advisor.as_ref(),
+				session_file.as_deref(),
+				Some(steering_tx.clone()),
+			);
+			hook.on_child_end(&context, child_aborted).await;
+		}
 		if let Some(manager) = crate::subagent_lifecycle::lookup(&self.supervisor)
 			&& let Some(messages) = final_messages
 				.lock()
@@ -1313,6 +1338,7 @@ impl TaskTool {
 				item,
 				cwd,
 				steering_rx,
+				steering_tx.clone(),
 				cancel.clone(),
 				child_ctx,
 				plan,
@@ -1685,6 +1711,7 @@ async fn run_background_child(
 	item: TaskItemSpec,
 	cwd: std::path::PathBuf,
 	steering_rx: tokio::sync::mpsc::Receiver<SteeringEvent>,
+	steering_tx: tokio::sync::mpsc::Sender<SteeringEvent>,
 	cancel: CancellationToken,
 	child_ctx: ChildContext,
 	plan: Option<Arc<dyn crate::state::PlanModeGuard>>,
@@ -1796,8 +1823,9 @@ async fn run_background_child(
 			Some(&item.agent.name),
 			item.agent.advisor.as_ref(),
 			session_file.as_deref(),
+			Some(steering_tx.clone()),
 		);
-		hook.on_child_start(&context, &initial_message);
+		hook.on_child_start(&context, &initial_message).await;
 	}
 	let events = forward_child_events(
 		Arc::clone(&supervisor),
@@ -1806,6 +1834,7 @@ async fn run_background_child(
 		item.agent.advisor.clone(),
 		event_rx,
 		salvage,
+		steering_tx.clone(),
 	);
 	let mut child_state = AgentState::default();
 	let cancel_for_finalize = cancel.clone();
@@ -1821,6 +1850,18 @@ async fn run_background_child(
 	// Drain the forwarder before the caller settles the record, so no event is
 	// emitted after the terminal lifecycle frame.
 	let _ = events.await;
+	let child_aborted = outcome.as_ref().is_err() || cancel_for_finalize.is_cancelled();
+	if let Some(hook) = supervisor.child_advisor_hook() {
+		let session_file = supervisor.child_session_file(&child_id);
+		let context = child_advisor_context(
+			&child_id,
+			Some(&item.agent.name),
+			item.agent.advisor.as_ref(),
+			session_file.as_deref(),
+			Some(steering_tx.clone()),
+		);
+		hook.on_child_end(&context, child_aborted).await;
+	}
 	if let Some(manager) = crate::subagent_lifecycle::lookup(&supervisor) {
 		manager.replace_live(&child_id, child_state.messages.clone());
 	}
@@ -1865,6 +1906,7 @@ fn child_advisor_context<'a>(
 	agent: Option<&'a str>,
 	definition: Option<&HandoffTarget>,
 	session_file: Option<&'a std::path::Path>,
+	steer: Option<tokio::sync::mpsc::Sender<SteeringEvent>>,
 ) -> crate::subagent_advisor::ChildAdvisorContext<'a> {
 	let (definition_advisor, definition_pattern) = match definition {
 		Some(HandoffTarget::Default) => (true, None),
@@ -1877,6 +1919,7 @@ fn child_advisor_context<'a>(
 		session_file,
 		definition_advisor,
 		definition_pattern,
+		steer,
 	}
 }
 
@@ -1889,6 +1932,7 @@ fn forward_child_events(
 	definition: Option<HandoffTarget>,
 	mut events: tokio::sync::mpsc::Receiver<AgentEvent>,
 	salvage: Arc<Mutex<ChildSalvage>>,
+	steering_tx: tokio::sync::mpsc::Sender<SteeringEvent>,
 ) -> tokio::task::JoinHandle<()> {
 	let manager = crate::subagent_lifecycle::lookup(&supervisor);
 	tokio::spawn(async move {
@@ -1912,10 +1956,12 @@ fn forward_child_events(
 					agent.as_deref(),
 					definition.as_ref(),
 					session_file.as_deref(),
+					Some(steering_tx.clone()),
 				);
 				let will_continue = matches!(status, crate::TurnStatus::ToolUse)
 					|| !message.tool_calls.is_empty();
-				hook.on_child_turn(&context, message, tool_results, will_continue);
+				hook.on_child_turn(&context, message, tool_results, will_continue)
+					.await;
 			}
 			// Live `history://` sees the event exactly as emitted; accounting
 			// still observes it once through `report_event` below.
@@ -1939,16 +1985,6 @@ impl Drop for LiveHistoryScope {
 	fn drop(&mut self) {
 		if let Some(manager) = crate::subagent_lifecycle::lookup(&self.supervisor) {
 			manager.drop_live(&self.id);
-		}
-		if let Some(hook) = self.supervisor.child_advisor_hook() {
-			let session_file = self.supervisor.child_session_file(&self.id);
-			let context = child_advisor_context(
-				&self.id,
-				None,
-				None,
-				session_file.as_deref(),
-			);
-			hook.on_child_end(&context);
 		}
 	}
 }
@@ -4753,13 +4789,14 @@ mod tests {
 			effort: None,
 			isolation: IsolationRequest::default(),
 		};
-		let (_steering_tx, steering_rx) = tokio::sync::mpsc::channel(1);
+		let (steering_tx, steering_rx) = tokio::sync::mpsc::channel(1);
 		let _ = run_background_child(
 			Arc::clone(&supervisor),
 			"task-bg".to_string(),
 			item,
 			std::path::PathBuf::from("."),
 			steering_rx,
+			steering_tx,
 			tokio_util::sync::CancellationToken::new(),
 			tool.child_context(),
 			None,

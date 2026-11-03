@@ -314,8 +314,11 @@ fn advisor_flag_runs_isolated_roster_and_preserves_late_blocker_card() {
 	assert!(log.contains("\"customType\":\"advisor\""), "journal card type");
 	assert!(log.contains("write target deleted"), "journal card body");
 
-	// Per-advisor transcript beside the session log, named for its slug.
-	let transcript = files[0].parent().expect("sessions dir").join("__advisor.reviewer.jsonl");
+	// Per-advisor transcript inside the session stem directory, named for its
+	// slug (TS `<session>/__advisor.<slug>.jsonl`).
+	let transcript = files[0]
+		.with_extension("")
+		.join("__advisor.reviewer.jsonl");
 	assert!(
 		transcript.is_file(),
 		"advisor transcript must be written: {}",

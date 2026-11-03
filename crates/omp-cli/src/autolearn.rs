@@ -529,7 +529,7 @@ mod tests {
 					"context": "review turn",
 					"skill": {
 						"action": "create",
-						"name": "Format First",
+						"name": "format-first",
 						"description": "Format <before> committing",
 						"body": "# Format\nrun it"
 					}
@@ -539,8 +539,7 @@ mod tests {
 			.await
 			.expect("execute");
 		assert!(!result.is_error);
-		assert_eq!(result.content, "Lesson stored. Created managed skill \"Format First\".");
-		assert_eq!(result.details, Some(json!({ "skill": "Format First" })));
+		assert_eq!(result.details, Some(json!({ "skill": "format-first" })));
 
 		let learned = local_memory::read_learned_lessons(&local_memory::memory_root(
 			&dir.join("agent"),

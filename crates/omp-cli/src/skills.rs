@@ -653,10 +653,12 @@ fn scan_dir(dir: &Path, require_description: bool) -> Result<(Vec<ScannedSkill>,
 				continue;
 			},
 		};
-		match parse_skill(&skill_path, &content, require_description) {
-			Ok(Some(skill)) => skills.push(skill),
-			Ok(None) => {},
-			Err(message) => warnings.push(message),
+		let (skill, warning) = parse_skill(&skill_path, &content, require_description);
+		if let Some(warning) = warning {
+			warnings.push(warning);
+		}
+		if let Some(skill) = skill {
+			skills.push(skill);
 		}
 	}
 	skills.sort_by(|left, right| {
@@ -674,22 +676,29 @@ fn parse_skill(
 	path: &Path,
 	content: &str,
 	require_description: bool,
-) -> std::result::Result<Option<ScannedSkill>, String> {
-	let Some((frontmatter, body)) = split_frontmatter(content) else {
-		return Err(format!("Failed to read skill file: {}", path.display()));
-	};
+) -> (Option<ScannedSkill>, Option<String>) {
+	// TS `parseFrontmatter` never rejects a missing or unclosed `---` block: the
+	// metadata is empty and the whole file is the body, so a frontmatter-less
+	// third-party `SKILL.md` still loads under its directory name.
+	let (frontmatter, body) = split_frontmatter(content).unwrap_or(("", content));
+	let mut warning = None;
 	let meta = if frontmatter.trim().is_empty() {
 		Value::Null
 	} else {
 		match yaml::parse(frontmatter) {
-			Ok(val) => val,
+			Ok(meta) => meta,
 			Err(err) => {
-				return Err(format!("Failed to read skill file: {} ({err})", path.display()));
+				// TS warns and keeps going with a `key: value` recovery pass.
+				warning = Some(format!(
+					"Failed to parse YAML frontmatter in {} ({err}); using the key: value fallback",
+					path.display()
+				));
+				parse_metadata_fallback(frontmatter)
 			},
 		}
 	};
 	if meta.get("enabled").and_then(Value::as_bool) == Some(false) {
-		return Ok(None);
+		return (None, warning);
 	}
 	let directory_name = path
 		.parent()
@@ -706,14 +715,46 @@ fn parse_skill(
 		.and_then(Value::to_text)
 		.unwrap_or_default();
 	if require_description && description.trim().is_empty() {
-		return Ok(None);
+		return (None, warning);
 	}
 	let hide = meta.get("hide").and_then(Value::as_bool) == Some(true)
 		|| meta.get("disableModelInvocation").and_then(Value::as_bool) == Some(true);
-	Ok(Some(ScannedSkill {
+	let scanned = ScannedSkill {
 		skill: Skill { name, description, path: path.to_path_buf(), body: body.to_string() },
 		hide,
-	}))
+	};
+	(Some(scanned), warning)
+}
+
+/// Recovery pass for metadata the YAML parser rejects, mirroring
+/// `parseFrontmatter`'s simple `key: value` fallback.
+///
+/// Each matched line is reparsed on its own so one malformed sibling cannot
+/// swallow the rest. A value that is not a scalar (null, mapping) or does not
+/// parse at all stays the raw trimmed text, exactly like the TS fallback.
+fn parse_metadata_fallback(metadata: &str) -> Value {
+	let mut pairs: Vec<(String, Value)> = Vec::new();
+	for line in metadata.lines() {
+		let Some((key, rest)) = line.split_once(':') else {
+			continue;
+		};
+		let valid_key = !key.is_empty()
+			&& key.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'));
+		if !valid_key {
+			continue;
+		}
+		let raw = rest.trim();
+		let value = if raw.is_empty() {
+			Value::Str(String::new())
+		} else {
+			match yaml::parse(raw) {
+				Ok(Value::Null | Value::Map(_)) | Err(_) => Value::Str(raw.to_string()),
+				Ok(value) => value,
+			}
+		};
+		pairs.push((key.to_string(), value));
+	}
+	Value::Map(pairs)
 }
 
 /// Split a `---` frontmatter block from the markdown body.
@@ -1138,6 +1179,55 @@ mod tests {
 			.map(|entry| entry.skill.name)
 			.collect();
 		assert_eq!(names, ["c", "x"]);
+	}
+
+	#[tokio::test]
+	async fn frontmatter_less_third_party_skill_loads_body_prompt_and_uri() {
+		use pi_agent::tools::internal_urls::{InternalUrl, ProtocolHandler, ResolveContext};
+
+		let dir = temp_dir();
+		let body = "# Bare\nno frontmatter at all\n";
+		write(&dir.join(".claude/skills/bare/SKILL.md"), body);
+
+		let result = load_with(&isolated_options(&dir)).expect("skills");
+		let bare = result.find("bare").expect("frontmatter-less claude skill loads");
+		assert_eq!(bare.skill.name, "bare", "the directory name is the name fallback");
+		assert_eq!(bare.skill.body, body, "the whole file becomes the body");
+		assert_eq!(bare.source, "claude:user");
+		assert_eq!(
+			result.prompt_skills().iter().map(|skill| skill.name.as_str()).collect::<Vec<_>>(),
+			["bare"]
+		);
+
+		let snapshot = SkillSnapshot::new();
+		snapshot.set(result.entries.clone());
+		let handler = crate::skill_protocol::SkillUrlHandler::new(snapshot);
+		let resource = handler
+			.resolve(
+				&InternalUrl::parse("skill://bare").expect("url"),
+				&ResolveContext::default(),
+			)
+			.await
+			.expect("skill:// resolves a frontmatter-less skill");
+		assert!(resource.content.contains("no frontmatter at all"));
+		assert_eq!(resource.content_type, "text/markdown");
+	}
+
+	#[test]
+	fn invalid_native_frontmatter_warns_and_skips_the_skill() {
+		let dir = temp_dir();
+		write(&dir.join("agent/skills/broken/SKILL.md"), "---\nname: broken\n- stray\n---\nbody\n");
+
+		let result = load_with(&isolated_options(&dir)).expect("skills");
+		assert!(result.find("broken").is_none(), "a native skill still needs a description");
+		assert!(
+			result
+				.warnings
+				.iter()
+				.any(|warning| warning.message.contains("Failed to parse YAML frontmatter")),
+			"the YAML failure is reported, not swallowed: {:?}",
+			result.warnings
+		);
 	}
 
 	#[test]

@@ -53,6 +53,10 @@ class MockModel:
         self.advisor_error = False
         self.child_error = False
         self.child_phase = False
+        self.child_gate = False
+        self.child_gate_seen = threading.Event()
+        self.child_gate_release = threading.Event()
+        self.child_gate_timed_out = False
         self.primary_delay = 0.0
         self.lock = threading.Lock()
         mock = self
@@ -79,6 +83,14 @@ class MockModel:
                     has_tool_result = any(
                         message.get("role") == "tool" for message in messages
                     )
+                    if child and mock.child_gate:
+                        mock.child_gate_seen.set()
+                        if mock.child_gate_release.wait(timeout=10):
+                            # Abort observed: close without a scripted assistant
+                            # chunk, so no fabricated card/transcript can follow.
+                            self.close_connection = True
+                            return
+                        mock.child_gate_timed_out = True
                     if not advisor and mock.primary_delay:
                         delay = mock.primary_delay
                     else:
@@ -172,6 +184,10 @@ class MockModel:
             self.advisor_error = False
             self.child_error = False
             self.child_phase = False
+            self.child_gate = False
+            self.child_gate_timed_out = False
+            self.child_gate_seen.clear()
+            self.child_gate_release.clear()
 
     def dump(self, path: Path) -> None:
         with self.lock:
@@ -873,10 +889,96 @@ def phase_child_failure(binary: str, mock: MockModel, base: Path) -> None:
 
 
 def phase_child_cancel(binary: str, mock: MockModel, base: Path) -> None:
-    # The current mock has no deterministic child-cancel gate: cancellation is
-    # driven by the live turn owner, not by a scripted provider chunk. Keep the
-    # phase explicit so a future gate can fill it without changing dispatch.
-    print("SKIP child cancellation: no deterministic mock gate")
+    agent_dir, cwd, sessions, _ = write_config(base / "child-cancel", mock.port)
+    mock.child_phase = True
+    mock.child_gate = True
+    proc, lines = spawn_with_reader(
+        binary,
+        [
+            binary,
+            "--cwd", str(cwd),
+            "--session-dir", str(sessions),
+            "--no-title",
+            "--yolo",
+            "--mode", "rpc",
+        ],
+        omp_env(agent_dir),
+    )
+    ready = read_lines(proc, lines, 20, lambda frame: frame.get("type") == "ready")
+    if not ready:
+        fail("child-cancel RPC never sent ready")
+    send(proc, {"id": "1", "type": "prompt", "message": "spawn one child-smoke task"})
+    if not mock.child_gate_seen.wait(TIMEOUT):
+        mock.child_gate_release.set()
+        close_stdin(proc)
+        fail("child stream gate never opened")
+    abort_frames: list[dict] = []
+    after_abort: list[dict] = []
+    try:
+        send(proc, {"id": "2", "type": "abort"})
+        # Release immediately after sending abort: the command is already on
+        # the wire; waiting for its response first could deadlock behind the
+        # gated child provider stream.
+        mock.child_gate_release.set()
+        abort_frames = read_lines(
+            proc,
+            lines,
+            20,
+            lambda frame: frame.get("type") == "response"
+            and frame.get("command") == "abort",
+        )
+        if not any(
+            frame.get("type") == "response" and frame.get("command") == "abort"
+            for frame in abort_frames
+        ):
+            fail("RPC abort produced no response")
+        if mock.child_gate_timed_out:
+            fail("child stream gate timed out before abort")
+        mock.child_gate_release.set()
+        terminal = ready + abort_frames
+        if not any(
+            frame.get("type") in {"turn_end", "error"} for frame in terminal
+        ):
+            after_abort = read_lines(
+                proc,
+                lines,
+                TIMEOUT,
+                lambda frame: frame.get("type") in {"turn_end", "error"},
+            )
+    finally:
+        mock.child_gate_release.set()
+    frames = ready + abort_frames + after_abort
+    if not any(frame.get("type") in {"turn_end", "error"} for frame in frames):
+        fail("aborted child task never produced a terminal frame")
+    primary_requests = [
+        request
+        for request in list(mock.requests)
+        if "CHILD-SMOKE-MARKER" not in json.dumps(request.get("messages", [])[:1])
+        and "passive advisor" not in json.dumps(request.get("messages", [])[:1])
+    ]
+    if len(primary_requests) != 1:
+        fail(
+            "abort did not stop the root before a second primary turn "
+            f"({len(primary_requests)} primary requests)"
+        )
+    if any(
+        isinstance(frame.get("message"), dict)
+        and frame["message"].get("customType") == "advisor"
+        for frame in frames
+    ):
+        fail("aborted child task fabricated an advisor card")
+    if any(
+        "passive advisor" in json.dumps(request.get("messages", [])[:1])
+        for request in list(mock.requests)
+    ):
+        fail("aborted child spawned an advisor provider request")
+    transcripts = list(sessions.rglob("__advisor*.jsonl"))
+    if transcripts:
+        fail(f"aborted child left an advisor transcript: {transcripts}")
+    code = close_stdin(proc)
+    if code != 0:
+        fail(f"child-cancel RPC dispose exited {code}")
+    print("PASS child cancellation gate, RPC abort, no card/transcript")
 
 
 def main() -> None:

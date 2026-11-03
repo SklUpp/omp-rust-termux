@@ -405,6 +405,15 @@ impl RpcSession {
 		)) {
 			return Err(Error::new(error));
 		}
+		let memory_agent_dir = skill_options
+			.agent_dir
+			.clone()
+			.unwrap_or_else(crate::dirs::agent_dir);
+		if let Err(error) = internal_urls.register(Arc::new(
+			crate::memory_protocol::MemoryUrlHandler::new(memory_agent_dir, config.memory_backend()),
+		)) {
+			return Err(Error::new(error));
+		}
 
 		let mut store = SessionStore::open(&store_options);
 		for warning in store.take_warnings() {
@@ -1716,7 +1725,13 @@ impl RpcSession {
 			self.config.memory_backend(),
 			crate::autolearn::MemoryBackend::Local
 		)
-		.then(|| crate::local_memory::build_learned_instructions(&self.agent_dir(), &self.cwd))
+		.then(|| {
+			crate::local_memory::build_memory_instructions(
+				&self.agent_dir(),
+				&self.cwd,
+				self.config.summary_injection_token_limit(),
+			)
+		})
 		.flatten();
 		let (manage, learn) = self.autolearn_tool_presence();
 		let autolearn = crate::autolearn::build_auto_learn_instructions(manage, learn);
@@ -1753,6 +1768,10 @@ impl RpcSession {
 		request.goal_context = None;
 		request.plan_context = None;
 		request.plan_mode = crate::agent::PlanModeHooks::default();
+		request.tool_ceiling = Some(crate::agent::ToolCeiling {
+			exclude_mcp:             true,
+			exclude_extension_tools: true,
+		});
 		request.todo_phases = Vec::new();
 		request.continuation = false;
 		request.acp_bridge = None;
@@ -2185,6 +2204,10 @@ impl RpcSession {
 			goal: Some(Arc::clone(&self.goal)),
 			goal_context,
 			plan_mode: self.plan_mode.clone(),
+			tool_ceiling: None,
+			skill_autoload: crate::agent::AutoloadHandle(Some(Arc::new(
+				crate::skills::SnapshotAutoloadResolver::new(self.skill_snapshot.clone()),
+			))),
 			continuation,
 			plan_context: self.plan_context(),
 			service_tier_by_family: self.service_tier_by_family(),

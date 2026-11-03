@@ -239,6 +239,13 @@ pub struct RunRequest {
 	/// Plan-mode runtime wiring: the write guard, the `xd://propose` handler and
 	/// the plan side of the composite tool policy. Empty outside plan mode.
 	pub plan_mode: PlanModeHooks,
+	/// Request-specific capability ceiling. `None` keeps the full registry;
+	/// isolated runs (auto-learn capture) exclude MCP and extension tools here
+	/// instead of changing global MCP selection.
+	pub tool_ceiling: Option<ToolCeiling>,
+	/// Session-scoped `autoloadSkills` resolver for child agents; default means
+	/// no session snapshot and declared names are skipped.
+	pub skill_autoload: AutoloadHandle,
 	/// Detached plan-reminder continuation: no caller message is appended and
 	/// the first request uses the policy's one-shot forced choice.
 	pub continuation: bool,
@@ -263,6 +270,37 @@ impl std::fmt::Debug for PlanModeHooks {
 			.field("propose", &self.propose.is_some())
 			.field("policy", &self.policy.is_some())
 			.finish()
+	}
+}
+
+/// Request-specific tool capability ceiling.
+///
+/// Used by isolated runs (auto-learn capture) to keep MCP servers and extension
+/// tools out of the registry without altering global MCP selection: every
+/// ordinary request leaves this `None`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ToolCeiling {
+	/// Mount no MCP tool and run no MCP discovery for this request.
+	pub exclude_mcp:              bool,
+	/// Bind no extension/eval tool for this request.
+	pub exclude_extension_tools:  bool,
+}
+
+/// Keeps [`RunRequest`]'s derived `Debug` intact for the session-scoped
+/// `autoloadSkills` resolver.
+#[derive(Clone, Default)]
+pub struct AutoloadHandle(pub Option<std::sync::Arc<dyn pi_agent::tools::task::AutoloadSkillResolver>>);
+
+impl std::fmt::Debug for AutoloadHandle {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_tuple("AutoloadHandle").field(&self.0.is_some()).finish()
+	}
+}
+
+impl AutoloadHandle {
+	#[must_use]
+	pub fn resolver(&self) -> Option<std::sync::Arc<dyn pi_agent::tools::task::AutoloadSkillResolver>> {
+		self.0.clone()
 	}
 }
 

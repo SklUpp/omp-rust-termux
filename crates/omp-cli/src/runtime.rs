@@ -1248,7 +1248,11 @@ impl AgentRunner for PiAgentRunner {
 			})
 		}));
 
-		let mcp_spawn = if request.tools_enabled {
+		let mcp_spawn = if request.tools_enabled
+			&& !request
+				.tool_ceiling
+				.is_some_and(|ceiling| ceiling.exclude_mcp)
+		{
 			let extra_mcp = request.extra_mcp_servers.clone();
 			match self.runtime.block_on(async {
 				if extra_mcp.is_empty() {
@@ -1354,6 +1358,7 @@ impl AgentRunner for PiAgentRunner {
 		// supervisor shares the same router with every child registry.
 		session.set_internal_urls(request.internal_urls.clone());
 		session.set_url_scope(request.url_scope.clone());
+		session.set_autoload_resolver(request.skill_autoload.resolver());
 		session.set_acp_bridge(request.acp_bridge.as_ref().map(|handle| Arc::clone(&handle.0)));
 		let acp_bridge = session.acp_bridge();
 		// `lsp.shared`/`tools.maxTimeout` are applied before the registry is built
@@ -1679,7 +1684,11 @@ impl AgentRunner for PiAgentRunner {
 		// Eval is mounted after the final registry exists: the host's bridged
 		// `tool.*` view must see ask/checkpoint/bash, and registering before the
 		// supervisor clones its template would leak a root-bound host to children.
-		let eval_allowed = request.tools_enabled && plan.tools.contains(&"eval");
+		let eval_allowed = request.tools_enabled
+			&& plan.tools.contains(&"eval")
+			&& !request
+				.tool_ceiling
+				.is_some_and(|ceiling| ceiling.exclude_extension_tools);
 		let eval_binder = if eval_allowed {
 			let settings = crate::eval_host::eval_settings(&request.config);
 			let eval_runtime = session.eval_runtime(&self.runtime, settings)?;
@@ -5963,6 +5972,8 @@ mod tests {
 			goal_context: None,
 			credential_resolver: None,
 			plan_mode: Default::default(),
+			tool_ceiling: None,
+			skill_autoload: Default::default(),
 			continuation: false,
 			plan_context: None,
 			service_tier_by_family: std::collections::BTreeMap::new(),

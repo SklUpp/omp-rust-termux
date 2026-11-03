@@ -181,6 +181,23 @@ fn respond(request: &serde_json::Value) -> String {
 		)
 	} else if text.contains("READ THE SKILL") {
 		tool_call_body("call-read", "read", &serde_json::json!({ "path": "skill://captured" }))
+	} else if text.contains("READ MEMORY") {
+		tool_call_body("call-memory", "read", &serde_json::json!({ "path": "memory://root" }))
+	} else if text.contains("READ LEARNED") {
+		tool_call_body(
+			"call-learned",
+			"read",
+			&serde_json::json!({ "path": "memory://root/learned.md" }),
+		)
+	} else if text.contains("SPAWN CHILD") {
+		tool_call_body(
+			"call-task",
+			"task",
+			&serde_json::json!({
+				"items": [{ "name": "child", "agent": "child", "task": "inspect the repo" }],
+				"async": false,
+			}),
+		)
 	} else {
 		text_body("ack")
 	}
@@ -335,5 +352,159 @@ fn local_learning_capture_skill_command_and_uri_resolve() {
 	assert!(
 		read_result.contains("# Captured\nrun it"),
 		"skill:// did not resolve to the managed skill: {read_result}"
+	);
+}
+
+#[test]
+fn memory_root_reads_and_exact_guidance() {
+	let server = MockModel::start();
+	let temp = temp_dir("memory");
+	let agent_dir = temp.join("agent");
+	let cwd = temp.join("project");
+	let sessions_dir = temp.join("sessions");
+	let share_dir = temp.join("share");
+	let config_dir = temp.join("config");
+	for dir in [&sessions_dir, &share_dir, &config_dir, &cwd] {
+		fs::create_dir_all(dir).expect("fixture dir");
+	}
+	setup_agent_dir(&agent_dir, server.port);
+	let memory_root = omp_cli::local_memory::memory_root(&agent_dir, &cwd);
+	fs::create_dir_all(&memory_root).expect("memory root");
+	fs::write(memory_root.join("memory_summary.md"), "summary text").expect("summary");
+	fs::write(memory_root.join("learned.md"), "lesson from disk").expect("learned");
+
+	let output = ProcCommand::new(env!("CARGO_BIN_EXE_omp"))
+		.env("PI_CODING_AGENT_DIR", &agent_dir)
+		.env("PI_CONFIG_DIR", &config_dir)
+		.env("OMP_SHARE_DIR", &share_dir)
+		.env("PI_NO_TITLE", "1")
+		.stdin(Stdio::null())
+		.args(["--cwd", cwd.to_str().unwrap()])
+		.args(["--session-dir", sessions_dir.to_str().unwrap()])
+		.args(["--no-session", "--tools", "read", "--yolo"])
+		.args(["--max-time", "20s", "--mode", "text", "-p"])
+		.args(["READ MEMORY", "READ LEARNED"])
+		.output()
+		.expect("run omp memory reads");
+	assert_eq!(
+		output.status.code(),
+		Some(0),
+		"{}",
+		String::from_utf8_lossy(&output.stderr)
+	);
+
+	let requests = server.requests.lock().expect("requests").clone();
+	let system = requests[0]
+		.get("messages")
+		.and_then(serde_json::Value::as_array)
+		.and_then(|messages| messages.first())
+		.map(message_text)
+		.unwrap_or_default();
+	assert!(system.contains("# Memory Guidance"), "{system}");
+	assert!(system.contains("Root: memory://root"), "{system}");
+	assert!(system.contains("1. Read `memory://root/memory_summary.md` first."), "{system}");
+	assert!(system.contains("Memory summary:\nsummary text"), "{system}");
+	assert!(system.contains("Learned lessons"), "{system}");
+	assert!(system.contains("lesson from disk"), "{system}");
+
+	let summary_result = requests[1]
+		.get("messages")
+		.and_then(serde_json::Value::as_array)
+		.and_then(|messages| messages.last())
+		.map(message_text)
+		.unwrap_or_default();
+	assert!(summary_result.contains("summary text"), "{summary_result}");
+	let learned_result = requests[3]
+		.get("messages")
+		.and_then(serde_json::Value::as_array)
+		.and_then(|messages| messages.last())
+		.map(message_text)
+		.unwrap_or_default();
+	assert!(learned_result.contains("lesson from disk"), "{learned_result}");
+}
+
+#[test]
+fn autoload_skills_reach_the_child_conversation_once() {
+	let server = MockModel::start();
+	let temp = temp_dir("autoload");
+	let agent_dir = temp.join("agent");
+	let cwd = temp.join("project");
+	let sessions_dir = temp.join("sessions");
+	let share_dir = temp.join("share");
+	let config_dir = temp.join("config");
+	for dir in [&sessions_dir, &share_dir, &config_dir, &cwd] {
+		fs::create_dir_all(dir).expect("fixture dir");
+	}
+	setup_agent_dir(&agent_dir, server.port);
+	fs::create_dir_all(cwd.join(".omp/agents")).expect("agents dir");
+	fs::write(
+		cwd.join(".omp/agents/child.md"),
+		"---\nname: child\ndescription: Child agent for autoload tests\nautoloadSkills: [captured]\n---\nChild marker instructions.\n",
+	)
+	.expect("agent md");
+
+	let output = ProcCommand::new(env!("CARGO_BIN_EXE_omp"))
+		.env("PI_CODING_AGENT_DIR", &agent_dir)
+		.env("PI_CONFIG_DIR", &config_dir)
+		.env("OMP_SHARE_DIR", &share_dir)
+		.env("PI_NO_TITLE", "1")
+		.stdin(Stdio::null())
+		.args(["--cwd", cwd.to_str().unwrap()])
+		.args(["--session-dir", sessions_dir.to_str().unwrap()])
+		.args(["--no-session", "--tools", "task,read,learn,manage_skill", "--yolo"])
+		.args(["--max-time", "30s", "--mode", "text", "-p"])
+		.args(["CREATE THE SKILL now", "SPAWN CHILD now"])
+		.output()
+		.expect("run omp autoload");
+	assert_eq!(
+		output.status.code(),
+		Some(0),
+		"{}",
+		String::from_utf8_lossy(&output.stderr)
+	);
+
+	let requests = server.requests.lock().expect("requests").clone();
+	let child_request = requests
+		.iter()
+		.find(|request| {
+			request
+				.get("messages")
+				.and_then(serde_json::Value::as_array)
+				.and_then(|messages| messages.first())
+				.map(message_text)
+				.is_some_and(|system| system.contains("Child marker instructions."))
+		})
+		.expect("child request reached the provider");
+	let messages = child_request
+		.get("messages")
+		.and_then(serde_json::Value::as_array)
+		.expect("messages");
+	let autoload_index = messages
+		.iter()
+		.position(|message| message_text(message).contains("# Captured\nrun it"))
+		.expect("autoload message in child conversation");
+	let assignment_index = messages
+		.iter()
+		.position(|message| message_text(message).contains("Complete assignment thoroughly:"))
+		.expect("assignment message");
+	assert!(
+		autoload_index < assignment_index,
+		"autoload must precede the assignment"
+	);
+	assert_eq!(
+		messages
+			.iter()
+			.filter(|message| message_text(message).contains("Complete assignment thoroughly:"))
+			.count(),
+		1,
+		"assignment must not be duplicated"
+	);
+	assert_eq!(
+		messages
+			.iter()
+			.filter(|message| message_text(message).contains("# Captured\nrun it"))
+			.count(),
+		1,
+		"autoload body must appear once"
 	);
 }

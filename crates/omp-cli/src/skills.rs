@@ -463,6 +463,34 @@ pub fn load_with(options: &LoadOptions) -> Result<LoadResult> {
 	Ok(LoadResult { entries, warnings })
 }
 
+/// Session-scoped `autoloadSkills` resolver for subagent agents.
+///
+/// Uses the same snapshot as `skill://` and `/skill`, so hidden skills and
+/// freshly refreshed entries resolve identically. Unknown names are `Ok(None)`
+/// (TS filters them out); a read failure is returned as `Err` instead of being
+/// mistaken for a missing skill.
+pub struct SnapshotAutoloadResolver {
+	snapshot: SkillSnapshot,
+}
+
+impl SnapshotAutoloadResolver {
+	#[must_use]
+	pub fn new(snapshot: SkillSnapshot) -> Self {
+		Self { snapshot }
+	}
+}
+
+impl pi_agent::tools::task::AutoloadSkillResolver for SnapshotAutoloadResolver {
+	fn autoload_message(&self, name: &str) -> Result<Option<String>, String> {
+		let Some(entry) = self.snapshot.find(name) else {
+			return Ok(None);
+		};
+		let built = build_skill_prompt_message(&entry.skill, "", SkillInvocationKind::Autoload)
+			.map_err(|error| format!("cannot autoload skill \"{name}\": {error}"))?;
+		Ok(Some(built.message))
+	}
+}
+
 /// Resolve a `/skill:<name>` invocation against one session's snapshot.
 ///
 /// TS `tryRunRpcSkillCommand` / interactive input controller: parse the

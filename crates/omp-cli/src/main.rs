@@ -28,6 +28,7 @@ use omp_cli::{
 	local_cmd,
 	local_memory,
 	local_models,
+	memory_protocol::MemoryUrlHandler,
 	output::{self, OutputMode, Reporter, session_id},
 	plan_yolo,
 	prewalk,
@@ -711,6 +712,16 @@ fn run() -> std::result::Result<(), CliError> {
 	let internal_urls = Arc::new(pi_agent::tools::internal_urls::InternalUrlRouter::new());
 	let _ = internal_urls
 		.register(Arc::new(SkillUrlHandler::new(skill_snapshot.clone())))
+		.map_err(Error::new)?;
+	let memory_agent_dir = skill_options
+		.agent_dir
+		.clone()
+		.unwrap_or_else(dirs::agent_dir);
+	let _ = internal_urls
+		.register(Arc::new(MemoryUrlHandler::new(
+			memory_agent_dir,
+			config.memory_backend(),
+		)))
 		.map_err(Error::new)?;
 	let catalog = Arc::new(Catalog::load(&cwd)?);
 	let approvals = Approvals::new(
@@ -1808,7 +1819,13 @@ impl Session<'_> {
 	/// memory guidance, then the auto-learn guidance driven by mounted tools.
 	fn runtime_append_prompt(&self) -> Option<String> {
 		let memory = matches!(self.config.memory_backend(), MemoryBackend::Local)
-			.then(|| local_memory::build_learned_instructions(&self.agent_dir(), &self.cwd))
+			.then(|| {
+				local_memory::build_memory_instructions(
+					&self.agent_dir(),
+					&self.cwd,
+					self.config.summary_injection_token_limit(),
+				)
+			})
 			.flatten();
 		let (manage, learn) = self.autolearn_tool_presence();
 		let autolearn = autolearn::build_auto_learn_instructions(manage, learn);
@@ -1986,6 +2003,11 @@ impl Session<'_> {
 			// Plan hooks stay off: plan mode is gated out above and a capture
 			// must never stage or approve plan writes.
 			request.plan_mode = agent::PlanModeHooks::default();
+			// Capability ceiling: no MCP, no extension/eval bridge for capture.
+			request.tool_ceiling = Some(agent::ToolCeiling {
+				exclude_mcp:             true,
+				exclude_extension_tools: true,
+			});
 			let stream = self.runner.run(&request)?;
 			for event in stream {
 				event?;
@@ -2156,6 +2178,10 @@ impl Session<'_> {
 			goal_context,
 			credential_resolver: None,
 			plan_mode,
+			tool_ceiling: None,
+			skill_autoload: agent::AutoloadHandle(Some(Arc::new(
+				skills::SnapshotAutoloadResolver::new(self.skill_snapshot.clone()),
+			))),
 			continuation: false,
 			plan_context,
 			service_tier_by_family,

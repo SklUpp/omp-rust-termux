@@ -191,7 +191,7 @@ pub fn validate_relative_path(relative_path: &str) -> Result<(), String> {
 }
 
 /// Percent-decode a URL path segment; invalid escapes are kept verbatim.
-fn decode_percent(input: &str) -> String {
+pub(crate) fn decode_percent(input: &str) -> String {
 	let bytes = input.as_bytes();
 	let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
 	let mut index = 0;
@@ -225,7 +225,7 @@ fn normalize_lexically(path: &Path) -> PathBuf {
 	out
 }
 
-fn content_type_for(path: &Path) -> &'static str {
+pub(crate) fn content_type_for(path: &Path) -> &'static str {
 	let markdown = path
 		.extension()
 		.and_then(std::ffi::OsStr::to_str)

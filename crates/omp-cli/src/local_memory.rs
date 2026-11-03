@@ -37,6 +37,8 @@ use crate::{Error, Result, dirs};
 
 /// Filename of the captured-lessons file under a project's memory root.
 pub const LEARNED_LESSONS_FILE: &str = "learned.md";
+/// Summary artifact consumed by the memory guidance (never produced here).
+pub const MEMORY_SUMMARY_FILE: &str = "memory_summary.md";
 /// Newest-first cap on retained lessons.
 pub const MAX_LEARNED_LESSONS: usize = 100;
 /// Per-field char caps so one huge capture cannot bloat `learned.md`.
@@ -351,22 +353,89 @@ pub fn read_learned_lessons(root: &Path) -> String {
 		.join("\n")
 }
 
-/// Render the learned-lessons developer instructions for one project.
+/// Default `memories.summaryInjectionTokenLimit` (`memories/index.ts:76`).
+pub const DEFAULT_SUMMARY_INJECTION_TOKEN_LIMIT: usize = 5_000;
+
+/// Read the project memory summary, if the summary producer wrote one.
 ///
-/// Mirrors the `learned` branch of TS `prompts/memories/read-path.md` (the
-/// local backend's `buildDeveloperInstructions`). This port stores only
-/// `learned.md` for the local backend, so the `memory://root` rules and the
-/// optional summary block are omitted rather than pointing at a scheme that is
-/// not mounted. `None` keeps an empty memory surface out of the prompt.
+/// This port has no summary pipeline: the file is consumed when another
+/// producer (or an earlier full-app session) created it, never synthesized.
 #[must_use]
-pub fn build_learned_instructions(agent_dir: &Path, cwd: &Path) -> Option<String> {
-	let learned = read_learned_lessons(&memory_root(agent_dir, cwd));
-	if learned.is_empty() {
+pub fn read_memory_summary(root: &Path) -> Option<String> {
+	let raw = fs::read_to_string(root.join(MEMORY_SUMMARY_FILE)).ok()?;
+	let trimmed = raw.trim();
+	(!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+/// Render the developer instructions exactly like TS
+/// `prompts/memories/read-path.md`.
+///
+/// `summary` is injected only when `memory_summary.md` really exists; `learned`
+/// is independent of it (and shares the summary token budget, TS
+/// `renderMemoryToolDeveloperInstructionsSnapshot`). `None` when both are empty.
+#[must_use]
+pub fn build_memory_instructions(
+	agent_dir: &Path,
+	cwd: &Path,
+	summary_token_limit: usize,
+) -> Option<String> {
+	let root = memory_root(agent_dir, cwd);
+	let summary = read_memory_summary(&root).unwrap_or_default();
+	let learned = read_learned_lessons(&root);
+	if summary.is_empty() && learned.is_empty() {
 		return None;
 	}
-	Some(format!(
-		"# Memory Guidance\n\nLearned lessons (`learn`-captured; durable but may be stale—verify against repo before relying):\n{learned}"
-	))
+	let summary_out = truncate_by_approx_tokens(&summary, summary_token_limit).trim().to_string();
+	let summary_chars = summary_out.chars().count();
+	let learned_budget =
+		summary_token_limit.saturating_sub(summary_chars.div_ceil(4));
+	let learned_out = if learned.is_empty() || learned_budget == 0 {
+		String::new()
+	} else {
+		truncate_by_approx_tokens(&learned, learned_budget).trim().to_string()
+	};
+	if summary_out.is_empty() && learned_out.is_empty() {
+		return None;
+	}
+	let mut message = String::from(
+		"# Memory Guidance\nRoot: memory://root\nRules:\n\
+		 1. Read `memory://root/memory_summary.md` first.\n\
+		 2. If needed, inspect `memory://root/MEMORY.md` and `memory://root/skills/<name>/SKILL.md`.\n\
+		 3. Memory: heuristics/process context; current repo files, runtime output, user instruction: factual state/final decisions.\n\
+		 4. Memory changes plan → cite artifact path (e.g. `memory://root/skills/<name>/SKILL.md`) and current-repo evidence.\n\
+		 5. Memory disagreement with repo state/user instruction → stale; corrected behavior, then update/regenerate memory artifacts.\n\
+		 6. Confidence only after repository verification; memory alone NEVER sufficient proof.",
+	);
+	if !summary_out.is_empty() {
+		message.push_str("\n\nMemory summary:\n");
+		message.push_str(&summary_out);
+	}
+	if !learned_out.is_empty() {
+		message.push_str(
+			"\n\nLearned lessons (`learn`-captured; durable but may be stale—verify against repo before relying):\n",
+		);
+		message.push_str(&learned_out);
+	}
+	Some(message)
+}
+
+/// TS `truncateByApproxTokens` (~4 chars/token, head 60% / tail 40%).
+fn truncate_by_approx_tokens(text: &str, token_limit: usize) -> String {
+	if token_limit == 0 {
+		return String::new();
+	}
+	let max_chars = token_limit.saturating_mul(4);
+	let chars = text.chars().collect::<Vec<_>>();
+	if chars.len() <= max_chars {
+		return text.to_string();
+	}
+	let head = max_chars * 6 / 10;
+	let tail = max_chars - head;
+	format!(
+		"{}\n\n...[truncated]...\n\n{}",
+		chars[..head].iter().collect::<String>(),
+		chars[chars.len() - tail..].iter().collect::<String>()
+	)
 }
 
 fn is_cancelled(cancel: Option<&CancelProbe<'_>>) -> bool {
@@ -638,5 +707,35 @@ mod tests {
 		assert_eq!(status.backend, "local");
 		assert!(status.active && status.writable);
 		assert!(!status.searchable);
+	}
+
+	#[test]
+	fn memory_instructions_render_summary_and_learned_independently() {
+		let dir = temp_dir();
+		let agent = dir.join("agent");
+		let cwd = dir.join("project");
+		fs::create_dir_all(&cwd).expect("cwd");
+		let root = memory_root(&agent, &cwd);
+		fs::create_dir_all(&root).expect("root");
+		assert!(build_memory_instructions(&agent, &cwd, DEFAULT_SUMMARY_INJECTION_TOKEN_LIMIT).is_none());
+
+		fs::write(root.join(LEARNED_LESSONS_FILE), "lesson only").expect("learned");
+		let learned = build_memory_instructions(&agent, &cwd, DEFAULT_SUMMARY_INJECTION_TOKEN_LIMIT)
+			.expect("learned guidance");
+		assert!(learned.starts_with("# Memory Guidance"));
+		assert!(learned.contains("Root: memory://root"));
+		assert!(learned.contains("1. Read `memory://root/memory_summary.md` first."));
+		assert!(!learned.contains("Memory summary:"), "{learned}");
+		assert!(learned.contains("lesson only"));
+
+		fs::write(root.join(MEMORY_SUMMARY_FILE), "summary here").expect("summary");
+		let both = build_memory_instructions(&agent, &cwd, DEFAULT_SUMMARY_INJECTION_TOKEN_LIMIT)
+			.expect("both");
+		assert!(both.contains("Memory summary:\nsummary here"), "{both}");
+		assert!(both.contains("lesson only"));
+
+		fs::write(root.join(MEMORY_SUMMARY_FILE), "x".repeat(40_000)).expect("big summary");
+		let truncated = build_memory_instructions(&agent, &cwd, 10).expect("truncated");
+		assert!(truncated.contains("...[truncated]..."));
 	}
 }

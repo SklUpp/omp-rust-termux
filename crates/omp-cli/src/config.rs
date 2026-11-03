@@ -725,6 +725,8 @@ pub struct Config {
 	pub memory_backend:       Option<MemoryBackend>,
 	/// Legacy `memories.enabled`, migrated to `memory.backend` by TS settings.
 	pub memories_enabled:     Option<bool>,
+	/// `memories.summaryInjectionTokenLimit`; absent means 5000.
+	pub memories_summary_injection_token_limit: Option<usize>,
 	/// `autolearn.*`: post-stop capture settings.
 	pub autolearn:            AutolearnConfig,
 	/// `skills.*`: discovery toggles and filters.
@@ -807,6 +809,14 @@ impl Config {
 			.unwrap_or(MemoryBackend::Off)
 	}
 
+	/// `memories.summaryInjectionTokenLimit`, default 5000.
+	#[must_use]
+	pub fn summary_injection_token_limit(&self) -> usize {
+		self
+			.memories_summary_injection_token_limit
+			.unwrap_or(crate::local_memory::DEFAULT_SUMMARY_INJECTION_TOKEN_LIMIT)
+	}
+
 	pub fn merge(&mut self, overlay: Self) {
 		if overlay.default_model.is_some() {
 			self.default_model = overlay.default_model;
@@ -841,6 +851,10 @@ impl Config {
 		}
 		if overlay.memories_enabled.is_some() {
 			self.memories_enabled = overlay.memories_enabled;
+		}
+		if overlay.memories_summary_injection_token_limit.is_some() {
+			self.memories_summary_injection_token_limit =
+				overlay.memories_summary_injection_token_limit;
 		}
 		self.prewalk.merge(overlay.prewalk);
 		self.eval_config.merge(overlay.eval_config);
@@ -1340,6 +1354,15 @@ fn apply_nested_settings(config: &mut Config, value: &Value, path: &Path) -> Res
 	}
 	if let Some(enabled) = settings_leaf(value, "memories", "enabled", "memories.enabled") {
 		config.memories_enabled = expect_bool(enabled, "memories.enabled", path)?;
+	}
+	if let Some(limit) = settings_leaf(
+		value,
+		"memories",
+		"summaryInjectionTokenLimit",
+		"memories.summaryInjectionTokenLimit",
+	) {
+		config.memories_summary_injection_token_limit =
+			expect_usize(limit, "memories.summaryInjectionTokenLimit", path)?;
 	}
 	for (leaf, dotted) in [
 		("enabled", "autolearn.enabled"),

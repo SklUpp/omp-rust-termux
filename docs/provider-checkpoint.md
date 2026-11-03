@@ -1,58 +1,92 @@
-# Provider checkpoint — 2026-11-03
+# Rust CLI verification and integration
 
-## Decision
+[Architecture](rust-cli-project-context.md) · [Scope and evidence](rust-cli-parity-plan.md)
 
-Provider implementation is paused at the user's request. Do not start new provider features, dialects or refactoring without a new instruction. Priority moves to Plan-yolo and remaining C1–C7 work. This checkpoint is not full C8 completion.
+## Working model
 
-## Verified baseline and publication boundary
+Each task has an isolated worktree, one implementation owner and an independent reviewer. Reuse both within that task. Shared files require explicit interfaces and parent-side integration, not mixed task ownership.
 
-- Last fully CI- and Android-runtime-verified revision: `37662476dcb25da07b9d2b79360ca3011c8d1264`.
-- CI: https://github.com/SklUpp/omp-termux/actions/runs/41540378633 — host 6 m 24 s, native 1 m 20 s and Android 9 m 13 s, all successful.
-- Downloaded binary: `/data/data/com.termux/files/usr/tmp/omp-37662476dc.vdFwxO/omp`.
-- SHA-256: `7ce8cc6656d73e67407db1f5b56a6ce90a56faaeabff22cec39089e89f513a19`, matched manifest; `--version` prints `0`. Actual headless Plan guard/target/default-resume plus ACP cancel/manual-reentry/ordinary-elicitation-default and non-empty-hide MCP echo/hidden-write denial combined PASS, exit 0 in 3.62 s (`bg55`); full RPC 33/33 actual in 2.81 s including a failed-switch durable error and reopened branch. Installed CLI was not replaced.
-- Earlier provider-only verified baseline: `dab7ed8e8dc706d503da247adc1fe271a28b8304`, CI https://github.com/SklUpp/omp-termux/actions/runs/41485151065, binary `/data/data/com.termux/files/usr/tmp/omp-dab7ed8e8d.Gg8ZlW/omp`, SHA-256 `665edd6ad40d08bca3909c8fd8cdd032b202b88c59561b590380550128e3b2d2`, matched manifest; actual RPC thinking-cache smoke passed three scenarios, exit 0, 2.03 s. Retained historical evidence.
-- Later published Anthropic priority revision `0da55ccd934951bd661d58c7b37f5bf402f9bb64` had CI https://github.com/SklUpp/omp-termux/actions/runs/41528328842 — native and Android successful; host failed compiling a test-only `CliChildModelFactory` initializer missing `service_tier_by_family` at `crates/omp-cli/src/runtime.rs:6342`.
-- Fix authored as `26005d554f`, integrated as `601b60aa49`: supplies an empty tier map to that cancelled-factory fixture. The correction is included in accepted `376`, closing the prior `b1963` host predicate failure. Do not call `0da55ccd93` fully green or artifact-accepted.
-- Later Plan-yolo changes are covered by accepted `376`; this checkpoint still does not claim all providers, full C1-C8 or UI completion.
+Finish the current implementation, fix review findings, exercise its real path, then integrate. READY and source review are not runtime acceptance. Do not begin new functionality while closing the current block.
 
-## Locally accepted behavior
+Before integration, inspect tracked and untracked changes in every task worktree. Commit all intended changes and reconcile each unique commit with base. Preserve unrelated user work; do not silently commit or merge it. A clean tree alone does not prove its commits were integrated.
 
-### Shared provider/runtime contracts
+No force-push, reset, worktree clean, deletion, dependency installation, installed-CLI replacement, tag, release or PR without separate authorization. Superseded files are preserved under `$HOME/.trash-<date>/`; moving them does not reclaim storage.
 
-- `crates/pi-agent/src/provider.rs`: `ModelProvider`, `StreamChunk`, indexed block events and `StreamAssembler`.
-- `crates/pi-agent/src/state.rs`: shared `Message`, ordered content parts, signed/redacted thinking, tool calls, usage, attribution and terminal reasons.
-- Native dispatch selects explicit provider APIs; unknown APIs fail before contact rather than silently falling back to OpenAI.
-- Root and child routing, endpoint/key isolation and typed replay use these contracts. Shared types do not imply all helper implementations are consolidated.
+## Local checks
 
-### Ollama
+Termux arm64 uses Bionic. Resolve executables through `command -v`; do not assume systemd, Docker, glibc or writable `/tmp`.
 
-- Native `/api/chat` NDJSON, history conversion, malformed tool/history healing, dialect thinking demotion, retry hints and empty-completion handling.
-- Terminal completion waits for EOF; records after `done:true` remain processed.
-- Adapter-level async payload hook receives resolved model metadata. This does not implement CLI extension/hook execution.
-- Default-client redirects disabled; injected clients own their redirect/TLS policy. Configured header values are redacted from diagnostics.
-- Bounded parser uses no native recursion; delimiter processing O(n log n), memory/output O(n). Deep nesting, nested siblings, malformed HTTP dates and partial wrappers covered.
-- Evidence: 47 wire tests passed, followed by the final wrapped-Qwen request regression and dialect regression, one each; 12 source-module regressions passed. Correctness and scoped security findings closed.
-- Actual Android Ollama/Hermes NDJSON and branched foreign-thinking replay passed on the previously verified `9848ffab82cef5afe109bac712313ce8072702ed` artifact; that revision is included in the later verified baseline.
-- Inlined retry, dialect/healing and history helpers remain in `provider_ollama.rs`. Consolidation/refactoring is paused, not a new implementation task.
+```sh
+export TMPDIR="$HOME/task-tmp"
+mkdir -p "$TMPDIR"
+env CARGO_TARGET_DIR="$HOME/omp-work/target" \
+  CARGO_INCREMENTAL=1 RUSTC_BOOTSTRAP=1 \
+  RUSTFLAGS='-C link-arg=-Wl,--threads=1' \
+  nice -n 15 cargo check --offline --locked -j1 -p omp-cli -p pi-agent --tests
+```
 
-### Anthropic priority slice
+Run one scoped Cargo command at a time, bounded to 600 seconds. Full/heavy suites run in Actions. A link timeout means no test result; do not repeat an unchanged failing or heavy command without a new hypothesis.
 
-- Source-exact HTTP 400/429 fast-mode rejection downgrade, terminal `disabledFeatures`, sticky family-tier reset, active-branch persistence, resume/fork, real child inheritance and live notices.
-- `--service-tier` overlays OpenAI family only. Anthropic priority comes from `tier.anthropic` or live fast-mode selection. Explicit `none`/null in a higher configuration layer clears the lower layer.
-- Statusless errors inside HTTP 200 SSE surface without downgrade retry. Notices do not enter model guidance or cause extra provider requests.
-- Local evidence: priority suite 8/8, RPC fast-mode 3/3, native Anthropic 33/33, root/child dispatch 4/4, all passing.
-- Parent actual ACP smoke: exit 0, 1.48 s; nine valid JSON-RPC frames, exactly one downgrade notification, two first-turn provider requests (rejection/retry), one non-priority follow-up request, no notice-induced provider request.
-- Harness: `/data/data/com.termux/files/usr/tmp/acp_priority_smoke.py`, accepts `OMP_BIN`. Correctness and scoped security findings, including ACP notice mapping, closed.
-- This is local acceptance; the later `0da` publication itself was not fully green, while its constructor correction is covered by accepted `376`. Full Anthropic parity is not claimed.
+After a successful build, copy the executable to a unique HOME path and record SHA-256 before another worktree uses the shared target. Test that pinned copy. Another Cargo invocation can replace `target/debug/omp`.
 
-## Retained work; not waived
+## Exact-SHA CI
 
-- Full Anthropic request/stream parity remains open: remaining gateway/account branches, request options, fallback/served-model attribution, server-tool handling and source-specific recovery contracts require re-audit against current implementation before coding. Earlier gap lists may be stale; passing priority tests does not close them.
-- Other provider dialects and remaining C8 cloud/browser/image integrations are not authorized for new implementation while paused.
-- No real external-account acceptance is claimed; localhost protocol fixtures are distinct from live service validation.
-- The constructor correction is verified in accepted `376` CI and its Android artifact. On resumption, reconcile remaining contracts against TS source and the canonical `docs/rust-cli-parity-plan.md`; do not restart already accepted work.
+`.github/workflows/rust-agent.yml` is authoritative for toolchain, dependencies and gates. It checks/tests `pi-agent`, `omp-cli`, native matching and support crates, then builds Android arm64 release output.
 
-## Ownership and retained workspace
+Push triggers apply only to `main` and `feat/rust-agent-termux-bionic`; other candidate branches need dispatch:
 
-- Original provider owner: `WireNativeProviderDispatch`; ordinary worktree `/data/data/com.termux/files/home/omp-anthropic-priority`, clean at author commit `26005d554f` when paused.
-- Worktrees and task-created smoke scripts retained. No package installation, installed-CLI replacement, tag or release performed for this checkpoint.
+```sh
+git push origin HEAD:refs/heads/ci/<task>
+gh workflow run rust-agent.yml --repo SklUpp/omp-termux --ref ci/<task>
+gh run watch <RUN_ID> --repo SklUpp/omp-termux --exit-status
+```
+
+Confirm the run's `headSha` equals the candidate. A green Android build does not imply green host tests. An older green run never verifies newer changes.
+
+## Android artifact
+
+```sh
+ART="$HOME/task-tmp/omp-art-<RUN_ID>"
+mkdir -p "$ART"
+gh run download <RUN_ID> --repo SklUpp/omp-termux \
+  -n omp-aarch64-linux-android -D "$ART"
+chmod +x "$ART/omp"
+python3 - "$ART/omp.sha256" "$ART/omp" <<'PY'
+import hashlib, pathlib, sys
+manifest, binary = map(pathlib.Path, sys.argv[1:])
+expected = manifest.read_text().split()[0]
+with binary.open('rb') as stream:
+    actual = hashlib.file_digest(stream, 'sha256').hexdigest()
+assert len(expected) == 64 and actual == expected, 'artifact hash mismatch'
+print(actual)
+PY
+file "$ART/omp"
+```
+
+The manifest contains a build-relative path, not the flat downloaded filename. Compare its digest to the actual executable. Download failures and partial archives are not artifacts accepted for execution. Never log signed download URLs or credentials.
+
+## Runtime acceptance
+
+Exercise invocation, typed result, failure, cancellation and persisted state. Use real CLI/RPC/ACP surfaces and localhost fixtures; mocks must emit valid protocol data and assertions must observe consumers.
+
+| Changed surface | Runnable acceptance |
+|---|---|
+| Saved agent outputs | `OMP_BIN="$ART/omp" bash scripts/agent-uri-home-harness.sh` |
+| Live/persisted history | `OMP_BIN="$ART/omp" bash scripts/history-uri-home-harness.sh` |
+| Local security scan | `OMP_BIN="$ART/omp" bash scripts/security-scan-home-harness.sh` |
+| GC apply | `sh scripts/gc-apply-smoke.sh "$ART/omp"` |
+| Advisor | `OMP_BIN="$ART/omp" python3 scripts/advisor-smoke-home.py` after C4 integration |
+| Local learning/skills | `python3 scripts/local-learning-home-smoke.py --omp "$ART/omp" --keep` after C7 integration |
+
+Keep failed fixtures and exact executable hashes. Remove task-created diagnostic scaffolding after proof. Do not rerun unchanged suites after exact green CI; run the missing Android-specific paths.
+
+## Closure
+
+1. Close independent findings; keep explicit unsupported/paused boundaries.
+2. Integrate scoped commits, resolving shared-file conflicts without dropping behavior.
+3. Verify the integrated SHA, not just individual task branches.
+4. Match manifest/hash and exercise affected Android paths.
+5. Reconcile external worktrees: clean current-block files and no unaccounted unique work. Report unrelated changes separately.
+6. Update only the plan's evidence table. Do not create another checkpoint diary.
+
+Performance remains a separate gate: matched 8-turn and 30-turn histories, same device/config/provider fixture, startup/CPU/PSS against the installed Bun CLI. `android/scripts/bench.sh` measures Bun and cannot establish Rust performance. No threshold or improvement claim without measurements.

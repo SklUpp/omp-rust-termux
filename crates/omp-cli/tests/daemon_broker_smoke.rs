@@ -54,10 +54,23 @@ impl Worker {
 		if let Some(logical) = logical {
 			command.env(protocol::RUNTIME_ROOT_ENV, logical);
 		}
+		// Capture startup failures (socket path rejection, bind errors) instead
+		// of discarding them; `Scratch::wait_socket` surfaces the log on timeout.
+		let stderr_log = project.parent().and_then(|root| {
+			std::fs::OpenOptions::new()
+				.create(true)
+				.append(true)
+				.open(root.join("worker.stderr.log"))
+				.ok()
+		});
+		let stderr = match stderr_log {
+			Some(file) => Stdio::from(file),
+			None => Stdio::null(),
+		};
 		command
 			.stdin(Stdio::null())
 			.stdout(Stdio::null())
-			.stderr(Stdio::null());
+			.stderr(stderr);
 		#[cfg(unix)]
 		{
 			use std::os::unix::process::CommandExt;
@@ -116,14 +129,31 @@ struct Scratch {
 
 impl Scratch {
 	fn new(tag: &str) -> Self {
+		// The broker rejects `sun_path` overflow at startup (`protocol::endpoint`),
+		// and the worker's stderr is not a reliable signal here, so keep the
+		// scratch root short regardless of the tag. Tests share one process, so
+		// uniqueness comes from the random suffix, not the pid.
 		let root = std::env::temp_dir().join(format!(
-			"omp-broker-smoke-{tag}-{}-{}",
+			"obs-{}-{}",
 			std::process::id(),
-			protocol::random_hex(6).expect("random")
+			protocol::random_hex(8).expect("random")
 		));
 		let project = root.join("project");
 		let runtime = root.join("runtime");
 		std::fs::create_dir_all(&project).expect("project dir");
+		#[cfg(unix)]
+		{
+			use std::os::unix::ffi::OsStrExt;
+			let endpoint = runtime.join(protocol::SOCKET_FILE);
+			let len = endpoint.as_os_str().as_bytes().len();
+			assert!(
+				len <= protocol::MAX_SOCKET_PATH_BYTES,
+				"scratch {tag} broker socket path is {len} bytes (max {}): {}; \
+				 set TMPDIR to a shorter directory",
+				protocol::MAX_SOCKET_PATH_BYTES,
+				endpoint.display()
+			);
+		}
 		Self { root, project, runtime }
 	}
 
@@ -134,7 +164,15 @@ impl Scratch {
 	async fn wait_socket(&self) {
 		let deadline = Instant::now() + Duration::from_secs(10);
 		while !self.endpoint().exists() {
-			assert!(Instant::now() < deadline, "broker socket never appeared");
+			if Instant::now() >= deadline {
+				let hint = std::fs::read_to_string(self.root.join("worker.stderr.log"))
+					.unwrap_or_default();
+				panic!(
+					"broker socket never appeared at {} (worker stderr: {})",
+					self.endpoint().display(),
+					hint.trim()
+				);
+			}
 			tokio::time::sleep(Duration::from_millis(25)).await;
 		}
 	}

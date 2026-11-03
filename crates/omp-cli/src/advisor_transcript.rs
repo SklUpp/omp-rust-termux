@@ -162,22 +162,7 @@ impl AdvisorTranscript {
 					.filter_map(ContentPart::from_agent_part)
 					.collect();
 				if parts.is_empty() {
-					if message.tool_calls.is_empty() {
-						let content = MessageContent::Text(message.content.clone());
-						return SessionMessage::assistant(
-							content,
-							message.api.clone().unwrap_or_default(),
-							message.provider.clone().unwrap_or_else(|| provider.to_string()),
-							message.model.clone().unwrap_or_else(|| model.to_string()),
-							usage,
-							message
-								.stop_reason
-								.map(pi_agent::StopReason::as_str)
-								.unwrap_or("stop"),
-							timestamp,
-						);
-					}
-					if !message.content.is_empty() {
+					if !message.tool_calls.is_empty() && !message.content.is_empty() {
 						parts.push(ContentPart::text(message.content.clone()));
 					}
 				}
@@ -196,8 +181,13 @@ impl AdvisorTranscript {
 						));
 					}
 				}
+				let content = if parts.is_empty() {
+					MessageContent::Text(message.content.clone())
+				} else {
+					MessageContent::Parts(parts)
+				};
 				SessionMessage::assistant(
-					MessageContent::Parts(parts),
+					content,
 					message.api.clone().unwrap_or_default(),
 					message.provider.clone().unwrap_or_else(|| provider.to_string()),
 					message.model.clone().unwrap_or_else(|| model.to_string()),

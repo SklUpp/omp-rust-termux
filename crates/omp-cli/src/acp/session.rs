@@ -1189,6 +1189,17 @@ impl AcpSession {
 								{
 									self.emit_update(update);
 								}
+								// Advice cards: persisted once as an `advisor`
+								// `custom_message`; ACP has no custom-message frame, so
+								// the visible text is emitted as a chunk carrying the card
+								// details in `_meta`. Never dropped, never duplicated.
+								for (content, details) in session.take_advisor_cards() {
+									self.emit_update(json!({
+										"sessionUpdate": "agent_message_chunk",
+										"content": { "type": "text", "text": content },
+										"_meta": { "advisor": details },
+									}));
+								}
 							}
 						},
 						Err(error) => {
@@ -1203,6 +1214,15 @@ impl AcpSession {
 			},
 		}
 		let cancelled = self.gate.cancel_requested();
+		// Cards that settled after the last stream event are still this turn's
+		// advice: persist and surface them before the turn reply.
+		for (content, details) in session.take_advisor_cards() {
+			self.emit_update(json!({
+				"sessionUpdate": "agent_message_chunk",
+				"content": { "type": "text", "text": content },
+				"_meta": { "advisor": details },
+			}));
+		}
 		let outcome =
 			TurnOutcome { error: stream_error.clone().filter(|_| !cancelled), aborted: cancelled };
 		session.finish_turn(&mut prepared, &outcome);

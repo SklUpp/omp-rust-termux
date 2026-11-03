@@ -242,6 +242,14 @@ pub struct RunRequest {
 	/// Detached plan-reminder continuation: no caller message is appended and
 	/// the first request uses the policy's one-shot forced choice.
 	pub continuation: bool,
+	/// Host adapter for the C6 security coordinator (runtime-owned glue). The
+	/// runner mounts `security_scan` and `security://` only when
+	/// `config.security.enabled()` and this is set.
+	pub security_host: Option<crate::security::SecurityHostHandle>,
+	/// Read-only security-scan worker: the `lsp` tool rejects every action
+	/// outside `LSP_READONLY_ACTIONS` and delegated children inherit the same
+	/// action ceiling, independently of the approval mode.
+	pub security_worker: bool,
 }
 
 /// Host plan-mode wiring for one run.

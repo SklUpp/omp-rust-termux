@@ -999,6 +999,7 @@ pub fn reserved_tool_names() -> Vec<String> {
 	names.push(pi_agent::tools::checkpoint::CHECKPOINT_TOOL_NAME.to_string());
 	names.push(pi_agent::tools::checkpoint::REWIND_TOOL_NAME.to_string());
 	names.push(crate::goal_tool::GOAL_TOOL_NAME.to_string());
+	names.push(crate::security::SECURITY_SCAN_TOOL_NAME.to_string());
 	names.extend(crate::eval_host::OWNED_TOOL_NAMES.iter().map(|name| (*name).to_string()));
 	names
 }
@@ -1354,6 +1355,36 @@ impl AgentRunner for PiAgentRunner {
 		// supervisor shares the same router with every child registry.
 		session.set_internal_urls(request.internal_urls.clone());
 		session.set_url_scope(request.url_scope.clone());
+		// C6: the security mount is real only when `security.enabled`. The host
+		// is the runtime-owned adapter; the scan worker runs as a normal
+		// restricted `RunRequest` through this same runner.
+		let security_host: Option<Arc<dyn crate::security::SecurityHost>> =
+			request.config.security.enabled().then(|| {
+				let host = crate::security_runtime::RuntimeSecurityHost {
+					config:       request.config.clone(),
+					catalog:      Arc::clone(&request.catalog),
+					cwd:          request.cwd.clone(),
+					session_id:   request.session_id.clone(),
+					agent_id:     None,
+					active_model: Some(active_model.clone()),
+					state_root:   Some(crate::dirs::root_subdir(
+						"security",
+						crate::dirs::AgentDirCategory::State,
+					)),
+					auth_db:      crate::dirs::agent_dir().join("agent.db"),
+					approvals:    request.approvals.clone(),
+					service_tier: request.service_tier_by_family.clone(),
+				};
+				Arc::new(host) as Arc<dyn crate::security::SecurityHost>
+			});
+		if security_host.is_some()
+			&& let Some(router) = &request.internal_urls
+		{
+			let _ = pi_agent::tools::internal_urls::register_security(
+				router,
+				crate::security::security_url_handler(true, None),
+			);
+		}
 		session.set_acp_bridge(request.acp_bridge.as_ref().map(|handle| Arc::clone(&handle.0)));
 		let acp_bridge = session.acp_bridge();
 		// `lsp.shared`/`tools.maxTimeout` are applied before the registry is built
@@ -1380,6 +1411,16 @@ impl AgentRunner for PiAgentRunner {
 			resolved_display,
 			&request.plan_mode,
 		)?;
+		// C6: the scan worker's tool-name allowlist includes `lsp`, so the
+		// action ceiling must be enforced here; the supervisor children inherit
+		// it via `set_lsp_read_only` below.
+		if request.security_worker && base_registry.get("lsp").is_some() {
+			base_registry.remove("lsp");
+			base_registry.register(Arc::new(LspTool::with_session_read_only(
+				session.lsp_session(),
+				true,
+			)));
+		}
 		// Mounted before the supervisor clones its child template so an agent that
 		// requests `web_search` inherits the same host-configured instance. The
 		// endpoint and credentials come from settings plus the `SEARXNG_*`
@@ -1391,6 +1432,21 @@ impl AgentRunner for PiAgentRunner {
 			)));
 		}
 		let (allow_task, allow_hub) = delegation_selection(request);
+		let security_selected = request.tools_enabled
+			&& request
+				.config
+				.tools
+				.as_ref()
+				.is_none_or(|allowed| {
+					allowed
+						.iter()
+						.any(|name| name == crate::security::SECURITY_SCAN_TOOL_NAME)
+				});
+		if let Some(host) = &security_host
+			&& security_selected
+		{
+			base_registry.register(crate::security::security_scan_tool(Arc::clone(host)));
+		}
 		// Needed for completion tiers and agent spawning; the `task` tool remains
 		// gated separately by `allow_task`.
 		let model_factory: Arc<dyn ChildModelFactory> = Arc::new(CliChildModelFactory {
@@ -1479,6 +1535,32 @@ impl AgentRunner for PiAgentRunner {
 			target.model,
 		)
 		.map(str::to_string);
+		let credential: Option<pi_agent::provider::CredentialCallback> =
+			request.credential_resolver.as_ref().map(|resolver| {
+				let resolver = std::sync::Arc::clone(&resolver.0);
+				let cancel = match &request.cancellation_token {
+					Some(token) => {
+						let token = token.clone();
+						crate::auth::http::Cancel::with_predicate(std::sync::Arc::new(
+							move || token.is_cancelled(),
+						))
+					},
+					None => crate::auth::http::Cancel::new(),
+				};
+				let provider_name = target.provider.to_string();
+				let session_id = request.session_id.clone();
+				std::sync::Arc::new(move |force_refresh: bool| {
+					crate::rpc::auth::CredentialResolver::api_key_force(
+						&*resolver,
+						&provider_name,
+						session_id.as_deref(),
+						force_refresh,
+						&cancel,
+					)
+					.map_err(|error| error.to_string())
+					.map(|key| key.unwrap_or_default())
+				}) as pi_agent::provider::CredentialCallback
+			});
 		let provider = wire_provider(
 			&request.catalog,
 			&request.config,
@@ -1486,6 +1568,7 @@ impl AgentRunner for PiAgentRunner {
 			request.provider_session_id.clone(),
 			request.prompt_cache_key.clone(),
 			service_tier,
+			credential,
 		)
 		.map_err(Error::new)?;
 		let config = AgentConfig {
@@ -1553,6 +1636,7 @@ impl AgentRunner for PiAgentRunner {
 				debug_max_timeout: request.config.max_tool_timeout_secs,
 			});
 			supervisor.set_active_model(active_model.clone());
+			supervisor.set_lsp_read_only(request.security_worker);
 			if let Some(observer) = &request.subagent_observer {
 				// Idempotent: a supervisor reused across turns keeps one
 				// subscription, and a replaced one is subscribed again.
@@ -2547,6 +2631,7 @@ fn wire_provider(
 	session_id: Option<String>,
 	prompt_cache_key: Option<String>,
 	service_tier: Option<String>,
+	credential: Option<pi_agent::provider::CredentialCallback>,
 ) -> std::result::Result<Arc<dyn ModelProvider>, String> {
 	let info = catalog
 		.providers
@@ -2574,6 +2659,7 @@ fn wire_provider(
 				.with_force_reasoning_off(config.external_thinking)
 				// The resolved per-family selection, never the launch flag alone.
 				.with_service_tier(service_tier)
+				.with_credential_callback(credential)
 				// Assembly stamps the real route on produced messages so signed
 				// reasoning is only replayed to the provider that issued it.
 				.with_provider_id(target.provider.to_string());
@@ -2671,7 +2757,8 @@ fn wire_provider(
 			anthropic.adaptive_only_thinking = thinking.adaptive_only;
 			let provider = AnthropicMessagesProvider::from_config(anthropic)
 				.map_err(setup)?
-				.with_service_tier(service_tier);
+				.with_service_tier(service_tier)
+				.with_credential_callback(credential);
 			Ok(Arc::new(provider))
 		},
 	}
@@ -3070,6 +3157,7 @@ pub fn build_switch_provider(
 		provider_session_id,
 		prompt_cache_key,
 		service_tier,
+		None,
 	)
 }
 
@@ -3306,7 +3394,8 @@ impl CliChildModelFactory {
 		connection: &crate::config::ProviderConfig,
 	) -> std::result::Result<String, String> {
 		let reuses_root = self.root_provider.as_deref() == Some(provider)
-			&& self.root_base_url.as_deref() == Some(base_url);
+			&& self.root_base_url.as_deref() == Some(base_url)
+			&& self.credential_resolver.is_none();
 		if reuses_root {
 			return Ok(self.api_key.clone().unwrap_or_default());
 		}
@@ -3386,6 +3475,32 @@ impl ChildModelFactory for CliChildModelFactory {
 				&selection.model,
 			)
 			.map(str::to_string);
+			let credential: Option<pi_agent::provider::CredentialCallback> =
+				self.credential_resolver.as_ref().map(|resolver| {
+					let resolver = std::sync::Arc::clone(&resolver.0);
+					let cancel = match &self.cancel {
+						Some(token) => {
+							let token = token.clone();
+							crate::auth::http::Cancel::with_predicate(std::sync::Arc::new(
+								move || token.is_cancelled(),
+							))
+						},
+						None => crate::auth::http::Cancel::new(),
+					};
+					let provider_name = selection.provider.to_string();
+					let session_id = self.session_id.clone();
+					std::sync::Arc::new(move |force_refresh: bool| {
+						crate::rpc::auth::CredentialResolver::api_key_force(
+							&*resolver,
+							&provider_name,
+							session_id.as_deref(),
+							force_refresh,
+							&cancel,
+						)
+						.map_err(|error| error.to_string())
+						.map(|key| key.unwrap_or_default())
+					}) as pi_agent::provider::CredentialCallback
+				});
 			let provider = match wire_provider(
 				&self.catalog,
 				&self.config,
@@ -3393,6 +3508,7 @@ impl ChildModelFactory for CliChildModelFactory {
 				None,
 				None,
 				service_tier,
+				credential,
 			) {
 					Ok(provider) => provider,
 					Err(error) => {
@@ -3920,6 +4036,16 @@ fn allowed_tools(request: &RunRequest, _has_mcp_tools: bool) -> Result<Vec<&'sta
 	if !ask_available {
 		tools.retain(|name| *name != "ask");
 	}
+	if request.tools_enabled
+		&& request.config.security.enabled()
+		&& request.config.tools.as_ref().is_none_or(|allowed| {
+			allowed
+				.iter()
+				.any(|name| name == crate::security::SECURITY_SCAN_TOOL_NAME)
+		})
+	{
+		tools.push(crate::security::SECURITY_SCAN_TOOL_NAME);
+	}
 	tools.sort_unstable();
 	Ok(tools)
 }
@@ -4075,6 +4201,9 @@ fn build_registry_with_display(
 			// Web search needs the host's SearXNG settings; `run_turn` mounts the
 			// configured instance before the supervisor clones its child template.
 			"web_search" => continue,
+			// Security scan is mounted by `run_turn` only when the host exists and
+			// `security.enabled` selected it; the static builder must not own it.
+			"security_scan" => continue,
 			other => {
 				return Err(Error::new(format!(
 					"unknown builtin tool `{other}`: BUILTIN_TOOLS and build_registry drifted"
@@ -4858,6 +4987,16 @@ pub async fn filter_and_spawn_mcp_servers_with_paths_detailed(
 				)));
 			}
 		}
+		if requested_tools
+			.iter()
+			.any(|name| name == crate::security::SECURITY_SCAN_TOOL_NAME)
+			&& !config.security.enabled()
+		{
+			return Err(Error::new(format!(
+				"tool `{}` requires `security.enabled: true`",
+				crate::security::SECURITY_SCAN_TOOL_NAME
+			)));
+		}
 		let mut valid: Vec<String> = BUILTIN_TOOLS.iter().map(|(n, _)| (*n).to_string()).collect();
 		valid.extend(DELEGATION_TOOLS.iter().map(|name| (*name).to_string()));
 		// `checkpoint`/`rewind` mount only when `checkpoint.enabled` supplies a
@@ -4867,6 +5006,9 @@ pub async fn filter_and_spawn_mcp_servers_with_paths_detailed(
 		// (`has_goal` or selected), but a restricted `--tools` selection may
 		// always name it (#9444).
 		valid.push(crate::goal_tool::GOAL_TOOL_NAME.to_string());
+		if config.security.enabled() {
+			valid.push(crate::security::SECURITY_SCAN_TOOL_NAME.to_string());
+		}
 		valid.extend(all_server_names.iter().cloned());
 		// MCP tool ids are only enumerable after a server responds; a name that
 		// matches no builtin, no delegation tool, and no configured server cannot
@@ -5037,6 +5179,17 @@ pub async fn filter_and_spawn_mcp_servers_with_paths_detailed(
 	}
 
 	if let Some(requested_tools) = &config.tools {
+		if requested_tools
+			.iter()
+			.any(|name| name == crate::security::SECURITY_SCAN_TOOL_NAME)
+			&& !config.security.enabled()
+		{
+			close_mcp_sessions(connections.drain(..)).await;
+			return Err(Error::new(format!(
+				"tool `{}` requires `security.enabled: true`",
+				crate::security::SECURITY_SCAN_TOOL_NAME
+			)));
+		}
 		let mut known_tools: Vec<String> = BUILTIN_TOOLS.iter().map(|(n, _)| n.to_string()).collect();
 		known_tools.extend(DELEGATION_TOOLS.iter().map(|name| (*name).to_string()));
 		// `checkpoint`/`rewind` are not default builtins: they mount only when
@@ -5045,6 +5198,9 @@ pub async fn filter_and_spawn_mcp_servers_with_paths_detailed(
 		// `goal` likewise mounts only under its own predicate, but `--tools` may
 		// name it so a restricted selection keeps the restored goal manageable.
 		known_tools.push(crate::goal_tool::GOAL_TOOL_NAME.to_string());
+		if config.security.enabled() {
+			known_tools.push(crate::security::SECURITY_SCAN_TOOL_NAME.to_string());
+		}
 		for tool in &unique_tools {
 			known_tools.push(tool.name().to_string());
 		}
@@ -5966,6 +6122,8 @@ mod tests {
 			continuation: false,
 			plan_context: None,
 			service_tier_by_family: std::collections::BTreeMap::new(),
+			security_host: None,
+			security_worker: false,
 		}
 }
 

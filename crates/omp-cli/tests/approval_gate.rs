@@ -176,6 +176,8 @@ fn make_run_request(
 		continuation: false,
 		plan_context: None,
 		service_tier_by_family: std::collections::BTreeMap::new(),
+		security_host: None,
+		security_worker: false,
 	}
 }
 

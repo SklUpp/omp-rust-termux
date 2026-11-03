@@ -135,6 +135,8 @@ fn request(catalog: Catalog, tiers: &[(&str, &str)]) -> RunRequest {
 		continuation: false,
 		plan_context: None,
 		service_tier_by_family,
+		security_host: None,
+		security_worker: false,
 	}
 }
 

@@ -48,7 +48,7 @@ const LOGIN_PROMPT_TIMEOUT: Duration = Duration::from_secs(600);
 /// The work runs on its own thread, so `api_key_for_session` never trips the
 /// "called from an async runtime worker" guard, and a queued caller can be
 /// cancelled while a login holds the store.
-fn off_thread<T, F>(work: F) -> Result<T, AuthError>
+pub(crate) fn off_thread<T, F>(work: F) -> Result<T, AuthError>
 where
 	F: FnOnce() -> Result<T, AuthError> + Send + 'static,
 	T: Send + 'static,
@@ -107,6 +107,20 @@ pub trait CredentialResolver: Send + Sync {
 
 	/// Status/doctor probe: no refresh, no lease, no interactive path.
 	fn peek_api_key(&self, provider: &str) -> Result<Option<String>, AuthError>;
+
+	/// Per-request transport lookup. `force_refresh` is `true` only for the
+	/// single retry after a 401/403 `invalid_key`; the default keeps every
+	/// existing resolver behavior unchanged.
+	fn api_key_force(
+		&self,
+		provider: &str,
+		session_id: Option<&str>,
+		force_refresh: bool,
+		cancel: &Cancel,
+	) -> Result<Option<String>, AuthError> {
+		let _ = force_refresh;
+		self.api_key(provider, session_id, cancel)
+	}
 }
 
 /// Resolver handle handed to the runtime; shares the bridge's single store.

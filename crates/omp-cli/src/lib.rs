@@ -39,6 +39,7 @@ pub mod repl;
 pub mod rpc;
 pub mod runtime;
 pub mod security;
+pub mod security_runtime;
 pub mod service_tier;
 pub mod session;
 pub mod session_checkpoint;

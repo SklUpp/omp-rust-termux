@@ -1996,6 +1996,8 @@ impl Session<'_> {
 			continuation: false,
 			plan_context,
 			service_tier_by_family,
+			security_host: None,
+			security_worker: false,
 })
 	}
 

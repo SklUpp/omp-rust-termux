@@ -3411,7 +3411,10 @@ mod display_tests {
 		assert_eq!(extracted.content, "[\n  1,\n  2\n]");
 		let paginated = read_with(&tool, &dir, "agent://Saved:1-1").await;
 		assert!(!paginated.is_error, "{}", paginated.content);
-		assert!(paginated.content.contains("1:"), "{}", paginated.content);
+		assert_eq!(
+			paginated.content, "1|{\"foo\":[1,2]}",
+			"selector must paginate the full JSON exactly once"
+		);
 	}
 
 	#[tokio::test]

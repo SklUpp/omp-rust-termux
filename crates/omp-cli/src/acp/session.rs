@@ -52,7 +52,7 @@ use crate::{
 	},
 	runtime,
 	session::{self as session_store, SessionHeader, SessionOptions, compute_default_session_dir},
-	skills::Skill,
+	skills::{self, LoadOptions, SkillSnapshot},
 };
 
 use super::{
@@ -115,7 +115,6 @@ pub struct AcpRecipe {
 	pub runner: Arc<dyn AgentRunner>,
 	pub config: Config,
 	pub prompts: Prompts,
-	pub skills: Vec<Skill>,
 	pub catalog: Arc<Catalog>,
 	pub resolver: Arc<dyn CredentialResolver>,
 	pub approval_mode: ApprovalMode,
@@ -147,7 +146,6 @@ impl AcpRecipe {
 		runner: Arc<dyn AgentRunner>,
 		config: Config,
 		prompts: Prompts,
-		skills: Vec<Skill>,
 		catalog: Arc<Catalog>,
 		resolver: Arc<dyn CredentialResolver>,
 	) -> Self {
@@ -155,7 +153,6 @@ impl AcpRecipe {
 			runner,
 			config,
 			prompts,
-			skills,
 			catalog,
 			resolver,
 			approval_mode: ApprovalMode::AlwaysAsk,
@@ -296,12 +293,23 @@ impl AcpRuntime {
 			no_title: false,
 			parent_session: None,
 		};
+		// One snapshot per ACP top-level session, discovered for this session's
+		// cwd; `skill://` and the auto-learn tools share this instance only.
+		let skill_options = LoadOptions::from_config(&self.recipe.config, &cwd, false, &[]);
+		let skill_snapshot = SkillSnapshot::new();
+		let loaded = skills::load_with(&skill_options)
+			.map_err(|error| RequestError::new(INTERNAL_ERROR, error.to_string()))?;
+		for warning in &loaded.warnings {
+			eprintln!("warning: {}", warning.message);
+		}
+		skill_snapshot.set(loaded.entries);
 		let launch = RpcLaunch {
 			runner: Arc::clone(&self.recipe.runner),
 			config: self.recipe.config.clone(),
 			cwd: cwd.clone(),
 			prompts: self.recipe.prompts.clone(),
-			skills: self.recipe.skills.clone(),
+			skill_snapshot,
+			skill_options,
 			catalog: Arc::clone(&self.recipe.catalog),
 			agent_db: PathBuf::new(),
 			// ACP hosts toggle tiers over the RPC protocol; there is no launch flag.
@@ -849,7 +857,13 @@ impl AcpSession {
 			}
 		}
 		let (text, images) = convert_prompt_blocks(prompt)?;
-		let mut text = text;
+		let mut text = match self.lock().expand_skill_command(&text) {
+			Ok(text) => text,
+			Err(error) => {
+				eprintln!("warning: {error}");
+				text
+			},
+		};
 		let ordinary_plan = self.runtime.recipe.tools_enabled
 			&& self.plan_yolo.as_ref().is_none_or(|shared| {
 				shared.is_completed() || shared.is_abandoned()
@@ -1149,6 +1163,7 @@ impl AcpSession {
 		let mut last_stop = String::new();
 		let mut last_calls: Vec<PlanToolCall> = Vec::new();
 		let mut stream_error: Option<String> = None;
+		let mut capture_tool_calls = 0usize;
 		let runner = Arc::clone(&self.runtime.recipe.runner);
 		match runner.run(&request) {
 			Ok(stream) => {
@@ -1178,6 +1193,7 @@ impl AcpSession {
 									last_stop = stop_reason.clone();
 								},
 								AgentEvent::ToolEnd { id, tool, .. } => {
+									capture_tool_calls += 1;
 									let args = map.tool_args.get(id);
 									let mut plan = self.lock_plan();
 									plan::observe_tool_end(&mut plan.settle, tool, args);
@@ -1280,7 +1296,7 @@ impl AcpSession {
 			"title": title,
 			"updatedAt": output::iso8601(SystemTime::now()),
 		}));
-		TurnDone {
+		let done = TurnDone {
 			stop_reason,
 			usage,
 			error: outcome
@@ -1291,7 +1307,41 @@ impl AcpSession {
 						.map(|message| RequestError::new(INTERNAL_ERROR, message))
 				})
 				.or(plan_error),
+		};
+		// TS `AutoLearnController` (autoContinue): ACP goes through the same SDK
+		// session, so a substantive successful turn gets one isolated capture
+		// turn. Build the request under the session lock, then release it before
+		// the provider call so host commands are not blocked by capture.
+		let capture = if done.error.is_none() {
+			let (manage, learn) = session.autolearn_tool_presence();
+			let goal_mode = session.goal.has_goal();
+			let plan_enabled = self.plan_enabled();
+			crate::autolearn::should_auto_capture(
+				&session.config,
+				capture_tool_calls,
+				false,
+				plan_enabled,
+				goal_mode,
+				manage || learn,
+			)
+			.then(|| session.autolearn_capture_request())
+		} else {
+			None
+		};
+		drop(session);
+		if let Some(result) = capture {
+			let result = result.and_then(|request| {
+				let stream = runner.run(&request).map_err(|error| error.to_string())?;
+				for event in stream {
+					event.map_err(|error| error.to_string())?;
+				}
+				Ok(())
+			});
+			if let Err(error) = result {
+				eprintln!("warning: auto-learn capture failed: {error}");
+			}
 		}
+		done
 	}
 
 	/// Exact reverse-call surface for the pi-agent tool composition slice.

@@ -157,6 +157,9 @@ pub struct LoadOptions {
 	pub custom_directories: Vec<PathBuf>,
 	pub ignored_skills: Vec<String>,
 	pub include_skills: Vec<String>,
+	/// `skills.enableSkillCommands`: `/skill:<name>` plus available-command
+	/// listings; discovery itself is unaffected.
+	pub enable_skill_commands: bool,
 	/// `skill:<name>` entries disable that skill (TS `disabledExtensions`).
 	pub disabled_extensions: Vec<String>,
 }
@@ -182,6 +185,41 @@ impl LoadOptions {
 			custom_directories: Vec::new(),
 			ignored_skills: Vec::new(),
 			include_skills: Vec::new(),
+			enable_skill_commands: true,
+			disabled_extensions: Vec::new(),
+		}
+	}
+
+	/// Map the `skills.*` group plus the CLI `--no-skills` / `--skills` inputs
+	/// onto discovery settings. Tilde expansion and the home/agent overrides
+	/// stay with [`load_with`], which every session owner calls.
+	#[must_use]
+	pub fn from_config(
+		config: &crate::config::Config,
+		cwd: impl AsRef<Path>,
+		no_skills: bool,
+		patterns: &[String],
+	) -> Self {
+		let skills = &config.skills;
+		Self {
+			cwd: cwd.as_ref().to_path_buf(),
+			repo_root: None,
+			home: None,
+			agent_dir: None,
+			no_skills,
+			patterns: patterns.to_vec(),
+			enabled: skills.enabled(),
+			enable_codex_user: skills.enable_codex_user(),
+			enable_claude_user: skills.enable_claude_user(),
+			enable_claude_project: skills.enable_claude_project(),
+			enable_pi_user: skills.enable_pi_user(),
+			enable_pi_project: skills.enable_pi_project(),
+			enable_agents_user: skills.enable_agents_user(),
+			enable_agents_project: skills.enable_agents_project(),
+			custom_directories: skills.custom_directories().to_vec(),
+			ignored_skills: skills.ignored_skills().to_vec(),
+			include_skills: skills.include_skills().to_vec(),
+			enable_skill_commands: skills.enable_skill_commands(),
 			disabled_extensions: Vec::new(),
 		}
 	}
@@ -425,18 +463,26 @@ pub fn load_with(options: &LoadOptions) -> Result<LoadResult> {
 	Ok(LoadResult { entries, warnings })
 }
 
-/// Existing CLI entry point: prompt-visible skills only.
+/// Resolve a `/skill:<name>` invocation against one session's snapshot.
 ///
-/// Kept byte-compatible with the previous subset loader until the integration
-/// writer mounts [`load_with`] + [`SkillSnapshot`]; no shared file is edited
-/// here.
-pub fn load(cwd: &Path, no_skills: bool, patterns: &[String]) -> Result<Vec<Skill>> {
-	let options = LoadOptions {
-		no_skills,
-		patterns: patterns.to_vec(),
-		..LoadOptions::new(cwd)
+/// TS `tryRunRpcSkillCommand` / interactive input controller: parse the
+/// invocation (leading or mid-prompt), look it up in the reachable set (hidden
+/// skills included), re-read the file from disk and render the user-invocation
+/// template. `Ok(None)` means the text is not a known skill command and must be
+/// sent unchanged; the caller gates this on `skills.enableSkillCommands`.
+pub fn expand_skill_invocation(snapshot: &SkillSnapshot, text: &str) -> Result<Option<String>> {
+	let Some(invocation) = parse_skill_invocation(text) else {
+		return Ok(None);
 	};
-	Ok(load_with(&options)?.prompt_skills())
+	let Some(entry) = snapshot.find(&invocation.name) else {
+		return Ok(None);
+	};
+	let built = build_skill_prompt_message(
+		&entry.skill,
+		&invocation.args,
+		SkillInvocationKind::User,
+	)?;
+	Ok(Some(built.message))
 }
 
 struct ProviderScan {
@@ -1018,15 +1064,19 @@ mod tests {
 		write(&dir.join("agent/skills/undescribed/SKILL.md"), "---\nname: undescribed\n---\nno description\n");
 		write(&dir.join("agent/skills/disabled/SKILL.md"), "---\ndescription: off\nenabled: false\n---\nx\n");
 
-		let all = load(&dir, false, &[]).expect("skills");
+		let all = load_with(&isolated_options(&dir)).expect("skills").prompt_skills();
 		let names: Vec<&str> = all.iter().map(|skill| skill.name.as_str()).collect();
 		assert_eq!(names, ["review", "test"]);
 		assert!(all[0].body.contains("body"));
 
-		let filtered = load(&dir, false, &["test".to_string()]).expect("skills");
+		let mut filtered_options = isolated_options(&dir);
+		filtered_options.patterns = vec!["test".to_string()];
+		let filtered = load_with(&filtered_options).expect("skills").prompt_skills();
 		assert_eq!(filtered.len(), 1);
 		assert_eq!(filtered[0].name, "test");
-		assert!(load(&dir, true, &[]).expect("skills").is_empty());
+		let mut none_options = isolated_options(&dir);
+		none_options.no_skills = true;
+		assert!(load_with(&none_options).expect("skills").prompt_skills().is_empty());
 	}
 
 	#[test]
@@ -1228,6 +1278,46 @@ mod tests {
 			"the YAML failure is reported, not swallowed: {:?}",
 			result.warnings
 		);
+	}
+
+	#[test]
+	fn load_options_follow_the_skills_group() {
+		let mut config = crate::config::Config::default();
+		config.skills.enabled = Some(false);
+		config.skills.enable_skill_commands = Some(false);
+		config.skills.enable_pi_project = Some(false);
+		config.skills.custom_directories = Some(vec![PathBuf::from("~/skills")]);
+		config.skills.ignored_skills = Some(vec!["draft".to_string()]);
+		let options = LoadOptions::from_config(&config, "/work", true, &["a*".to_string()]);
+		assert!(!options.enabled);
+		assert!(!options.enable_skill_commands);
+		assert!(!options.enable_pi_project);
+		assert!(options.enable_claude_user, "unset toggles keep the TS default");
+		assert_eq!(options.custom_directories, [PathBuf::from("~/skills")]);
+		assert_eq!(options.ignored_skills, ["draft"]);
+		assert!(options.no_skills);
+		assert_eq!(options.patterns, ["a*"]);
+	}
+
+	#[test]
+	fn skill_invocation_renders_the_user_template_and_reaches_hidden_skills() {
+		let dir = temp_dir();
+		write(
+			&dir.join("agent/skills/quiet/SKILL.md"),
+			"---\nname: quiet\ndescription: hidden\nhide: true\n---\n# Quiet\nbody\n",
+		);
+		let result = load_with(&isolated_options(&dir)).expect("skills");
+		let snapshot = SkillSnapshot::new();
+		snapshot.set(result.entries);
+
+		let expanded = expand_skill_invocation(&snapshot, "/skill:quiet focus")
+			.expect("expand")
+			.expect("known skill");
+		assert!(expanded.contains("[IMPORTANT: User invoked the \"quiet\" skill"));
+		assert!(expanded.contains("# Quiet\nbody"));
+		assert!(expanded.ends_with("User: focus"));
+		assert!(expand_skill_invocation(&snapshot, "/skill:missing").expect("expand").is_none());
+		assert!(expand_skill_invocation(&snapshot, "plain prompt").expect("expand").is_none());
 	}
 
 	#[test]

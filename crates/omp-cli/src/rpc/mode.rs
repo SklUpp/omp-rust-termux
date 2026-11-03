@@ -969,18 +969,26 @@ impl RpcMode {
 					"active": session.fast_mode_active(),
 				})))
 			},
-			RpcCommand::GetAvailableCommands { .. } => Some(ok_data(json!({
-				"commands": self
-					.lock_session()
-					.skills
-					.iter()
-					.map(|skill| json!({
-						"name": format!("skill:{}", skill.name),
-						"description": skill.description,
-						"source": "skill",
-					}))
-					.collect::<Vec<Value>>(),
-			}))),
+			RpcCommand::GetAvailableCommands { .. } => {
+				let session = self.lock_session();
+				// TS lists every reachable skill (hidden included); only the
+				// `enableSkillCommands` setting can suppress the surface.
+				let commands = if session.skill_options.enable_skill_commands {
+					session
+						.skill_snapshot
+						.all_skills()
+						.into_iter()
+						.map(|skill| json!({
+							"name": format!("skill:{}", skill.name),
+							"description": skill.description,
+							"source": "skill",
+						}))
+						.collect::<Vec<Value>>()
+				} else {
+					Vec::new()
+				};
+				Some(ok_data(json!({ "commands": commands })))
+			},
 			RpcCommand::SetTodos { phases, .. } => {
 				self.lock_session().set_todos(phases);
 				let phases = self.lock_session().todo_phases.clone();
@@ -1240,24 +1248,14 @@ impl RpcMode {
 	// --------------------------------------------------------------- prompts --
 
 	fn expand_skill(&self, text: &str) -> String {
-		let trimmed = text.trim_start();
-		let Some(rest) = trimmed.strip_prefix("/skill:") else {
-			return text.to_string();
-		};
-		let (name, arguments) = match rest.find(char::is_whitespace) {
-			Some(index) => (&rest[..index], rest[index..].trim()),
-			None => (rest, ""),
-		};
 		let session = self.lock_session();
-		let Some(skill) = session.skills.iter().find(|skill| skill.name == name) else {
-			return text.to_string();
-		};
-		let mut expanded = skill.body.trim().to_string();
-		if !arguments.is_empty() {
-			expanded.push_str("\n\nUser arguments: ");
-			expanded.push_str(arguments);
+		match session.expand_skill_command(text) {
+			Ok(expanded) => expanded,
+			Err(error) => {
+				eprintln!("warning: cannot load skill: {error}");
+				text.to_string()
+			},
 		}
-		expanded
 	}
 
 	fn prompt(
@@ -1724,6 +1722,7 @@ fn run_turn(
 		Arc::clone(&guard.runner)
 	};
 	let mut outcome = TurnOutcome::default();
+	let mut capture_tool_calls = 0usize;
 	let mut attempt = 0u32;
 	const MAX_RETRY_ATTEMPTS: u32 = 3;
 	loop {
@@ -1777,6 +1776,9 @@ fn run_turn(
 							let mut guard = session
 								.lock()
 								.unwrap_or_else(std::sync::PoisonError::into_inner);
+							if matches!(event, AgentEvent::ToolEnd { .. }) {
+								capture_tool_calls += 1;
+							}
 							guard.observe_event(&mut prepared, event);
 							frames.emit(event, sink.as_ref(), &meta, &guard);
 							// Goal accounting/persistence produced by this event lands
@@ -1905,6 +1907,40 @@ fn run_turn(
 		// goal tool call cannot lose its `goal_updated`/terminal metric.
 		for frame in guard.finish_goal_turn() {
 			sink.send(frame);
+		}
+	}
+	// TS `AutoLearnController` auto-continue arm: one isolated capture run after
+	// a substantive successful top-level turn. The source journal never sees it.
+	let capture = if outcome.error.is_none() && !outcome.aborted {
+		let guard = session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+		let (manage, learn) = guard.autolearn_tool_presence();
+		let goal_mode = guard.goal.has_goal();
+		let plan_enabled = guard
+			.plan_yolo
+			.as_ref()
+			.is_some_and(|shared| shared.is_armed());
+		crate::autolearn::should_auto_capture(
+			&guard.config,
+			capture_tool_calls,
+			false,
+			plan_enabled,
+			goal_mode,
+			manage || learn,
+		)
+		.then(|| guard.autolearn_capture_request())
+	} else {
+		None
+	};
+	if let Some(result) = capture {
+		let result = result.and_then(|request| {
+			let stream = runner.run(&request).map_err(|error| error.to_string())?;
+			for event in stream {
+				event.map_err(|error| error.to_string())?;
+			}
+			Ok(())
+		});
+		if let Err(error) = result {
+			eprintln!("warning: auto-learn capture failed: {error}");
 		}
 	}
 	outcome

@@ -43,7 +43,7 @@ use crate::{
 		SessionStore, TurnBuilder, TurnRecord,
 	},
 	session_checkpoint::CheckpointHost,
-	skills::Skill,
+	skills::{LoadOptions, SkillSnapshot},
 };
 
 use super::{
@@ -110,7 +110,9 @@ pub struct RpcLaunch {
 	pub config:   Config,
 	pub cwd:      PathBuf,
 	pub prompts:  Prompts,
-	pub skills:   Vec<Skill>,
+	/// One snapshot for this top-level session; tools and `skill://` share it.
+	pub skill_snapshot: SkillSnapshot,
+	pub skill_options:  LoadOptions,
 	pub catalog:  Arc<Catalog>,
 	/// Resolved credential-store path (`<agent dir>/agent.db`), resolved once by
 	/// the CLI so no hidden default can pick a different store here.
@@ -264,7 +266,9 @@ pub struct RpcSession {
 	pub(crate) config:   Config,
 	pub(crate) cwd:      PathBuf,
 	pub(crate) prompts:  Prompts,
-	pub(crate) skills:   Vec<Skill>,
+	/// One snapshot per top-level session; discovery settings feed refreshes.
+	pub(crate) skill_snapshot: SkillSnapshot,
+	pub(crate) skill_options:  LoadOptions,
 	pub(crate) catalog:  Arc<Catalog>,
 	pub(crate) approvals: Approvals,
 	pub(crate) store:    SessionStore,
@@ -370,7 +374,8 @@ impl RpcSession {
 			config,
 			cwd,
 			prompts,
-			skills,
+			skill_snapshot,
+			skill_options,
 			catalog,
 			agent_db: _,
 			approval_mode: _,
@@ -392,6 +397,14 @@ impl RpcSession {
 			steer,
 			service_tier_explicit,
 		} = launch;
+
+		// Mount `skill://` on this session's router before any turn can read it;
+		// the handler resolves only against this session's snapshot.
+		if let Err(error) = internal_urls.register(Arc::new(
+			crate::skill_protocol::SkillUrlHandler::new(skill_snapshot.clone()),
+		)) {
+			return Err(Error::new(error));
+		}
 
 		let mut store = SessionStore::open(&store_options);
 		for warning in store.take_warnings() {
@@ -466,7 +479,8 @@ impl RpcSession {
 			config,
 			cwd,
 			prompts,
-			skills,
+			skill_snapshot,
+			skill_options,
 			catalog,
 			approvals,
 			store,
@@ -1654,6 +1668,100 @@ impl RpcSession {
 			&& (self.goal.has_goal() || self.tool_selected(crate::goal_tool::GOAL_TOOL_NAME))
 	}
 
+	fn agent_dir(&self) -> PathBuf {
+		self.skill_options.agent_dir.clone().unwrap_or_else(crate::dirs::agent_dir)
+	}
+
+	/// TS `isToolAllowed` for the two auto-learn tools plus this port's
+	/// top-level-only registry gate: `manage_skill` follows `autolearn.enabled`,
+	/// `learn` additionally needs the local backend (no other backend is wired).
+	pub(crate) fn autolearn_tool_presence(&self) -> (bool, bool) {
+		if !self.tools_enabled || !self.config.autolearn.enabled() {
+			return (false, false);
+		}
+		let manage = self.tool_selected(crate::autolearn::MANAGE_SKILL_TOOL_NAME);
+		let learn = manage
+			&& matches!(self.config.memory_backend(), crate::autolearn::MemoryBackend::Local)
+			&& self.tool_selected(crate::autolearn::LEARN_TOOL_NAME);
+		(manage, learn)
+	}
+
+	fn autolearn_extra_tools(&self) -> Vec<crate::agent::ExtraTool> {
+		let (manage, learn) = self.autolearn_tool_presence();
+		let mut tools = Vec::new();
+		if manage && let Some(tool) = crate::autolearn::ManageSkillTool::create_if(
+			true,
+			self.skill_options.clone(),
+			self.skill_snapshot.clone(),
+		) {
+			let tool: Arc<dyn pi_agent::tools::Tool> = Arc::new(tool);
+			tools.push(crate::agent::ExtraTool::from(tool));
+		}
+		if learn && let Some(tool) = crate::autolearn::LocalLearnTool::create_if(
+			true,
+			crate::autolearn::MemoryBackend::Local,
+			self.skill_options.clone(),
+			self.skill_snapshot.clone(),
+		) {
+			let tool: Arc<dyn pi_agent::tools::Tool> = Arc::new(tool);
+			tools.push(crate::agent::ExtraTool::from(tool));
+		}
+		tools
+	}
+
+	/// TS `appendPrompt` suffixes: configured append, memory guidance, then the
+	/// auto-learn guidance for the tools actually mounted this session.
+	fn runtime_append_prompt(&self) -> Option<String> {
+		let memory = matches!(
+			self.config.memory_backend(),
+			crate::autolearn::MemoryBackend::Local
+		)
+		.then(|| crate::local_memory::build_learned_instructions(&self.agent_dir(), &self.cwd))
+		.flatten();
+		let (manage, learn) = self.autolearn_tool_presence();
+		let autolearn = crate::autolearn::build_auto_learn_instructions(manage, learn);
+		let mut parts: Vec<String> = self.prompts.append.iter().cloned().collect();
+		parts.extend(memory);
+		parts.extend(autolearn);
+		(!parts.is_empty()).then(|| parts.join("\n\n"))
+	}
+
+	/// `/skill:<name>` expansion for the RPC and ACP prompt entry points.
+	pub(crate) fn expand_skill_command(&self, text: &str) -> Result<String> {
+		if !self.skill_options.enable_skill_commands {
+			return Ok(text.to_string());
+		}
+		Ok(crate::skills::expand_skill_invocation(&self.skill_snapshot, text)?
+			.unwrap_or_else(|| text.to_string()))
+	}
+
+	/// Isolated auto-learn capture turn: the conversation context and model are
+	/// reused, but nothing is journaled, no goal/plan context rides along, and
+	/// only the capture tools are mounted (`config.tools = []` removes every
+	/// builtin while the extra tools still mount).
+	pub(crate) fn autolearn_capture_request(&self) -> Result<RunRequest> {
+		let mut request =
+			self.request(crate::autolearn::auto_learn_nudge().to_string(), Vec::new(), false)?;
+		request.session_persisted = false;
+		request.session_file = None;
+		request.session_id = None;
+		request.child_session_root = None;
+		request.checkpoint_controller = None;
+		request.turn_ack = None;
+		request.cancellation_token = None;
+		request.goal = None;
+		request.goal_context = None;
+		request.plan_context = None;
+		request.plan_mode = crate::agent::PlanModeHooks::default();
+		request.todo_phases = Vec::new();
+		request.continuation = false;
+		request.acp_bridge = None;
+		request.extra_mcp_servers = Vec::new();
+		request.config.tools = Some(Vec::new());
+		request.extra_tools = self.autolearn_extra_tools();
+		Ok(request)
+	}
+
 	/// Hidden per-turn goal context (TS `goal-mode-context`).
 	fn goal_mode_context(&self) -> Option<String> {
 		let active = self.goal.build_active_prompt()?;
@@ -2026,6 +2134,7 @@ impl RpcSession {
 			);
 			extra_tools.push(crate::agent::ExtraTool::from(tool));
 		}
+		extra_tools.extend(self.autolearn_extra_tools());
 		// The live host tool set, mounted by the runner after every
 		// builtin/ask/checkpoint/eval tool; empty when the host registered none.
 		for tool in self.host_tools.adapters() {
@@ -2043,9 +2152,9 @@ impl RpcSession {
 			provider_session_id: self.provider_session_id.clone(),
 			prompt_cache_key: self.prompt_cache_key.clone(),
 			system_prompt: self.prompts.system.clone(),
-			append_system_prompt: self.prompts.append.clone(),
+			append_system_prompt: self.runtime_append_prompt(),
 			context_files: self.prompts.files.clone(),
-			skills: self.skills.clone(),
+			skills: self.skill_snapshot.prompt_skills(),
 			history: self.history.clone(),
 			history_messages,
 			checkpoint_controller,
@@ -3550,7 +3659,8 @@ mod tests {
 				config,
 				cwd: cwd.clone(),
 				prompts: Prompts::default(),
-				skills: Vec::new(),
+				skill_snapshot: SkillSnapshot::new(),
+				skill_options: LoadOptions::new(cwd.clone()),
 				catalog: Arc::new(Catalog::default()),
 				agent_db: cwd.join("agent.db"),
 				approval_mode: ApprovalMode::Yolo,

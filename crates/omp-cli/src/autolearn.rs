@@ -101,6 +101,34 @@ pub fn auto_learn_nudge() -> &'static str {
 	AUTOLEARN_NUDGE_AUTOCONTINUE.trim()
 }
 
+/// TS `AutoLearnController#onAgentEnd` gate for the auto-continue capture.
+///
+/// `goal_mode` covers both halves of the upstream rule: the turn started in
+/// goal mode, or goal mode is still active when the turn ends. Capture tools
+/// must exist for the run (`manage_skill`/`learn` mounted); otherwise the
+/// capture request would have nothing to do.
+#[must_use]
+pub fn should_auto_capture(
+	config: &crate::config::Config,
+	tool_calls: usize,
+	aborted: bool,
+	plan_enabled: bool,
+	goal_mode: bool,
+	has_capture_tools: bool,
+) -> bool {
+	if aborted
+		|| !has_capture_tools
+		|| !config.autolearn.enabled()
+		|| !config.autolearn.auto_continue()
+	{
+		return false;
+	}
+	if tool_calls < config.autolearn.min_tool_calls() {
+		return false;
+	}
+	!plan_enabled && !goal_mode
+}
+
 fn learn_schema() -> Value {
 	json!({
 		"type": "object",
@@ -650,6 +678,23 @@ mod tests {
 		let deleted = tool.execute(&json!({ "action": "delete", "name": "deploy" }), &ctx()).await.expect("delete");
 		assert_eq!(deleted.content, "Deleted managed skill \"deploy\".");
 		assert!(snapshot.find("deploy").is_none());
+	}
+
+	#[test]
+	fn auto_continue_gate_requires_enabled_auto_continue_and_threshold() {
+		let mut config = crate::config::Config::default();
+		assert!(!should_auto_capture(&config, 99, false, false, false, true));
+		config.autolearn.enabled = Some(true);
+		assert!(!should_auto_capture(&config, 99, false, false, false, true));
+		config.autolearn.auto_continue = Some(true);
+		assert!(!should_auto_capture(&config, 4, false, false, false, true));
+		assert!(should_auto_capture(&config, 5, false, false, false, true));
+		assert!(!should_auto_capture(&config, 5, true, false, false, true));
+		assert!(!should_auto_capture(&config, 5, false, true, false, true));
+		assert!(!should_auto_capture(&config, 5, false, false, true, true));
+		assert!(!should_auto_capture(&config, 5, false, false, false, false));
+		config.autolearn.min_tool_calls = Some(1);
+		assert!(should_auto_capture(&config, 1, false, false, false, true));
 	}
 
 	#[tokio::test]

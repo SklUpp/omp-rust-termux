@@ -351,6 +351,24 @@ pub fn read_learned_lessons(root: &Path) -> String {
 		.join("\n")
 }
 
+/// Render the learned-lessons developer instructions for one project.
+///
+/// Mirrors the `learned` branch of TS `prompts/memories/read-path.md` (the
+/// local backend's `buildDeveloperInstructions`). This port stores only
+/// `learned.md` for the local backend, so the `memory://root` rules and the
+/// optional summary block are omitted rather than pointing at a scheme that is
+/// not mounted. `None` keeps an empty memory surface out of the prompt.
+#[must_use]
+pub fn build_learned_instructions(agent_dir: &Path, cwd: &Path) -> Option<String> {
+	let learned = read_learned_lessons(&memory_root(agent_dir, cwd));
+	if learned.is_empty() {
+		return None;
+	}
+	Some(format!(
+		"# Memory Guidance\n\nLearned lessons (`learn`-captured; durable but may be stale—verify against repo before relying):\n{learned}"
+	))
+}
+
 fn is_cancelled(cancel: Option<&CancelProbe<'_>>) -> bool {
 	cancel.is_some_and(|probe| probe())
 }

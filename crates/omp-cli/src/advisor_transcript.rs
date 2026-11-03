@@ -12,7 +12,7 @@
 //! one advisor worker owns its file and messages are small; move to a writer
 //! thread if transcripts ever block the advisor loop.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -161,24 +161,43 @@ impl AdvisorTranscript {
 					.iter()
 					.filter_map(ContentPart::from_agent_part)
 					.collect();
-				if !message.tool_calls.is_empty()
-					&& !parts.iter().any(|part| part.kind == "toolCall")
-				{
-					parts.extend(message.tool_calls.iter().map(|call| {
-						ContentPart::tool_call(
+				if parts.is_empty() {
+					if message.tool_calls.is_empty() {
+						let content = MessageContent::Text(message.content.clone());
+						return SessionMessage::assistant(
+							content,
+							message.api.clone().unwrap_or_default(),
+							message.provider.clone().unwrap_or_else(|| provider.to_string()),
+							message.model.clone().unwrap_or_else(|| model.to_string()),
+							usage,
+							message
+								.stop_reason
+								.map(pi_agent::StopReason::as_str)
+								.unwrap_or("stop"),
+							timestamp,
+						);
+					}
+					if !message.content.is_empty() {
+						parts.push(ContentPart::text(message.content.clone()));
+					}
+				}
+				let existing: BTreeSet<String> = parts
+					.iter()
+					.filter(|part| part.kind == "toolCall")
+					.filter_map(|part| part.extra.get("id").and_then(serde_json::Value::as_str))
+					.map(str::to_string)
+					.collect();
+				for call in &message.tool_calls {
+					if !existing.contains(&call.id) {
+						parts.push(ContentPart::tool_call(
 							call.id.clone(),
 							call.name.clone(),
 							call.arguments.clone(),
-						)
-					}));
+						));
+					}
 				}
-				let content = if parts.is_empty() {
-					MessageContent::Text(message.content.clone())
-				} else {
-					MessageContent::Parts(parts)
-				};
 				SessionMessage::assistant(
-					content,
+					MessageContent::Parts(parts),
 					message.api.clone().unwrap_or_default(),
 					message.provider.clone().unwrap_or_else(|| provider.to_string()),
 					message.model.clone().unwrap_or_else(|| model.to_string()),
@@ -351,6 +370,105 @@ mod tests {
 		assert!(is_advisor_transcript_name("__advisor.reviewer.jsonl"));
 		assert!(!is_advisor_transcript_name("__advisor-other.jsonl"));
 		assert!(!is_advisor_transcript_name("task.jsonl"));
+	}
+
+	#[test]
+	fn fallback_keeps_content_and_adds_tool_calls_once() {
+		let dir = temp_dir("fallback");
+		let session_file = dir.join("session.jsonl");
+		std::fs::write(&session_file, "{}\n").expect("primary log");
+		let arguments = serde_json::json!({
+			"note": "child advice marker",
+			"severity": "blocker"
+		});
+		let mut assistant = Message::assistant_with_tools(
+			"preamble",
+			vec![pi_agent::ToolCall {
+				id: "call-adv".to_string(),
+				name: "advise".to_string(),
+				arguments: arguments.clone(),
+			}],
+		);
+		assistant.usage = Some(pi_agent::TokenUsage {
+			input: 100,
+			output: 20,
+			..pi_agent::TokenUsage::default()
+		});
+		let mut transcript = AdvisorTranscript::new();
+		transcript.record(
+			&assistant,
+			Some(&session_file),
+			"reviewer",
+			&dir,
+			&Catalog::default(),
+			"mock",
+			"model",
+		);
+		let file = transcript_path(&session_file, "reviewer").expect("path");
+		let content = std::fs::read_to_string(file).expect("transcript");
+		let line = content.lines().nth(1).expect("assistant line");
+		let entry: MessageEntry = serde_json::from_str(line).expect("message entry");
+		assert_eq!(entry.message.usage.expect("usage").input, 100);
+		let MessageContent::Parts(parts) = entry.message.content else {
+			panic!("expected parts: {line}");
+		};
+		assert_eq!(parts[0].kind, "text");
+		assert_eq!(parts[0].text.as_deref(), Some("preamble"));
+		assert_eq!(parts[1].kind, "toolCall");
+		assert_eq!(parts[1].extra["id"], "call-adv");
+		assert_eq!(parts[1].extra["name"], "advise");
+		assert_eq!(parts[1].extra["arguments"], arguments);
+		assert_eq!(parts.len(), 2, "tool call must not duplicate");
+	}
+
+	#[test]
+	fn structured_parts_round_trip_signature_redaction_and_arguments() {
+		let dir = temp_dir("parts");
+		let session_file = dir.join("session.jsonl");
+		std::fs::write(&session_file, "{}\n").expect("primary log");
+		let arguments = serde_json::json!({
+			"note": "child advice marker",
+			"severity": "blocker"
+		});
+		let mut assistant = Message::assistant("");
+		assistant.parts = vec![
+			pi_agent::ContentPart::thinking_with_signature("plan", "signed-json"),
+			pi_agent::ContentPart::redacted_thinking("redacted-blob"),
+			pi_agent::ContentPart::tool_call("call-adv", "advise", arguments.clone()),
+		];
+		assistant.usage = Some(pi_agent::TokenUsage {
+			input: 100,
+			output: 20,
+			..pi_agent::TokenUsage::default()
+		});
+		let mut transcript = AdvisorTranscript::new();
+		transcript.record(
+			&assistant,
+			Some(&session_file),
+			"reviewer",
+			&dir,
+			&Catalog::default(),
+			"mock",
+			"model",
+		);
+		let file = transcript_path(&session_file, "reviewer").expect("path");
+		let content = std::fs::read_to_string(file).expect("transcript");
+		let line = content.lines().nth(1).expect("assistant line");
+		let entry: MessageEntry = serde_json::from_str(line).expect("message entry");
+		assert_eq!(entry.message.usage.expect("usage").input, 100);
+		let MessageContent::Parts(parts) = entry.message.content else {
+			panic!("expected parts: {line}");
+		};
+		assert_eq!(parts[0].kind, "thinking");
+		assert_eq!(parts[0].extra["thinking"], "plan");
+		assert_eq!(parts[0].extra["thinkingSignature"], "signed-json");
+		assert_eq!(parts[1].kind, "redactedThinking");
+		assert_eq!(parts[1].data.as_deref(), Some("redacted-blob"));
+		assert_eq!(parts[2].kind, "toolCall");
+		assert_eq!(parts[2].extra["id"], "call-adv");
+		assert_eq!(parts[2].extra["name"], "advise");
+		assert_eq!(parts[2].extra["arguments"], arguments);
+		assert_eq!(parts.len(), 3);
 	}
 
 	#[test]

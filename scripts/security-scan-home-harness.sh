@@ -237,19 +237,20 @@ def root_reply(messages, body):
         })
 
     if name == "security_scan" and action == "status":
-        if "; completed;" in content:
+        # Tool text: `Security scan <id>: <phase>; <n> finding(s).`
+        if ": completed;" in content:
             scan = SCAN.search(content)
             if not scan:
                 return text("SECURITY_SMOKE_FAIL_NO_SCAN:" + content)
             return tool_call("read", {
                 "path": f"security://scans/{scan.group(0)}/findings",
             })
-        if "; failed;" in content or "; partial;" in content or "; cancelled;" in content:
+        if any(f": {phase};" in content for phase in ("failed", "partial", "cancelled")):
             return text("SECURITY_SMOKE_FAIL_STATUS:" + content)
         polls = sum(
             1
             for message in messages
-            if message.get("role") == "tool" and "; completed;" not in message_text(message)
+            if message.get("role") == "tool" and ": completed;" not in message_text(message)
         )
         if polls > 400:
             return text("SECURITY_SMOKE_FAIL_STATUS_TIMEOUT:" + content)
@@ -260,7 +261,9 @@ def root_reply(messages, body):
         })
 
     if name == "read":
-        if "secf_" not in content or "src/lib.rs" not in content:
+        # `security://scans/<id>/findings` lists `secf_` ids; the location lives
+        # in the per-finding resource, so the listing only needs the ids.
+        if "secf_" not in content or "Findings for" not in content:
             return text("SECURITY_SMOKE_FAIL_RESOURCE:" + content)
         finding = FINDING.search(content)
         scan = SCAN.search(content)
@@ -430,18 +433,24 @@ check "sarif has a result" grep -q '"version": "2.1.0"' "$OUTPUT/results.sarif"
 check "provenance has no email" bash -c "! grep -q 'user1@example.test' '$OUTPUT/provenance.json'"
 check "provenance has no token" bash -c "! grep -q 'access-1' '$OUTPUT/provenance.json'"
 check "store committed the scan" bash -c "find '$ROOT' -path '*security*/scans/*/scan.json' -print -quit | grep -q ."
-JOURNAL="$(find "$ROOT" -path '*security*/sessions/*.jsonl' -print -quit)"
-check "worker journal persisted" test -n "$JOURNAL"
-check "journal has assistant turn" bash -c "grep -q '\"role\": \"assistant\"' '$JOURNAL'"
-check "journal has tool result" bash -c "grep -q '\"role\": \"tool\"' '$JOURNAL'"
 # The coordinator publishes the journal path through the tool's structured
-# details; compare that API value with the file on disk (never the other way).
+# details; take that API value and require the file on disk to exist (the
+# `find` pattern is never used to guess it).
 PUBLISHED_SESSION_FILE="$(grep -o '"sessionFile":"[^"]*"' "$RUN_OUT" | tail -1 | sed 's/^"sessionFile":"//;s/"$//')"
 check "published sessionFile present" test -n "$PUBLISHED_SESSION_FILE"
-check "published sessionFile equals journal" test "$PUBLISHED_SESSION_FILE" = "$JOURNAL"
+JOURNAL="$PUBLISHED_SESSION_FILE"
+check "published sessionFile exists" test -f "$JOURNAL"
+check "journal lives in the security store" \
+	bash -c "case '$JOURNAL' in */security/*/sessions/*.jsonl) true;; *) false;; esac"
+check "journal has assistant turn" bash -c "grep -q '\"role\":\"assistant\"' '$JOURNAL'"
+check "journal has tool result" bash -c "grep -q '\"role\":\"toolResult\"' '$JOURNAL'"
+check "one journal for the scan" \
+	bash -c "test \"\$(find \"\$(dirname '$JOURNAL')\" -name '*.jsonl' | wc -l)\" -eq 1"
 SCAN_ID_FROM_JOURNAL="$(basename "$JOURNAL" .jsonl)"
 SCAN_ID_FROM_OUTPUT="$(grep -o 'secscan_[0-9a-zA-Z]*' "$RUN_OUT" | head -1)"
-check "journal is named after the scan" test "$SCAN_ID_FROM_JOURNAL" = "$SCAN_ID_FROM_OUTPUT"
+# Session logs are `<file-safe-timestamp>_<id>.jsonl`; the id must be the suffix.
+check "journal is named after the scan" \
+	bash -c "case '$SCAN_ID_FROM_JOURNAL' in *_'$SCAN_ID_FROM_OUTPUT') true;; *) false;; esac"
 check "scan session kept lsp despite parent off" grep -q 'lsp' "$ROOT/tools.log"
 check "scan session had publication tool" grep -q 'security_publish' "$ROOT/tools.log"
 

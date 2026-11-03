@@ -3195,6 +3195,11 @@ fn ensure_source_within(
 	Ok(())
 }
 
+#[cfg(test)]
+thread_local! {
+	static FAIL_GC_PUBLISH: std::cell::Cell<bool> = std::cell::Cell::new(false);
+}
+
 fn gzip_session_file(
 	source: &Path,
 	destination: &Path,
@@ -3229,9 +3234,20 @@ fn gzip_session_file(
 	// ever exposing a partial archive or replacing a foreign destination. On
 	// Android `hard_link` can fail with EACCES, so the native
 	// `renameat2(RENAME_NOREPLACE)` fallback is a normal platform path.
-	let published = pi_agent::tools::atomic_publish::publish_staged_file(&temp, destination)
-		.map_err(|error| format!("{}: {error}", destination.display()))?;
+	#[cfg(test)]
+	let inject_publish_failure = FAIL_GC_PUBLISH.with(|flag| flag.replace(false));
+	#[cfg(not(test))]
+	let inject_publish_failure = false;
+	let published = if inject_publish_failure {
+		Err("injected publish failure".to_string())
+	} else {
+		pi_agent::tools::atomic_publish::publish_staged_file(&temp, destination)
+	};
+	// The staging file is ours on every outcome; remove it before propagating a
+	// failure so a rejected archive never leaks the session temp.
 	let _ = fs::remove_file(&temp);
+	let published =
+		published.map_err(|error| format!("{}: {error}", destination.display()))?;
 	if !published {
 		return Err(format!(
 			"archive destination exists: {}",

@@ -847,6 +847,31 @@ fn gc_gzip_publication_is_complete_before_rename_and_cleans_staging() {
 }
 
 #[test]
+fn gc_gzip_publish_failure_removes_staged_temp_and_preserves_source() {
+	let dir = TempDir::new("gc-publish-fail");
+	let archive_root = dir.path().join("archive");
+	let content = "{\"type\":\"session\",\"id\":\"s1\"}\n";
+	let source = dir.write("sessions/project/s1.jsonl", content);
+	let destination = archive_root.join("project/s1.jsonl.gz");
+	super::FAIL_GC_PUBLISH.with(|flag| flag.set(true));
+	let error = gzip_session_file(&source, &destination, &archive_root)
+		.expect_err("injected publish failure");
+	assert!(error.contains("injected publish failure"), "{error}");
+	assert!(source.exists(), "source must survive a publication failure");
+	assert!(!destination.exists(), "failed publication must not create the archive");
+	let leftovers: Vec<PathBuf> = fs::read_dir(destination.parent().expect("archive parent"))
+		.expect("archive dir")
+		.filter_map(|entry| entry.ok())
+		.map(|entry| entry.path())
+		.filter(|path| path.to_string_lossy().contains(".tmp"))
+		.collect();
+	assert!(
+		leftovers.is_empty(),
+		"failed publication must not leak the staged session"
+	);
+}
+
+#[test]
 fn gc_torn_empty_stale_lock_uses_mtime_milliseconds() {
 	let dir = TempDir::new("gc-torn-lock");
 	let agent = dir.path().join("agent");

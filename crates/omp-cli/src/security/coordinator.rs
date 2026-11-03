@@ -677,14 +677,15 @@ struct PreparedTarget {
 }
 
 fn prepare_execution_target(
-	host: &dyn SecurityHost,
 	adapter: &dyn SecurityGitAdapter,
 	store: &SecurityStore,
 	plan: &SecurityScanPlan,
 	scan_id: &str,
 ) -> Result<PreparedTarget, String> {
 	if plan.target.kind != "ref_diff" {
-		return Ok(PreparedTarget { cwd: host.cwd(), diff_text: None });
+		// Every scope path is repository-relative, so the session must run at the
+		// planned root even when the caller's cwd is a subdirectory.
+		return Ok(PreparedTarget { cwd: PathBuf::from(&plan.repository_root), diff_text: None });
 	}
 	let head = plan
 		.target
@@ -779,13 +780,7 @@ fn run_operation(
 				.map_err(crate::Error::new)?;
 			record.update("preparing", None, now_iso);
 			host.ensure_model(&plan.model)?;
-			let target = prepare_execution_target(
-				host.as_ref(),
-				adapter.as_ref(),
-				&store,
-				&plan,
-				&scan_id,
-			)
+			let target = prepare_execution_target(adapter.as_ref(), &store, &plan, &scan_id)
 			.map_err(crate::Error::new)?;
 			let execution_root = target.cwd.clone();
 			let diff_text = target.diff_text.clone();

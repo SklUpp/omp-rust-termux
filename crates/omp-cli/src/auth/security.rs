@@ -15,7 +15,6 @@ use serde::{Deserialize, Serialize};
 
 use super::error::{AuthError, AuthErrorKind};
 use super::http::Cancel;
-use super::selection::{self, OAUTH};
 use super::store::{Credential, StoredCredential};
 use super::{registry, AuthBackend};
 
@@ -71,17 +70,23 @@ pub struct SecurityOAuthAccess {
 
 /// `selectSecurityAccount`: pin one OAuth row for `model.provider`.
 ///
-/// Selection order matches the TypeScript contract:
 /// 1. an explicit `requested_credential_id` must exist among the provider's
 ///    active OAuth rows;
-/// 2. otherwise the session-sticky OAuth row wins;
-/// 3. a lone account is selected automatically;
-/// 4. several accounts without a sticky row is an error — never a guess.
+/// 2. a lone account is selected automatically;
+/// 3. several accounts without an explicit id is an error — never a guess.
+///
+/// `session_id` is accepted for call-site parity with TS
+/// `listOAuthAccounts(provider, sessionId).active`, but this backend records no
+/// session→credential pin: [`SelectionState`](super::selection::SelectionState)
+/// only holds round-robin counters and backoff windows, so a session id merely
+/// shifts a selection order. Treating it as a pin would silently scan under a
+/// hash-chosen account, which the security contract forbids; only a durable
+/// `credentialId` can pin a multi-account provider here.
 pub fn select_security_account(
 	backend: &AuthBackend,
 	provider: &str,
 	requested_credential_id: Option<i64>,
-	session_id: Option<&str>,
+	_session_id: Option<&str>,
 ) -> Result<SecurityOAuthAccount, AuthError> {
 	let entry = registry::find(provider).ok_or_else(|| AuthError::unknown_provider(provider))?;
 	let stored_as = registry::storage_provider(entry);
@@ -102,34 +107,16 @@ pub fn select_security_account(
 					format!("Security OAuth credential {requested} is not available for {provider}"),
 				)
 			})?,
-		None => {
-			let sticky = session_id.and_then(|session_id| {
-				selection::select(
-					backend.store(),
-					backend.selection_state(),
-					stored_as,
-					OAUTH,
-					Some(session_id),
-					&[],
-					|row| matches!(row.credential, Credential::OAuth(_)),
-					None,
-				)
-				.ok()
-				.flatten()
-				.map(|row| row.id)
-			});
-			match sticky {
-				Some(id) => accounts.iter().find(|row| row.id == id).unwrap_or(&accounts[0]),
-				None if accounts.len() == 1 => &accounts[0],
-				None => {
-					return Err(AuthError::config(
-						provider,
-						format!(
-							"Multiple OAuth accounts are available for {provider}; supply credentialId to pin one exact account"
-						),
-					))
-				},
-			}
+		None => match accounts.as_slice() {
+			[only] => only,
+			_ => {
+				return Err(AuthError::config(
+					provider,
+					format!(
+						"Multiple OAuth accounts are available for {provider}; supply credentialId to pin one exact account"
+					),
+				))
+			},
 		},
 	};
 	account_from_row(provider, selected)

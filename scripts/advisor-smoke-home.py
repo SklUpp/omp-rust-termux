@@ -216,7 +216,13 @@ class MockModel:
                 self.send_header("content-length", str(len(encoded)))
                 self.send_header("connection", "close")
                 self.end_headers()
-                self.wfile.write(encoded)
+                try:
+                    self.wfile.write(encoded)
+                except BrokenPipeError:
+                    # A cancelled CLI/ACP/RPC client can close while the mock
+                    # is writing. That is the expected cancellation edge, not
+                    # a fixture failure; every other write error stays visible.
+                    pass
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.port = self.server.server_address[1]
@@ -585,10 +591,19 @@ def spawn_with_reader(binary: str, args: list[str], env: dict[str, str]) -> tupl
     return proc, lines
 
 
-def send(proc: subprocess.Popen[str], frame: dict) -> None:
+def send(
+    proc: subprocess.Popen[str],
+    frame: dict,
+    allow_broken_pipe: bool = False,
+) -> None:
     assert proc.stdin is not None
-    proc.stdin.write(json.dumps(frame) + "\n")
-    proc.stdin.flush()
+    try:
+        proc.stdin.write(json.dumps(frame) + "\n")
+        proc.stdin.flush()
+    except BrokenPipeError:
+        if allow_broken_pipe:
+            return
+        raise
 
 
 def close_stdin(proc: subprocess.Popen[str], timeout: float = TIMEOUT) -> int:
@@ -879,6 +894,7 @@ def phase_acp(binary: str, mock: MockModel, base: Path) -> None:
             "method": "session/cancel",
             "params": {"sessionId": session_id},
         },
+        allow_broken_pipe=True,
     )
     code = close_stdin(proc)
     if code != 0:
@@ -987,8 +1003,11 @@ def phase_child_failure(binary: str, mock: MockModel, base: Path) -> None:
         fail(f"expected one child-failure root log, got {failure_logs}")
     root_log = failure_logs[0].read_text()
     failed_results = []
+    advisor_cards = []
     for line in root_log.splitlines():
         entry = json.loads(line)
+        if entry.get("customType") == "advisor":
+            advisor_cards.append(entry)
         message = entry.get("message") or {}
         if message.get("role") != "toolResult":
             continue
@@ -1005,8 +1024,9 @@ def phase_child_failure(binary: str, mock: MockModel, base: Path) -> None:
         fail("failed child task result carries no error or stderr")
     if "19191" in root_log:
         fail("child advisor usage leaked into the parent session log")
-    if root_log.count("child advice marker") > 1:
-        fail("failed child emitted duplicate advice cards")
+    card_ids = [card.get("id") for card in advisor_cards]
+    if len(card_ids) != len(set(card_ids)):
+        fail(f"failed child persisted the same advice card twice: {card_ids}")
     root_advisors = [
         path for path in sessions.rglob("__advisor*.jsonl")
         if "subagents" not in path.parts
@@ -1044,10 +1064,9 @@ def phase_child_cancel(binary: str, mock: MockModel, base: Path) -> None:
     after_abort: list[dict] = []
     try:
         send(proc, {"id": "2", "type": "abort"})
-        # Release immediately after sending abort: the command is already on
-        # the wire; waiting for its response first could deadlock behind the
-        # gated child provider stream.
-        mock.child_gate_release.set()
+        # The RPC reader handles abort independently of the active turn. Wait
+        # for its response before releasing the child gate so the child cannot
+        # finish and start a second root turn while cancellation is in flight.
         abort_frames = read_lines(
             proc,
             lines,
@@ -1055,6 +1074,7 @@ def phase_child_cancel(binary: str, mock: MockModel, base: Path) -> None:
             lambda frame: frame.get("type") == "response"
             and frame.get("command") == "abort",
         )
+        mock.child_gate_release.set()
         if not any(
             frame.get("type") == "response" and frame.get("command") == "abort"
             for frame in abort_frames
@@ -1133,6 +1153,7 @@ def main() -> None:
         phase_child(binary, mock, base)
         mock.begin_phase()
         phase_child_failure(binary, mock, base)
+        mock.begin_phase()
         phase_child_cancel(binary, mock, base)
     finally:
         mock.stop()

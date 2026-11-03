@@ -1445,6 +1445,13 @@ mod tests {
 	}
 
 	#[test]
+	fn advisor_flag_reaches_the_parsed_cli() {
+		let cli = parse(&["omp", "--advisor", "--mode", "text", "say hi"]);
+		assert!(cli.advisor);
+		assert_eq!(cli.prompt, ["say hi"]);
+	}
+
+	#[test]
 	fn session_uuid_detection_matches_ts_pattern() {
 		assert!(is_session_uuid("019ea530-ffff-7000-8000-000000000000"));
 		assert!(is_session_uuid("019EA530-FFFF-7000-8000-000000000000"));

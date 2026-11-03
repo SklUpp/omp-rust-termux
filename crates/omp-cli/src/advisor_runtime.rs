@@ -1810,6 +1810,30 @@ mod tests {
 	}
 
 	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn disposed_manager_drops_late_cards_before_the_sink() {
+		let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+		let sink_count = Arc::clone(&count);
+		let card_sink: CardSink = Arc::new(move |_content, _details| {
+			sink_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+		});
+		let manager = manager(Arc::new(FakeExecutor {
+			calls: StdMutex::new(Vec::new()),
+			error: StdMutex::new(None),
+		}));
+		manager.configure_run(None, None, None, Some(card_sink), None);
+		manager.dispose();
+		manager.route_advice(
+			&manager.slots[0],
+			Note { note: "late".to_string(), severity: Some(Severity::Blocker), advisor: None },
+		);
+		assert_eq!(
+			count.load(std::sync::atomic::Ordering::SeqCst),
+			0,
+			"a closed manager must not publish a card"
+		);
+	}
+
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 	async fn paused_entry_makes_zero_provider_calls() {
 		let executor = Arc::new(FakeExecutor {
 			calls: StdMutex::new(Vec::new()),

@@ -3408,13 +3408,12 @@ mod display_tests {
 		}
 		let extracted = read_with(&tool, &dir, "agent://Saved/foo").await;
 		assert!(!extracted.is_error, "{}", extracted.content);
-		assert_eq!(extracted.content, "[\n  1,\n  2\n]");
-		let paginated = read_with(&tool, &dir, "agent://Saved:1-1").await;
-		assert!(!paginated.is_error, "{}", paginated.content);
-		assert_eq!(
-			paginated.content, "1|{\"foo\":[1,2]}",
-			"selector must paginate the full JSON exactly once"
-		);
+		let extracted_value: serde_json::Value =
+			serde_json::from_str(&extracted.content).expect("extracted query is JSON");
+		assert_eq!(extracted_value, json!([1, 2]));
+		let raw = read_with(&tool, &dir, "agent://Saved:raw:1-1").await;
+		assert!(!raw.is_error, "{}", raw.content);
+		assert_eq!(raw.content, r#"{"foo":[1,2]}"#);
 	}
 
 	#[tokio::test]

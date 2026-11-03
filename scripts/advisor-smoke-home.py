@@ -5,11 +5,12 @@ Invocation:
     OMP_BIN=target/debug/omp python3 scripts/advisor-smoke-home.py
     python3 scripts/advisor-smoke-home.py /path/to/omp
 
-Everything is created under ``$HOME/task-tmp/advisor-smoke-<pid>`` (fallback:
-the platform temp dir). Nothing outside that directory is touched; sessions,
-transcripts, the mock server log, and captured stdout/stderr stay there for
-inspection. No process is killed with a forced signal unless a phase times out;
-a timeout fails the step and the child is terminated.
+Everything is created under ``$HOME/task-tmp/advisor-smoke-<pid>`` (HOME required;
+TMPDIR is used only when it is set and is not ``/tmp``). Nothing outside that
+directory is touched; sessions, transcripts, the mock server log, and captured
+stdout/stderr stay there for inspection. No process is killed with a forced
+signal unless a phase times out; a timeout fails the step and the child is
+terminated.
 
 Phases (all assert observable behavior, never source shape):
  1. CLI text:        `--advisor` succeeds, the blocker card is visible.
@@ -20,6 +21,11 @@ Phases (all assert observable behavior, never source shape):
                      advisor frames on the wire, EOF dispose exits 0.
  5. ACP:             initialize -> session/new -> session/prompt, advisor
                      update visible, session/cancel returns, EOF exits 0.
+ 6. Child:           root advisor off, real task spawn with `advisor: true`,
+                     child provider call, advice card, child-local transcript,
+                     no advisor usage in the parent session log.
+ 7. Child failure:   scripted child provider error is contained.
+ 8. Child cancel:    skipped until a deterministic mock gate exists.
 """
 from __future__ import annotations
 
@@ -45,6 +51,8 @@ class MockModel:
         self.requests: list[dict] = []
         self.advisor_notes_sent = 0
         self.advisor_error = False
+        self.child_error = False
+        self.child_phase = False
         self.primary_delay = 0.0
         self.lock = threading.Lock()
         mock = self
@@ -64,12 +72,21 @@ class MockModel:
                     payload = {}
                 with mock.lock:
                     mock.requests.append(payload)
-                    system = json.dumps(payload.get("messages", [{}])[:1])
+                    messages = payload.get("messages", [])
+                    system = json.dumps(messages[:1])
                     advisor = "passive advisor" in system
+                    child = "CHILD-SMOKE-MARKER" in system
+                    has_tool_result = any(
+                        message.get("role") == "tool" for message in messages
+                    )
                     if not advisor and mock.primary_delay:
                         delay = mock.primary_delay
                     else:
                         delay = 0.0
+                    usage = (
+                        'data: {"choices":[],"usage":{"prompt_tokens":19191,'
+                        '"completion_tokens":1919,"total_tokens":21110}}\n\n'
+                    )
                     if advisor and mock.advisor_error:
                         chunk = (
                             'data: {"error":{"type":"insufficient_quota",'
@@ -78,20 +95,58 @@ class MockModel:
                     elif advisor and mock.advisor_notes_sent == 0:
                         mock.advisor_notes_sent += 1
                         args = json.dumps(
-                            {"note": "write target deleted", "severity": "blocker"}
+                            {
+                                "note": (
+                                    "child advice marker"
+                                    if mock.child_phase
+                                    else "write target deleted"
+                                ),
+                                "severity": "blocker",
+                            }
                         )
                         chunk = (
                             'data: {"choices":[{"delta":{"tool_calls":[{"index":0,'
                             '"id":"call-adv","type":"function","function":{"name":"advise",'
                             f'"arguments":{json.dumps(args)}}}}}]}}]}}\n\n'
+                            + usage
+                            + "data: [DONE]\n\n"
+                        )
+                    elif advisor:
+                        chunk = (
+                            'data: {"choices":[{"delta":{"content":"noted"},'
+                            '"finish_reason":"stop"}]}\n\n'
+                            + usage
+                            + "data: [DONE]\n\n"
+                        )
+                    elif child and mock.child_error:
+                        chunk = (
+                            'data: {"error":{"type":"server_error",'
+                            '"message":"child provider failed"}}\n\n'
+                            "data: [DONE]\n\n"
+                        )
+                    elif child:
+                        chunk = (
+                            'data: {"choices":[{"delta":{"content":"child finished"},'
+                            '"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'
+                        )
+                    elif mock.child_phase and not has_tool_result:
+                        args = json.dumps(
+                            {
+                                "name": "child-smoke-1",
+                                "agent": "child-smoke",
+                                "task": "do child work",
+                            }
+                        )
+                        chunk = (
+                            'data: {"choices":[{"delta":{"tool_calls":[{"index":0,'
+                            '"id":"call-task","type":"function","function":{"name":"task",'
+                            f'"arguments":{json.dumps(args)}}}}}]}}]}}\n\n'
                             "data: [DONE]\n\n"
                         )
                     else:
-                        text = "noted" if advisor else "done"
                         chunk = (
-                            'data: {"choices":[{"delta":{"content":'
-                            f'"{text}"'
-                            '},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'
+                            'data: {"choices":[{"delta":{"content":"root done"},'
+                            '"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'
                         )
                 if delay:
                     time.sleep(delay)
@@ -110,6 +165,14 @@ class MockModel:
     def start(self) -> None:
         self.thread.start()
 
+    def begin_phase(self) -> None:
+        with self.lock:
+            self.requests.clear()
+            self.advisor_notes_sent = 0
+            self.advisor_error = False
+            self.child_error = False
+            self.child_phase = False
+
     def stop(self) -> None:
         self.server.shutdown()
         self.server.server_close()
@@ -121,7 +184,15 @@ class MockModel:
 
 def base_dir() -> Path:
     home = os.environ.get("HOME")
-    root = Path(home) / "task-tmp" if home else Path(tempfile.gettempdir())
+    if home:
+        root = Path(home) / "task-tmp"
+    else:
+        tmp = os.environ.get("TMPDIR")
+        if not tmp:
+            raise SystemExit("HOME or TMPDIR is required for advisor smoke artifacts")
+        root = Path(tmp)
+        if root.resolve() == Path("/tmp"):
+            raise SystemExit("refusing /tmp outside HOME for advisor smoke artifacts")
     root.mkdir(parents=True, exist_ok=True)
     return Path(tempfile.mkdtemp(prefix="advisor-smoke-", dir=root))
 
@@ -130,8 +201,18 @@ def write_config(base: Path, port: int) -> tuple[Path, Path, Path, Path]:
     agent_dir = base / "agent"
     cwd = base / "work"
     sessions = base / "sessions"
-    for directory in (agent_dir, cwd / ".omp", sessions):
+    for directory in (agent_dir, cwd / ".omp", cwd / ".omp" / "agents", sessions):
         directory.mkdir(parents=True, exist_ok=True)
+    (cwd / ".omp" / "agents" / "child-smoke.md").write_text(
+        "---\n"
+        "name: child-smoke\n"
+        "description: Child advisor smoke agent\n"
+        "tools: [read]\n"
+        "blocking: true\n"
+        "advisor: true\n"
+        "---\n"
+        "You are the CHILD-SMOKE-MARKER child. Do exactly one short turn.\n"
+    )
     (agent_dir / "config.yml").write_text(
         "defaultModel: mock/primary\n"
         "modelRoles:\n"
@@ -172,6 +253,25 @@ def cli_run(binary: str, agent_dir: Path, cwd: Path, sessions: Path) -> subproce
             "--advisor",
             "--mode", "text",
             "say hi",
+        ],
+        env=omp_env(agent_dir),
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+    )
+
+
+def child_run(binary: str, agent_dir: Path, cwd: Path, sessions: Path) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [
+            binary,
+            "--cwd", str(cwd),
+            "--session-dir", str(sessions),
+            "--no-title",
+            "--yolo",
+            "--mode", "json",
+            "spawn one child-smoke task",
         ],
         env=omp_env(agent_dir),
         stdin=subprocess.DEVNULL,
@@ -469,6 +569,78 @@ def phase_acp(binary: str, mock: MockModel, base: Path) -> None:
     print("PASS acp advisor update + cancel + dispose")
 
 
+def phase_child(binary: str, mock: MockModel, base: Path) -> None:
+    agent_dir, cwd, sessions, _ = write_config(base / "child", mock.port)
+    mock.child_phase = True
+    out = child_run(binary, agent_dir, cwd, sessions)
+    if out.returncode != 0:
+        fail(f"child advisor run exited {out.returncode}: {out.stderr}")
+    frames = [json.loads(line) for line in out.stdout.splitlines() if line.startswith("{")]
+    cards = [
+        frame for frame in frames
+        if frame.get("type") == "message_end"
+        and isinstance(frame.get("message"), dict)
+        and frame["message"].get("customType") == "advisor"
+    ]
+    if not any("child advice marker" in json.dumps(card) for card in cards):
+        fail(f"child advice card missing: {cards}")
+    requests = list(mock.requests)
+    child_requests = [
+        request for request in requests
+        if "CHILD-SMOKE-MARKER" in json.dumps(request.get("messages", [])[:1])
+        and "passive advisor" not in json.dumps(request.get("messages", [])[:1])
+    ]
+    advisor_requests = [
+        request for request in requests
+        if "passive advisor" in json.dumps(request.get("messages", [])[:1])
+    ]
+    if not child_requests:
+        fail("mock never received a real child provider request")
+    if not advisor_requests:
+        fail("mock never received a child advisor provider request")
+    root_logs = [
+        path for path in session_logs(sessions)
+        if "subagents" not in path.parts and "__advisor" not in path.name
+    ]
+    if len(root_logs) != 1:
+        fail(f"expected one root session log, got {root_logs}")
+    root_log = root_logs[0].read_text()
+    if "child advice marker" not in root_log:
+        fail("child advice card was not persisted by the parent host")
+    child_advisors = [
+        path for path in sessions.rglob("__advisor*.jsonl")
+        if "subagents" in path.parts
+    ]
+    if not child_advisors:
+        fail("child-local __advisor transcript missing")
+    if "19191" in root_log:
+        fail("advisor usage leaked into the parent session log")
+    print(f"PASS child advisor opt-in, card, provider calls, transcript ({child_advisors[0]})")
+
+
+def phase_child_failure(binary: str, mock: MockModel, base: Path) -> None:
+    agent_dir, cwd, sessions, _ = write_config(base / "child-failure", mock.port)
+    mock.child_phase = True
+    mock.child_error = True
+    out = child_run(binary, agent_dir, cwd, sessions)
+    if out.returncode != 0:
+        fail(f"contained child failure exited {out.returncode}: {out.stderr}")
+    requests = list(mock.requests)
+    if not any(
+        "CHILD-SMOKE-MARKER" in json.dumps(request.get("messages", [])[:1])
+        for request in requests
+    ):
+        fail("child failure phase never reached the child provider")
+    print("PASS child provider failure contained")
+
+
+def phase_child_cancel(binary: str, mock: MockModel, base: Path) -> None:
+    # The current mock has no deterministic child-cancel gate: cancellation is
+    # driven by the live turn owner, not by a scripted provider chunk. Keep the
+    # phase explicit so a future gate can fill it without changing dispatch.
+    print("SKIP child cancellation: no deterministic mock gate")
+
+
 def main() -> None:
     binary = os.environ.get("OMP_BIN") or (sys.argv[1] if len(sys.argv) > 1 else "target/debug/omp")
     binary = shutil.which(binary) or binary
@@ -479,14 +651,24 @@ def main() -> None:
     mock = MockModel()
     mock.start()
     try:
+        mock.begin_phase()
         phase_cli_text(binary, mock, base)
+        mock.begin_phase()
         phase_cli_json(binary, mock, base)
+        mock.begin_phase()
         phase_cli_error(binary, mock, base)
+        mock.begin_phase()
         phase_rpc(binary, mock, base)
+        mock.begin_phase()
         phase_acp(binary, mock, base)
+        mock.begin_phase()
+        phase_child(binary, mock, base)
+        mock.begin_phase()
+        phase_child_failure(binary, mock, base)
+        phase_child_cancel(binary, mock, base)
     finally:
         mock.stop()
-    print("PASS advisor smoke (CLI text/json, error, RPC, ACP)")
+    print("PASS advisor smoke (CLI text/json, error, RPC, ACP, child)")
 
 
 if __name__ == "__main__":

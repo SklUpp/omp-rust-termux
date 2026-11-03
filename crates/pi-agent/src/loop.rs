@@ -1140,18 +1140,12 @@ impl AgentLoop {
 				// apply, but a provider swap or guidance must not start another turn.
 				let TurnAckDecision { rewrite, warning, .. } = decision;
 				let _ = self.apply_turn_rewrite(&mut state.messages, rewrite, warning);
-				let terminal_status = assistant_status(&assistant, false);
 				turn_results.push(TurnResult {
 					message: assistant,
 					tool_results: results,
 					is_completed: true,
 				});
-				return match terminal_status {
-					TurnStatus::Error(message) => {
-						Err(AgentError::Provider(ProviderError::Protocol(message)))
-					},
-					_ => Ok(turn_results),
-				};
+				return Ok(turn_results);
 			}
 
 			if soft_non_compliant

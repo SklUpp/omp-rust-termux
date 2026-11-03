@@ -561,6 +561,8 @@ pub struct Config {
 	pub plan:                 PlanConfig,
 	/// `prewalk.*`: one-way model switch for fresh sessions.
 	pub prewalk:              PrewalkConfig,
+	/// `security.enabled` (flat leaf; nested group for a typed home).
+	pub security:             crate::security::SecurityConfig,
 	/// `eval.*` backend enablement and interpreter groups.
 	pub eval_config:          EvalConfig,
 	/// `searxng.*`: the web-search endpoint and its credentials.
@@ -651,6 +653,7 @@ impl Config {
 		self.goal.merge(overlay.goal);
 		self.plan.merge(overlay.plan);
 		self.prewalk.merge(overlay.prewalk);
+		self.security.merge(overlay.security);
 		self.eval_config.merge(overlay.eval_config);
 		// `searxng.*` merges per leaf so an explicit host overlay can add
 		// credentials to a globally configured endpoint (and vice versa).
@@ -1166,6 +1169,14 @@ fn apply_nested_settings(config: &mut Config, value: &Value, path: &Path) -> Res
 				},
 				_ => {},
 			}
+		}
+	}
+	if let Some(security) = value.get("security") {
+		if let Some(enabled) = security.get("enabled") {
+			let enabled = enabled
+				.as_bool()
+				.ok_or_else(|| invalid(path, "security.enabled", "expected a boolean"))?;
+			config.security.enabled = Some(enabled);
 		}
 	}
 	if let Some(extensions) = value.get("extensions").and_then(Value::as_list) {

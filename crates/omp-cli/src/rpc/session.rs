@@ -2079,6 +2079,8 @@ impl RpcSession {
 			continuation,
 			plan_context: self.plan_context(),
 			service_tier_by_family: self.service_tier_by_family(),
+			security_host: None,
+			security_worker: false,
 })
 	}
 

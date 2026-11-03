@@ -136,6 +136,13 @@ pub fn classify_tool(name: &str, args: &serde_json::Value) -> ToolTier {
 		// xd://resolve`; the staging call itself is a write-tier action, and the
 		// dispatch stays Read like `write`.
 		"ast_edit" => ToolTier::Write,
+		// Security publication mutates the results index / artifacts. The tool
+		// only exists in the restricted scan worker, but its approval tier must
+		// still be a write when a host inspects it.
+		// The root coordinator tool only reads/preflights/starts; the worker
+		// owns publication and is the only write surface.
+		"security_scan" => ToolTier::Read,
+		"security_publish" => ToolTier::Write,
 		"bash" => ToolTier::Exec,
 		// Upstream classifies LSP per action: rename/reload/raw `request`/format
 		// mutate state, so they need explicit approval even though the tool is

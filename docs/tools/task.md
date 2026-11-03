@@ -203,6 +203,22 @@ call through `pi_agent::Supervisor`; there is no background job manager.
 - The supervisor reserves an immutable `id` before spawning (`task-1`,
   `task-2`, ...); the model-supplied `name` is a non-unique label. Results carry
   both: `SingleResult{id, name, ...}`.
+- Saved output identity is separate from that lifecycle id: `outputId` is
+  allocated from the requested name (verbatim, then `-2`/`-3`), nests as
+  `Parent.Child`, reserves `__advisor`, and is seeded from existing `.md` and
+  `.jsonl` files so a restarted session never overwrites prior output.
+  `SingleResult.outputId`, `ChildRecord.outputId`, eval-agent details, the
+  background `<task-result output="agent://…">` pointer, and `hub jobs`
+  snapshots expose it; `id` and `resultKey` keep their existing meaning.
+- Every initial child with a session root publishes the full pre-cap result as
+  `<outputId>.md` through the shared atomic no-clobber primitive (`hard_link`,
+  falling back to `renameat2(RENAME_NOREPLACE)`), after the child settles but
+  before its terminal status is published. Completed, failed, and aborted runs
+  all produce the artifact; a hard abort with no captured text is an empty file,
+  matching the TS initial-run behavior. A collision allocates the next id
+  without touching the existing file. Rust revived turns currently do not
+  rewrite `<outputId>.md`; the TS follow-up rewrite uses an explicit replace and
+  is intentionally not part of this no-clobber path.
 - `outputSchema`, `schemaMode`, `effort`, and `isolated` are rejected as invalid
   arguments rather than silently ignored.
 - Parent cancellation cancels the child's token, interrupts its loop, and waits

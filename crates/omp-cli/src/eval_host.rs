@@ -620,78 +620,18 @@ async fn create_artifact_stage(
 
 /// Publish an already complete staging file under `final_path` without
 /// replacing an existing artifact. The hard link is atomic and no-clobber;
-/// when the filesystem refuses it, [`rename_noreplace`] provides the same
-/// guarantee. `Ok(false)` means another writer owns this id and the caller
+/// when the filesystem refuses it, the shared
+/// [`pi_agent::tools::atomic_publish::publish_staged_file`] fallback provides
+/// the same guarantee. `Ok(false)` means another writer owns this id and the caller
 /// must retry the next id, leaving the existing file untouched.
 async fn publish_staged_artifact(staged: &Path, final_path: &Path) -> Result<bool, String> {
-	match fs::hard_link(staged, final_path).await {
-		Ok(()) => Ok(true),
-		Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
-		// Android app-private storage can refuse hard links (EACCES/EPERM) and
-		// some filesystems do not support them. `exists()` + `rename` is NOT a
-		// safe fallback: the check is racy and `rename` replaces an existing
-		// artifact. `renameat2(RENAME_NOREPLACE)` is the native atomic
-		// no-clobber publish, so use that instead.
-		Err(error) => match rename_noreplace(staged, final_path) {
-			Ok(published) => Ok(published),
-			Err(fallback) => Err(format!(
-				"hard link failed ({error}); atomic no-clobber rename failed ({fallback})"
-			)),
-		},
-	}
-}
-
-/// Atomically move `from` onto `to` only when `to` does not exist.
-///
-/// `Ok(false)` means another writer owns the destination. Linux and Android
-/// implement this natively as `renameat2(..., RENAME_NOREPLACE)`. The raw
-/// syscall avoids a link-time dependency on a bionic `renameat2` symbol that
-/// older API levels do not export; kernels without `renameat2` fail with
-/// `ENOSYS` and the publication reports both errors instead of silently
-/// overwriting.
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<bool> {
-	use std::{ffi::CString, os::unix::ffi::OsStrExt};
-
-	fn cstring(path: &Path) -> std::io::Result<CString> {
-		CString::new(path.as_os_str().as_bytes()).map_err(|_| {
-			std::io::Error::new(
-				std::io::ErrorKind::InvalidInput,
-				format!("path contains a NUL: {}", path.display()),
-			)
-		})
-	}
-
-	let from = cstring(from)?;
-	let to = cstring(to)?;
-	// SAFETY: both C strings are NUL-terminated and outlive the call; the
-	// variadic arguments are the `renameat2` signature with LP64-wide integers.
-	let result = unsafe {
-		libc::syscall(
-			libc::SYS_renameat2,
-			libc::AT_FDCWD as libc::c_long,
-			from.as_ptr(),
-			libc::AT_FDCWD as libc::c_long,
-			to.as_ptr(),
-			libc::RENAME_NOREPLACE as libc::c_long,
-		)
-	};
-	if result == 0 {
-		return Ok(true);
-	}
-	let error = std::io::Error::last_os_error();
-	match error.raw_os_error() {
-		Some(libc::EEXIST) => Ok(false),
-		_ => Err(error),
-	}
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
-fn rename_noreplace(_from: &Path, _to: &Path) -> std::io::Result<bool> {
-	Err(std::io::Error::new(
-		std::io::ErrorKind::Unsupported,
-		"atomic no-clobber rename needs renameat2 on this platform",
-	))
+	let staged = staged.to_path_buf();
+	let final_path = final_path.to_path_buf();
+	tokio::task::spawn_blocking(move || {
+		pi_agent::tools::atomic_publish::publish_staged_file(&staged, &final_path)
+	})
+	.await
+	.map_err(|error| format!("artifact publication task failed: {error}"))?
 }
 
 #[cfg(test)]
@@ -1211,21 +1151,29 @@ mod tests {
 
 	#[cfg(any(target_os = "linux", target_os = "android"))]
 	#[test]
-	fn rename_noreplace_never_replaces_an_existing_artifact() {
+	fn publish_staged_file_never_replaces_an_existing_artifact() {
 		let dir = temp_dir("rename-noreplace");
 		let staged = dir.join(".stage");
 		let final_path = dir.join("0.eval.log");
 		std::fs::write(&staged, b"new").expect("stage");
 		std::fs::write(&final_path, b"existing").expect("existing artifact");
 
-		assert!(!rename_noreplace(&staged, &final_path).expect("no-clobber rename"));
+		assert!(
+			!pi_agent::tools::atomic_publish::publish_staged_file(&staged, &final_path)
+				.expect("no-clobber publication")
+		);
 		assert_eq!(std::fs::read(&final_path).expect("read"), b"existing");
 		assert!(staged.exists(), "rejected publication must keep the stage");
 
 		std::fs::remove_file(&final_path).expect("unlink");
-		assert!(rename_noreplace(&staged, &final_path).expect("publish"));
+		assert!(
+			pi_agent::tools::atomic_publish::publish_staged_file(&staged, &final_path)
+				.expect("publish")
+		);
 		assert_eq!(std::fs::read(&final_path).expect("read"), b"new");
-		assert!(!staged.exists());
+		// A successful hard-link publication leaves the private stage inode
+		// behind for the caller to unlink; a rename fallback consumes it.
+		let _ = std::fs::remove_file(&staged);
 		std::fs::remove_dir_all(&dir).ok();
 	}
 }

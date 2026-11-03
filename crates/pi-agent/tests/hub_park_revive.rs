@@ -121,6 +121,7 @@ fn adoptable_child(supervisor: &Arc<Supervisor>, root: &PathBuf) -> (String, Per
 			parent_id:           None,
 			parent_tool_call_id: Some("call-park"),
 			detached:            true,
+			output_prefix:       None,
 		})
 		.expect("reserve child");
 	supervisor.append_child_transcript(
@@ -151,6 +152,7 @@ fn adoptable_child(supervisor: &Arc<Supervisor>, root: &PathBuf) -> (String, Per
 		context_limit: 100_000,
 		display_name: Some("kept".to_string()),
 		parent_id: None,
+		output_id: None,
 	};
 	contract.write(root).expect("write contract");
 	supervisor.mark_completed(&id, 7, "prior-answer");
@@ -415,6 +417,7 @@ fn contract_for(
 		context_limit: 100_000,
 		display_name: Some(id.to_string()),
 		parent_id: Some("Main".to_string()),
+		output_id: None,
 	}
 }
 
@@ -550,6 +553,7 @@ fn reserve_in(supervisor: &Arc<Supervisor>, name: &str) -> String {
 			parent_id: None,
 			parent_tool_call_id: Some("call-depth"),
 			detached: false,
+			output_prefix: None,
 		})
 		.expect("reserve child");
 	id

@@ -77,6 +77,7 @@ fn spawn(name: &str, index: usize, detached: bool) -> ChildSpawn<'_> {
 		parent_id: None,
 		parent_tool_call_id: Some("call-7"),
 		detached,
+		output_prefix: None,
 	}
 }
 

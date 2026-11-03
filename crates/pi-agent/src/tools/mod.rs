@@ -1,5 +1,7 @@
+pub mod agent_output;
 pub mod ask;
 pub mod ast_edit;
+pub mod atomic_publish;
 pub mod ast_grep;
 pub mod checkpoint;
 pub mod conflict;
@@ -8,6 +10,7 @@ pub mod hashline;
 pub mod hub;
 pub mod hub_park;
 pub mod internal_urls;
+pub mod internal_urls_agent;
 pub mod internal_urls_artifact;
 pub mod internal_urls_github;
 pub mod pending;

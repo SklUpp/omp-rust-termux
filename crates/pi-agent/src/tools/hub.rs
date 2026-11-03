@@ -186,6 +186,9 @@ impl HubTool {
 #[serde(rename_all = "camelCase")]
 pub struct HubJobSnapshot {
 	pub id: String,
+	/// Saved-output identity for `agent://<outputId>`, distinct from `id`.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub output_id: Option<String>,
 	/// Model-supplied label; not unique, never accepted by `hub cancel`.
 	pub name: String,
 	#[serde(rename = "type")]
@@ -327,6 +330,7 @@ fn snapshot(record: &ChildRecord, consumed: bool) -> HubJobSnapshot {
 		.filter(|_| record.detached && !consumed);
 	HubJobSnapshot {
 		id: record.id.clone(),
+		output_id: record.output_id.clone(),
 		name: record.name.clone(),
 		kind: "task".to_string(),
 		status: status.to_string(),

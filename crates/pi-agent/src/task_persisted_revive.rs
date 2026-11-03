@@ -147,6 +147,11 @@ pub struct PersistedChildSession {
 	/// Roster-only parent agent id.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub parent_id: Option<String>,
+	/// Stable saved-output identity (`agent://<output_id>`). New contracts
+	/// record it so a revived nested child can keep allocating its own
+	/// children under the same prefix; older contracts simply omit it.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub output_id: Option<String>,
 }
 
 impl PersistedChildSession {
@@ -454,14 +459,17 @@ fn revived_child_registry(
 			.clone()
 			.unwrap_or_else(|| "task".to_string());
 		let tools = contract.tools.iter().cloned().collect();
-		registry.register(Arc::new(TaskTool::revived(
-			Arc::clone(supervisor),
-			contract.depth,
-			contract.id.clone(),
-			agent_name,
-			spawns_from_contract(contract.spawns.as_deref()),
-			tools,
-		)));
+		registry.register(Arc::new(
+			TaskTool::revived(
+				Arc::clone(supervisor),
+				contract.depth,
+				contract.id.clone(),
+				agent_name,
+				spawns_from_contract(contract.spawns.as_deref()),
+				tools,
+			)
+			.with_output_prefix(contract.output_id.clone()),
+		));
 	}
 	registry
 }

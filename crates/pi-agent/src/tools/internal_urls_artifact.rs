@@ -220,7 +220,7 @@ fn resolve_in_roots(id: &str, roots: &[PathBuf]) -> Result<ResolvedArtifact, Str
 /// the root or the leaf, so a swapped link cannot redirect the read outside the
 /// session's artifact store.
 #[cfg(unix)]
-fn open_artifact_file(root: &Path, name: &str) -> Result<fs::File, String> {
+pub(super) fn open_artifact_file(root: &Path, name: &str) -> Result<fs::File, String> {
 	use std::{
 		ffi::CString,
 		os::{
@@ -267,7 +267,7 @@ fn open_artifact_file(root: &Path, name: &str) -> Result<fs::File, String> {
 }
 
 #[cfg(not(unix))]
-fn open_artifact_file(_root: &Path, _name: &str) -> Result<fs::File, String> {
+pub(super) fn open_artifact_file(_root: &Path, _name: &str) -> Result<fs::File, String> {
 	Err("artifact:// needs descriptor-relative traversal; unsupported on this platform".to_string())
 }
 

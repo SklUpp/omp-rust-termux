@@ -51,6 +51,9 @@ pub struct TaskTool {
 	/// Factory snapshot captured when this tool was created as a nested child;
 	/// `None` for a root tool, which reads the current per-turn snapshot.
 	pub model_factory: Option<Arc<dyn ChildModelFactory>>,
+	/// Parent child's saved-output id, used to nest this tool's children as
+	/// `Parent.Child`. `None` at the root or when the parent has no saved id.
+	output_prefix: Option<String>,
 }
 
 /// Immutable per-spawn snapshot shared by the task tool and detached background
@@ -188,6 +191,9 @@ impl TaskTool {
 		} else {
 			limits.max_concurrency
 		};
+		let output_prefix = parent_id
+			.as_deref()
+			.and_then(|parent| supervisor.child_output_id(parent));
 		Self {
 			supervisor,
 			depth,
@@ -198,6 +204,7 @@ impl TaskTool {
 			spawns: None,
 			parent_tools: None,
 			model_factory: None,
+			output_prefix,
 		}
 	}
 
@@ -212,6 +219,7 @@ impl TaskTool {
 			spawns: None,
 			parent_tools: None,
 			model_factory: None,
+			output_prefix: None,
 		}
 	}
 
@@ -237,6 +245,13 @@ impl TaskTool {
 	#[must_use]
 	pub fn with_model_factory(mut self, factory: Arc<dyn ChildModelFactory>) -> Self {
 		self.model_factory = Some(factory);
+		self
+	}
+
+	/// Restore the parent output prefix for a cold-revived nested tool.
+	#[must_use]
+	pub fn with_output_prefix(mut self, prefix: Option<String>) -> Self {
+		self.output_prefix = prefix.filter(|id| super::agent_output::valid_output_id(id));
 		self
 	}
 
@@ -431,10 +446,12 @@ impl TaskTool {
 			parent_id:           self.parent_id.as_deref(),
 			parent_tool_call_id: parent_call_id,
 			detached:            false,
+			output_prefix:       self.output_prefix.as_deref(),
 		}) else {
 			return SingleResult {
 				index,
 				id: child_name.clone(),
+				output_id: None,
 				name: child_name,
 				agent: agent_name.clone(),
 				agent_source: agent_source.clone(),
@@ -486,6 +503,7 @@ impl TaskTool {
 				return SingleResult {
 					index,
 					id: child_id,
+					output_id: None,
 					name: child_name,
 					agent: agent_name.clone(),
 					agent_source: agent_source.clone(),
@@ -520,6 +538,7 @@ impl TaskTool {
 			return SingleResult {
 				index,
 				id: child_id,
+				output_id: None,
 				name: child_name,
 				agent: agent_name.clone(),
 				agent_source: agent_source.clone(),
@@ -769,6 +788,7 @@ impl TaskTool {
 			return SingleResult {
 				index,
 				id: child_id,
+				output_id: None,
 				name: child_name,
 				agent: agent_name.clone(),
 				agent_source: agent_source.clone(),
@@ -841,6 +861,7 @@ impl TaskTool {
 		let observed_usage = self.supervisor.observed_usage(&outstanding_id);
 
 		let mut terminal_mark = None;
+		let mut artifact_body: Option<String> = None;
 		let mut result = match outcome {
 			Ok(turn_results) => {
 				// Journal the whole turn tail (assistant + tool results): a
@@ -929,9 +950,18 @@ impl TaskTool {
 					terminal_mark = Some(TerminalMark::Completed(record_output));
 				}
 
+				// Full pre-cap body is the saved `agent://` artifact; the result
+				// body below keeps the existing per-result cap. A yield-abort is
+				// persisted as the TS `{aborted,error}` JSON scalar.
+				artifact_body = Some(if is_aborted {
+					aborted_output(abort_reason.as_deref())
+				} else {
+					finalized.output
+				});
 				SingleResult {
 					index,
 					id: child_id,
+					output_id: None,
 					name: child_name,
 					agent: agent_name.clone(),
 					agent_source: agent_source.clone(),
@@ -958,10 +988,12 @@ impl TaskTool {
 				}
 			},
 			Err(AgentError::Interrupted) => {
+				artifact_body = Some(String::new());
 				terminal_mark = Some(TerminalMark::Aborted("aborted by parent".to_string()));
 				SingleResult {
 					index,
 					id: child_id,
+					output_id: None,
 					name: child_name,
 					agent: agent_name.clone(),
 					agent_source: agent_source.clone(),
@@ -988,11 +1020,13 @@ impl TaskTool {
 				}
 			},
 			Err(err) => {
+				artifact_body = Some(String::new());
 				let err_msg = err.to_string();
 				terminal_mark = Some(TerminalMark::Failed(err_msg.clone()));
 				SingleResult {
 					index,
 					id: child_id,
+					output_id: None,
 					name: child_name,
 					agent: agent_name.clone(),
 					agent_source: agent_source.clone(),
@@ -1064,6 +1098,11 @@ impl TaskTool {
 				result.isolation_artifacts.branch_base_sha = report.base_sha.clone();
 				result.isolation_artifacts.nested_patches = report.nested_patches.clone();
 			}
+		}
+		if let Some(body) = artifact_body {
+			result.output_id = self
+				.supervisor
+				.save_agent_output(&outstanding_id, &item.name, &body);
 		}
 		if let Some(mark) = terminal_mark {
 			match mark {
@@ -1139,6 +1178,7 @@ impl TaskTool {
 			parent_id:           self.parent_id.as_deref(),
 			parent_tool_call_id: parent_call_id,
 			detached:            true,
+			output_prefix:       self.output_prefix.as_deref(),
 		}) else {
 			return Err(format!(
 				"{child_name}: result capacity exhausted ({} outstanding); wait for or consume finished jobs first",
@@ -1399,6 +1439,12 @@ impl TaskTool {
 			"text": text,
 			"details": { "id": single.id, "agent": single.agent },
 		});
+		if let Some(output_id) = single.output_id.clone() {
+			result["details"]
+				.as_object_mut()
+				.expect("details object")
+				.insert("outputId".to_string(), Value::String(output_id));
+		}
 		if let Some(report) = &isolation {
 			let details = result["details"].as_object_mut().expect("details object");
 			details.insert("isolated".to_string(), Value::Bool(true));
@@ -1625,6 +1671,17 @@ fn forward_child_events(
 	})
 }
 
+/// TS `finalizeSubprocessOutput` abort body: `{aborted:true, error?}` pretty
+/// JSON. The error key is omitted when the yield carried no message.
+fn aborted_output(reason: Option<&str>) -> String {
+	let mut payload = serde_json::Map::new();
+	payload.insert("aborted".to_string(), Value::Bool(true));
+	if let Some(reason) = reason {
+		payload.insert("error".to_string(), Value::String(reason.to_string()));
+	}
+	serde_json::to_string_pretty(&Value::Object(payload)).unwrap_or_else(|_| "null".to_string())
+}
+
 /// Summarize a finished child: final assistant text, abort flag/reason, and a
 /// terminal `yield` payload when one exists.
 fn summarize_turns(turns: &[TurnResult]) -> (String, bool, Option<String>) {
@@ -1683,6 +1740,14 @@ fn settle_background_result(
 			let journaled = turn_journal_messages(&turns);
 			let journaled_refs: Vec<&Message> = journaled.iter().collect();
 			supervisor.append_child_transcript(&id, &journaled_refs);
+			let (base, aborted, reason) = summarize_turns(&turns);
+			let finalized = finalize_output(&item, &turns, &base, aborted);
+			let artifact = if aborted {
+				aborted_output(reason.as_deref())
+			} else {
+				finalized.output.clone()
+			};
+			let output_id = supervisor.save_agent_output(&id, &item.name, &artifact);
 			if cancelled {
 				supervisor.mark_aborted(&id, "cancelled during isolation finalize");
 				tombstone_aborted_child(&supervisor, &id, "cancelled during isolation finalize");
@@ -1691,7 +1756,6 @@ fn settle_background_result(
 				fill(child_usage(&turns));
 				return;
 			}
-			let (base, aborted, reason) = summarize_turns(&turns);
 			if aborted {
 				let reason = reason.as_deref().unwrap_or("aborted by yield");
 				supervisor.mark_aborted(&id, reason);
@@ -1702,12 +1766,12 @@ fn settle_background_result(
 			// Reported turns count even when the child later fails validation;
 			// an unreported child stays `None` (unknown, never zero-filled).
 			let usage = child_usage(&turns);
-			let finalized = finalize_output(&item, &turns, &base, false);
 			let (output, _) = cap_result_text(&finalized.output);
 			if finalized.failed {
 				let envelope = task_result_envelope(
 					&id,
 					&agent,
+					output_id.as_deref(),
 					"failed (schema_violation)",
 					duration_ms,
 					&output,
@@ -1731,6 +1795,7 @@ fn settle_background_result(
 			let envelope = task_result_envelope(
 				&id,
 				&agent,
+				output_id.as_deref(),
 				"completed",
 				duration_ms,
 				&output,
@@ -1745,6 +1810,7 @@ fn settle_background_result(
 			// The loop discarded its turns on cancellation, but every request it
 			// completed was charged: `observed` carries exactly those counters,
 			// and stays `None` when nothing completed (unknown, never zero).
+			supervisor.save_agent_output(&id, &item.name, "");
 			supervisor.mark_aborted(&id, "aborted");
 			tombstone_aborted_child(&supervisor, &id, "aborted");
 			fill(observed);
@@ -1753,9 +1819,11 @@ fn settle_background_result(
 			let message = error.to_string();
 			// Requests that already completed were charged even though the loop
 			// never returned their turns.
+			let output_id = supervisor.save_agent_output(&id, &item.name, "");
 			let envelope = task_result_envelope(
 				&id,
 				&agent,
+				output_id.as_deref(),
 				"failed (exit 1)",
 				duration_ms,
 				&message,
@@ -1797,9 +1865,9 @@ where
 	}
 }
 
-/// `<task-result>` envelope from `prompts/tools/task-summary.md`. No
-/// `agent://`/`history://` pointer is emitted: this build has no transcript
-/// resolver, so a link would be fake.
+/// `<task-result>` envelope from `prompts/tools/task-summary.md`. A saved
+/// `agent://<outputId>` pointer is emitted only after the artifact was
+/// published, so the link is never fake; no `history://` pointer is emitted.
 ///
 /// `usage` carries the child's summed provider-reported counters (the same
 /// value retained on the job record). It is rendered before `<output>` so the
@@ -1808,6 +1876,7 @@ where
 fn task_result_envelope(
 	id: &str,
 	agent: &str,
+	output_id: Option<&str>,
 	status: &str,
 	duration_ms: u64,
 	output: &str,
@@ -1815,9 +1884,13 @@ fn task_result_envelope(
 	usage: Option<&TokenUsage>,
 ) -> String {
 	let mut envelope = format!(
-		"<task-result id=\"{id}\" agent=\"{agent}\" status=\"{status}\" duration=\"{}\">",
+		"<task-result id=\"{id}\" agent=\"{agent}\" status=\"{status}\" duration=\"{}\"",
 		format_duration_ms(duration_ms)
 	);
+	if let Some(output_id) = output_id {
+		envelope.push_str(&format!(" output=\"agent://{output_id}\""));
+	}
+	envelope.push('>');
 	if let Some(usage) = usage {
 		envelope.push('\n');
 		envelope.push_str(&usage_element(usage));
@@ -2192,6 +2265,7 @@ fn persist_child_contract(
 		context_limit:    config.context_limit,
 		display_name:     Some(display_name.to_string()),
 		parent_id,
+		output_id:        supervisor.child_output_id(child_id),
 	};
 	if let Err(error) = contract.write(&root) {
 		eprintln!(
@@ -2516,6 +2590,7 @@ fn single_failure(
 	SingleResult {
 		index,
 		id,
+		output_id: None,
 		name,
 		agent,
 		agent_source,
@@ -2575,6 +2650,10 @@ pub struct SingleResult {
 	pub index: usize,
 	/// Supervisor-generated identity, used for `hub cancel`.
 	pub id: String,
+	/// Stable saved-output identity (`agent://<outputId>`). Distinct from the
+	/// lifecycle `id` and the accounting `resultKey`.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub output_id: Option<String>,
 	/// Model-supplied display label (may repeat across children).
 	pub name: String,
 	pub agent: String,
@@ -3114,6 +3193,17 @@ mod tests {
 		supervisor::DelegationLimits,
 	};
 
+	/// TS `finalizeSubprocessOutput` abort body: the error key is only present
+	/// when the yield carried a message, and serialization is pretty JSON.
+	#[test]
+	fn abort_artifact_body_matches_ts_payload() {
+		assert_eq!(
+			aborted_output(Some("boom")),
+			"{\n  \"aborted\": true,\n  \"error\": \"boom\"\n}"
+		);
+		assert_eq!(aborted_output(None), "{\n  \"aborted\": true\n}");
+	}
+
 	/// Child usage aggregation: reported totals sum once, unreported children
 	/// stay absent (no zero-filled stand-in), and turns that completed before a
 	/// later failure keep contributing.
@@ -3134,6 +3224,7 @@ mod tests {
 		let result = |usage: Option<TokenUsage>| SingleResult {
 			index: 0,
 			id: "a".to_string(),
+			output_id: None,
 			name: "a".to_string(),
 			agent: "a".to_string(),
 			agent_source: "builtin".to_string(),
@@ -3185,6 +3276,7 @@ mod tests {
 		let envelope = task_result_envelope(
 			"task-1",
 			"scout",
+			None,
 			"completed",
 			1_500,
 			"body",
@@ -3202,13 +3294,27 @@ mod tests {
 		);
 
 		let unreported =
-			task_result_envelope("task-2", "scout", "completed", 1, "body", None, None);
+			task_result_envelope("task-2", "scout", None, "completed", 1, "body", None, None);
 		assert!(!unreported.contains("<usage"), "no report, no zero-filled element");
+		assert!(
+			task_result_envelope(
+				"task-2",
+				"scout",
+				Some("Saved-2"),
+				"completed",
+				1,
+				"body",
+				None,
+				None,
+			)
+			.contains("output=\"agent://Saved-2\""),
+			"background envelopes point at the saved output id"
+		);
 
 		// Even a body past the per-result cap keeps the counters.
 		let long = "x".repeat(crate::supervisor::MAX_RESULT_BYTES + 16);
 		let huge =
-			task_result_envelope("task-3", "scout", "completed", 1, &long, None, Some(&usage));
+			task_result_envelope("task-3", "scout", None, "completed", 1, &long, None, Some(&usage));
 		let (capped, truncated) = cap_result_text(&huge);
 		assert!(truncated);
 		assert!(capped.contains("<usage input=\"11\""));
@@ -3629,6 +3735,7 @@ mod tests {
 				parent_id: None,
 				parent_tool_call_id: None,
 				detached: true,
+				output_prefix: None,
 			})
 			.expect("reserve");
 		let key = supervisor.capture_result_key(&id).expect("spawn-time key");

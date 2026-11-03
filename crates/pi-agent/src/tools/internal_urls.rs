@@ -17,6 +17,9 @@
 //! [`super::internal_urls_artifact`]: it reads a session's spilled tool output
 //! from roots bound in [`UrlScope::local_roots`], never a process-global
 //! registry.
+//! The `agent://` handler is built in and lives in
+//! [`super::internal_urls_agent`]: it reads saved subagent `<id>.md` outputs
+//! from the caller's own session roots, never a live transcript.
 
 use std::{
 	collections::BTreeMap,
@@ -35,11 +38,12 @@ pub const LOCAL_SCHEME: &str = "local";
 
 /// OMP-owned namespaces a host may never replace: `security://` is reserved for
 /// the security review surface, `local://` for the built-in root handler,
-/// `artifact://` for the built-in spilled-output reader, `ssh://` for the
-/// built-in native OpenSSH read handler, `mcp://` for the built-in MCP resource
-/// consumer, and `issue://`/`pr://` for the built-in native GitHub handlers.
-pub const RESERVED_SCHEMES: [&str; 7] =
-	["artifact", "issue", "local", "mcp", "pr", "security", "ssh"];
+/// `artifact://` for the built-in spilled-output reader, `agent://` for saved
+/// subagent outputs, `ssh://` for the built-in native OpenSSH read handler,
+/// `mcp://` for the built-in MCP resource consumer, and `issue://`/`pr://` for
+/// the built-in native GitHub handlers.
+pub const RESERVED_SCHEMES: [&str; 8] =
+	["agent", "artifact", "issue", "local", "mcp", "pr", "security", "ssh"];
 
 /// One parsed internal URL (`skill://plugin:name` style colons are preserved in
 /// the path because only the first `://` separates the scheme).
@@ -248,15 +252,20 @@ pub struct InternalUrlRouter {
 
 impl Default for InternalUrlRouter {
 	/// Every constructor starts with the built-in `local://`, `artifact://`,
-	/// `ssh://`, `mcp://`, `issue://`, and `pr://` handlers, so a session scope
-	/// root, a spilled artifact, a remote read, an MCP resource, and a GitHub
-	/// issue or PR resolve without an extra mount step.
+	/// `agent://`, `ssh://`, `mcp://`, `issue://`, and `pr://` handlers, so a
+	/// session scope root, a spilled artifact, a saved subagent output, a remote
+	/// read, an MCP resource, and a GitHub issue or PR resolve without an extra
+	/// mount step.
 	fn default() -> Self {
 		let mut handlers: BTreeMap<String, Arc<dyn ProtocolHandler>> = BTreeMap::new();
 		handlers.insert(LOCAL_SCHEME.to_string(), Arc::new(LocalRootHandler));
 		handlers.insert(
 			super::internal_urls_artifact::ARTIFACT_SCHEME.to_string(),
 			Arc::new(super::internal_urls_artifact::ArtifactUrlHandler),
+		);
+		handlers.insert(
+			super::internal_urls_agent::AGENT_SCHEME.to_string(),
+			Arc::new(super::internal_urls_agent::AgentUrlHandler),
 		);
 		handlers.insert(
 			super::ssh::SSH_SCHEME.to_string(),
@@ -290,8 +299,8 @@ impl InternalUrlRouter {
 	}
 
 	/// Reserved namespaces are built in and refuse replacement, so a host can
-	/// never displace `local://`, `security://`, `ssh://`, `mcp://`, `issue://`,
-	/// or `pr://`.
+	/// never displace `local://`, `artifact://`, `agent://`, `security://`,
+	/// `ssh://`, `mcp://`, `issue://`, or `pr://`.
 	pub fn register(
 		&self,
 		handler: Arc<dyn ProtocolHandler>,
@@ -783,6 +792,7 @@ mod tests {
 		assert!(is_valid_scheme("a1+-."));
 		assert!(!is_valid_scheme("A"));
 		assert!(is_reserved_scheme("security"));
+		assert!(is_reserved_scheme("agent"));
 		assert!(is_reserved_scheme("local"));
 		assert!(is_reserved_scheme("ssh"));
 		assert!(is_reserved_scheme("mcp"));
@@ -802,7 +812,7 @@ mod tests {
 			.expect_err("unknown");
 		assert_eq!(
 			error,
-			"Unknown protocol: nope://\nSupported: artifact://, issue://, local://, mcp://, pr://, ssh://"
+			"Unknown protocol: nope://\nSupported: agent://, artifact://, issue://, local://, mcp://, pr://, ssh://"
 		);
 		router.register(Echo::new("notes", false, false)).expect("register");
 		let error = runtime()
@@ -810,7 +820,7 @@ mod tests {
 			.expect_err("unknown");
 		assert_eq!(
 			error,
-			"Unknown protocol: nope://\nSupported: artifact://, issue://, local://, mcp://, notes://, pr://, ssh://"
+			"Unknown protocol: nope://\nSupported: agent://, artifact://, issue://, local://, mcp://, notes://, pr://, ssh://"
 		);
 		assert!(!router.can_handle("nope://x"));
 		assert!(router.can_handle("notes://x"));
@@ -842,6 +852,7 @@ mod tests {
 		assert_eq!(
 			router.schemes(),
 			vec![
+				"agent".to_string(),
 				"artifact".to_string(),
 				"issue".to_string(),
 				"local".to_string(),
@@ -880,6 +891,7 @@ mod tests {
 		assert_eq!(
 			router.schemes(),
 			vec![
+				"agent".to_string(),
 				"artifact".to_string(),
 				"issue".to_string(),
 				"local".to_string(),

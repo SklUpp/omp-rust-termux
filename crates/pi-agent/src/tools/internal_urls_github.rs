@@ -547,7 +547,7 @@ fn split_segments(raw_path: &str, scheme: &str) -> Result<Vec<String>, String> {
 }
 
 /// Strict `%XX` decoding; `None` on a malformed escape or non-UTF-8 result.
-fn percent_decode(value: &str) -> Option<String> {
+pub(super) fn percent_decode(value: &str) -> Option<String> {
 	let bytes = value.as_bytes();
 	let mut decoded = Vec::with_capacity(bytes.len());
 	let mut index = 0;
@@ -569,7 +569,7 @@ fn percent_decode(value: &str) -> Option<String> {
 }
 
 /// `URLSearchParams.get`: first match, `+` as space, invalid escapes kept.
-fn query_param(query: &str, key: &str) -> Option<String> {
+pub(super) fn query_param(query: &str, key: &str) -> Option<String> {
 	for pair in query.split('&') {
 		if pair.is_empty() {
 			continue;

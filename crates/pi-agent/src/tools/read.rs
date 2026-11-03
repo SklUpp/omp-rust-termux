@@ -45,6 +45,7 @@ use super::{
 	Tool, ToolError,
 	edit_variants::mode::{EditMode, FileDisplayMode, resolve_file_display_mode},
 	internal_urls::{self, InternalResource, InternalUrlRouter},
+	internal_urls_agent,
 	internal_urls_artifact,
 	tool_result,
 };
@@ -460,6 +461,42 @@ impl Tool for ReadTool {
 				Ok(parsed) => parsed,
 				Err(message) => return Ok(tool_result(message, true)),
 			};
+			// `agent://` extraction (`/path` or `?q=`) rejects line selectors and
+			// returns the extracted body directly, bypassing pagination. A plain
+			// `agent://<id>` still runs through the shared in-memory text renderer.
+			if scheme == internal_urls_agent::AGENT_SCHEME {
+				let extraction = internal_urls_agent::has_extraction(base);
+				if extraction && !matches!(parsed, Sel::None | Sel::Raw) {
+					return Ok(tool_result(
+						"Cannot combine query extraction with line selectors",
+						true,
+					));
+				}
+				if extraction {
+					let resource = match router
+						.resolve(
+							base,
+							&self.scope.resolve_context(&ctx.cwd, &ctx.cancellation_token),
+						)
+						.await
+					{
+						Ok(resource) => resource,
+						Err(message) => return Ok(tool_result(message, true)),
+					};
+					let mut details = Some(json!({}));
+					if let Some(path) = &resource.source_path {
+						details
+							.as_object_mut()
+							.expect("details object")
+							.insert("resolvedPath".into(), json!(path.display().to_string()));
+					}
+					attach_internal_resource(&mut details, &resource);
+					let mut result = tool_result(String::new(), false);
+					result.content = resource.content;
+					result.details = details;
+					return Ok(result);
+				}
+			}
 			if matches!(parsed, Sel::Image | Sel::Conflicts) {
 				return Ok(tool_result(
 					format!(
@@ -3360,14 +3397,15 @@ mod display_tests {
 		let dir = TempDir::new("immutable");
 		let sink = Arc::new(TestSink::default());
 		let router = Arc::new(InternalUrlRouter::new());
-		// `artifact://` is built in and reserved; only the custom schemes mount
-		// a handler here.
-		for scheme in ["agent", "memory"] {
-			router.register(Arc::new(ImmutableHandler(scheme))).expect("register");
-		}
+		// `artifact://` and `agent://` are built in and reserved; only the
+		// custom `memory://` scheme mounts a handler here.
+		router
+			.register(Arc::new(ImmutableHandler("memory")))
+			.expect("register");
 		let artifacts = dir.0.join("artifacts");
 		fs::create_dir_all(&artifacts).expect("artifacts dir");
 		fs::write(artifacts.join("0.eval.log"), "alpha\nbeta\n").expect("artifact");
+		fs::write(artifacts.join("x.md"), "alpha\nbeta\n").expect("saved agent output");
 		let mut scope = UrlScope::default();
 		scope.local_roots.insert("local".to_string(), artifacts);
 		let tool = ReadTool::with_snapshot_sink(sink.clone())
@@ -3684,7 +3722,7 @@ mod display_tests {
 		let result = read_with(&tool, &dir, "nope://x").await;
 		assert_eq!(
 			result.content,
-			"Unknown protocol: nope://\nSupported: artifact://, issue://, local://, mcp://, notes://, pr://, ssh://"
+			"Unknown protocol: nope://\nSupported: agent://, artifact://, issue://, local://, mcp://, notes://, pr://, ssh://"
 		);
 	}
 

@@ -25,6 +25,7 @@ use crate::{
 	tools::{
 		AstGrepTool, BashTool, EditTool, HubTool, PendingStore, TaskTool, ThinkTool, WriteTool,
 		YieldTool,
+		agent_output::{self, OutputIdAllocator},
 		edit_variants::{ResolvedSessionTools, SessionDisplayResolver, default_session_tools},
 		hashline::{self, NativeSnapshotSink, SnapshotStore},
 		internal_urls::{InternalUrlRouter, LOCAL_SCHEME, UrlScope},
@@ -261,6 +262,12 @@ pub struct ChildRecord {
 	pub aborted: Option<bool>,
 	#[serde(skip_serializing_if = "Option::is_none", alias = "abort_reason")]
 	pub abort_reason: Option<String>,
+	/// Stable saved-output identity (`agent://<output_id>`), allocated from the
+	/// requested name independently of the `task-N` lifecycle id and the
+	/// accounting `result_key`. `None` for records reserved before any output
+	/// id was assigned.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub output_id: Option<String>,
 	/// Real child transcript log (`<session artifacts>/<child_id>.jsonl`) the
 	/// task executor writes. `None` when no session root was installed.
 	#[serde(skip_serializing_if = "Option::is_none")]
@@ -301,6 +308,9 @@ pub struct ChildSpawn<'a> {
 	pub parent_id:           Option<&'a str>,
 	pub parent_tool_call_id: Option<&'a str>,
 	pub detached:            bool,
+	/// Parent output id for a nested `Parent.Child` allocation. `None` at the
+	/// root, or when the parent has no saved output identity.
+	pub output_prefix:       Option<&'a str>,
 }
 
 impl<'a> ChildSpawn<'a> {
@@ -315,6 +325,7 @@ impl<'a> ChildSpawn<'a> {
 			parent_id: None,
 			parent_tool_call_id: None,
 			detached: false,
+			output_prefix: None,
 		}
 	}
 }
@@ -546,6 +557,8 @@ pub struct Supervisor {
 	emission: Mutex<()>,
 	/// Directory child transcripts are written to (`<artifacts>/<id>.jsonl`).
 	child_session_root: Mutex<Option<PathBuf>>,
+	/// Saved `agent://` output ids allocated across this session tree.
+	output_ids: OutputIdAllocator,
 	/// Session internal URL router. Children rebuild `read`/`write` with their
 	/// own snapshot/pending stores, so the router must be re-applied there.
 	internal_urls: Mutex<Option<Arc<InternalUrlRouter>>>,
@@ -690,6 +703,7 @@ impl Supervisor {
 			observer_seq: AtomicU64::new(0),
 			emission: Mutex::new(()),
 			child_session_root: Mutex::new(None),
+			output_ids: OutputIdAllocator::default(),
 			internal_urls: Mutex::new(None),
 			url_scope: Mutex::new(Arc::new(UrlScope::default())),
 		})
@@ -1693,6 +1707,17 @@ impl Supervisor {
 					id = format!("task-{seq}");
 				}
 			}
+			let parent_output_id = spawn.output_prefix.map(str::to_string).or_else(|| {
+				spawn
+					.parent_id
+					.and_then(|parent| state.records.get(parent))
+					.and_then(|record| record.output_id.clone())
+			});
+			let output_id = self.output_ids.allocate(
+				self.child_session_root().as_deref(),
+				spawn.name,
+				parent_output_id.as_deref(),
+			);
 			let cancellation_token = CancellationToken::new();
 			let started_at = SystemTime::now()
 				.duration_since(UNIX_EPOCH)
@@ -1714,6 +1739,7 @@ impl Supervisor {
 				error: None,
 				aborted: None,
 				abort_reason: None,
+				output_id: Some(output_id),
 				session_file,
 				agent_source: spawn.agent_source.to_string(),
 				parent_tool_call_id: spawn.parent_tool_call_id.map(str::to_string),
@@ -1783,6 +1809,71 @@ impl Supervisor {
 	pub fn child_session_file(&self, id: &str) -> Option<PathBuf> {
 		let state = self.state.lock().unwrap();
 		state.records.get(id).and_then(|record| record.session_file.clone())
+	}
+
+	/// Saved-output identity for one child, when one was allocated.
+	#[must_use]
+	pub fn child_output_id(&self, id: &str) -> Option<String> {
+		let state = self.state.lock().unwrap();
+		state
+			.records
+			.get(id)
+			.and_then(|record| record.output_id.clone())
+	}
+
+	/// Allocate a unique `agent://` output id without changing the child's
+	/// lifecycle identity. `prefix` nests under a parent output id.
+	pub fn allocate_output_id(&self, requested: &str, prefix: Option<&str>) -> String {
+		let root = self.child_session_root();
+		self
+			.output_ids
+			.allocate(root.as_deref(), requested, prefix)
+	}
+
+	/// Mark an id owned after losing a first-publication race.
+	pub fn mark_output_id_taken(&self, output_id: &str) {
+		self.output_ids.reserve(output_id);
+	}
+
+	/// Replace a child's saved-output id after a no-clobber retry.
+	pub fn set_child_output_id(&self, id: &str, output_id: &str) {
+		let mut state = self.state.lock().unwrap();
+		if let Some(record) = state.records.get_mut(id) {
+			record.output_id = Some(output_id.to_string());
+		}
+	}
+
+	/// Persist one settled child's full output as `<output_id>.md`.
+	///
+	/// The write happens before the caller releases the record, so a consumer
+	/// that observes the terminal status can already resolve `agent://<id>`.
+	/// A publication race reserves the colliding id and retries the next
+	/// candidate; an existing file is never replaced. Returns the id actually
+	/// published, or `None` when this session has no artifacts directory.
+	pub fn save_agent_output(&self, id: &str, requested: &str, body: &str) -> Option<String> {
+		let root = self.child_session_root()?;
+		let mut output_id = self.child_output_id(id)?;
+		for _ in 0..64 {
+			match agent_output::publish_agent_output(&root, &output_id, body) {
+				Ok(Some(_)) => return Some(output_id),
+				Ok(None) => {
+					self.mark_output_id_taken(&output_id);
+					let prefix = output_id
+						.rsplit_once('.')
+						.map(|(prefix, _)| prefix.to_string());
+					output_id = self.allocate_output_id(requested, prefix.as_deref());
+					self.set_child_output_id(id, &output_id);
+				},
+				Err(error) => {
+					eprintln!(
+						"warning: cannot persist agent output {output_id}: {error}"
+					);
+					return None;
+				},
+			}
+		}
+		eprintln!("warning: cannot persist agent output: exhausted publication retries");
+		None
 	}
 
 	/// Parent agent id recorded for one child, if any.
@@ -2400,6 +2491,7 @@ mod process_wiring_tests {
 			parent_id: parent,
 			parent_tool_call_id: None,
 			detached: true,
+			output_prefix: None,
 		}
 	}
 

@@ -1,12 +1,14 @@
 use std::{
+	path::PathBuf,
 	sync::Arc,
-	time::Duration,
+	time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use pi_agent::{
 	AgentConfig, AgentContext, AgentLoop, AgentState,
 	ChildStatus, DelegationLimits, HubTool, OpenAiCompatibleProvider,
 	Role, Supervisor, TaskTool, Tool, ToolRegistry,
+	tools::{InternalUrlRouter, UrlScope},
 };
 use pi_agent::tools::hub::HubToolDetails;
 use pi_agent::tools::task::TaskToolDetails;
@@ -449,6 +451,112 @@ async fn test_t1_happy_delegation() {
 	assert_eq!(children[0].name, "sub-1");
 	assert_eq!(children[0].status, ChildStatus::Completed);
 	assert!(children[0].duration_ms.is_some());
+}
+
+fn saved_output_root(label: &str) -> PathBuf {
+	let nanos = SystemTime::now()
+		.duration_since(UNIX_EPOCH)
+		.map(|duration| duration.as_nanos())
+		.unwrap_or_default();
+	let home = std::env::var_os("HOME")
+		.map(PathBuf::from)
+		.expect("HOME must be set for agent output tests");
+	let root = home.join(format!(
+		".omp-agent-output-it-{label}-{}-{nanos}",
+		std::process::id()
+	));
+	std::fs::create_dir_all(&root).expect("output root");
+	root
+}
+
+#[tokio::test]
+async fn saved_child_output_survives_restart_and_resolves_via_agent_uri() {
+	let (server, _) = spawn_mock_server(None).await;
+	let provider = Arc::new(
+		OpenAiCompatibleProvider::new(&server.base_url, "fake-key", "test-model").unwrap(),
+	);
+	let root = saved_output_root("restart");
+
+	let supervisor = Supervisor::new(
+		ToolRegistry::new(),
+		provider.clone(),
+		None,
+		DelegationLimits::default(),
+	);
+	supervisor.set_child_session_root(Some(root.clone()));
+	let tool = TaskTool::new(supervisor.clone(), 0);
+	let ctx = AgentContext::new(root.clone());
+	let result = tool
+		.execute(&json!({ "name": "Saved", "task": "T1_CHILD_WORK" }), &ctx)
+		.await
+		.expect("task result");
+	let details: TaskToolDetails = serde_json::from_str(&result.content).expect("details");
+	let saved = &details.results[0];
+	let output_id = saved.output_id.clone().expect("saved output id");
+	assert_eq!(output_id, "Saved");
+	assert!(saved.id.starts_with("task-"), "lifecycle id stays unchanged");
+	let path = root.join(format!("{output_id}.md"));
+	let body = std::fs::read_to_string(&path).expect("saved markdown");
+	assert!(body.contains("result_val"), "unexpected body: {body}");
+
+	let hub = HubTool::root(supervisor.clone());
+	let jobs = hub.execute(&json!({ "op": "jobs" }), &ctx).await.expect("jobs");
+	let jobs: HubToolDetails = serde_json::from_str(&jobs.content).expect("details");
+	assert_eq!(jobs.jobs[0].output_id.as_deref(), Some("Saved"));
+
+	let mut scope = UrlScope::default();
+	scope.session_file = Some(root.join("main.jsonl"));
+	scope
+		.local_roots
+		.insert("local".to_string(), root.clone());
+	let router = InternalUrlRouter::new();
+	let context = scope.resolve_context(std::path::Path::new("."), &pi_agent::CancellationToken::new());
+	let resource = router
+		.resolve(&format!("agent://{output_id}"), &context)
+		.await
+		.expect("agent uri");
+	assert_eq!(resource.content, body);
+	assert!(resource.immutable);
+	assert!(!resource.writable);
+	let extracted = router
+		.resolve(&format!("agent://{output_id}?q=.result_key"), &context)
+		.await
+		.expect("extraction");
+	assert_eq!(extracted.content, "\"result_val\"");
+
+	// A restarted process seeds the allocator from disk: the same requested
+	// name must not overwrite the already published output.
+	let restarted = Supervisor::new(
+		ToolRegistry::new(),
+		provider,
+		None,
+		DelegationLimits::default(),
+	);
+	restarted.set_child_session_root(Some(root.clone()));
+	let restarted_tool = TaskTool::new(restarted, 0);
+	let second = restarted_tool
+		.execute(&json!({ "name": "Saved", "task": "T1_CHILD_WORK" }), &ctx)
+		.await
+		.expect("second task result");
+	let second: TaskToolDetails = serde_json::from_str(&second.content).expect("details");
+	let second_id = second.results[0].output_id.clone().expect("second id");
+	assert_eq!(second_id, "Saved-2");
+	assert_eq!(std::fs::read_to_string(&path).expect("first intact"), body);
+
+	let aborted = restarted_tool
+		.execute(&json!({ "name": "Aborted", "task": "YIELD_ERROR" }), &ctx)
+		.await
+		.expect("aborted result");
+	let aborted: TaskToolDetails = serde_json::from_str(&aborted.content).expect("details");
+	let aborted = &aborted.results[0];
+	assert_eq!(aborted.aborted, Some(true));
+	let aborted_id = aborted.output_id.clone().expect("aborted output id");
+	let aborted_body =
+		std::fs::read_to_string(root.join(format!("{aborted_id}.md"))).expect("aborted artifact");
+	assert!(aborted_body.contains("\"aborted\": true"), "unexpected: {aborted_body}");
+	assert!(aborted_body.contains("boom"), "unexpected: {aborted_body}");
+
+	std::fs::remove_dir_all(&root).ok();
 }
 
 #[tokio::test]

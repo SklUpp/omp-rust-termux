@@ -761,6 +761,19 @@ def phase_rpc(binary: str, mock: MockModel, base: Path) -> None:
     print("PASS rpc card + advisor status + dispose")
 
 
+def acp_update_has_advisor(frame: dict) -> bool:
+    params = frame.get("params")
+    update = params.get("update") if isinstance(params, dict) else None
+    if not isinstance(update, dict):
+        return False
+    meta = update.get("_meta")
+    if isinstance(meta, dict):
+        return "advisor" in json.dumps(meta, sort_keys=True)
+    if isinstance(meta, str):
+        return "advisor" in meta
+    return False
+
+
 def phase_acp(binary: str, mock: MockModel, base: Path) -> None:
     agent_dir, cwd, sessions, _ = write_config(base / "acp", mock.port)
     proc, lines = spawn_with_reader(
@@ -818,13 +831,13 @@ def phase_acp(binary: str, mock: MockModel, base: Path) -> None:
         proc,
         lines,
         TIMEOUT,
-        lambda frame: frame.get("method") == "session/update"
-        and "advisor"
-        in json.dumps((frame.get("params") or {}).get("update") or {}).get("_meta", {})
+        lambda frame: (
+            frame.get("method") == "session/update" and acp_update_has_advisor(frame)
+        )
         or frame.get("id") == 3,
     )
     if not any(
-        "advisor" in json.dumps((frame.get("params") or {}).get("update") or {}).get("_meta", {})
+        acp_update_has_advisor(frame)
         for frame in updates
         if frame.get("method") == "session/update"
     ):

@@ -38,6 +38,16 @@ mod imp {
 		io::Error::last_os_error()
 	}
 
+	/// Directory traversal flags. Linux/Android `O_PATH` opens a directory
+	/// anchor without read permission on its ancestors (Termux app sandboxes
+	/// expose `/data/data` as execute-only), while `O_DIRECTORY|O_NOFOLLOW`
+	/// still rejects a symlink at every component. Other Unix targets keep the
+	/// readable flags: their authorized roots are traversable that way.
+	#[cfg(any(target_os = "linux", target_os = "android"))]
+	const TRAVERSE_FLAGS: libc::c_int = libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+	#[cfg(not(any(target_os = "linux", target_os = "android")))]
+	const TRAVERSE_FLAGS: libc::c_int = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+
 	fn open_dir_at(dir: &OwnedFd, name: &OsStr) -> io::Result<OwnedFd> {
 		let name_c = CString::new(name.as_bytes())
 			.map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "history:// path component contains a NUL"))?;
@@ -47,6 +57,36 @@ mod imp {
 				dir.as_raw_fd(),
 				name_c.as_ptr(),
 				libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+			)
+		};
+		if fd < 0 {
+			return Err(last_error());
+		}
+		// SAFETY: fresh descriptor owned by this call.
+		Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+	}
+
+	fn open_traverse_at(dir: &OwnedFd, name: &OsStr) -> io::Result<OwnedFd> {
+		let name_c = CString::new(name.as_bytes())
+			.map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "history:// path component contains a NUL"))?;
+		// SAFETY: `dir` is an open directory fd and `name_c` is NUL-terminated.
+		let fd = unsafe { libc::openat(dir.as_raw_fd(), name_c.as_ptr(), TRAVERSE_FLAGS) };
+		if fd < 0 {
+			return Err(last_error());
+		}
+		// SAFETY: fresh descriptor owned by this call.
+		Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+	}
+
+	/// Reopen a pinned directory readably through its descriptor (`.`), never
+	/// by pathname, so enumeration sees the exact inode that was pinned.
+	fn open_readable(dir: &OwnedFd) -> io::Result<OwnedFd> {
+		// SAFETY: `.` is a literal NUL-terminated path relative to a pinned dir.
+		let fd = unsafe {
+			libc::openat(
+				dir.as_raw_fd(),
+				c".".as_ptr(),
+				libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
 			)
 		};
 		if fd < 0 {
@@ -68,6 +108,11 @@ mod imp {
 
 	impl PinnedDir {
 		/// Open an absolute path from `/`, rejecting a symlink at any component.
+		///
+		/// Components are pinned with [`TRAVERSE_FLAGS`] (Linux/Android
+		/// `O_PATH`), so an execute-only platform ancestor such as `/data/data`
+		/// is traversable without being readable. Only the authorized final
+		/// root is reopened readably via `.` on that pinned descriptor.
 		pub fn open(path: &Path) -> io::Result<Self> {
 			if !path.is_absolute() {
 				return Err(io::Error::new(
@@ -77,10 +122,7 @@ mod imp {
 			}
 			// SAFETY: literal NUL-terminated path.
 			let mut current = unsafe {
-				let root = libc::open(
-					c"/".as_ptr(),
-					libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-				);
+				let root = libc::open(c"/".as_ptr(), TRAVERSE_FLAGS);
 				if root < 0 {
 					return Err(last_error());
 				}
@@ -93,7 +135,7 @@ mod imp {
 					Component::CurDir => {},
 					Component::Normal(name) => {
 						seen_component = true;
-						current = open_dir_at(&current, name)?;
+						current = open_traverse_at(&current, name)?;
 					},
 					Component::ParentDir | Component::Prefix(_) => {
 						return Err(io::Error::new(
@@ -109,9 +151,17 @@ mod imp {
 					format!("history:// root is empty: {}", path.display()),
 				));
 			}
-			let (dev, ino) = stat_fd(&current)?;
+			let pinned = stat_fd(&current)?;
+			let readable = open_readable(&current)?;
+			let (dev, ino) = stat_fd(&readable)?;
+			if (dev, ino) != pinned {
+				return Err(io::Error::new(
+					io::ErrorKind::InvalidData,
+					format!("history:// root changed while pinning: {}", path.display()),
+				));
+			}
 			Ok(Self {
-				fd: current,
+				fd: readable,
 				display: path.to_path_buf(),
 				dev,
 				ino,

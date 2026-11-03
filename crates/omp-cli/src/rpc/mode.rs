@@ -908,6 +908,9 @@ impl RpcMode {
 			session_file.as_deref(),
 			Duration::from_secs(30),
 		);
+		// Stop every deferred producer before taking the final cards; a card
+		// routed after the take would otherwise be lost at transport exit.
+		runner.advisor_dispose(session_id.as_deref(), session_file.as_deref());
 		let cards = {
 			let mut session = self.lock_session();
 			session.take_advisor_cards()
@@ -921,7 +924,6 @@ impl RpcMode {
 				self.sink.send(frame);
 			}
 		}
-		runner.advisor_dispose(session_id.as_deref(), session_file.as_deref());
 	}
 
 	fn lock_session(&self) -> MutexGuard<'_, RpcSession> {

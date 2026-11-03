@@ -3447,6 +3447,70 @@ impl crate::advisor_runtime::AdvisorExecutor for CliAdvisorExecutor {
 	}
 }
 
+struct QuarantineProvider {
+	inner:       Arc<dyn ModelProvider>,
+	source_text: String,
+	available:   std::collections::BTreeSet<String>,
+}
+
+impl QuarantineProvider {
+	fn sanitized(&self, messages: &[pi_agent::Message]) -> Vec<pi_agent::Message> {
+		let mut sanitized = messages.to_vec();
+		for message in &mut sanitized {
+			if message.role != pi_agent::Role::Assistant {
+				continue;
+			}
+			let mut generated = message.content.clone();
+			let mut unavailable = Vec::new();
+			for call in &message.tool_calls {
+				if !self.available.contains(&call.name) {
+					unavailable.push(call.name.clone());
+				}
+				if call.name == "advise"
+					&& let Some(note) = call.arguments.get("note").and_then(serde_json::Value::as_str)
+				{
+					generated.push('\n');
+					generated.push_str(note);
+				}
+			}
+			if let Some(quarantined) = crate::advisor_runtime::quarantine_turn_text(
+				&generated,
+				&self.source_text,
+				&unavailable,
+			) {
+				message.content = quarantined;
+				message.tool_calls.clear();
+			}
+		}
+		sanitized
+	}
+}
+
+#[async_trait::async_trait]
+impl ModelProvider for QuarantineProvider {
+	async fn complete(
+		&self,
+		messages: &[pi_agent::Message],
+		tools: &[serde_json::Value],
+		tool_choice: &pi_agent::ToolChoice,
+	) -> std::result::Result<pi_agent::Message, pi_agent::ProviderError> {
+		self.inner
+			.complete(&self.sanitized(messages), tools, tool_choice)
+			.await
+	}
+
+	async fn stream(
+		&self,
+		messages: &[pi_agent::Message],
+		tools: &[serde_json::Value],
+		tool_choice: &pi_agent::ToolChoice,
+	) -> std::result::Result<pi_agent::ChunkStream, pi_agent::ProviderError> {
+		self.inner
+			.stream(&self.sanitized(messages), tools, tool_choice)
+			.await
+	}
+}
+
 async fn run_advisor_call(
 	spec: crate::advisor_runtime::AdvisorCallSpec,
 ) -> std::result::Result<crate::advisor_runtime::AdvisorCallResult, String> {
@@ -3494,63 +3558,54 @@ async fn run_advisor_call(
 	}
 	let mut state = AgentState { messages: history, total_turns: 0 };
 	let agent = AgentLoop::with_approver(config, provider, registry, approvals);
-	let available: std::collections::BTreeSet<String> = names.iter().cloned().collect();
+	let available: std::collections::BTreeSet<String> = names
+		.iter()
+		.cloned()
+		.chain(std::iter::once("advise".to_string()))
+		.collect();
 	let source_text = {
 		let mut text = String::new();
 		for message in &spec.history {
-			text.push_str(&message.content);
-			text.push('\n');
+			if message.role == pi_agent::Role::Tool {
+				text.push_str(&message.content);
+				text.push('\n');
+			}
 		}
 		text.push_str(&spec.prompt);
 		text
 	};
+	spec.advise.set_source_text(source_text.clone());
+	let provider: Arc<dyn ModelProvider> = Arc::new(QuarantineProvider {
+		inner: provider,
+		source_text: source_text.clone(),
+		available: available.clone(),
+	});
 	let loop_config = spec.config.tool_call_loop_guard.clone();
 	let (steer_tx, steer_rx) = tokio::sync::mpsc::channel(16);
 	let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(256);
 	let guard_cancel = spec.cancel.clone();
 	let guard = tokio::spawn(async move {
-		let mut last: Option<String> = None;
-		let mut count = 0usize;
-		let mut redirected = false;
+		let mut state = crate::advisor_runtime::LoopGuardState::default();
 		while let Some(event) = event_rx.recv().await {
 			let pi_agent::AgentEvent::TurnEnd { message, .. } = event else {
 				continue;
 			};
-			for call in &message.tool_calls {
-				if loop_config.exempt(&call.name) {
-					last = None;
-					count = 0;
-					continue;
-				}
-				let fingerprint = format!(
-					"{}\u{1}{}",
-					call.name,
-					serde_json::to_string(&call.arguments).unwrap_or_default()
-				);
-				if last.as_deref() == Some(fingerprint.as_str()) {
-					count += 1;
-				} else {
-					last = Some(fingerprint);
-					count = 1;
-				}
-				if count >= loop_config.threshold() {
-					if redirected {
-						// The corrective was ignored: stop this advisor update
-						// instead of letting it loop forever.
-						guard_cancel.cancel();
-						break;
-					}
-					redirected = true;
-					let text = format!(
-						"You repeated the same `{}` tool call {} times with identical arguments. Change approach: inspect the result, adjust the arguments, or explain the blocker instead of reissuing it.",
-						call.name, count
-					);
+			match crate::advisor_runtime::loop_guard_step(
+				&mut state,
+				&message.tool_calls,
+				&loop_config,
+			) {
+				crate::advisor_runtime::LoopGuardAction::None => {},
+				crate::advisor_runtime::LoopGuardAction::Redirect(text) => {
 					let _ = steer_tx.try_send(pi_agent::SteeringEvent::InjectMessage(
 						pi_agent::Message::user(text).parts,
 					));
-					last = None;
-					count = 0;
-				}
+				},
+				crate::advisor_runtime::LoopGuardAction::Abort => {
+					// The corrective was ignored: stop this advisor update.
+					guard_cancel.cancel();
+					break;
+				},
 			}
 		}
 	});
@@ -4042,6 +4097,14 @@ fn role_patterns(
 		.map(str::to_string);
 	let mut patterns = if let Some(configured) = configured {
 		split_pattern_list(&configured)
+	} else if role == "advisor"
+		&& let Some(slow) = config
+			.model_roles
+			.get("slow")
+			.map(|value| value.trim())
+			.filter(|value| !value.is_empty())
+	{
+		split_pattern_list(slow)
 	} else if should_inherit_default(role) {
 		match config
 			.model_roles

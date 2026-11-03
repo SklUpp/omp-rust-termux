@@ -212,6 +212,21 @@ impl ChildAdvisorHost {
 	}
 }
 
+impl Drop for ChildAdvisorHost {
+	fn drop(&mut self) {
+		let managers: Vec<_> = self
+			.children
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner())
+			.drain()
+			.map(|(_, manager)| manager)
+			.collect();
+		for manager in managers {
+			manager.dispose();
+		}
+	}
+}
+
 fn child_steer_sink(child: &ChildAdvisorContext<'_>) -> Option<crate::advisor_runtime::SteerSink> {
 	child.steer.as_ref().map(|sender| {
 		let sender = sender.clone();

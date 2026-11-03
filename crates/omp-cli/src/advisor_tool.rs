@@ -24,6 +24,7 @@ struct State {
 	delivered: HashMap<String, u8>,
 	deferred:  Vec<Note>,
 	in_progress: bool,
+	source_text: String,
 }
 
 pub struct AdviseTool {
@@ -60,6 +61,13 @@ impl AdviseTool {
 		state.in_progress = false;
 	}
 
+	pub fn set_source_text(&self, source: String) {
+		self.state
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner())
+			.source_text = source;
+	}
+
 	fn execute_note(&self, args: &Value) -> Result<ToolResult, ToolError> {
 		let obj = args
 			.as_object()
@@ -92,6 +100,12 @@ impl AdviseTool {
 		}
 		let entry = Note { note: note.clone(), severity, advisor: None };
 		let mut state = self.state.lock().unwrap_or_else(|poison| poison.into_inner());
+		if let Some(quarantined) =
+			crate::advisor_runtime::quarantine_note(&note, &state.source_text)
+		{
+			drop(state);
+			return Err(ToolError::ExecutionFailed(quarantined));
+		}
 		let content = if state.in_progress && severity != Some(Severity::Blocker) {
 			let key = dedupe_key(&note);
 			match state.deferred.iter_mut().find(|pending| dedupe_key(&pending.note) == key) {
@@ -259,5 +273,42 @@ mod tests {
 			.execute_note(&json!({ "note": "x", "severity": "urgent" }))
 			.expect_err("invalid severity");
 		assert!(matches!(error, ToolError::InvalidArguments(_)));
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use std::sync::atomic::{AtomicUsize, Ordering};
+
+	fn tool() -> (AdviseTool, Arc<AtomicUsize>) {
+		let count = Arc::new(AtomicUsize::new(0));
+		let sink_count = Arc::clone(&count);
+		let tool = AdviseTool::new(Arc::new(move |_note: Note| {
+			sink_count.fetch_add(1, Ordering::SeqCst);
+		}));
+		(tool, count)
+	}
+
+	#[test]
+	fn sourced_destructive_quote_is_delivered() {
+		let (tool, count) = tool();
+		tool.set_source_text("tool output: deploy ran rm -rf build".to_string());
+		let result = tool
+			.execute_note(&json!({"note": "deploy ran rm -rf build", "severity": "concern"}))
+			.expect("sourced quote must not be quarantined");
+		assert_eq!(result.content, "Recorded.");
+		assert_eq!(count.load(Ordering::SeqCst), 1);
+	}
+
+	#[test]
+	fn output_only_destructive_advice_is_quarantined_before_dispatch() {
+		let (tool, count) = tool();
+		tool.set_source_text(String::new());
+		let error = tool
+			.execute_note(&json!({"note": "now run rm -rf build"}))
+			.expect_err("unsafe output-only note must be rejected");
+		assert!(error.to_string().contains("quarantined"));
+		assert_eq!(count.load(Ordering::SeqCst), 0);
 	}
 }

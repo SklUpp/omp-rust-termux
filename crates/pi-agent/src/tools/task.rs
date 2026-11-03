@@ -904,7 +904,7 @@ impl TaskTool {
 		};
 
 		let _ = events.await;
-		let child_aborted = outcome.as_ref().is_err() || child_cancel.is_cancelled();
+		let child_aborted = child_cancel.is_cancelled();
 		if let Some(hook) = self.supervisor.child_advisor_hook() {
 			let session_file = self.supervisor.child_session_file(&child_id);
 			let context = child_advisor_context(
@@ -1851,7 +1851,7 @@ async fn run_background_child(
 	// Drain the forwarder before the caller settles the record, so no event is
 	// emitted after the terminal lifecycle frame.
 	let _ = events.await;
-	let child_aborted = outcome.as_ref().is_err() || cancel_for_finalize.is_cancelled();
+	let child_aborted = cancel_for_finalize.is_cancelled();
 	if let Some(hook) = supervisor.child_advisor_hook() {
 		let session_file = supervisor.child_session_file(&child_id);
 		let context = child_advisor_context(

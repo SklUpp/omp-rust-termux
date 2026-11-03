@@ -625,7 +625,7 @@ impl ToolCallLoopGuardConfig {
 
 	#[must_use]
 	pub fn threshold(&self) -> usize {
-		self.threshold.unwrap_or(5).max(2)
+		self.threshold.unwrap_or(5).max(1)
 	}
 
 	#[must_use]

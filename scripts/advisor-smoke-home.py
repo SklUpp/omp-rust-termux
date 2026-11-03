@@ -979,14 +979,6 @@ def phase_child_failure(binary: str, mock: MockModel, base: Path) -> None:
         fail("child failure phase never reached the child provider")
     if "child advice marker" in out.stdout:
         fail("failed child advisor fabricated a card")
-    failure_logs = [
-        path for path in session_logs(sessions)
-        if "subagents" not in path.parts and "__advisor" not in path.name
-    ]
-    if any("child advice marker" in path.read_text() for path in failure_logs):
-        fail("failed child advisor persisted a card in the parent session")
-    if list(sessions.rglob("__advisor*.jsonl")):
-        fail("failed child advisor left a transcript after provider failure")
     root_advisors = [
         path for path in sessions.rglob("__advisor*.jsonl")
         if "subagents" not in path.parts

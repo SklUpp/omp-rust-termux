@@ -130,7 +130,7 @@ class MockModel:
                                                         "type": "function",
                                                         "function": {
                                                             "name": "advise",
-                                                            "arguments": json.dumps(args),
+                                                            "arguments": args,
                                                         },
                                                     }
                                                 ]
@@ -183,7 +183,7 @@ class MockModel:
                                                         "type": "function",
                                                         "function": {
                                                             "name": "task",
-                                                            "arguments": json.dumps(args),
+                                                            "arguments": args,
                                                         },
                                                     }
                                                 ]

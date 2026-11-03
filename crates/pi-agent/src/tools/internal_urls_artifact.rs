@@ -14,7 +14,15 @@
 //! child publishes into that same directory (`crates/omp-cli/src/eval_host.rs`
 //! hands children one shared `artifacts_dir`). Scanning every session on the
 //! box would leak artifacts across unrelated sessions, so only those
-//! caller-owned roots are searched.
+//! caller-owned roots are searched. This is a deliberate security boundary:
+//! upstream `artifact-protocol.ts` also walks the process-global agent registry
+//! after its pinned dir, and this port does not claim that behaviour.
+//!
+//! [`resolve_artifact`] is the path-only seam: it returns identity, path and
+//! size without reading bytes, so consumers can address an artifact of any
+//! size. Rust `read` is its only caller; the minimizer layers
+//! (`pi-shell`, `pi-natives`) only splice `artifact://<id>` references into
+//! text and never resolve them.
 
 use std::{
 	fs,

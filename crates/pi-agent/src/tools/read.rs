@@ -1370,6 +1370,16 @@ impl<'a> TextSource<'a> {
 		matches!(self, Self::Artifact { .. })
 	}
 
+	/// Continuation pointer for a pagination notice. Artifact reads address the
+	/// artifact URL (upstream `#readArtifactFile` uses `artifact://N:offset`);
+	/// every other source keeps the bare `:offset` selector.
+	fn continuation(&self, next_offset: u64) -> String {
+		match self {
+			Self::Artifact { url, .. } => format!("{url}:{next_offset}"),
+			_ => format!(":{next_offset}"),
+		}
+	}
+
 	/// Label shown as `resolvedPath` / in errors.
 	/// Authored URL of an internal resource, when this source came from one.
 	fn memory_url(&self) -> Option<&str> {
@@ -1485,6 +1495,14 @@ fn attach_artifact_resource(
 			"notes": Value::Null,
 		}),
 	);
+	// The blocked-raw path builds details itself, so the source kind must ride
+	// with the helper; ranged reads set the same value in `read_single_range`.
+	let meta = map
+		.entry("meta".to_string())
+		.or_insert_with(|| json!({}))
+		.as_object_mut()
+		.expect("meta object");
+	meta.insert("source".into(), json!({ "type": "internal", "value": url }));
 }
 
 /// TS `#formatArtifactWorkflowNotice`: how to page a large artifact without
@@ -1916,8 +1934,9 @@ pub(super) async fn read_single_range(
 			"The file is empty.".to_string()
 		} else {
 			format!(
-				"Use :1 to read from the start, or :{} to read the last line.",
-				window.total_lines
+				"Use {} to read from the start, or {} to read the last line.",
+				source.continuation(1),
+				source.continuation(window.total_lines)
 			)
 		};
 		let details = json!({
@@ -2040,14 +2059,15 @@ pub(super) async fn read_single_range(
 	} else if start_line + user_limited_lines < window.total_lines || !window.reached_eof {
 		output = format_body(&display_lines);
 		let next_offset = start_line + user_limited_lines + 1;
+		let pointer = source.continuation(next_offset);
 		if window.reached_eof {
 			let remaining = window.total_lines - (start_line + user_limited_lines);
 			output.push_str(&format!(
-				"\n\n[{remaining} more lines in file. Use :{next_offset} to continue]"
+				"\n\n[{remaining} more lines in file. Use {pointer} to continue]"
 			));
 		} else {
 			output.push_str(&format!(
-				"\n\n[More lines in file ({} total; not scanned to EOF). Use :{next_offset} to continue]",
+				"\n\n[More lines in file ({} total; not scanned to EOF). Use {pointer} to continue]",
 				format_bytes(file_size)
 			));
 		}
@@ -3536,6 +3556,12 @@ mod display_tests {
 			read_with(&tool, &dir, "artifact://7").await.content,
 			"Artifact 7 not found. Available: 0"
 		);
+		let beyond = read_with(&tool, &dir, "artifact://0:99").await;
+		assert!(
+			beyond.content.contains("Use artifact://0:1 to read from the start"),
+			"{}",
+			beyond.content
+		);
 
 		let ctx = AgentContext::new(dir.0.clone());
 		ctx.cancellation_token.cancel();
@@ -3560,20 +3586,39 @@ mod display_tests {
 		let tool = artifact_tool(&[("local", artifacts.as_path())]);
 
 		// Ranged reads stream from the file and stay available past the cap.
+		// The result is exactly the selected lines plus a continuation pointer
+		// at the next unread line, never the artifact body.
 		let ranged = read_with(&tool, &dir, "artifact://0:raw:1-2").await;
 		assert!(!ranged.is_error, "{}", ranged.content);
-		assert_eq!(ranged.content, "first-line\npad-line");
+		let (selected, notice) = ranged
+			.content
+			.split_once("\n\n[")
+			.expect("continuation notice");
+		assert_eq!(selected, "first-line\npad-line");
+		assert!(notice.contains("Use artifact://0:3 to continue"), "{notice}");
+		assert!(ranged.content.len() < 4096, "{}", ranged.content.len());
 
-		// Bounded, non-raw paging works and points at the storage path.
+		// Bounded, non-raw paging works and points at the storage path. Range
+		// `1-2` also pulls three trailing context lines, so line 6 is next.
 		let paged = read_with(&tool, &dir, "artifact://0:1-2").await;
 		assert!(!paged.is_error, "{}", paged.content);
 		assert!(paged.content.starts_with("1|first-line\n2|pad-line"), "{}", paged.content);
 		assert!(paged.content.contains("Artifact storage:"), "{}", paged.content);
+		assert!(
+			paged.content.contains("Use artifact://0:6 to continue"),
+			"{}",
+			paged.content
+		);
 
 		// A bare `:raw` would materialize the whole artifact, so it is refused.
 		let blocked = read_with(&tool, &dir, "artifact://0:raw").await;
 		assert!(!blocked.is_error, "{}", blocked.content);
 		assert!(blocked.content.contains("Unbounded raw read blocked"), "{}", blocked.content);
+		let details = blocked.details.expect("blocked details");
+		assert_eq!(
+			details["meta"]["source"],
+			json!({ "type": "internal", "value": "artifact://0" })
+		);
 
 		// The router's full-text resolution stays capped at 8 MiB.
 		let router = InternalUrlRouter::new();

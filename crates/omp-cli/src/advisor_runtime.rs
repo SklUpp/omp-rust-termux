@@ -927,8 +927,9 @@ impl AdvisorManager {
 	}
 
 	/// Block until every advisor has no queued delta and no provider call in
-	/// flight, or the runtime is quota/halted (terminal states release the
-	/// primary). A transient `failing` retry stays pending until it settles.
+	/// flight. Quota/halted release as terminal. A transient `failing` retry
+	/// with backlog releases the wait as incomplete (false), matching TS
+	/// `session-advisors`; it must not park the primary for 600s.
 	#[must_use]
 	pub fn wait_for_catchup(&self, timeout: Duration) -> bool {
 		let deadline = Instant::now() + timeout;
@@ -941,7 +942,14 @@ impl AdvisorManager {
 				{
 					let state = slot.state.lock().unwrap_or_else(|poison| poison.into_inner());
 					let idle = state.pending.is_empty() && state.inflight == 0;
-					if idle || state.quota || state.halted {
+					if idle {
+						break;
+					}
+					if state.failing && state.backlog > 0 {
+						caught_up = false;
+						break;
+					}
+					if state.quota || state.halted {
 						break;
 					}
 				}

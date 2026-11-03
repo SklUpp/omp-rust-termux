@@ -15,7 +15,6 @@ use pi_agent::tools::internal_urls::{
 };
 
 use super::{
-	preflight::{NativeSecurityGitAdapter, SecurityGitAdapter as _},
 	provenance::{create_public_security_scan, redact_private_security_metadata},
 	store::{SecurityScanSummary, SecurityStore},
 };
@@ -40,12 +39,10 @@ impl SecurityUrlHandler {
 	}
 
 	fn store(&self, context: &ResolveContext) -> Result<SecurityStore, String> {
-		let cwd = context.cwd.clone();
-		let root = NativeSecurityGitAdapter
-			.root(&cwd)
-			.map_err(|error| format!("Security store is unavailable: {error}"))?
-			.unwrap_or(cwd);
-		SecurityStore::open(&root, self.state_root.as_deref())
+		// `SecurityStore::open` resolves the enclosing worktree itself, so the
+		// namespace sees the same project whether the read runs at the root or in
+		// a subdirectory.
+		SecurityStore::open(&context.cwd, self.state_root.as_deref())
 			.map_err(|error| error.to_string())
 	}
 

@@ -995,6 +995,91 @@ async fn validate_updates_finding_and_rejects_unknown_ids() {
 }
 
 // ---------------------------------------------------------------------------
+// Repository root vs subdirectory: one project store
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn repository_subdirectory_shares_one_security_store() {
+	let root = TempRoot::new("subdir");
+	let repo = git_fixture(root.path());
+	let host = TestHost::new(
+		&repo,
+		root.path(),
+		Some(model()),
+		Behavior::Publish(publish_params()),
+	);
+	let state_root = host.state_root().expect("state root");
+	let (coordinator, _tool) = tool(Arc::clone(&host));
+	let output = root.path().join("security-output");
+
+	let plan = coordinator
+		.preflight(preflight_input(&output))
+		.expect("preflight");
+	let operation = coordinator.start(&plan.id).expect("start");
+	let snapshot = coordinator.wait(&operation.operation_id).expect("wait");
+	assert_eq!(snapshot.phase, "completed", "{snapshot:?}");
+
+	// The root and a directory inside it resolve to ONE project store.
+	let at_root = SecurityStore::open(&repo, Some(&state_root)).expect("root store");
+	let in_subdir =
+		SecurityStore::open(&repo.join("src"), Some(&state_root)).expect("subdirectory store");
+	assert_eq!(at_root.project_key(), in_subdir.project_key());
+	assert_eq!(at_root.project_directory(), in_subdir.project_directory());
+
+	// A coordinator started from the subdirectory sees the same operation.
+	let subdir_host = TestHost::new(
+		&repo.join("src"),
+		root.path(),
+		Some(model()),
+		Behavior::Partial,
+	);
+	let subdir = SecurityCoordinator::new(subdir_host);
+	let recovered = subdir
+		.status(&operation.operation_id)
+		.expect("status")
+		.expect("known operation");
+	assert_eq!(recovered.phase, "completed");
+	assert_eq!(recovered.scan_id, snapshot.scan_id);
+
+	let bundle = at_root
+		.get_bundle(&snapshot.scan_id)
+		.expect("read")
+		.expect("bundle");
+	let finding_id = bundle.findings[0].id.clone();
+	let updated = subdir
+		.validate(
+			&snapshot.scan_id,
+			&finding_id,
+			"validated",
+			"Subdirectory reader reaches the same finding.",
+			&[],
+		)
+		.expect("validate from subdirectory");
+	assert_eq!(updated.validation.status, "validated");
+
+	// The read-only namespace resolves that same project from the subdirectory.
+	let handler = SecurityUrlHandler::new(true, Some(state_root));
+	let context = pi_agent::tools::internal_urls::ResolveContext {
+		cwd: repo.join("src"),
+		session_file: None,
+		local_roots: std::collections::BTreeMap::new(),
+		signal: pi_agent::CancellationToken::new(),
+	};
+	let listing = pi_agent::tools::internal_urls::ProtocolHandler::resolve(
+		&handler,
+		&InternalUrl::parse("security://scans").expect("parse url"),
+		&context,
+	)
+	.await
+	.expect("resolve scans from subdirectory");
+	assert!(
+		listing.content.contains(&snapshot.scan_id),
+		"unexpected: {}",
+		listing.content
+	);
+}
+
+// ---------------------------------------------------------------------------
 // `security://` namespace
 // ---------------------------------------------------------------------------
 

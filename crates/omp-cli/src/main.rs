@@ -885,6 +885,9 @@ fn run() -> std::result::Result<(), CliError> {
 		};
 		let new_file = session::fork_session(&source_path, Some(&cwd), session_dir.as_deref())
 			.map_err(CliError::usage)?;
+		// The fork's new file has no runner scope yet; reset the real source
+		// scope, and let the new scope seed from its first transcript.
+		native_runner.advisor_reset_boundary(None, Some(&source_path), &[]);
 		chosen_file = Some(new_file);
 	} else if let Some(resume_arg) = &cli.resume {
 		if resume_arg.trim().is_empty() {
@@ -946,6 +949,7 @@ fn run() -> std::result::Result<(), CliError> {
 		}
 	}
 
+	let (advisor_cards_tx, advisor_cards_rx) = std::sync::mpsc::channel();
 	let mut session = Session {
 		runner,
 		config,
@@ -984,6 +988,8 @@ fn run() -> std::result::Result<(), CliError> {
 		prewalk: prewalk::PrewalkState::new(prewalk_policy.arm.clone()),
 		plan_yolo: None,
 		plan_yolo_tools: None,
+		advisor_cards_tx: Arc::new(std::sync::Mutex::new(advisor_cards_tx)),
+		advisor_cards_rx,
 	};
 	if let Some(model) = requested_model.or(default_model) {
 		session.select_model(model);
@@ -1363,6 +1369,9 @@ fn run() -> std::result::Result<(), CliError> {
 			},
 		};
 		if let Err(error) = session.turn(ctx, prompt, parts, mode, &mut reporter) {
+			// A failed turn still settles the roster, but bounded short: never
+			// wait ten minutes on a session that already failed.
+			let _ = session.advisor_headless_drain(&mut reporter, Duration::from_secs(30));
 			reporter.finish().ok();
 			session.finish(&native_runner);
 			return Err(CliError::from(error));
@@ -1370,12 +1379,17 @@ fn run() -> std::result::Result<(), CliError> {
 		// Opt-in headless continuation (`goal.continuationModes`); the default
 		// `["interactive"]` leaves this a no-op.
 		if let Err(error) = session.drive_goal_continuation(mode, &mut reporter) {
+			let _ = session.advisor_headless_drain(&mut reporter, Duration::from_secs(30));
 			reporter.finish().ok();
 			session.finish(&native_runner);
 			return Err(CliError::from(error));
 		}
 		session.drive_autolearn_capture(mode);
 	}
+	// Every primary prompt has settled: preserve late advice, wait bounded for
+	// the roster, persist/render it, then stop advisor work (TS
+	// `prepareForHeadlessAdvisorDrain` -> `waitForAdvisorCatchup(10min)`).
+	session.advisor_headless_drain(&mut reporter, Duration::from_secs(600))?;
 	// Last chance for a child that settled after the final turn boundary.
 	session.finish(&native_runner);
 	reporter.finish().map_err(CliError::from)
@@ -1555,6 +1569,28 @@ fn apply_goal_intents(store: &mut SessionStore, goal_runtime: &GoalRuntime) {
 	}
 }
 
+/// Persist one advisor card as a `custom_message` (so resume replays it) and
+/// render it on the active output surface. Exactly one call per card: the
+/// runner's sink never also writes an event-wire card.
+fn persist_advisor_card<W: Write, E: Write>(
+	store: &mut SessionStore,
+	reporter: &mut Reporter<W, E>,
+	content: &str,
+	details: &serde_json::Value,
+) -> Result<()> {
+	if store.enabled()
+		&& let Err(err) = store.append_custom_message(
+			omp_cli::advisor_runtime::CARD_CUSTOM_TYPE,
+			content,
+			true,
+			details.clone(),
+		)
+	{
+		eprintln!("warning: {err}");
+	}
+	reporter.advisor_card(content, details)
+}
+
 struct Session<'a> {
 	runner: &'a dyn AgentRunner,
 	config: Config,
@@ -1621,6 +1657,20 @@ struct Session<'a> {
 	plan_yolo: Option<Arc<plan_yolo::PlanYoloShared>>,
 	/// Planning tool selection to restore after approval or a failed arm.
 	plan_yolo_tools: Option<plan_yolo::PlanYoloToolSelection>,
+	/// Advisor card sink (session-scoped): the runner calls it once per card and
+	/// the host persists/forwards from the receiver, so a card emitted after a
+	/// turn settles (or during the headless drain) is never lost.
+	advisor_cards_tx: Arc<std::sync::Mutex<std::sync::mpsc::Sender<(String, serde_json::Value)>>>,
+	advisor_cards_rx: std::sync::mpsc::Receiver<(String, serde_json::Value)>,
+}
+
+/// Scope selector matching a run request, derived from the live store rather
+/// than from `self`: rewind/fork handlers need the current journal identity.
+fn advisor_scope_for(store: &SessionStore) -> (Option<String>, Option<PathBuf>) {
+	(
+		store.enabled().then(|| store.id().to_string()),
+		store.file().map(Path::to_path_buf),
+	)
 }
 
 impl Session<'_> {
@@ -1875,6 +1925,38 @@ impl Session<'_> {
 	fn finish(&mut self, runner: &runtime::PiAgentRunner) {
 		runner.shutdown();
 		self.apply_goal_pending();
+	}
+
+	/// Persist and render every advisor card queued since the last boundary.
+	fn drain_advisor_cards<W: Write, E: Write>(
+		&mut self,
+		reporter: &mut Reporter<W, E>,
+	) -> Result<()> {
+		while let Ok((content, details)) = self.advisor_cards_rx.try_recv() {
+			persist_advisor_card(&mut self.store, reporter, &content, &details)?;
+		}
+		Ok(())
+	}
+
+	/// Headless settle (TS `prepareForHeadlessAdvisorDrain`): from here every card
+	/// is preserved, the primary waits once for the roster, and every late card
+	/// is persisted/rendered before advisor work stops. `timeout` is 10min on
+	/// the success path and 30s when a turn already failed.
+	fn advisor_headless_drain<W: Write, E: Write>(
+		&mut self,
+		reporter: &mut Reporter<W, E>,
+		timeout: Duration,
+	) -> Result<()> {
+		let (id, file) = advisor_scope_for(&self.store);
+		self
+			.runner
+			.advisor_prepare_headless_drain(id.as_deref(), file.as_deref());
+		self
+			.runner
+			.advisor_wait_catchup(id.as_deref(), file.as_deref(), timeout);
+		self.drain_advisor_cards(reporter)?;
+		self.runner.advisor_dispose(id.as_deref(), file.as_deref());
+		Ok(())
 	}
 
 	/// Complete-exit (TS `#exitGoalMode(reason: "completed")`): the goal tool
@@ -2138,6 +2220,16 @@ impl Session<'_> {
 				.map(|dir| std::collections::BTreeMap::from([("local".to_string(), dir)]))
 				.unwrap_or_default(),
 		};
+		// One card per advisor note batch reaches this sink exactly once; the
+		// host persists and renders it from the receiver at event boundaries and
+		// after the headless drain, so late advice is never dropped.
+		let advisor_cards = Arc::clone(&self.advisor_cards_tx);
+		let advisor_card_sink: omp_cli::advisor_runtime::CardSink =
+			Arc::new(move |content: &str, details: &serde_json::Value| {
+				if let Ok(tx) = advisor_cards.lock() {
+					let _ = tx.send((content.to_string(), details.clone()));
+				}
+			});
 		Ok(RunRequest {
 			prompt,
 			parts,
@@ -2188,6 +2280,7 @@ impl Session<'_> {
 			))),
 			continuation: false,
 			plan_context,
+			advisor_card_sink: Some(agent::AdvisorCardHandle(advisor_card_sink)),
 			service_tier_by_family,
 			security_host: None,
 			security_worker: false,
@@ -2668,6 +2761,14 @@ impl Session<'_> {
 								};
 								match rebuilt {
 									Ok(messages) => {
+										if let Some(runner) = agent::runner() {
+											let (id, file) = advisor_scope_for(store);
+											runner.advisor_reset_boundary(
+												id.as_deref(),
+												file.as_deref(),
+												&messages,
+											);
+										}
 										decision.rewrite = Some(pi_agent::TurnRewrite::Replace(messages));
 									},
 									// The journal already moved to the rewound branch.
@@ -2702,9 +2803,27 @@ impl Session<'_> {
 									omp_cli::session_checkpoint::apply_in_memory_rewind(
 										messages, &rewind,
 									);
+									if let Some(runner) = agent::runner() {
+										let (id, file) = advisor_scope_for(store);
+										runner.advisor_reset_boundary(
+											id.as_deref(),
+											file.as_deref(),
+											messages,
+										);
+									}
 									Some(pi_agent::TurnRewrite::Replace(messages.clone()))
 								},
-								None => Some(pi_agent::TurnRewrite::InMemory(rewind)),
+								None => {
+									if let Some(runner) = agent::runner() {
+										let (id, file) = advisor_scope_for(store);
+										runner.advisor_reset_boundary(
+											id.as_deref(),
+											file.as_deref(),
+											&[],
+										);
+									}
+									Some(pi_agent::TurnRewrite::InMemory(rewind))
+								},
 							};
 						} else if captured {
 							decision.warning = host.active_notice().map(str::to_string);
@@ -3108,6 +3227,17 @@ impl Session<'_> {
 					reporter_failed = true;
 					return Err(err);
 				}
+				// Advice cards reach the host through the session-scoped sink;
+				// persist/render them at this boundary so they cannot be lost
+				// between turns or after the stream drops.
+				while let Ok((content, details)) = self.advisor_cards_rx.try_recv() {
+					if let Err(err) =
+						persist_advisor_card(&mut self.store, reporter, &content, &details)
+					{
+						reporter_failed = true;
+						return Err(err);
+					}
+				}
 				Ok(())
 			},
 		);
@@ -3138,6 +3268,18 @@ impl Session<'_> {
 					);
 					if !reporter_failed {
 						let _ = reporter.event(&event);
+					}
+					while let Ok((content, details)) = self.advisor_cards_rx.try_recv() {
+						if persist_advisor_card(
+							&mut self.store,
+							reporter,
+							&content,
+							&details,
+						)
+						.is_err()
+						{
+							reporter_failed = true;
+						}
 					}
 				}
 			}

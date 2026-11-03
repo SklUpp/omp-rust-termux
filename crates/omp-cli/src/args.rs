@@ -108,6 +108,10 @@ struct LaunchArgs {
 	#[arg(long = "plan-yolo-into", value_name = "MODEL")]
 	plan_yolo_into: Option<String>,
 
+	/// Enable the passive advisor model for this session.
+	#[arg(long = "advisor")]
+	advisor: bool,
+
 	/// Private think scratchpad; disables supported native provider reasoning.
 	#[arg(long = "external-thinking")]
 	external_thinking: bool,
@@ -333,6 +337,9 @@ pub struct Cli {
 	/// Target model or role for plan-yolo execution (default `@smol`).
 	pub plan_yolo_into: Option<String>,
 
+	/// Enable the passive advisor model for this session (`--advisor`).
+	pub advisor: bool,
+
 	/// Private think scratchpad; disables supported native provider reasoning.
 	pub external_thinking: bool,
 
@@ -546,6 +553,7 @@ impl Cli {
 			prewalk_into: raw.prewalk_into,
 			plan_yolo: raw.plan_yolo,
 			plan_yolo_into: raw.plan_yolo_into,
+			advisor: raw.advisor,
 			external_thinking: raw.external_thinking,
 			service_tier: raw.service_tier,
 			provider: raw.provider,
@@ -1434,6 +1442,29 @@ mod tests {
 
 	fn raw(args: &[&str]) -> Vec<std::ffi::OsString> {
 		args.iter().map(std::ffi::OsString::from).collect()
+	}
+
+	#[test]
+	fn advisor_flag_reaches_the_parsed_cli() {
+		let cli = parse(&["omp", "--advisor", "--mode", "text", "say hi"]);
+		assert!(cli.advisor);
+		assert_eq!(cli.prompt, ["say hi"]);
+	}
+
+	#[test]
+	fn advisor_flag_parses_after_mode_text() {
+		let cli = parse(&[
+			"omp",
+			"--no-tools",
+			"--no-title",
+			"--mode",
+			"text",
+			"--advisor",
+			"say hi",
+		]);
+		assert_eq!(cli.mode, OutputMode::Text);
+		assert!(cli.advisor);
+		assert_eq!(cli.prompt, ["say hi"]);
 	}
 
 	#[test]

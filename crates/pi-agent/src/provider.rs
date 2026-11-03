@@ -606,7 +606,17 @@ impl ModelProvider for OpenAiCompatibleProvider {
 		let body = response
 			.bytes_stream()
 			.map(|item| item.map_err(|err| err.to_string()));
-		Ok(sse_stream(Box::pin(body)))
+		let secrets = vec![self.api_key.clone()];
+		Ok(sse_stream(Box::pin(body))
+			.map(move |item| {
+				item.map_err(|error| match error {
+					ProviderError::Protocol(text) => {
+						ProviderError::Protocol(redact_with(&text, &secrets))
+					},
+					other => other,
+				})
+			})
+			.boxed())
 	}
 }
 
@@ -1176,6 +1186,16 @@ pub struct OpenAiStreamChunk {
 	pub choices: Vec<OpenAiStreamChoice>,
 	#[serde(default)]
 	pub usage: Option<OpenAiUsage>,
+	#[serde(default)]
+	pub error: Option<OpenAiStreamError>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenAiStreamError {
+	#[serde(default, alias = "type")]
+	pub kind: String,
+	#[serde(default)]
+	pub message: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1620,6 +1640,18 @@ pub fn parse_sse_line(line: &str) -> Option<Result<StreamChunk, ProviderError>> 
 
 	match serde_json::from_str::<OpenAiStreamChunk>(data) {
 		Ok(chunk) => {
+			if let Some(error) = chunk.error {
+				let message = if error.message.is_empty() {
+					"provider stream error".to_string()
+				} else {
+					error.message
+				};
+				return Some(Err(ProviderError::Protocol(if error.kind.is_empty() {
+					message
+				} else {
+					format!("{}: {message}", error.kind)
+				})));
+			}
 			let mut content = None;
 			let mut reasoning = None;
 			let mut stop_reason = None;
@@ -1833,6 +1865,16 @@ fn network_error(err: reqwest::Error) -> ProviderError {
 
 pub(crate) fn snippet(text: &str) -> String {
 	text.chars().take(ERROR_BODY_CHARS).collect()
+}
+
+/// Replace every known credential value in diagnostics. Shared with providers
+/// that echo stream errors so a gateway cannot leak the key it received.
+pub(crate) fn redact_with(text: &str, secrets: &[String]) -> String {
+	let mut redacted = text.to_string();
+	for secret in secrets.iter().filter(|secret| !secret.trim().is_empty()) {
+		redacted = redacted.replace(secret.as_str(), "[redacted]");
+	}
+	redacted
 }
 
 #[cfg(test)]

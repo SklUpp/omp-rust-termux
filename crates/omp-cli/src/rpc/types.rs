@@ -329,6 +329,13 @@ pub enum RpcCommand {
 		#[serde(default)]
 		id: Option<String>,
 	},
+	/// Rendered advisor status for the live scope; `configured:false` until an
+	/// enabled advisor has actually run for this session.
+	#[serde(rename_all = "camelCase")]
+	GetAdvisorStatus {
+		#[serde(default)]
+		id: Option<String>,
+	},
 	#[serde(rename_all = "camelCase")]
 	ExportHtml {
 		#[serde(default)]
@@ -434,6 +441,7 @@ impl RpcCommand {
 			| Self::Bash { id, .. }
 			| Self::AbortBash { id }
 			| Self::GetSessionStats { id }
+			| Self::GetAdvisorStatus { id }
 			| Self::ExportHtml { id, .. }
 			| Self::SwitchSession { id, .. }
 			| Self::Branch { id, .. }
@@ -483,6 +491,7 @@ impl RpcCommand {
 			Self::Bash { .. } => "bash",
 			Self::AbortBash { .. } => "abort_bash",
 			Self::GetSessionStats { .. } => "get_session_stats",
+			Self::GetAdvisorStatus { .. } => "get_advisor_status",
 			Self::ExportHtml { .. } => "export_html",
 			Self::SwitchSession { .. } => "switch_session",
 			Self::Branch { .. } => "branch",

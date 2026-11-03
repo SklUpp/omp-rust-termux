@@ -11,6 +11,7 @@ pub mod provider;
 pub mod provider_anthropic;
 pub mod provider_ollama;
 pub mod state;
+pub mod subagent_advisor;
 pub mod subagent_lifecycle;
 pub mod supervisor;
 pub mod task_persisted_revive;
@@ -19,8 +20,8 @@ pub mod tools;
 
 pub use compaction::Compactor;
 pub use loop_module::{
-	AgentError, AgentEvent, AgentLoop, InMemoryRewind, SteeringEvent, TurnAck, TurnAckDecision,
-	TurnAckRequest, TurnRewrite, TurnToolSelection, INTERRUPTED_TOOL_RESULT,
+	AgentError, AgentEvent, AgentLoop, AssistantGuard, InMemoryRewind, SteeringEvent, TurnAck,
+	TurnAckDecision, TurnAckRequest, TurnRewrite, TurnToolSelection, INTERRUPTED_TOOL_RESULT,
 	repair_tool_batch_boundary, tool_batch_end, tool_image_parts_of,
 };
 pub use tokio_util::sync::CancellationToken;

@@ -799,11 +799,28 @@ impl TaskTool {
 		let child_cancel_for_loop = child_cancel.clone();
 		let (event_tx, event_rx) = tokio::sync::mpsc::channel(256);
 		let salvage = Arc::new(Mutex::new(ChildSalvage::default()));
+		if let Some(hook) = self.supervisor.child_advisor_hook() {
+			let session_file = self.supervisor.child_session_file(&child_id);
+			let context = child_advisor_context(
+				&child_id,
+				Some(&item.agent.name),
+				item.agent.advisor.as_ref(),
+				session_file.as_deref(),
+				Some(steering_tx.clone()),
+			);
+			hook.on_child_start(&context, &initial_message).await;
+		}
+		if let Some(manager) = crate::subagent_lifecycle::lookup(&self.supervisor) {
+			manager.seed_live(&child_id, initial_message);
+		}
 		let events = forward_child_events(
 			self.supervisor.clone(),
 			child_id.clone(),
+			Some(item.agent.name.clone()),
+			item.agent.advisor.clone(),
 			event_rx,
 			Arc::clone(&salvage),
+			steering_tx.clone(),
 		);
 		let child_plan = ctx.plan.clone();
 		let final_messages = Arc::new(Mutex::new(None::<Vec<Message>>));
@@ -850,6 +867,17 @@ impl TaskTool {
 			let _ = task_handle.await;
 			self.supervisor.mark_aborted(&child_id, "cancelled by hub");
 			self.supervisor.unregister_active_child(&child_id);
+			if let Some(hook) = self.supervisor.child_advisor_hook() {
+				let session_file = self.supervisor.child_session_file(&child_id);
+				let context = child_advisor_context(
+					&child_id,
+					Some(&item.agent.name),
+					item.agent.advisor.as_ref(),
+					session_file.as_deref(),
+					Some(steering_tx.clone()),
+				);
+				hook.on_child_end(&context, true).await;
+			}
 			return SingleResult {
 				index,
 				id: child_id,
@@ -917,6 +945,18 @@ impl TaskTool {
 		};
 
 		let _ = events.await;
+		let child_aborted = child_cancel.is_cancelled();
+		if let Some(hook) = self.supervisor.child_advisor_hook() {
+			let session_file = self.supervisor.child_session_file(&child_id);
+			let context = child_advisor_context(
+				&child_id,
+				Some(&item.agent.name),
+				item.agent.advisor.as_ref(),
+				session_file.as_deref(),
+				Some(steering_tx.clone()),
+			);
+			hook.on_child_end(&context, child_aborted).await;
+		}
 		if let Some(manager) = crate::subagent_lifecycle::lookup(&self.supervisor)
 			&& let Some(messages) = final_messages
 				.lock()
@@ -997,6 +1037,8 @@ impl TaskTool {
 				}
 
 				let finalized = finalize_output(&item, &turn_results, &base_output, is_aborted);
+				let terminal_error = terminal_error_message(&turn_results)
+					.and_then(|message| message.error_message.clone());
 				let (output, output_truncated) = cap_result_text(&finalized.output);
 				let exit_code = if is_aborted { 1 } else { finalized.exit_code };
 
@@ -1051,7 +1093,7 @@ impl TaskTool {
 					duration_ms,
 					tokens: 0,
 					requests,
-					error: None,
+					error: terminal_error,
 					aborted: if is_aborted { Some(true) } else { None },
 					abort_reason,
 					extracted_tool_data,
@@ -1312,6 +1354,7 @@ impl TaskTool {
 		);
 		let background_salvage = Arc::new(Mutex::new(ChildSalvage::default()));
 
+		let steering_for_child = steering_tx.clone();
 		let handle = tokio::spawn(async move {
 			// Wait until the reservation is registered as active, so an early
 			// cancel can abort this task before it ever reaches the model.
@@ -1343,6 +1386,7 @@ impl TaskTool {
 				item,
 				cwd,
 				steering_rx,
+				steering_for_child,
 				cancel.clone(),
 				child_ctx,
 				plan,
@@ -1716,6 +1760,7 @@ async fn run_background_child(
 	item: TaskItemSpec,
 	cwd: std::path::PathBuf,
 	steering_rx: tokio::sync::mpsc::Receiver<SteeringEvent>,
+	steering_tx: tokio::sync::mpsc::Sender<SteeringEvent>,
 	cancel: CancellationToken,
 	child_ctx: ChildContext,
 	plan: Option<Arc<dyn crate::state::PlanModeGuard>>,
@@ -1826,11 +1871,28 @@ async fn run_background_child(
 		.with_background_results(supervisor.owner_results_sink(Some(&child_id)))
 		.with_peer_inbox(supervisor.mailbox(), child_id.clone());
 	let (event_tx, event_rx) = tokio::sync::mpsc::channel(256);
+	if let Some(hook) = supervisor.child_advisor_hook() {
+		let session_file = supervisor.child_session_file(&child_id);
+		let context = child_advisor_context(
+			&child_id,
+			Some(&item.agent.name),
+			item.agent.advisor.as_ref(),
+			session_file.as_deref(),
+			Some(steering_tx.clone()),
+		);
+		hook.on_child_start(&context, &initial_message).await;
+	}
+	if let Some(manager) = crate::subagent_lifecycle::lookup(&supervisor) {
+		manager.seed_live(&child_id, initial_message);
+	}
 	let events = forward_child_events(
 		Arc::clone(&supervisor),
 		child_id.clone(),
+		Some(item.agent.name.clone()),
+		item.agent.advisor.clone(),
 		event_rx,
 		salvage,
+		steering_tx.clone(),
 	);
 	let mut child_state = AgentState { messages: autoload_msgs, total_turns: 0 };
 	let cancel_for_finalize = cancel.clone();
@@ -1846,6 +1908,18 @@ async fn run_background_child(
 	// Drain the forwarder before the caller settles the record, so no event is
 	// emitted after the terminal lifecycle frame.
 	let _ = events.await;
+	let child_aborted = cancel_for_finalize.is_cancelled();
+	if let Some(hook) = supervisor.child_advisor_hook() {
+		let session_file = supervisor.child_session_file(&child_id);
+		let context = child_advisor_context(
+			&child_id,
+			Some(&item.agent.name),
+			item.agent.advisor.as_ref(),
+			session_file.as_deref(),
+			Some(steering_tx.clone()),
+		);
+		hook.on_child_end(&context, child_aborted).await;
+	}
 	if let Some(manager) = crate::subagent_lifecycle::lookup(&supervisor) {
 		manager.replace_live(&child_id, child_state.messages.clone());
 	}
@@ -1882,13 +1956,41 @@ async fn run_background_child(
 	})
 }
 
+/// Host advisor context for one child session. The definition fields carry the
+/// agent frontmatter; the host applies `task.agentAdvisor` first (TS
+/// `resolveAgentAdvisorSelection`).
+fn child_advisor_context<'a>(
+	child_id: &'a str,
+	agent: Option<&'a str>,
+	definition: Option<&'a HandoffTarget>,
+	session_file: Option<&'a std::path::Path>,
+	steer: Option<tokio::sync::mpsc::Sender<SteeringEvent>>,
+) -> crate::subagent_advisor::ChildAdvisorContext<'a> {
+	let (definition_advisor, definition_pattern) = match definition {
+		Some(HandoffTarget::Default) => (true, None),
+		Some(HandoffTarget::Pattern(pattern)) => (true, Some(pattern.as_str())),
+		None => (false, None),
+	};
+	crate::subagent_advisor::ChildAdvisorContext {
+		child_id,
+		agent,
+		session_file,
+		definition_advisor,
+		definition_pattern,
+		steer,
+	}
+}
+
 /// Forward real child agent events to the supervisor's observer bus. Stops when
 /// the record stops being live, so a frame never outlives its child.
 fn forward_child_events(
 	supervisor: Arc<Supervisor>,
 	child_id: String,
+	agent: Option<String>,
+	definition: Option<HandoffTarget>,
 	mut events: tokio::sync::mpsc::Receiver<AgentEvent>,
 	salvage: Arc<Mutex<ChildSalvage>>,
+	steering_tx: tokio::sync::mpsc::Sender<SteeringEvent>,
 ) -> tokio::task::JoinHandle<()> {
 	let manager = crate::subagent_lifecycle::lookup(&supervisor);
 	tokio::spawn(async move {
@@ -1898,6 +2000,26 @@ fn forward_child_events(
 					.lock()
 					.unwrap_or_else(std::sync::PoisonError::into_inner)
 					.capture_message(message, status);
+			}
+			// Advisor trigger parity: one settled turn, after its tool results,
+			// never an aborted one (TS `setOnTurnEnd` skips an aborted signal,
+			// `session-advisors.ts:337`). The hook schedules its own work.
+			if let AgentEvent::TurnEnd { message, tool_results, status } = &event
+				&& !matches!(status, crate::TurnStatus::Aborted)
+				&& let Some(hook) = supervisor.child_advisor_hook()
+			{
+				let session_file = supervisor.child_session_file(&child_id);
+				let context = child_advisor_context(
+					&child_id,
+					agent.as_deref(),
+					definition.as_ref(),
+					session_file.as_deref(),
+					Some(steering_tx.clone()),
+				);
+				let will_continue = matches!(status, crate::TurnStatus::ToolUse)
+					|| !message.tool_calls.is_empty();
+				hook.on_child_turn(&context, message, tool_results, will_continue)
+					.await;
 			}
 			// Live `history://` sees the event exactly as emitted; accounting
 			// still observes it once through `report_event` below.
@@ -2055,11 +2177,22 @@ fn settle_background_result(
 			let usage = child_usage(&turns);
 			let (output, _) = cap_result_text(&finalized.output);
 			if finalized.failed {
+				let terminal_error = terminal_error_message(&turns).is_some();
+				let (status, output) = if terminal_error {
+					let output = if finalized.stderr.is_empty() {
+						output
+					} else {
+						format!("{}{output}", finalized.stderr)
+					};
+					("failed (provider_error)", output)
+				} else {
+					("failed (schema_violation)", output)
+				};
 				let envelope = task_result_envelope(
 					&id,
 					&agent,
 					output_id.as_deref(),
-					"failed (schema_violation)",
+					status,
 					duration_ms,
 					&output,
 					None,
@@ -2534,12 +2667,6 @@ fn check_agent_capabilities(agent: &AgentDefinition) -> Result<(), ToolError> {
 			agent.name
 		)));
 	}
-	if agent.advisor.is_some() {
-		return Err(ToolError::InvalidArguments(format!(
-			"Agent '{}' requests an advisor model, which this build does not implement",
-			agent.name
-		)));
-	}
 	if agent.read_summarize == Some(true) {
 		return Err(ToolError::InvalidArguments(format!(
 			"Agent '{}' requests read summarization, which this build does not implement",
@@ -2884,6 +3011,17 @@ pub(crate) fn follow_up_output(
 	Some(finalize_output(&item, turns, &base, false).output)
 }
 
+/// Last assistant turn that ended with a provider error. The loop keeps such a
+/// terminal turn in `Ok(turns)` so callers can journal the error message and
+/// partial usage; the task outcome must still fail instead of accepting it.
+fn terminal_error_message(turns: &[TurnResult]) -> Option<&Message> {
+	turns
+		.iter()
+		.rev()
+		.map(|turn| &turn.message)
+		.find(|message| message.stop_reason == Some(crate::state::StopReason::Error))
+}
+
 fn finalize_output(
 	item: &TaskItemSpec,
 	turns: &[TurnResult],
@@ -2894,6 +3032,15 @@ fn finalize_output(
 		return FinalizedOutput {
 			output: base.to_string(),
 			stderr: String::new(),
+			exit_code: 1,
+			structured: None,
+			failed: true,
+		};
+	}
+	if let Some(message) = terminal_error_message(turns) {
+		return FinalizedOutput {
+			output: base.to_string(),
+			stderr: message.error_message.clone().unwrap_or_default(),
 			exit_code: 1,
 			structured: None,
 			failed: true,
@@ -4031,6 +4178,96 @@ mod tests {
 		std::fs::remove_dir_all(&root).ok();
 	}
 
+	#[tokio::test]
+	async fn background_terminal_provider_error_keeps_message_and_partial_output() {
+		let nanos = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.map(|duration| duration.as_nanos())
+			.unwrap_or_default();
+		let home = std::env::var_os("HOME")
+			.map(std::path::PathBuf::from)
+			.expect("HOME must be set");
+		let root = home.join(format!(
+			".omp-agent-provider-error-{}-{nanos}",
+			std::process::id()
+		));
+		let subagents = root.join("subagents");
+		std::fs::create_dir_all(&subagents).expect("subagents");
+		let supervisor = Supervisor::with_selection(
+			ToolRegistry::with_builtins(),
+			Arc::new(NullProvider),
+			None,
+			DelegationLimits::default(),
+			true,
+			false,
+		);
+		supervisor.set_child_session_root(Some(subagents));
+		let mut scope = crate::tools::internal_urls::UrlScope::default();
+		scope
+			.local_roots
+			.insert("local".to_string(), root.clone());
+		supervisor.set_url_scope(Arc::new(scope));
+		let (id, _cancel) = supervisor
+			.reserve_child_full(ChildSpawn {
+				name:                "bg-provider-error",
+				index:               0,
+				agent:               "task",
+				agent_source:        "builtin",
+				task:                "work",
+				parent_id:           None,
+				parent_tool_call_id: None,
+				detached:            true,
+				output_prefix:       None,
+			})
+			.expect("reserve");
+		supervisor.mark_contract_expected(&id);
+		let mut message = Message::assistant("partial answer");
+		message.stop_reason = Some(crate::state::StopReason::Error);
+		message.error_message = Some("upstream failed".to_string());
+		message.usage = Some(TokenUsage {
+			input: 11,
+			output: 7,
+			total_tokens: 18,
+			..TokenUsage::default()
+		});
+		let turns = vec![TurnResult {
+			message,
+			tool_results: Vec::new(),
+			is_completed: true,
+		}];
+		settle_background_result(
+			Arc::clone(&supervisor),
+			id,
+			Instant::now(),
+			Ok(BackgroundOutcome {
+				turns,
+				isolation: None,
+				cancelled: false,
+			}),
+			TaskItemSpec {
+				name: "bg-provider-error".to_string(),
+				agent: model_agent(),
+				task: "work".to_string(),
+				context: None,
+				output_schema: None,
+				schema_mode: SchemaMode::default(),
+				schema_error: None,
+				effort: None,
+				isolation: IsolationRequest::default(),
+			},
+			None,
+			Arc::new(Mutex::new(ChildSalvage::default())),
+		);
+		let deliveries = supervisor.take_results_for(None);
+		assert_eq!(deliveries.len(), 1);
+		let envelope = &deliveries[0];
+		assert!(envelope.contains("status=\"failed (provider_error)\""), "{envelope}");
+		assert!(envelope.contains("upstream failed"), "{envelope}");
+		assert!(envelope.contains("partial answer"), "{envelope}");
+		assert!(envelope.contains("<usage input=\"11\""), "{envelope}");
+		std::fs::remove_dir_all(root).ok();
+	}
+
 	#[test]
 	fn abort_partial_stream_is_preserved_and_empty_abort_uses_exact_salvage() {
 		let mut salvage = ChildSalvage::default();
@@ -4720,6 +4957,247 @@ mod tests {
 		);
 	}
 
+	#[derive(Default)]
+	struct EndHook {
+		aborted: Mutex<Vec<bool>>,
+	}
+
+	#[async_trait::async_trait]
+	impl crate::subagent_advisor::ChildAdvisorHook for EndHook {
+		async fn on_child_end(
+			&self,
+			_child: &crate::subagent_advisor::ChildAdvisorContext<'_>,
+			aborted: bool,
+		) {
+			self.aborted.lock().expect("hook").push(aborted);
+		}
+	}
+
+	struct TerminalErrorProvider;
+
+	#[async_trait]
+	impl ModelProvider for TerminalErrorProvider {
+		async fn complete(
+			&self,
+			_messages: &[Message],
+			_tools: &[serde_json::Value],
+			_tool_choice: &ToolChoice,
+		) -> std::result::Result<Message, ProviderError> {
+			Err(ProviderError::Network("unused".to_string()))
+		}
+
+		async fn stream(
+			&self,
+			_messages: &[Message],
+			_tools: &[serde_json::Value],
+			_tool_choice: &ToolChoice,
+		) -> std::result::Result<ChunkStream, ProviderError> {
+			let chunk = crate::provider::StreamChunk {
+				content: Some("partial answer".to_string()),
+				reasoning: None,
+				tool_call_deltas: Vec::new(),
+				usage: Some(TokenUsage {
+					input: 11,
+					output: 7,
+					total_tokens: 18,
+					..TokenUsage::default()
+				}),
+				is_done: true,
+				disabled_features: None,
+				content_index: None,
+				signature: None,
+				redacted: None,
+				stop_reason: Some(crate::state::StopReason::Error),
+				error_message: Some("upstream failed".to_string()),
+			};
+			Ok(Box::pin(futures::stream::iter(vec![Ok(chunk)])))
+		}
+	}
+
+	#[tokio::test]
+	async fn child_terminal_provider_error_fails_task_result() {
+		let root: Arc<dyn ModelProvider> = Arc::new(NullProvider);
+		let child: Arc<dyn ModelProvider> = Arc::new(TerminalErrorProvider);
+		let supervisor = Supervisor::with_selection(
+			ToolRegistry::new(),
+			Arc::clone(&root),
+			None,
+			DelegationLimits::default(),
+			true,
+			false,
+		);
+		let mut agent = model_agent();
+		agent.blocking = true;
+		let catalog = Arc::new(
+			AgentCatalog::new(vec![agent], None)
+				.with_model_factory(Arc::new(SharedFactory(Arc::clone(&child)))),
+		);
+		let tool = TaskTool::new(Arc::clone(&supervisor), 0).with_catalog(catalog);
+		let context = AgentContext::new(std::env::temp_dir());
+		let result = tool
+			.execute(&json!({ "agent": "task", "task": "work" }), &context)
+			.await
+			.expect("terminal child still returns a tool envelope");
+		let details: TaskToolDetails =
+			serde_json::from_str(&result.content).expect("task details");
+		let child = &details.results[0];
+		assert_eq!(child.exit_code, 1, "terminal provider error must fail the task");
+		assert_eq!(child.error.as_deref(), Some("upstream failed"));
+		assert_eq!(child.stderr, "upstream failed");
+		assert_eq!(child.output, "partial answer", "partial child text survives");
+		assert_eq!(child.usage.expect("reported usage").input, 11);
+	}
+
+	#[tokio::test]
+	async fn child_provider_failure_is_not_reported_as_abort() {
+		let root: Arc<dyn ModelProvider> = Arc::new(NullProvider);
+		let child: Arc<dyn ModelProvider> = Arc::new(NullProvider);
+		let supervisor = Supervisor::with_selection(
+			ToolRegistry::new(),
+			Arc::clone(&root),
+			None,
+			DelegationLimits::default(),
+			true,
+			false,
+		);
+		let hook = Arc::new(EndHook::default());
+		supervisor.set_child_advisor_hook(Some(hook.clone()));
+		let catalog = Arc::new(
+			AgentCatalog::new(vec![model_agent()], None)
+				.with_model_factory(Arc::new(SharedFactory(Arc::clone(&child)))),
+		);
+		let tool = TaskTool::new(Arc::clone(&supervisor), 0).with_catalog(catalog);
+		let item = TaskItemSpec {
+			name: "task-bg".to_string(),
+			agent: model_agent(),
+			task: "work".to_string(),
+			context: None,
+			output_schema: None,
+			schema_mode: SchemaMode::default(),
+			schema_error: None,
+			effort: None,
+			isolation: IsolationRequest::default(),
+		};
+		let (steering_tx, steering_rx) = tokio::sync::mpsc::channel(1);
+		let _ = tokio::time::timeout(
+			std::time::Duration::from_secs(5),
+			run_background_child(
+				Arc::clone(&supervisor),
+				"task-bg".to_string(),
+				item,
+				std::path::PathBuf::from("."),
+				steering_rx,
+				steering_tx,
+				tokio_util::sync::CancellationToken::new(),
+				tool.child_context(),
+				None,
+				Arc::new(Mutex::new(ChildSalvage::default())),
+			),
+		)
+		.await
+		.expect("child settled");
+		assert_eq!(
+			hook.aborted.lock().expect("hook").clone(),
+			vec![false],
+			"provider failure must still drain the advisor"
+		);
+	}
+
+	struct GatedProvider {
+		started: Arc<tokio::sync::Notify>,
+	}
+
+	#[async_trait]
+	impl ModelProvider for GatedProvider {
+		async fn complete(
+			&self,
+			_messages: &[Message],
+			_tools: &[serde_json::Value],
+			_tool_choice: &ToolChoice,
+		) -> std::result::Result<Message, ProviderError> {
+			Err(ProviderError::Network("cancelled child".to_string()))
+		}
+
+		async fn stream(
+			&self,
+			_messages: &[Message],
+			_tools: &[serde_json::Value],
+			_tool_choice: &ToolChoice,
+		) -> std::result::Result<ChunkStream, ProviderError> {
+			self.started.notify_one();
+			Ok(Box::pin(futures::stream::pending()))
+		}
+	}
+
+	#[tokio::test]
+	async fn child_cancellation_is_reported_as_abort_to_the_end_hook() {
+		let started = Arc::new(tokio::sync::Notify::new());
+		let root: Arc<dyn ModelProvider> = Arc::new(NullProvider);
+		let child: Arc<dyn ModelProvider> = Arc::new(GatedProvider {
+			started: Arc::clone(&started),
+		});
+		let supervisor = Supervisor::with_selection(
+			ToolRegistry::new(),
+			Arc::clone(&root),
+			None,
+			DelegationLimits::default(),
+			true,
+			false,
+		);
+		let hook = Arc::new(EndHook::default());
+		supervisor.set_child_advisor_hook(Some(hook.clone()));
+		let catalog = Arc::new(
+			AgentCatalog::new(vec![model_agent()], None)
+				.with_model_factory(Arc::new(SharedFactory(Arc::clone(&child)))),
+		);
+		let tool = TaskTool::new(Arc::clone(&supervisor), 0).with_catalog(catalog);
+		let item = TaskItemSpec {
+			name: "task-bg".to_string(),
+			agent: model_agent(),
+			task: "work".to_string(),
+			context: None,
+			output_schema: None,
+			schema_mode: SchemaMode::default(),
+			schema_error: None,
+			effort: None,
+			isolation: IsolationRequest::default(),
+		};
+		let (steering_tx, steering_rx) = tokio::sync::mpsc::channel(1);
+		let cancel = tokio_util::sync::CancellationToken::new();
+		let cancel_for_test = cancel.clone();
+		let mut child_future = Box::pin(run_background_child(
+			Arc::clone(&supervisor),
+			"task-bg".to_string(),
+			item,
+			std::path::PathBuf::from("."),
+			steering_rx,
+			steering_tx,
+			cancel,
+			tool.child_context(),
+			None,
+			Arc::new(Mutex::new(ChildSalvage::default())),
+		));
+		tokio::select! {
+			() = started.notified() => {}
+			settled = &mut child_future => {
+				drop(settled);
+				panic!("child settled before its model stream was polled");
+			}
+		}
+		cancel_for_test.cancel();
+		let _ = tokio::time::timeout(
+			std::time::Duration::from_secs(5),
+			child_future,
+		)
+		.await
+		.expect("cancelled child settles");
+		assert_eq!(
+			hook.aborted.lock().expect("hook").clone(),
+			vec![true],
+			"cancellation must skip the advisor drain"
+		);
+	}
+
 	/// The detached background path builds its own registry after the spawn
 	/// future, so it needs the same provider rebind as the foreground path.
 	/// Assert through the binder seam rather than the child loop's request.
@@ -4755,7 +5233,7 @@ mod tests {
 			effort: None,
 			isolation: IsolationRequest::default(),
 		};
-		let (_steering_tx, steering_rx) = tokio::sync::mpsc::channel(1);
+		let (steering_tx, steering_rx) = tokio::sync::mpsc::channel(1);
 		let _ = run_background_child(
 			Arc::clone(&supervisor),
 			None,
@@ -4763,6 +5241,7 @@ mod tests {
 			item,
 			std::path::PathBuf::from("."),
 			steering_rx,
+			steering_tx,
 			tokio_util::sync::CancellationToken::new(),
 			tool.child_context(),
 			None,

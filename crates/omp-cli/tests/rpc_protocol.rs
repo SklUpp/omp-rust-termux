@@ -2523,3 +2523,62 @@ fn fast_mode_toggle_rearms_priority_after_an_anthropic_downgrade() {
 		"rejected again, retried without fast mode"
 	);
 }
+
+/// RPC idle delivery and EOF must publish an advisor card that settles after
+/// the primary turn, using the real `RpcMode`/`PiAgentRunner` harness.
+#[test]
+fn advisor_card_is_published_by_the_rpc_pump_before_eof() {
+	let (port, _requests) = spawn_tool_model(vec![
+		ToolScript { text: "done".to_string(), tool: None },
+		ToolScript {
+			text: String::new(),
+			tool: Some(("advise", json!({"note": "late finding", "severity": "blocker"}))),
+		},
+		ToolScript { text: "noted".to_string(), tool: None },
+	]);
+	let root = std::env::temp_dir().join(format!(
+		"omp-rpc-advisor-{}-{}",
+		std::process::id(),
+		std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.unwrap_or_default()
+			.as_nanos()
+	));
+	fs::create_dir_all(root.join(".omp")).expect("project");
+	fs::write(
+		root.join(".omp/WATCHDOG.yml"),
+		"advisors:\n  - name: reviewer\n    model: local/advisor\n    tools:\n      - read\n",
+	)
+	.expect("watchdog");
+	let mut launch = launch(port, "local/mock-model", "local");
+	launch.cwd = root.clone();
+	launch.config.advisor.enabled = Some(true);
+	launch.config.model_roles.insert("advisor".to_string(), "local/advisor".to_string());
+	launch.config.model_roles.insert("slow".to_string(), "local/advisor".to_string());
+	let mut models = std::collections::BTreeMap::new();
+	for id in ["mock-model", "advisor"] {
+		models.insert(
+			id.to_string(),
+			ModelInfo {
+				provider: "local".to_string(),
+				context_window: Some(128_000),
+				..ModelInfo::default()
+			},
+		);
+	}
+	let mut catalog = Catalog::default();
+	catalog.providers.insert("local".to_string(), models);
+	launch.catalog = Arc::new(catalog);
+	let harness = Harness::start(launch);
+	harness.send(json!({"type": "prompt", "prompt": "check it"}));
+	harness.wait_for(
+		|frames| {
+			frames.iter().any(|frame| {
+				frame["type"] == "message_end"
+					&& frame["message"]["customType"] == "advisor"
+			})
+		},
+		timeout(),
+	);
+	assert!(harness.join().is_ok(), "EOF must publish the settled card");
+}

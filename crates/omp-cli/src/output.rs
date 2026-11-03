@@ -320,6 +320,46 @@ impl<W: Write, E: Write> Reporter<W, E> {
 		Ok(())
 	}
 
+	/// Emit one advisor advice card: NDJSON `message_start`/`message_end` pair
+	/// with the TS custom message shape in JSON mode, and a visible stderr block
+	/// in text mode. Cards are never silently dropped; the same content was
+	/// already persisted by the host as a `custom_message` entry.
+	pub fn advisor_card(
+		&mut self,
+		content: &str,
+		details: &serde_json::Value,
+	) -> Result<()> {
+		match self.mode {
+			OutputMode::Json => {
+				let mut message = serde_json::json!({
+					"role": "custom",
+					"customType": "advisor",
+					"display": true,
+					"content": [{ "type": "text", "text": content }],
+					"timestamp": current_timestamp_ms(),
+				});
+				if !details.is_null() {
+					message["details"] = details.clone();
+				}
+				let start = serde_json::json!({
+					"type": "message_start",
+					"message": { "role": "custom", "customType": "advisor", "display": true },
+				});
+				writeln!(self.out, "{start}")?;
+				let end = serde_json::json!({ "type": "message_end", "message": message });
+				writeln!(self.out, "{end}")?;
+				self.out.flush()?;
+			},
+			OutputMode::Text => {
+				writeln!(self.err, "advisor: {content}")?;
+				self.err.flush()?;
+			},
+			// `RpcMode` owns the writer; cards reach that wire as frames.
+			OutputMode::Rpc => {},
+		}
+		Ok(())
+	}
+
 	/// Flush the final assistant blocks (text mode) and stdout.
 	///
 	/// TS `print-mode.ts:228-233` walks `assistantMsg.content` in order: every

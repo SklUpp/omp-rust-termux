@@ -701,6 +701,111 @@ impl SkillsConfig {
 	}
 }
 
+
+/// `advisor.*`, `tier.advisor`, and `task.agentAdvisor`.
+///
+/// The advisor is a second model that passively reviews each primary turn.
+/// `enabled` defaults to `false`; `syncBacklog` pauses the primary up to 30s
+/// when the advisor falls this many turns behind (off/1/3/5, TS schema);
+/// `immuneTurns` is the post-interrupt cooldown (default 3). Invalid file
+/// values are warned about and dropped, matching the TS schema validator's
+/// "never kill the session" behavior in the Rust reader.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AdvisorSettings {
+	pub enabled:      Option<bool>,
+	/// `off` | `1` | `3` | `5`.
+	pub sync_backlog: Option<String>,
+	pub immune_turns: Option<i64>,
+	/// `none` | `inherit` | a concrete service tier.
+	pub tier:         Option<String>,
+	/// `task.agentAdvisor`: agent name -> `on` | `off` | model pattern.
+	pub agent_advisor: BTreeMap<String, String>,
+}
+
+impl AdvisorSettings {
+	#[must_use]
+	pub fn enabled(&self) -> bool {
+		self.enabled.unwrap_or(false)
+	}
+
+	/// Catch-up backlog threshold; `off`/absent disables the primary pause.
+	#[must_use]
+	pub fn sync_backlog(&self) -> Option<usize> {
+		match self.sync_backlog.as_deref() {
+			Some("1") => Some(1),
+			Some("3") => Some(3),
+			Some("5") => Some(5),
+			_ => None,
+		}
+	}
+
+	#[must_use]
+	pub fn immune_turns(&self) -> i64 {
+		self.immune_turns.unwrap_or(3).max(0)
+	}
+
+	#[must_use]
+	pub fn tier_setting(&self) -> &str {
+		self.tier.as_deref().unwrap_or("none")
+	}
+
+	#[must_use]
+	pub fn agent_advisor_for(&self, agent: &str) -> Option<&str> {
+		self.agent_advisor.get(agent).map(String::as_str)
+	}
+
+	fn merge(&mut self, overlay: Self) {
+		if overlay.enabled.is_some() {
+			self.enabled = overlay.enabled;
+		}
+		if overlay.sync_backlog.is_some() {
+			self.sync_backlog = overlay.sync_backlog;
+		}
+		if overlay.immune_turns.is_some() {
+			self.immune_turns = overlay.immune_turns;
+		}
+		if overlay.tier.is_some() {
+			self.tier = overlay.tier;
+		}
+		self.agent_advisor.extend(overlay.agent_advisor);
+	}
+}
+
+/// `model.toolCallLoopGuard.*`: same knobs as the primary loop, applied to
+/// each advisor's own loop.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ToolCallLoopGuardConfig {
+	pub enabled:      Option<bool>,
+	pub threshold:    Option<usize>,
+	pub exempt_tools: Option<Vec<String>>,
+}
+
+impl ToolCallLoopGuardConfig {
+	#[must_use]
+	pub fn enabled(&self) -> bool {
+		self.enabled.unwrap_or(true)
+	}
+
+	#[must_use]
+	pub fn threshold(&self) -> usize {
+		self.threshold.unwrap_or(5).max(1)
+	}
+
+	#[must_use]
+	pub fn exempt(&self, tool: &str) -> bool {
+		match self.exempt_tools.as_deref() {
+			Some(list) => list.iter().any(|name| name == tool),
+			None => tool == "hub",
+		}
+	}
+
+	fn merge(&mut self, overlay: Self) {
+		if overlay.enabled.is_some() { self.enabled = overlay.enabled; }
+		if overlay.threshold.is_some() { self.threshold = overlay.threshold; }
+		if overlay.exempt_tools.is_some() { self.exempt_tools = overlay.exempt_tools; }
+	}
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Config {
 	pub default_model:        Option<String>,
@@ -735,6 +840,10 @@ pub struct Config {
 	pub prewalk:              PrewalkConfig,
 	/// `security.enabled` (flat leaf; nested group for a typed home).
 	pub security:             crate::security::SecurityConfig,
+	/// `advisor.*`, `tier.advisor`, `task.agentAdvisor`.
+	pub advisor:              AdvisorSettings,
+	/// `model.toolCallLoopGuard.*`.
+	pub tool_call_loop_guard: ToolCallLoopGuardConfig,
 	/// `eval.*` backend enablement and interpreter groups.
 	pub eval_config:          EvalConfig,
 	/// `searxng.*`: the web-search endpoint and its credentials.
@@ -863,6 +972,8 @@ impl Config {
 		}
 		self.prewalk.merge(overlay.prewalk);
 		self.security.merge(overlay.security);
+		self.advisor.merge(overlay.advisor);
+		self.tool_call_loop_guard.merge(overlay.tool_call_loop_guard);
 		self.eval_config.merge(overlay.eval_config);
 		// `searxng.*` merges per leaf so an explicit host overlay can add
 		// credentials to a globally configured endpoint (and vice versa).
@@ -1288,6 +1399,9 @@ impl Config {
 		if let Some(models) = &cli.models {
 			self.model_scope = Some(models.clone());
 		}
+		if cli.advisor {
+			self.advisor.enabled = Some(true);
+		}
 		if cli.external_thinking {
 			self.external_thinking = true;
 		}
@@ -1316,6 +1430,33 @@ impl Config {
 fn apply_nested_settings(config: &mut Config, value: &Value, path: &Path) -> Result<()> {
 	if let Some(tier) = value.get("tier").and_then(Value::as_map) {
 		for (family, item) in tier {
+			if family == "advisor" {
+				let parsed = match item {
+					Value::Null => Some("none".to_string()),
+					_ => match expect_text(item, "tier.advisor", path)? {
+						Some(value) if matches!(value.as_str(), "none" | "inherit") => Some(value),
+						Some(value)
+							if ["openai", "anthropic", "google"]
+								.iter()
+								.any(|family| crate::service_tier::family_value(family, &value).is_some()) =>
+						{
+							Some(value)
+						},
+						Some(value) => {
+							eprintln!(
+								"warning: {}: tier.advisor value `{value}` is not realizable; ignoring",
+								path.display()
+							);
+							None
+						},
+						None => None,
+					},
+				};
+				if let Some(tier) = parsed {
+					config.advisor.tier = Some(tier);
+				}
+				continue;
+			}
 			if !matches!(family.as_str(), "openai" | "anthropic" | "google") {
 				continue;
 			}
@@ -1480,6 +1621,21 @@ fn apply_nested_settings(config: &mut Config, value: &Value, path: &Path) -> Res
 				"maxEffort" => {
 					config.max_effort = expect_text(item, "task.maxEffort", path)?;
 				},
+				"agentAdvisor" => {
+					let overrides = item.as_map().ok_or_else(|| {
+						invalid(path, "task.agentAdvisor", "expected a mapping")
+					})?;
+					for (agent, value) in overrides {
+						let Some(pattern) = value.to_text().filter(|value| !value.trim().is_empty())
+						else {
+							continue;
+						};
+						config
+							.advisor
+							.agent_advisor
+							.insert(agent.clone(), pattern.trim().to_string());
+					}
+				},
 				_ => {},
 			}
 		}
@@ -1562,6 +1718,93 @@ fn apply_nested_settings(config: &mut Config, value: &Value, path: &Path) -> Res
 	}
 	if let Some(enabled) = settings_leaf(value, "prewalk", "enabled", "prewalk.enabled") {
 		config.prewalk.enabled = expect_bool(enabled, "prewalk.enabled", path)?;
+	}
+	if let Some(enabled) = settings_leaf(value, "advisor", "enabled", "advisor.enabled") {
+		config.advisor.enabled = expect_bool(enabled, "advisor.enabled", path)?;
+	}
+	if let Some(enabled) = settings_nested_leaf(
+		value,
+		"model",
+		"toolCallLoopGuard",
+		"enabled",
+		"model.toolCallLoopGuard.enabled",
+	) {
+		config.tool_call_loop_guard.enabled =
+			expect_bool(enabled, "model.toolCallLoopGuard.enabled", path)?;
+	}
+	if let Some(threshold) = settings_nested_leaf(
+		value,
+		"model",
+		"toolCallLoopGuard",
+		"threshold",
+		"model.toolCallLoopGuard.threshold",
+	) {
+		match threshold {
+			Value::Int(value) if *value >= 1 => {
+				config.tool_call_loop_guard.threshold = Some(*value as usize);
+			},
+			_ => {
+				eprintln!(
+					"warning: {}: model.toolCallLoopGuard.threshold must be an integer >= 1; ignoring",
+					path.display()
+				);
+			},
+		}
+	}
+	if let Some(exempt) = settings_nested_leaf(
+		value,
+		"model",
+		"toolCallLoopGuard",
+		"exemptTools",
+		"model.toolCallLoopGuard.exemptTools",
+	) {
+		match exempt {
+			Value::List(items) => {
+				config.tool_call_loop_guard.exempt_tools = Some(
+					items
+						.iter()
+						.filter_map(Value::as_str)
+						.filter(|name| !name.is_empty())
+						.map(str::to_string)
+						.collect(),
+				);
+			},
+			_ => {
+				eprintln!(
+					"warning: {}: model.toolCallLoopGuard.exemptTools must be an array of tool names; ignoring",
+					path.display()
+				);
+			},
+		}
+	}
+	if let Some(sync) = settings_leaf(value, "advisor", "syncBacklog", "advisor.syncBacklog") {
+		match sync.to_text().as_deref() {
+			Some(value @ ("off" | "1" | "3" | "5")) => {
+				config.advisor.sync_backlog = Some(value.to_string());
+			},
+			_ => {
+				eprintln!(
+					"warning: {}: advisor.syncBacklog must be one of off, 1, 3, 5; ignoring",
+					path.display()
+				);
+			},
+		}
+	}
+	if let Some(immune) =
+		settings_leaf(value, "advisor", "immuneTurns", "advisor.immuneTurns")
+	{
+		match immune {
+			Value::Null => {},
+			Value::Int(value) if *value >= 0 => {
+				config.advisor.immune_turns = Some(*value);
+			},
+			_ => {
+				eprintln!(
+					"warning: {}: advisor.immuneTurns must be a non-negative integer; ignoring",
+					path.display()
+				);
+			},
+		}
 	}
 	// `searxng.*` feeds the `web_search` tool; environment fallbacks are applied
 	// by the runtime, which is the only place that may read `SEARXNG_*`.
@@ -2696,6 +2939,21 @@ mod tests {
 		assert!(config.configured_service_tiers().is_empty());
 	}
 
+	#[test]
+	fn tool_call_loop_guard_parser_accepts_threshold_one_and_yaml_lists() {
+		let config = parse_config(
+			"model:
+  toolCallLoopGuard:
+    threshold: 1
+    exemptTools: [hub, advise]
+",
+		)
+		.expect("loop guard");
+		assert_eq!(config.tool_call_loop_guard.threshold(), 1);
+		assert!(config.tool_call_loop_guard.exempt("advise"));
+		assert!(!config.tool_call_loop_guard.exempt("read"));
+	}
+
 	fn parse_config(text: &str) -> Result<Config> {
 		Config::from_value(&yaml::parse(text).expect("yaml"), Path::new("test.yml"))
 	}
@@ -3348,6 +3606,24 @@ mod tests {
 		layered.merge(parse_config("async:\n  enabled: false\n").expect("overlay"));
 		assert!(!layered.async_config.enabled());
 		assert!(parse_config("async:\n  enabled: nope\n").is_err());
+	}
+
+	#[test]
+	fn advisor_flag_overrides_a_disabled_file_layer() {
+		use clap::Parser;
+		let mut config = parse_config("advisor:\n  enabled: false\n").expect("config");
+		let cli = crate::args::Cli::try_parse_from([
+			"omp",
+			"--no-tools",
+			"--no-title",
+			"--mode",
+			"text",
+			"--advisor",
+			"say hi",
+		])
+		.expect("cli");
+		config.apply_runtime(&cli);
+		assert!(config.advisor.enabled());
 	}
 
 	#[test]

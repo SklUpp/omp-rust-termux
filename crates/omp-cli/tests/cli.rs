@@ -462,6 +462,7 @@ fn fake_request(prompt: &str) -> RunRequest {
 		skill_autoload: Default::default(),
 		continuation: false,
 		plan_context: None,
+		advisor_card_sink: None,
 		service_tier_by_family: std::collections::BTreeMap::new(),
 		security_host: None,
 		security_worker: false,

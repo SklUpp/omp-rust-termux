@@ -317,6 +317,55 @@ async fn complete_reports_empty_choices_and_invalid_json_as_protocol_errors() {
 	}
 }
 
+#[tokio::test]
+async fn openai_top_level_sse_error_is_protocol_and_redacted() {
+	let secret = "sk-boundary-secret";
+	let body = format!(
+		"data: {{\"error\":{{\"type\":\"server_error\",\"message\":\"boom {secret}\"}}}}\n\n\
+		 data: [DONE]\n\n"
+	);
+	let url = serve_responses(vec![response("200 OK", "text/event-stream", &body)]).await;
+	let provider =
+		OpenAiCompatibleProvider::new(url, secret, "model").expect("provider");
+	let mut stream = provider
+		.stream(&[Message::user("hi")], &[], &ToolChoice::Auto)
+		.await
+		.expect("stream");
+	let item = stream.next().await.expect("error chunk");
+	match item {
+		Err(ProviderError::Protocol(message)) => {
+			assert!(message.contains("server_error"), "{message}");
+			assert!(message.contains("boom"), "{message}");
+			assert!(message.contains("[redacted]"), "{message}");
+			assert!(!message.contains(secret), "{message}");
+			assert!(!message.contains("data:"), "raw SSE must not surface: {message}");
+		},
+		other => panic!("expected redacted protocol error, got {other:?}"),
+	}
+}
+
+#[tokio::test]
+async fn openai_top_level_sse_error_with_empty_key_stays_readable() {
+	let body = "data: {\"error\":{\"type\":\"server_error\",\"message\":\"boom\"}}\n\n\
+		data: [DONE]\n\n";
+	for key in ["", "   "] {
+		let url = serve_responses(vec![response("200 OK", "text/event-stream", body)]).await;
+		let provider = OpenAiCompatibleProvider::new(url, key, "model").expect("provider");
+		let mut stream = provider
+			.stream(&[Message::user("hi")], &[], &ToolChoice::Auto)
+			.await
+			.expect("stream");
+		let item = stream.next().await.expect("error chunk");
+		match item {
+			Err(ProviderError::Protocol(message)) => {
+				assert_eq!(message, "server_error: boom");
+				assert!(!message.contains("[redacted]"), "{message}");
+			},
+			other => panic!("expected protocol error, got {other:?}"),
+		}
+	}
+}
+
 #[test]
 fn sse_finish_reason_maps_exactly_like_ts() {
 	fn mapped(reason: &str) -> (Option<StopReason>, Option<String>) {

@@ -43,9 +43,22 @@ pub const LOCAL_SCHEME: &str = "local";
 /// `mcp://` for the built-in MCP resource consumer, `issue://`/`pr://` for the
 /// built-in native GitHub handlers, and `history://` for the session transcript
 /// reader mounted by `hub_park::register_history`.
+///
+/// `history://` and `security://` are per-session mounts rather than
+/// constructor built-ins; they install only through their own reserved mount
+/// helpers ([`register_security`] and `hub_park::register_history`), never
+/// through [`InternalUrlRouter::register`].
 pub const RESERVED_SCHEMES: [&str; 9] = [
 	"agent", "artifact", "history", "issue", "local", "mcp", "pr", "security", "ssh",
 ];
+
+/// Reserved scheme for the read-only security review surface.
+pub const SECURITY_SCHEME: &str = "security";
+
+/// The only reserved schemes OMP itself mounts after construction. Keeping the
+/// list closed is what stops a host bridge from installing a handler over any
+/// other built-in namespace.
+const RESERVED_MOUNT_SCHEMES: [&str; 2] = ["history", SECURITY_SCHEME];
 
 /// One parsed internal URL (`skill://plugin:name` style colons are preserved in
 /// the path because only the first `://` separates the scheme).
@@ -314,19 +327,22 @@ impl InternalUrlRouter {
 		Ok(self.lock_handlers().insert(scheme, handler))
 	}
 
-	/// Mount a reserved built-in handler.
+	/// Mount one of OMP's own reserved handlers.
 	///
-	/// Only OMP's own `history://` mount uses this: the scheme is reserved so a
-	/// host bridge cannot replace it, but the handler is still installed per
-	/// session because it is bound to one lifecycle manager. Every other
-	/// registration goes through [`Self::register`] and is refused.
+	/// Only `history://` (`hub_park::register_history`) and `security://`
+	/// ([`register_security`]) use this: both are reserved so a host bridge
+	/// cannot replace them, but they are installed per session or on opt-in.
+	/// Any other scheme — reserved or not — is refused here, so no host can
+	/// install itself over a built-in namespace.
 	pub(crate) fn register_core(
 		&self,
 		handler: Arc<dyn ProtocolHandler>,
 	) -> Result<Option<Arc<dyn ProtocolHandler>>, String> {
 		let scheme = handler.scheme().to_ascii_lowercase();
-		if !is_reserved_scheme(&scheme) {
-			return Err(format!("{scheme}:// is not a reserved built-in scheme"));
+		if !RESERVED_MOUNT_SCHEMES.contains(&scheme.as_str()) {
+			return Err(format!(
+				"{scheme}:// is not an OMP-reserved mount scheme"
+			));
 		}
 		Ok(self.lock_handlers().insert(scheme, handler))
 	}
@@ -412,6 +428,30 @@ impl InternalUrlRouter {
 	fn lock_handlers(&self) -> MutexGuard<'_, BTreeMap<String, Arc<dyn ProtocolHandler>>> {
 		self.handlers.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 	}
+}
+
+/// Mount the read-only `security://` review namespace.
+///
+/// `security://` is reserved for the OMP-native security surface: a host bridge
+/// can never register or replace it through [`InternalUrlRouter::register`].
+/// The CLI security module owns the handler and calls this to install it, so
+/// the mount pins the exact scheme and refuses a writable handler — the
+/// namespace stays read-only no matter what the caller passes.
+pub fn register_security(
+	router: &InternalUrlRouter,
+	handler: Arc<dyn ProtocolHandler>,
+) -> Result<(), String> {
+	if handler.scheme().to_ascii_lowercase() != SECURITY_SCHEME {
+		return Err(format!(
+			"security:// mount requires a handler for exactly {SECURITY_SCHEME}://"
+		));
+	}
+	if handler.writable() {
+		return Err(format!(
+			"{SECURITY_SCHEME}:// is read-only and refuses a writable handler"
+		));
+	}
+	router.register_core(handler).map(|_| ())
 }
 
 /// Registered scheme for live MCP resource reads.
@@ -933,6 +973,50 @@ mod tests {
 			assert!(!router.unregister(scheme));
 			assert!(router.get_handler(scheme).is_some());
 		}
+	}
+
+	#[test]
+	fn security_mount_is_exact_readonly_and_reserved() {
+		let router = InternalUrlRouter::new();
+		// The generic path keeps refusing the reserved namespace.
+		let error = router
+			.register(Echo::new(SECURITY_SCHEME, true, false))
+			.err()
+			.expect("reserved");
+		assert_eq!(error, "security:// is reserved for built-in handlers");
+		assert!(router.get_handler(SECURITY_SCHEME).is_none());
+
+		register_security(&router, Echo::new(SECURITY_SCHEME, true, false)).expect("mount security");
+		let mounted = router.get_handler(SECURITY_SCHEME).expect("mounted");
+		assert_eq!(mounted.scheme(), SECURITY_SCHEME);
+
+		let error = register_security(&router, Echo::new("notes", true, false))
+			.err()
+			.expect("wrong scheme");
+		assert_eq!(
+			error,
+			"security:// mount requires a handler for exactly security://"
+		);
+
+		let error = register_security(&router, Echo::new(SECURITY_SCHEME, false, true))
+			.err()
+			.expect("writable handler");
+		assert_eq!(
+			error,
+			"security:// is read-only and refuses a writable handler"
+		);
+
+		// Another reserved scheme cannot ride the security mount or the core.
+		let error = register_security(&router, Echo::new("local", true, false))
+			.err()
+			.expect("reserved scheme");
+		assert!(error.contains("exactly security://"));
+		let error = router
+			.register_core(Echo::new("mcp", true, false))
+			.err()
+			.expect("core refuses non-mount schemes");
+		assert_eq!(error, "mcp:// is not an OMP-reserved mount scheme");
+		assert!(router.get_handler("mcp").is_some());
 	}
 
 	#[test]

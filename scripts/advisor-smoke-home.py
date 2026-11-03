@@ -968,6 +968,7 @@ def phase_child_failure(binary: str, mock: MockModel, base: Path) -> None:
     mock.child_phase = True
     mock.child_error = True
     out = child_run(binary, agent_dir, cwd, sessions)
+    mock.dump(base / "child-failure" / "child-failure-mock-requests.json")
     if out.returncode != 0:
         fail(f"contained child failure exited {out.returncode}: {out.stderr}")
     requests = list(mock.requests)

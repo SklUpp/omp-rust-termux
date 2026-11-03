@@ -688,6 +688,7 @@ fn gc_live_and_breaker_locks_block_and_stale_lock_recovers() {
 }
 
 #[test]
+
 fn gc_wal_apply_failure_is_nonzero_and_releases_lock() {
 	let dir = TempDir::new("gc-wal-apply");
 	let agent = dir.path().join("agent");
@@ -887,7 +888,10 @@ fn gc_guard_lock_contends_and_persists_without_blocking_after_release() {
 	fs::create_dir_all(&agent).expect("agent dir");
 	let lock_path = agent.join("gc.lock");
 	let guard = open_gc_guard(&lock_path).expect("first guard");
-	let error = acquire_gc_lock(&agent).expect_err("contended guard");
+	let error = match acquire_gc_lock(&agent) {
+		Err(error) => error,
+		Ok(_) => panic!("contended guard must block acquisition"),
+	};
 	assert!(error.contains("GC already running"), "{error}");
 	assert!(!lock_path.exists(), "contention must not create gc.lock");
 	drop(guard);

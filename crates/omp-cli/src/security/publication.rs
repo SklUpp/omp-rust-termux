@@ -41,88 +41,73 @@ const DESCRIPTION: &str = include_str!(
 );
 
 /// `securityPublishSchema` (snake_case tool arguments).
+///
+/// Nested pieces are built as locals: one `json!` literal this deep exceeds the
+/// macro expansion budget, and the composed value is byte-identical.
 #[must_use]
 pub fn security_publish_schema() -> Value {
+	let location = json!({
+		"type": "object",
+		"additionalProperties": false,
+		"required": ["path", "start_line"],
+		"properties": {
+			"path": {"type": "string", "minLength": 1},
+			"start_line": {"type": "integer", "minimum": 1},
+			"end_line": {"type": "integer", "minimum": 1},
+			"start_column": {"type": "integer", "minimum": 1},
+			"end_column": {"type": "integer", "minimum": 1},
+			"role": {"type": "string"}
+		}
+	});
+	let evidence = json!({
+		"type": "object",
+		"additionalProperties": false,
+		"required": ["label", "explanation"],
+		"properties": {
+			"label": {"type": "string", "minLength": 1},
+			"explanation": {"type": "string"},
+			"excerpt": {"type": "string"},
+			"location": location.clone()
+		}
+	});
+	let finding = json!({
+		"type": "object",
+		"additionalProperties": false,
+		"required": ["rule_id", "title", "summary", "severity", "confidence", "category", "locations"],
+		"properties": {
+			"rule_id": {"type": "string", "minLength": 1},
+			"title": {"type": "string", "minLength": 1},
+			"summary": {"type": "string"},
+			"severity": {"enum": ["critical", "high", "medium", "low", "informational"]},
+			"confidence": {"enum": ["high", "medium", "low"]},
+			"category": {"type": "string", "minLength": 1},
+			"anchor": {"type": "string"},
+			"cwe": {"type": "array", "items": {"type": "string"}},
+			"locations": {"type": "array", "minItems": 1, "items": location},
+			"evidence": {"type": "array", "items": evidence},
+			"remediation": {"type": "string"},
+			"validation": {"enum": ["unvalidated", "validated", "partial"]}
+		}
+	});
+	let coverage = json!({
+		"type": "object",
+		"additionalProperties": false,
+		"required": ["completeness"],
+		"properties": {
+			"completeness": {"enum": ["complete", "partial", "unknown"]},
+			"surfaces": {"type": "array", "items": {"type": "object"}},
+			"explicit_exclusions": {"type": "array", "items": {"type": "object"}},
+			"deferred": {"type": "array", "items": {"type": "object"}},
+			"open_questions": {"type": "array", "items": {"type": "object"}}
+		}
+	});
 	json!({
 		"type": "object",
 		"additionalProperties": false,
 		"required": ["findings", "coverage", "report"],
 		"properties": {
-			"findings": {
-				"type": "array",
-				"items": {
-					"type": "object",
-					"additionalProperties": false,
-					"required": ["rule_id", "title", "summary", "severity", "confidence", "category", "locations"],
-					"properties": {
-						"rule_id": {"type": "string", "minLength": 1},
-						"title": {"type": "string", "minLength": 1},
-						"summary": {"type": "string"},
-						"severity": {"enum": ["critical", "high", "medium", "low", "informational"]},
-						"confidence": {"enum": ["high", "medium", "low"]},
-						"category": {"type": "string", "minLength": 1},
-						"anchor": {"type": "string"},
-						"cwe": {"type": "array", "items": {"type": "string"}},
-						"locations": {
-							"type": "array",
-							"minItems": 1,
-							"items": {
-								"type": "object",
-								"additionalProperties": false,
-								"required": ["path", "start_line"],
-								"properties": {
-									"path": {"type": "string", "minLength": 1},
-									"start_line": {"type": "integer", "minimum": 1},
-									"end_line": {"type": "integer", "minimum": 1},
-									"start_column": {"type": "integer", "minimum": 1},
-									"end_column": {"type": "integer", "minimum": 1},
-									"role": {"type": "string"}
-								}
-							}
-						},
-						"evidence": {
-							"type": "array",
-							"items": {
-								"type": "object",
-								"additionalProperties": false,
-								"required": ["label", "explanation"],
-								"properties": {
-									"label": {"type": "string", "minLength": 1},
-									"explanation": {"type": "string"},
-									"excerpt": {"type": "string"},
-									"location": {
-										"type": "object",
-										"additionalProperties": false,
-										"required": ["path", "start_line"],
-										"properties": {
-											"path": {"type": "string", "minLength": 1},
-											"start_line": {"type": "integer", "minimum": 1},
-											"end_line": {"type": "integer", "minimum": 1},
-											"start_column": {"type": "integer", "minimum": 1},
-											"end_column": {"type": "integer", "minimum": 1},
-											"role": {"type": "string"}
-										}
-									}
-								}
-							}
-						},
-						"remediation": {"type": "string"},
-						"validation": {"enum": ["unvalidated", "validated", "partial"]}
-					}
-				}
-			},
-			"coverage": {
-				"type": "object",
-				"additionalProperties": false,
-				"required": ["completeness"],
-				"properties": {
-					"completeness": {"enum": ["complete", "partial", "unknown"]},
-					"surfaces": {"type": "array", "items": {"type": "object"}},
-					"explicit_exclusions": {"type": "array", "items": {"type": "object"}},
-					"deferred": {"type": "array", "items": {"type": "object"}},
-					"open_questions": {"type": "array", "items": {"type": "object"}}
-				}
-			},
+			"findings": {"type": "array", "items": finding},
+			"coverage": coverage,
 			"report": {"type": "string"}
 		}
 	})

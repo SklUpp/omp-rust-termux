@@ -318,12 +318,21 @@ class Handler(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(length) or b"{}")
         messages = body.get("messages") or []
         names = tool_names(body)
+        last = messages[-1] if messages else {}
         serialized = json.dumps(messages)
+        # Child routing needs the child's user turn, not a worker tool result
+        # that merely echoes the task JSON back.
+        child_route = (
+            last.get("role") == "user"
+            and "ADVISED_CHILD_TASK" in message_text(last)
+            and "security_publish" not in names
+        )
         with request_lock, open(request_log, "a", encoding="utf-8") as handle:
             handle.write(json.dumps({
                 "model": body.get("model"),
                 "marker": "WORKER_ADVISOR_MARKER" in serialized,
                 "child": "ADVISED_CHILD_TASK" in serialized,
+                "child_route": child_route,
             }) + "\n")
         if message_text(messages[-1] if messages else {}).find("NO_TOOLS_TASK") >= 0:
             # `--no-tools` must carry an empty tool definition list: any mounted
@@ -337,7 +346,7 @@ class Handler(BaseHTTPRequestHandler):
             # The root session's passive advisor is allowed; the worker and its
             # advised child must never reach this route (asserted below).
             payload = text("advisor-ack")
-        elif "ADVISED_CHILD_TASK" in message_text(messages[-1] if messages else {}):
+        elif child_route:
             payload = text("child-done")
         elif "security_scan" in names:
             payload = root_reply(messages, body)
@@ -531,7 +540,7 @@ check "normal root advisor ran without worker markers" \
 	grep -q '"model": "advisor".*"marker": false.*"child": false' "$ROOT/requests.log"
 check "security worker had zero advisor requests" \
 	bash -c "! grep -q '\"model\": \"advisor\".*\"marker\": true' '$ROOT/requests.log'"
-check "advised child was spawned" grep -q '"child": true' "$ROOT/requests.log"
+check "advised child was routed" grep -q '"child_route": true' "$ROOT/requests.log"
 check "security worker had no child advisor request" \
 	bash -c "! grep -q '\"model\": \"advisor\".*\"child\": true' '$ROOT/requests.log'"
 check "security worker spawned no MCP server" bash -c "! test -f '$ROOT/mcp-started.log'"

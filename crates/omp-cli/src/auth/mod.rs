@@ -37,6 +37,7 @@ pub mod flows;
 pub mod http;
 pub mod pkce;
 pub mod registry;
+pub mod security;
 pub mod selection;
 pub mod store;
 
@@ -438,6 +439,96 @@ impl AuthBackend {
 			)
 			.await
 		}))
+	}
+
+	/// The backing store. Security pinning reads exact rows here instead of
+	/// going through the normal credential precedence.
+	pub(crate) fn store(&self) -> &CredentialStore {
+		&self.store
+	}
+
+	/// Selection state owned by this backend (session stickiness only; the
+	/// security path never rotates).
+	pub(crate) fn selection_state(&self) -> &SelectionState {
+		&self.selection
+	}
+
+	/// Resolve one exact OAuth row for a security scan.
+	///
+	/// `force_refresh` asks the provider even when the token is still fresh
+	/// (auth-retry "last chance" path). A refresh re-reads the SAME row and
+	/// never falls back to a sibling, an API key, env, or a static credential.
+	/// Returns the durable identity of the row and its raw access token.
+	///
+	/// Call from a blocking thread: refresh may await the provider.
+	pub(crate) fn resolve_exact_oauth_access(
+		&self,
+		provider_id: &str,
+		credential_id: i64,
+		force_refresh: bool,
+		cancel: &Cancel,
+	) -> Result<(security::SecurityOAuthAccount, String), AuthError> {
+		require_blocking_context(provider_id)?;
+		let runtime = runtime()?;
+		runtime.block_on(self.resolve_exact_oauth_access_core(
+			provider_id,
+			credential_id,
+			force_refresh,
+			cancel,
+		))
+	}
+
+	async fn resolve_exact_oauth_access_core(
+		&self,
+		provider_id: &str,
+		credential_id: i64,
+		force_refresh: bool,
+		cancel: &Cancel,
+	) -> Result<(security::SecurityOAuthAccount, String), AuthError> {
+		let unavailable = || {
+			AuthError::config(provider_id, "The pinned security OAuth credential is unavailable")
+		};
+		let entry = registry::find(provider_id).ok_or_else(|| AuthError::unknown_provider(provider_id))?;
+		let stored_as = registry::storage_provider(entry);
+		let Some(stored) = self.store.active_by_id(credential_id)? else {
+			return Err(unavailable());
+		};
+		if stored.provider != stored_as {
+			return Err(unavailable());
+		}
+		let Credential::OAuth(creds) = stored.credential.clone() else {
+			return Err(AuthError::config(
+				provider_id,
+				"The pinned security OAuth credential is unavailable",
+			));
+		};
+		if force_refresh || now_ms() >= effective_expiry(provider_id, &creds) {
+			self.refresh_core(provider_id, credential_id, &stored.data, &creds, cancel)
+				.await?;
+		}
+		// Re-read the exact row: the refreshed access token and the identity
+		// metadata must come from the same durable credential.
+		let Some(current) = self.store.active_by_id(credential_id)? else {
+			return Err(unavailable());
+		};
+		let Credential::OAuth(current_creds) = current.credential else {
+			return Err(unavailable());
+		};
+		if now_ms() >= effective_expiry(provider_id, &current_creds) {
+			return Err(AuthError::config(
+				provider_id,
+				"The pinned security OAuth credential could not be resolved",
+			));
+		}
+		let account = security::SecurityOAuthAccount {
+			provider: provider_id.to_string(),
+			credential_id: current.id,
+			account_id: current_creds.account_id,
+			email: current_creds.email,
+			org_id: current_creds.org_id,
+			org_name: current_creds.org_name,
+		};
+		Ok((account, current_creds.access))
 	}
 
 	/// `#selectCredentialByType` against this backend's store and policy.

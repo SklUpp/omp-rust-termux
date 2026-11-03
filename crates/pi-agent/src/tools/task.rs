@@ -996,6 +996,8 @@ impl TaskTool {
 				}
 
 				let finalized = finalize_output(&item, &turn_results, &base_output, is_aborted);
+				let terminal_error = terminal_error_message(&turn_results)
+					.and_then(|message| message.error_message.clone());
 				let (output, output_truncated) = cap_result_text(&finalized.output);
 				let exit_code = if is_aborted { 1 } else { finalized.exit_code };
 
@@ -1050,7 +1052,7 @@ impl TaskTool {
 					duration_ms,
 					tokens: 0,
 					requests,
-					error: None,
+					error: terminal_error,
 					aborted: if is_aborted { Some(true) } else { None },
 					abort_reason,
 					extracted_tool_data,
@@ -2919,6 +2921,17 @@ pub(crate) fn follow_up_output(
 	Some(finalize_output(&item, turns, &base, false).output)
 }
 
+/// Last assistant turn that ended with a provider error. The loop keeps such a
+/// terminal turn in `Ok(turns)` so callers can journal the error message and
+/// partial usage; the task outcome must still fail instead of accepting it.
+fn terminal_error_message(turns: &[TurnResult]) -> Option<&Message> {
+	turns
+		.iter()
+		.rev()
+		.map(|turn| &turn.message)
+		.find(|message| message.stop_reason == Some(crate::state::StopReason::Error))
+}
+
 fn finalize_output(
 	item: &TaskItemSpec,
 	turns: &[TurnResult],
@@ -2929,6 +2942,15 @@ fn finalize_output(
 		return FinalizedOutput {
 			output: base.to_string(),
 			stderr: String::new(),
+			exit_code: 1,
+			structured: None,
+			failed: true,
+		};
+	}
+	if let Some(message) = terminal_error_message(turns) {
+		return FinalizedOutput {
+			output: base.to_string(),
+			stderr: message.error_message.clone().unwrap_or_default(),
 			exit_code: 1,
 			structured: None,
 			failed: true,
@@ -4769,6 +4791,81 @@ mod tests {
 		) {
 			self.aborted.lock().expect("hook").push(aborted);
 		}
+	}
+
+	struct TerminalErrorProvider;
+
+	#[async_trait]
+	impl ModelProvider for TerminalErrorProvider {
+		async fn complete(
+			&self,
+			_messages: &[Message],
+			_tools: &[serde_json::Value],
+			_tool_choice: &ToolChoice,
+		) -> std::result::Result<Message, ProviderError> {
+			Err(ProviderError::Network("unused".to_string()))
+		}
+
+		async fn stream(
+			&self,
+			_messages: &[Message],
+			_tools: &[serde_json::Value],
+			_tool_choice: &ToolChoice,
+		) -> std::result::Result<ChunkStream, ProviderError> {
+			let chunk = crate::provider::StreamChunk {
+				content: Some("partial answer".to_string()),
+				reasoning: None,
+				tool_call_deltas: Vec::new(),
+				usage: Some(TokenUsage {
+					input: 11,
+					output: 7,
+					total_tokens: 18,
+					..TokenUsage::default()
+				}),
+				is_done: true,
+				disabled_features: None,
+				content_index: None,
+				signature: None,
+				redacted: None,
+				stop_reason: Some(crate::state::StopReason::Error),
+				error_message: Some("upstream failed".to_string()),
+			};
+			Ok(Box::pin(futures::stream::iter(vec![Ok(chunk)])))
+		}
+	}
+
+	#[tokio::test]
+	async fn child_terminal_provider_error_fails_task_result() {
+		let root: Arc<dyn ModelProvider> = Arc::new(NullProvider);
+		let child: Arc<dyn ModelProvider> = Arc::new(TerminalErrorProvider);
+		let supervisor = Supervisor::with_selection(
+			ToolRegistry::new(),
+			Arc::clone(&root),
+			None,
+			DelegationLimits::default(),
+			true,
+			false,
+		);
+		let mut agent = model_agent();
+		agent.blocking = true;
+		let catalog = Arc::new(
+			AgentCatalog::new(vec![agent], None)
+				.with_model_factory(Arc::new(SharedFactory(Arc::clone(&child)))),
+		);
+		let tool = TaskTool::new(Arc::clone(&supervisor), 0).with_catalog(catalog);
+		let context = AgentContext::new(std::env::temp_dir());
+		let result = tool
+			.execute(&json!({ "agent": "task", "task": "work" }), &context)
+			.await
+			.expect("terminal child still returns a tool envelope");
+		let details: TaskToolDetails =
+			serde_json::from_str(&result.content).expect("task details");
+		let child = &details.results[0];
+		assert_eq!(child.exit_code, 1, "terminal provider error must fail the task");
+		assert_eq!(child.error.as_deref(), Some("upstream failed"));
+		assert_eq!(child.stderr, "upstream failed");
+		assert_eq!(child.output, "partial answer", "partial child text survives");
+		assert_eq!(child.usage.expect("reported usage").input, 11);
 	}
 
 	#[tokio::test]

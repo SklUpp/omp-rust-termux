@@ -531,10 +531,26 @@ pub(crate) type CloseHook = Arc<dyn Fn(&str) + Send + Sync>;
 struct TurnDone {
 	stop_reason: String,
 	usage: Option<Value>,
-	error: Option<RequestError>,
+	pub error: Option<RequestError>,
+}
+
+/// Active plan mode, not the `plan.enabled` feature flag: an idle session with
+/// the feature on must still allow auto-learn capture.
+fn plan_is_active(gate: &PlanGate) -> bool {
+	gate.state.as_ref().is_some_and(|state| state.enabled)
+}
+
+/// TS reads `stopReason` from the last assistant message; a local cancel is
+/// not the only abort signal.
+fn stopped_aborted(stop_reason: Option<&str>) -> bool {
+	stop_reason == Some("aborted")
 }
 
 impl AcpSession {
+	fn plan_active(&self) -> bool {
+		plan_is_active(&self.lock_plan())
+	}
+
 	#[must_use]
 	pub fn id(&self) -> &str {
 		&self.id
@@ -1164,6 +1180,8 @@ impl AcpSession {
 		let mut last_calls: Vec<PlanToolCall> = Vec::new();
 		let mut stream_error: Option<String> = None;
 		let mut capture_tool_calls = 0usize;
+		let turn_started_in_goal = session.goal.has_goal();
+		let mut last_assistant_stop: Option<String> = None;
 		let runner = Arc::clone(&self.runtime.recipe.runner);
 		match runner.run(&request) {
 			Ok(stream) => {
@@ -1173,6 +1191,10 @@ impl AcpSession {
 							session.observe_event(&mut prepared, &event);
 							match &event {
 								AgentEvent::MessageEnd { message, stop_reason, .. } => {
+									if message.role == pi_agent::state::Role::Assistant {
+										last_assistant_stop =
+											message.stop_reason.clone().or(stop_reason.clone());
+									}
 									if stop_reason.is_some() {
 										last_stop = stop_reason.clone().unwrap_or_default();
 									}
@@ -1314,14 +1336,17 @@ impl AcpSession {
 		// the provider call so host commands are not blocked by capture.
 		let capture = if done.error.is_none() {
 			let (manage, learn) = session.autolearn_tool_presence();
-			let goal_mode = session.goal.has_goal();
-			let plan_enabled = self.plan_enabled();
-			crate::autolearn::should_auto_capture(
+			let goal_now = session.goal.has_goal();
+			let plan_active = self.plan_active();
+			let aborted =
+				cancelled || stopped_aborted(last_assistant_stop.as_deref());
+			crate::autolearn::should_capture_turn(
 				&session.config,
 				capture_tool_calls,
-				false,
-				plan_enabled,
-				goal_mode,
+				aborted,
+				plan_active,
+				turn_started_in_goal,
+				goal_now,
 				manage || learn,
 			)
 			.then(|| session.autolearn_capture_request())
@@ -3764,7 +3789,57 @@ impl AcpSession {
 mod tests {
 	use std::sync::Arc;
 
-	use super::{PromptGate, ReserveOpen, SessionManager};
+	use super::{PromptGate, ReserveOpen, SessionManager, plan_is_active, stopped_aborted};
+
+	#[test]
+	fn capture_gate_uses_active_plan_state_not_the_feature_flag() {
+		use crate::acp::plan::{AcpPlanState, PlanGate};
+		use crate::autolearn::should_capture_turn;
+
+		let mut config = crate::config::Config::default();
+		assert!(config.plan.enabled(), "plan feature defaults to enabled");
+		config.autolearn.enabled = Some(true);
+		config.autolearn.auto_continue = Some(true);
+		config.autolearn.min_tool_calls = Some(1);
+
+		let mut gate = PlanGate::new(true);
+		assert!(!plan_is_active(&gate), "feature enabled, plan idle");
+		assert!(should_capture_turn(
+			&config,
+			1,
+			false,
+			plan_is_active(&gate),
+			false,
+			false,
+			true
+		));
+		gate.state = Some(AcpPlanState::enter(None));
+		assert!(plan_is_active(&gate));
+		assert!(!should_capture_turn(
+			&config,
+			1,
+			false,
+			plan_is_active(&gate),
+			false,
+			false,
+			true
+		));
+	}
+
+	#[test]
+	fn capture_gate_skips_cancelled_aborted_and_completed_goal_turns() {
+		use crate::autolearn::should_capture_turn;
+
+		let mut config = crate::config::Config::default();
+		config.autolearn.enabled = Some(true);
+		config.autolearn.auto_continue = Some(true);
+		config.autolearn.min_tool_calls = Some(1);
+		assert!(stopped_aborted(Some("aborted")));
+		assert!(!stopped_aborted(Some("endTurn")));
+		assert!(!should_capture_turn(&config, 1, true, false, false, false, true));
+		assert!(!should_capture_turn(&config, 1, false, false, true, false, true));
+		assert!(should_capture_turn(&config, 1, false, false, false, false, true));
+	}
 
 	#[test]
 	fn reservation_blocks_duplicate_open_until_dropped() {

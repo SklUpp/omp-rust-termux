@@ -492,6 +492,26 @@ fn autoload_skills_reach_the_child_conversation_once() {
 		"autoload must precede the assignment"
 	);
 	assert_eq!(
+		messages[autoload_index].get("role").and_then(serde_json::Value::as_str),
+		Some("developer"),
+		"autoload is hidden developer guidance, not a user turn"
+	);
+	assert_eq!(
+		messages[assignment_index].get("role").and_then(serde_json::Value::as_str),
+		Some("user"),
+		"the assignment is the only user message"
+	);
+	assert_eq!(
+		messages
+			.iter()
+			.filter(|message| {
+				message.get("role").and_then(serde_json::Value::as_str) == Some("user")
+			})
+			.count(),
+		1,
+		"autoload must not add a second user turn"
+	);
+	assert_eq!(
 		messages
 			.iter()
 			.filter(|message| message_text(message).contains("Complete assignment thoroughly:"))
@@ -506,5 +526,76 @@ fn autoload_skills_reach_the_child_conversation_once() {
 			.count(),
 		1,
 		"autoload body must appear once"
+	);
+}
+
+#[test]
+fn disabled_extensions_remove_a_skill_from_every_surface() {
+	let server = MockModel::start();
+	let temp = temp_dir("disabled-skill");
+	let agent_dir = temp.join("agent");
+	let cwd = temp.join("project");
+	let sessions_dir = temp.join("sessions");
+	let share_dir = temp.join("share");
+	let config_dir = temp.join("config");
+	for dir in [&sessions_dir, &share_dir, &config_dir, &cwd] {
+		fs::create_dir_all(dir).expect("fixture dir");
+	}
+	setup_agent_dir(&agent_dir, server.port);
+	let config = fs::read_to_string(agent_dir.join("config.yml")).expect("config.yml");
+	fs::write(
+		agent_dir.join("config.yml"),
+		format!("{config}disabledExtensions:\n  - skill:blocked\n"),
+	)
+	.expect("disabledExtensions");
+	fs::create_dir_all(cwd.join(".omp/skills/blocked")).expect("skill dir");
+	fs::write(
+		cwd.join(".omp/skills/blocked/SKILL.md"),
+		"---\nname: blocked\ndescription: Disabled project skill\n---\nBLOCKED BODY MARKER\n",
+	)
+	.expect("skill md");
+
+	let output = ProcCommand::new(env!("CARGO_BIN_EXE_omp"))
+		.env("PI_CODING_AGENT_DIR", &agent_dir)
+		.env("PI_CONFIG_DIR", &config_dir)
+		.env("OMP_SHARE_DIR", &share_dir)
+		.env("PI_NO_TITLE", "1")
+		.stdin(Stdio::null())
+		.args(["--cwd", cwd.to_str().unwrap()])
+		.args(["--session-dir", sessions_dir.to_str().unwrap()])
+		.args(["--no-session", "--tools", "read", "--yolo"])
+		.args(["--max-time", "20s", "--mode", "text", "-p"])
+		.args(["/skill:blocked now"])
+		.output()
+		.expect("run omp with a disabled skill");
+	assert_eq!(
+		output.status.code(),
+		Some(0),
+		"{}",
+		String::from_utf8_lossy(&output.stderr)
+	);
+	let requests = server.requests.lock().expect("requests").clone();
+	assert!(!requests.is_empty(), "provider was reached");
+	let system = requests[0]
+		.get("messages")
+		.and_then(serde_json::Value::as_array)
+		.and_then(|messages| messages.first())
+		.map(message_text)
+		.unwrap_or_default();
+	assert!(!system.contains("blocked"), "prompt listing must omit it: {system}");
+	let user = requests[0]
+		.get("messages")
+		.and_then(serde_json::Value::as_array)
+		.and_then(|messages| messages.last())
+		.map(message_text)
+		.unwrap_or_default();
+	assert_eq!(user, "/skill:blocked now", "disabled slash command stays literal");
+	assert!(
+		!requests
+			.iter()
+			.any(|request| serde_json::to_string(request)
+				.expect("request json")
+				.contains("BLOCKED BODY MARKER")),
+		"disabled skill body must never reach the provider"
 	);
 }

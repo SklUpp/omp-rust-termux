@@ -1294,6 +1294,9 @@ impl TaskTool {
 		// fill must prove it addresses this exact record, never a later one.
 		let spawn_result_key = self.supervisor.capture_result_key(&child_id);
 		let supervisor = self.supervisor.clone();
+		// Capture the resolver with the spawn, like the foreground path: a later
+		// root turn must not change a background child's autoload view.
+		let autoload = self.autoload.clone();
 		// Per-`TaskTool` (per-session) permits: nested spawns use their own
 		// semaphore, so a parent holding a permit while waiting for descendants
 		// cannot deadlock when every parent permit is occupied.
@@ -1335,6 +1338,7 @@ impl TaskTool {
 			}
 			let outcome = run_background_child(
 				supervisor.clone(),
+				autoload,
 				task_id.clone(),
 				item,
 				cwd,
@@ -1707,6 +1711,7 @@ enum TerminalMark {
 /// a background job.
 async fn run_background_child(
 	supervisor: Arc<Supervisor>,
+	autoload: Option<Arc<dyn AutoloadSkillResolver>>,
 	child_id: String,
 	item: TaskItemSpec,
 	cwd: std::path::PathBuf,
@@ -1772,7 +1777,7 @@ async fn run_background_child(
 		system_prompt: child_system_prompt(&item.agent, prompt_schema.as_ref()),
 		cwd: child_cwd,
 	};
-	let autoload_msgs = autoload_messages(supervisor.autoload_resolver().as_deref(), &item.agent)
+	let autoload_msgs = autoload_messages(autoload.as_deref(), &item.agent)
 		.map_err(AgentError::Internal)?;
 	// An isolated child is merged and its worktree is deleted after finalize,
 	// so a revivable contract would restore it into a stale workspace.
@@ -2493,7 +2498,9 @@ fn autoload_messages(
 	let mut messages = Vec::new();
 	for name in &agent.autoload_skills {
 		match resolver.autoload_message(name)? {
-			Some(message) if !message.is_empty() => messages.push(Message::user(message)),
+			Some(message) if !message.is_empty() => {
+				messages.push(Message::guidance("skill-prompt", message));
+			},
 			_ => {},
 		}
 	}
@@ -4751,6 +4758,7 @@ mod tests {
 		let (_steering_tx, steering_rx) = tokio::sync::mpsc::channel(1);
 		let _ = run_background_child(
 			Arc::clone(&supervisor),
+			None,
 			"task-bg".to_string(),
 			item,
 			std::path::PathBuf::from("."),
@@ -4771,5 +4779,77 @@ mod tests {
 			!recorded.iter().any(|provider| Arc::ptr_eq(provider, &root)),
 			"background child eval must never fall back to the root provider"
 		);
+	}
+
+	struct FixedAutoload(&'static str);
+
+	impl AutoloadSkillResolver for FixedAutoload {
+		fn autoload_message(&self, _name: &str) -> std::result::Result<Option<String>, String> {
+			Ok(Some(self.0.to_string()))
+		}
+	}
+
+	struct FailingAutoload;
+
+	impl AutoloadSkillResolver for FailingAutoload {
+		fn autoload_message(&self, _name: &str) -> std::result::Result<Option<String>, String> {
+			Err("captured sentinel".to_string())
+		}
+	}
+
+	/// A background spawn must resolve `autoloadSkills` through the resolver it
+	/// captured, not through a later root-turn resolver on the supervisor.
+	#[tokio::test]
+	async fn background_child_uses_the_resolver_captured_at_spawn() {
+		let root: Arc<dyn ModelProvider> = Arc::new(NullProvider);
+		let child: Arc<dyn ModelProvider> = Arc::new(NullProvider);
+		let supervisor = Supervisor::with_selection(
+			ToolRegistry::new(),
+			Arc::clone(&root),
+			None,
+			DelegationLimits::default(),
+			true,
+			false,
+		);
+		supervisor.set_autoload_resolver(Some(Arc::new(FixedAutoload("SUPERVISOR"))));
+		let catalog = Arc::new(
+			AgentCatalog::new(vec![model_agent()], None)
+				.with_model_factory(Arc::new(SharedFactory(child))),
+		);
+		let tool = TaskTool::new(Arc::clone(&supervisor), 0).with_catalog(catalog);
+		let mut agent = model_agent();
+		agent.autoload_skills = vec!["needed".to_string()];
+		let item = TaskItemSpec {
+			name: "task-bg".to_string(),
+			agent,
+			task: "work".to_string(),
+			context: None,
+			output_schema: None,
+			schema_mode: SchemaMode::default(),
+			schema_error: None,
+			effort: None,
+			isolation: IsolationRequest::default(),
+		};
+		let (_steering_tx, steering_rx) = tokio::sync::mpsc::channel(1);
+		let result = run_background_child(
+			Arc::clone(&supervisor),
+			Some(Arc::new(FailingAutoload)),
+			"task-bg".to_string(),
+			item,
+			std::path::PathBuf::from("."),
+			steering_rx,
+			tokio_util::sync::CancellationToken::new(),
+			tool.child_context(),
+			None,
+			Arc::new(Mutex::new(ChildSalvage::default())),
+		)
+		.await;
+		match result {
+			Err(AgentError::Internal(message)) => assert!(
+				message.contains("captured sentinel"),
+				"background child must use the captured resolver, got {message}"
+			),
+			other => panic!("expected the captured resolver to fail the spawn, got {other:?}"),
+		}
 	}
 }

@@ -977,6 +977,7 @@ fn run() -> std::result::Result<(), CliError> {
 		history: Vec::new(),
 		checkpoint_host: CheckpointHost::new(),
 		turn_tool_calls: 0,
+		turn_started_in_goal: false,
 		in_memory_messages: None,
 		session_dir: session_dir.clone(),
 		goal: Arc::new(GoalRuntime::new()),
@@ -1605,6 +1606,9 @@ struct Session<'a> {
 	/// Tool results in the just-finished turn (TS `tool_execution_end` count),
 	/// consumed by the `autolearn.minToolCalls` gate.
 	turn_tool_calls: usize,
+	/// Goal mode when the just-finished turn started; capture skips the turn
+	/// even if a goal tool completed it.
+	turn_started_in_goal: bool,
 	/// Live branch conversation for `--no-session` runs (no leading system
 	/// message). Rewinds rewrite it; each later request replays it verbatim.
 	in_memory_messages: Option<Vec<pi_agent::Message>>,
@@ -1968,17 +1972,18 @@ impl Session<'_> {
 	/// never writes to this session's journal.
 	fn drive_autolearn_capture(&mut self, mode: OutputMode) {
 		let (manage, learn) = self.autolearn_tool_presence();
-		let goal_mode = self.goal.has_goal();
-		let plan_enabled = self
+		let goal_now = self.goal.has_goal();
+		let plan_active = self
 			.plan_yolo
 			.as_ref()
 			.is_some_and(|shared| shared.is_armed());
-		if !autolearn::should_auto_capture(
+		if !autolearn::should_capture_turn(
 			&self.config,
 			self.turn_tool_calls,
 			false,
-			plan_enabled,
-			goal_mode,
+			plan_active,
+			self.turn_started_in_goal,
+			goal_now,
 			manage || learn,
 		) {
 			return;
@@ -2370,6 +2375,7 @@ impl Session<'_> {
 		let mut tool_name_by_id: std::collections::HashMap<String, String> =
 			std::collections::HashMap::new();
 		let mut turn_tool_calls = 0usize;
+		let turn_started_in_goal = self.goal.has_goal();
 
 		let cancel_token = pi_agent::CancellationToken::new();
 		if !self.store.enabled() {
@@ -3137,6 +3143,7 @@ impl Session<'_> {
 		}
 		drop(handle_event);
 		self.turn_tool_calls = turn_tool_calls;
+		self.turn_started_in_goal = turn_started_in_goal;
 		if priority_downgraded
 			&& self.service_tier_by_family.get("anthropic").map(String::as_str)
 				== Some("priority")

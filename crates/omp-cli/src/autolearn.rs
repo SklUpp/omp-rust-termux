@@ -129,6 +129,31 @@ pub fn should_auto_capture(
 	!plan_enabled && !goal_mode
 }
 
+/// Turn-level gate shared by CLI, RPC, and ACP.
+///
+/// `started_in_goal` is snapshotted before the turn starts; `goal_now` covers a
+/// turn that completed the goal. Either blocks capture, matching
+/// `controller.ts` (`startedInGoalMode || getGoalModeState().enabled`).
+#[must_use]
+pub fn should_capture_turn(
+	config: &crate::config::Config,
+	tool_calls: usize,
+	aborted: bool,
+	plan_active: bool,
+	started_in_goal: bool,
+	goal_now: bool,
+	has_capture_tools: bool,
+) -> bool {
+	should_auto_capture(
+		config,
+		tool_calls,
+		aborted,
+		plan_active,
+		started_in_goal || goal_now,
+		has_capture_tools,
+	)
+}
+
 fn learn_schema() -> Value {
 	json!({
 		"type": "object",
@@ -695,6 +720,26 @@ mod tests {
 		assert!(!should_auto_capture(&config, 5, false, false, false, false));
 		config.autolearn.min_tool_calls = Some(1);
 		assert!(should_auto_capture(&config, 1, false, false, false, true));
+	}
+
+	#[test]
+	fn turn_gate_allows_idle_plan_but_blocks_cancel_active_plan_and_goals() {
+		let mut config = crate::config::Config::default();
+		assert!(config.plan.enabled(), "default PlanGate feature is enabled");
+		config.autolearn.enabled = Some(true);
+		config.autolearn.auto_continue = Some(true);
+		config.autolearn.min_tool_calls = Some(1);
+		assert!(
+			should_capture_turn(&config, 1, false, false, false, false, true),
+			"feature enabled with no active plan must capture"
+		);
+		assert!(!should_capture_turn(&config, 1, true, false, false, false, true));
+		assert!(!should_capture_turn(&config, 1, false, true, false, false, true));
+		assert!(
+			!should_capture_turn(&config, 1, false, false, true, false, true),
+			"a turn that started in goal mode blocks capture even after completing it"
+		);
+		assert!(!should_capture_turn(&config, 1, false, false, false, true, true));
 	}
 
 	#[tokio::test]

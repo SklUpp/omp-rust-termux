@@ -1726,6 +1726,10 @@ fn run_turn(
 	};
 	let mut outcome = TurnOutcome::default();
 	let mut capture_tool_calls = 0usize;
+	let turn_started_in_goal = {
+		let guard = session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+		guard.goal.has_goal()
+	};
 	let mut attempt = 0u32;
 	const MAX_RETRY_ATTEMPTS: u32 = 3;
 	loop {
@@ -1917,17 +1921,18 @@ fn run_turn(
 	let capture = if outcome.error.is_none() && !outcome.aborted {
 		let guard = session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 		let (manage, learn) = guard.autolearn_tool_presence();
-		let goal_mode = guard.goal.has_goal();
-		let plan_enabled = guard
+		let goal_now = guard.goal.has_goal();
+		let plan_active = guard
 			.plan_yolo
 			.as_ref()
 			.is_some_and(|shared| shared.is_armed());
-		crate::autolearn::should_auto_capture(
+		crate::autolearn::should_capture_turn(
 			&guard.config,
 			capture_tool_calls,
 			false,
-			plan_enabled,
-			goal_mode,
+			plan_active,
+			turn_started_in_goal,
+			goal_now,
 			manage || learn,
 		)
 		.then(|| guard.autolearn_capture_request())

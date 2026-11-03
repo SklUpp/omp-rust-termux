@@ -762,6 +762,9 @@ pub struct Config {
 	/// `disabledProviders`; path-scoped groups resolve against the run cwd in
 	/// [`Config::disabled_providers`].
 	pub disabled_providers:   Option<Vec<DisabledProviderEntry>>,
+	/// Top-level `disabledExtensions`; `skill:<name>` ids disable skills for
+	/// every surface that reads the session snapshot.
+	pub disabled_extensions:  Option<Vec<String>>,
 	/// `task.agentModelOverrides` (string or list per agent).
 	pub agent_model_overrides: BTreeMap<String, Vec<String>>,
 	/// `task.maxRecursionDepth`.
@@ -908,6 +911,9 @@ impl Config {
 		}
 		if overlay.disabled_providers.is_some() {
 			self.disabled_providers = overlay.disabled_providers;
+		}
+		if overlay.disabled_extensions.is_some() {
+			self.disabled_extensions = overlay.disabled_extensions;
 		}
 		for (agent, patterns) in overlay.agent_model_overrides {
 			self.agent_model_overrides.insert(agent, patterns);
@@ -1211,6 +1217,12 @@ impl Config {
 		ids
 	}
 
+	/// Top-level `disabledExtensions`, defaulting to empty.
+	#[must_use]
+	pub fn disabled_extensions(&self) -> &[String] {
+		self.disabled_extensions.as_deref().unwrap_or_default()
+	}
+
 	/// Apply dedicated CLI flags after the layered load. Runtime overrides are
 	/// the highest settings layer (`docs/settings.md` order 1) and are never
 	/// persisted: flags replace the file value even when the file set one.
@@ -1329,6 +1341,13 @@ fn apply_nested_settings(config: &mut Config, value: &Value, path: &Path) -> Res
 	}
 	if let Some(disabled) = value.get("disabledProviders") {
 		config.disabled_providers = Some(parse_disabled_providers(disabled, path)?);
+	}
+	if let Some(disabled) = value.get("disabledExtensions") {
+		config.disabled_extensions = Some(expect_list_of_text(
+			disabled,
+			"disabledExtensions",
+			path,
+		)?);
 	}
 	if let Some(roles) = value.get("modelRoles").and_then(Value::as_map) {
 		for (role, pattern) in roles {

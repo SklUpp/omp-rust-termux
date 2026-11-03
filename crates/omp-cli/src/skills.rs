@@ -220,7 +220,7 @@ impl LoadOptions {
 			ignored_skills: skills.ignored_skills().to_vec(),
 			include_skills: skills.include_skills().to_vec(),
 			enable_skill_commands: skills.enable_skill_commands(),
-			disabled_extensions: Vec::new(),
+			disabled_extensions: config.disabled_extensions().to_vec(),
 		}
 	}
 }
@@ -1222,13 +1222,28 @@ mod tests {
 
 		let mut options = isolated_options(&dir);
 		options.disabled_extensions = vec!["skill:gamma".to_string()];
-		let names: Vec<String> = load_with(&options)
-			.expect("skills")
-			.entries
-			.into_iter()
-			.map(|entry| entry.skill.name)
-			.collect();
+		let result = load_with(&options).expect("skills");
+		let names: Vec<String> =
+			result.entries.iter().map(|entry| entry.skill.name.clone()).collect();
 		assert_eq!(names, ["alpha", "beta"]);
+		let snapshot = SkillSnapshot::new();
+		snapshot.set(result.entries);
+		assert!(snapshot.find("gamma").is_none());
+		assert!(!snapshot.prompt_skills().iter().any(|skill| skill.name == "gamma"));
+		assert!(
+			expand_skill_invocation(&snapshot, "/skill:gamma").expect("expand").is_none(),
+			"a disabled skill must not expand through the same snapshot"
+		);
+	}
+
+	#[test]
+	fn config_disabled_extensions_reach_load_options() {
+		let config = crate::config::Config {
+			disabled_extensions: Some(vec!["skill:quiet".to_string()]),
+			..crate::config::Config::default()
+		};
+		let options = LoadOptions::from_config(&config, ".", false, &[]);
+		assert_eq!(options.disabled_extensions, ["skill:quiet"]);
 	}
 
 	#[test]

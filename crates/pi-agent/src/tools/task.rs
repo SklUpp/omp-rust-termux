@@ -788,9 +788,6 @@ impl TaskTool {
 				.supervisor
 				.append_child_transcript(&child_id, &transcript_messages);
 		}
-		if let Some(manager) = crate::subagent_lifecycle::lookup(&self.supervisor) {
-			manager.seed_live(&child_id, initial_message);
-		}
 		let _live_history = LiveHistoryScope {
 			supervisor: Arc::clone(&self.supervisor),
 			id:         child_id.clone(),
@@ -1852,9 +1849,6 @@ async fn run_background_child(
 		let mut transcript_messages: Vec<&Message> = autoload_msgs.iter().collect();
 		transcript_messages.push(&initial_message);
 		supervisor.append_child_transcript(&child_id, &transcript_messages);
-	}
-	if let Some(manager) = crate::subagent_lifecycle::lookup(&supervisor) {
-		manager.seed_live(&child_id, initial_message);
 	}
 	let _live_history = LiveHistoryScope {
 		supervisor: Arc::clone(&supervisor),
@@ -5083,6 +5077,7 @@ mod tests {
 			std::time::Duration::from_secs(5),
 			run_background_child(
 				Arc::clone(&supervisor),
+				None,
 				"task-bg".to_string(),
 				item,
 				std::path::PathBuf::from("."),
@@ -5167,6 +5162,7 @@ mod tests {
 		let cancel_for_test = cancel.clone();
 		let mut child_future = Box::pin(run_background_child(
 			Arc::clone(&supervisor),
+			None,
 			"task-bg".to_string(),
 			item,
 			std::path::PathBuf::from("."),
@@ -5309,7 +5305,7 @@ mod tests {
 			effort: None,
 			isolation: IsolationRequest::default(),
 		};
-		let (_steering_tx, steering_rx) = tokio::sync::mpsc::channel(1);
+		let (steering_tx, steering_rx) = tokio::sync::mpsc::channel(1);
 		let result = run_background_child(
 			Arc::clone(&supervisor),
 			Some(Arc::new(FailingAutoload)),
@@ -5317,6 +5313,7 @@ mod tests {
 			item,
 			std::path::PathBuf::from("."),
 			steering_rx,
+			steering_tx,
 			tokio_util::sync::CancellationToken::new(),
 			tool.child_context(),
 			None,

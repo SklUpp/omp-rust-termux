@@ -31,6 +31,8 @@ Selection follows tools-enabled, configured allowlist, feature gate and caller c
 
 Approval and capability are separate. Yolo cannot bypass Plan write containment, a restricted worker's read-only LSP ceiling or a caller's tool ceiling. `--add-dir` is a workspace feature, not a sandbox; `--allow-home` controls startup directory behavior, not permissions.
 
+Restricted security workers and automatic learning captures must not start root or child advisors. Advisors use separate provider routes and tool registries; a missing card sink does not disable their execution. These isolated runs exclude MCP discovery and extension tools before process startup.
+
 ## Sessions and persistence
 
 `session::SessionStore` writes JSONL with stable IDs, parent linkage, provider metadata and ordered typed content. Resume/fork must preserve text, images, tool calls/results and signed/redacted thinking. Rewind branches conversation history; it does not restore Git or filesystem state.

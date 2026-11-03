@@ -1315,6 +1315,14 @@ impl PiAgentRunner {
 			.advisor
 			.lock()
 			.unwrap_or_else(|poison| poison.into_inner());
+		// Restricted runs never own an advisor. The security worker's tool
+		// allowlist, Yolo approvals and exact credential resolver would
+		// otherwise be bypassed by a separate provider route. Returning before
+		// the slot is touched also keeps an in-memory primary scope's advisor
+		// (same anonymous scope, no session file) alive across its capture.
+		if advisor_restricted(request) {
+			return None;
+		}
 		if !request.config.advisor.enabled() {
 			if let Some(existing) = slot.take() {
 				existing.dispose();
@@ -1391,6 +1399,16 @@ impl PiAgentRunner {
 		*slot = Some(Arc::clone(&manager));
 		Some(manager)
 	}
+}
+
+/// `true` for runs whose capability ceiling forbids an advisor: the security
+/// scan worker and the isolated auto-learn capture. Both also skip the child
+/// advisor hook, so an agent definition cannot opt a child back in.
+fn advisor_restricted(request: &RunRequest) -> bool {
+	request.security_worker
+		|| request
+			.tool_ceiling
+			.is_some_and(|ceiling| ceiling.exclude_mcp && ceiling.exclude_extension_tools)
 }
 
 fn advisor_primary_session_id(request: &RunRequest) -> Option<String> {
@@ -1952,30 +1970,37 @@ impl AgentRunner for PiAgentRunner {
 			}
 			supervisor.set_async_enabled(request.config.async_config.enabled());
 			supervisor.set_external_thinking(request.config.external_thinking);
-			supervisor.set_child_advisor_hook(Some({
-				let mut slot = resources
-					.advisor_child_host
-					.lock()
-					.unwrap_or_else(|poison| poison.into_inner());
-				let host = match slot.as_ref() {
-					Some(host) => {
-						host.refresh(request);
-						Arc::clone(host)
-					},
-					None => {
-						let host = Arc::new(
-							crate::advisor_child_host::ChildAdvisorHost::new(
-								request,
-								self.runtime.handle().clone(),
-								Arc::clone(&resources.advisor_identities),
-							),
-						);
-						*slot = Some(Arc::clone(&host));
-						host
-					},
-				};
-				host as Arc<dyn pi_agent::subagent_advisor::ChildAdvisorHook>
-			}));
+			if advisor_restricted(request) {
+				// A supervisor reused from an earlier root turn still carries
+				// that turn's hook; clear it so neither the root's disabled
+				// advisor nor an agent definition can re-enable it here.
+				supervisor.set_child_advisor_hook(None);
+			} else {
+				supervisor.set_child_advisor_hook(Some({
+					let mut slot = resources
+						.advisor_child_host
+						.lock()
+						.unwrap_or_else(|poison| poison.into_inner());
+					let host = match slot.as_ref() {
+						Some(host) => {
+							host.refresh(request);
+							Arc::clone(host)
+						},
+						None => {
+							let host = Arc::new(
+								crate::advisor_child_host::ChildAdvisorHost::new(
+									request,
+									self.runtime.handle().clone(),
+									Arc::clone(&resources.advisor_identities),
+								),
+							);
+							*slot = Some(Arc::clone(&host));
+							host
+						},
+					};
+					host as Arc<dyn pi_agent::subagent_advisor::ChildAdvisorHook>
+				}));
+			}
 			root_sink = Some(supervisor.owner_results_sink(None));
 			root_supervisor = Some(Arc::clone(&supervisor));
 			supervisor.root_registry()
@@ -3581,6 +3606,7 @@ pub(crate) fn build_advisor_provider(
 		provider_session_id,
 		prompt_cache_key,
 		service_tier,
+		None,
 	)
 }
 

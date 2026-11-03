@@ -1836,6 +1836,9 @@ impl RpcSession {
 		request.goal_context = None;
 		request.plan_context = None;
 		request.plan_mode = crate::agent::PlanModeHooks::default();
+		// No advisor card may reach the primary session's sink from a capture;
+		// the runtime gate also refuses an advisor manager.
+		request.advisor_card_sink = None;
 		request.tool_ceiling = Some(crate::agent::ToolCeiling {
 			exclude_mcp:             true,
 			exclude_extension_tools: true,

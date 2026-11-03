@@ -93,6 +93,17 @@ fn message_text(message: &serde_json::Value) -> String {
 	}
 }
 
+fn request_mentions(request: &serde_json::Value, needle: &str) -> bool {
+	request
+		.get("messages")
+		.and_then(serde_json::Value::as_array)
+		.is_some_and(|messages| {
+			messages
+				.iter()
+				.any(|message| message_text(message).contains(needle))
+		})
+}
+
 fn tool_names(request: &serde_json::Value) -> Vec<String> {
 	request
 		.get("tools")
@@ -217,14 +228,14 @@ for line in sys.stdin:
 	fs::write(
 		agent_dir.join("config.yml"),
 		format!(
-			"defaultModel: mock/mock-model\nmemory:\n  backend: local\nautolearn:\n  enabled: true\n  autoContinue: true\n  minToolCalls: 1\nproviders:\n  mock:\n    baseUrl: \"http://127.0.0.1:{port}/v1\"\n    api: openai-completions\n    apiKey: test-key\n"
+			"defaultModel: mock/mock-model\nmodelRoles:\n  advisor: mock/advisor\nadvisor:\n  enabled: true\nmemory:\n  backend: local\nautolearn:\n  enabled: true\n  autoContinue: true\n  minToolCalls: 1\nproviders:\n  mock:\n    baseUrl: \"http://127.0.0.1:{port}/v1\"\n    api: openai-completions\n    apiKey: test-key\n"
 		),
 	)
 	.expect("config");
 	fs::write(
 		agent_dir.join("models.yml"),
 		format!(
-			"providers:\n  mock:\n    baseUrl: \"http://127.0.0.1:{port}/v1\"\n    api: openai-completions\n    apiKey: test-key\n    models:\n      - id: mock-model\n        contextWindow: 128000\n"
+			"providers:\n  mock:\n    baseUrl: \"http://127.0.0.1:{port}/v1\"\n    api: openai-completions\n    apiKey: test-key\n    models:\n      - id: mock-model\n        contextWindow: 128000\n      - id: advisor\n        contextWindow: 128000\n"
 		),
 	)
 	.expect("models");
@@ -237,7 +248,7 @@ for line in sys.stdin:
 		.stdin(Stdio::null())
 		.args(["--cwd", project.to_str().unwrap()])
 		.args(["--session-dir", sessions.to_str().unwrap()])
-		.args(["--no-session", "--tools", "read,learn,manage_skill,mcp__mock_echo", "--yolo"])
+		.args(["--no-session", "--advisor", "--tools", "read,learn,manage_skill,mcp__mock_echo", "--yolo"])
 		.args(["--max-time", "30s", "--mode", "text", "-p"])
 		.args(["TOOL first"])
 		.output()
@@ -257,17 +268,49 @@ for line in sys.stdin:
 
 	let requests = requests.lock().expect("requests").clone();
 	assert!(requests.len() >= 3, "tool turn, continuation and capture calls");
-	let normal = tool_names(&requests[0]);
-	assert!(
-		normal.iter().any(|name| name.starts_with("mcp__")),
-		"normal turn must keep MCP tools: {normal:?}"
-	);
-	let capture = tool_names(requests.last().expect("capture request"));
+	// The advisor is asynchronous, so request order is not a stable identity:
+	// find the capture by its nudge and a normal turn by model/non-capture.
+	let nudge = omp_cli::autolearn::auto_learn_nudge();
+	let capture_request = requests
+		.iter()
+		.find(|request| request_mentions(request, nudge))
+		.expect("capture request");
+	let capture = tool_names(capture_request);
 	assert!(
 		capture.iter().all(|name| !name.starts_with("mcp__")),
 		"capture turn must not mount MCP tools: {capture:?}"
 	);
 	assert!(capture.iter().any(|name| name == "learn"), "{capture:?}");
+	let normal_request = requests
+		.iter()
+		.find(|request| {
+			request.get("model").and_then(serde_json::Value::as_str) == Some("mock-model")
+				&& !request_mentions(request, nudge)
+		})
+		.expect("normal primary request");
+	let normal = tool_names(normal_request);
+	assert!(
+		normal.iter().any(|name| name.starts_with("mcp__")),
+		"normal turn must keep MCP tools: {normal:?}"
+	);
+	// The advisor is enabled for the session, so the normal turn must still
+	// reach its own provider route; the capture must not start one.
+	let advisor_requests: Vec<&serde_json::Value> = requests
+		.iter()
+		.filter(|request| {
+			request.get("model").and_then(serde_json::Value::as_str) == Some("advisor")
+		})
+		.collect();
+	assert!(
+		!advisor_requests.is_empty(),
+		"normal root advisor must still run with --advisor"
+	);
+	assert!(
+		advisor_requests
+			.iter()
+			.all(|request| !request_mentions(request, nudge)),
+		"capture must not call the advisor executor/provider"
+	);
 	let started = fs::read_to_string(&marker).unwrap_or_default();
 	let lines: Vec<&str> = started.lines().collect();
 	assert_eq!(

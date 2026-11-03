@@ -14,7 +14,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::agent::{AgentRunner, Event, PlanModeHooks, ResolverHandle, RunRequest};
+use crate::agent::{AgentRunner, Event, PlanModeHooks, ResolverHandle, RunRequest, ToolCeiling};
 use crate::approve::Approvals;
 use crate::auth::error::AuthError;
 use crate::auth::http::Cancel;
@@ -288,6 +288,14 @@ impl SecurityRunSession {
 				cancel:   self.request.cancel.clone(),
 			}))),
 			plan_mode: PlanModeHooks::default(),
+			// The tool-name allowlist is not enough: a same-name MCP server and
+			// the extension/eval bridge would spawn outside it.
+			tool_ceiling: Some(ToolCeiling {
+				exclude_mcp:             true,
+				exclude_extension_tools: true,
+			}),
+			skill_autoload: Default::default(),
+			advisor_card_sink: None,
 			continuation: false,
 			security_host: None,
 			security_worker: true,

@@ -56,7 +56,7 @@ trap cleanup EXIT
 # ---------------------------------------------------------------------------
 # Deterministic localhost provider + auth fixture
 # ---------------------------------------------------------------------------
-python3 - "$PORT_FILE" "$AGENT_DIR/agent.db" "$OUTPUT" "$ROOT/tools.log" >"$SERVER_LOG" 2>&1 <<'PY' &
+python3 - "$PORT_FILE" "$AGENT_DIR/agent.db" "$OUTPUT" "$ROOT/tools.log" "$ROOT/requests.log" >"$SERVER_LOG" 2>&1 <<'PY' &
 import json
 import os
 import re
@@ -65,8 +65,9 @@ import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-port_file, auth_db, output_root, tools_log = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+port_file, auth_db, output_root, tools_log, request_log = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
 seed_lock = threading.Lock()
+request_lock = threading.Lock()
 seeded = False
 
 OAUTH_DATA = {
@@ -291,10 +292,16 @@ def root_reply(messages, body):
 def scan_reply(messages):
     last = messages[-1] if messages else {}
     if last.get("role") == "user":
-        return tool_call("security_publish", fixture_publication())
+        # Delegate first, so the child advisor opt-in path is exercised from
+        # inside the restricted worker session.
+        return tool_call("task", {"agent": "advised", "task": "ADVISED_CHILD_TASK"})
     if last.get("role") != "tool":
         return None
     content = message_text(last)
+    if "child-done" in content:
+        return tool_call("read", {"path": "worker-marker.txt"})
+    if "WORKER_ADVISOR_MARKER" in content:
+        return tool_call("security_publish", fixture_publication())
     if "Published security scan" in content or "already been published" in content:
         return text("scan-session-done")
     return text("SECURITY_SMOKE_FAIL_PUBLISH:" + content)
@@ -311,6 +318,13 @@ class Handler(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(length) or b"{}")
         messages = body.get("messages") or []
         names = tool_names(body)
+        serialized = json.dumps(messages)
+        with request_lock, open(request_log, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps({
+                "model": body.get("model"),
+                "marker": "WORKER_ADVISOR_MARKER" in serialized,
+                "child": "ADVISED_CHILD_TASK" in serialized,
+            }) + "\n")
         if message_text(messages[-1] if messages else {}).find("NO_TOOLS_TASK") >= 0:
             # `--no-tools` must carry an empty tool definition list: any mounted
             # tool (not just `security_scan`) is a mount leak, so report the
@@ -319,6 +333,12 @@ class Handler(BaseHTTPRequestHandler):
                 payload = text("SECURITY_SMOKE_FAIL_NO_TOOLS_MOUNTED:" + ",".join(names))
             else:
                 payload = text("NO_TOOLS_OK")
+        elif body.get("model") == "advisor":
+            # The root session's passive advisor is allowed; the worker and its
+            # advised child must never reach this route (asserted below).
+            payload = text("advisor-ack")
+        elif "ADVISED_CHILD_TASK" in message_text(messages[-1] if messages else {}):
+            payload = text("child-done")
         elif "security_scan" in names:
             payload = root_reply(messages, body)
         elif "security_publish" in names:
@@ -375,11 +395,53 @@ pub fn read(raw: *const u8) -> u8 {
     unsafe { *raw }
 }
 RS
+# An MCP server named after a security tool proves the allowlist is not the
+# worker boundary: the scan session must never spawn `mcp__task_*`.
+cat >"$ROOT/mcp_server.py" <<'PY'
+import json
+import sys
+
+open(sys.argv[1], "a").write("started\n")
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    message = json.loads(line)
+    method = message.get("method")
+    if method == "initialize":
+        result = {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}}, "serverInfo": {"name": "task", "version": "1"}}
+    elif method == "tools/list":
+        result = {"tools": [{"name": "echo", "description": "echo", "inputSchema": {"type": "object", "properties": {}}}]}
+    else:
+        continue
+    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result}) + "\n")
+    sys.stdout.flush()
+PY
+mkdir -p "$PROJECT/.omp/agents"
+cat >"$PROJECT/.omp/agents/advised.md" <<'MD'
+---
+name: advised
+description: "Advisor opt-in child"
+tools: [read]
+advisor: true
+---
+Report back and stop.
+MD
+cat >"$PROJECT/worker-marker.txt" <<'MARKER'
+WORKER_ADVISOR_MARKER
+MARKER
+cat >"$PROJECT/.omp/mcp.json" <<JSON
+{"mcpServers": {"task": {"command": "python3", "args": ["$ROOT/mcp_server.py", "$ROOT/mcp-started.log"]}}}
+JSON
 git -C "$PROJECT" add .
 git -C "$PROJECT" commit -q -m "fixture"
 
 cat >"$AGENT_DIR/config.yml" <<YAML
 defaultModel: openai-codex/gpt-5-codex
+modelRoles:
+  advisor: openai-codex/advisor
+advisor:
+  enabled: true
 providers:
   openai-codex:
     baseUrl: "http://127.0.0.1:$PORT/v1"
@@ -402,6 +464,8 @@ providers:
     models:
       - id: gpt-5-codex
         contextWindow: 128000
+      - id: advisor
+        contextWindow: 128000
 YAML
 
 # ---------------------------------------------------------------------------
@@ -409,7 +473,8 @@ YAML
 # ---------------------------------------------------------------------------
 set +e
 HOME="$ROOT" PI_CODING_AGENT_DIR="$AGENT_DIR" \
-	"$OMP_BIN" --cwd "$PROJECT" --session-dir "$SESSIONS" --mode json -p SECURITY_ROOT_TASK \
+	"$OMP_BIN" --cwd "$PROJECT" --session-dir "$SESSIONS" --mode json \
+	--tools security_scan,read -p SECURITY_ROOT_TASK \
 	>"$RUN_OUT" 2>"$RUN_ERR"
 STATUS=$?
 set -e
@@ -460,6 +525,17 @@ check "journal is named after the scan" \
 	bash -c "case '$SCAN_ID_FROM_JOURNAL' in *_'$SCAN_ID_FROM_OUTPUT') true;; *) false;; esac"
 check "scan session kept lsp despite parent off" grep -q 'lsp' "$ROOT/tools.log"
 check "scan session had publication tool" grep -q 'security_publish' "$ROOT/tools.log"
+check "worker marker reached the provider" \
+	grep -q '"marker": true' "$ROOT/requests.log"
+check "normal root advisor ran without worker markers" \
+	grep -q '"model": "advisor".*"marker": false.*"child": false' "$ROOT/requests.log"
+check "security worker had zero advisor requests" \
+	bash -c "! grep -q '\"model\": \"advisor\".*\"marker\": true' '$ROOT/requests.log'"
+check "advised child was spawned" grep -q '"child": true' "$ROOT/requests.log"
+check "security worker had no child advisor request" \
+	bash -c "! grep -q '\"model\": \"advisor\".*\"child\": true' '$ROOT/requests.log'"
+check "security worker spawned no MCP server" bash -c "! test -f '$ROOT/mcp-started.log'"
+check "security worker mounted no MCP tool" bash -c "! grep -q 'mcp__' '$ROOT/tools.log'"
 
 # ---------------------------------------------------------------------------
 # Negatives: `--no-tools` never mounts the coordinator; an explicit selection

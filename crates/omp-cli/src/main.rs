@@ -2089,6 +2089,9 @@ impl Session<'_> {
 			// Plan hooks stay off: plan mode is gated out above and a capture
 			// must never stage or approve plan writes.
 			request.plan_mode = agent::PlanModeHooks::default();
+			// No advisor card may reach the primary session's sink from a
+			// capture; the runtime gate also refuses an advisor manager.
+			request.advisor_card_sink = None;
 			// Capability ceiling: no MCP, no extension/eval bridge for capture.
 			request.tool_ceiling = Some(agent::ToolCeiling {
 				exclude_mcp:             true,

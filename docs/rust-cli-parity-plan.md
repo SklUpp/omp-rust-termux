@@ -31,8 +31,10 @@ Do not add a `session` subcommand. Use existing resume/fork/continue flags and R
 | History URLs | 21 protocol tests pass; actual live read, persisted read, park, resume, revive and isolation pass | Local evidence; later integrated commits need exact-commit CI |
 | GC apply | Actual isolated-HOME dry-run/apply/repeat/collision scenario passes | Cross-filesystem artifact moves refuse; earlier phone test link timeout is not a test pass |
 | Local security scan | 14 coordinator tests, 7 HTTP authentication tests and 29 mounted-runtime assertions pass | Local OAuth fixture, not a live account; cloud actions remain open |
-| C7 `e10cae8998a40f6350537ce24dcc1e9125dfcb0b` | [CI 41720874309](https://github.com/SklUpp/omp-termux/actions/runs/41720874309): host, native and Android pass | Downloaded-artifact runtime acceptance and base integration remain open |
-| C4 advisor | Pinned `170345d12b` binary passed CLI text/JSON, RPC, ACP, child opt-in, failure and cancellation | CI 41725278360 found test compilation errors; correction and integrated CI remain open |
+| C7 `e10cae8998a40f6350537ce24dcc1e9125dfcb0b` | [CI 41720874309](https://github.com/SklUpp/omp-termux/actions/runs/41720874309): host, native and Android pass; integrated in `d17fb8a908` | Downloaded-artifact runtime acceptance remains open |
+| C4 advisor | Pinned `170345d12b` binary passed CLI text/JSON, RPC, ACP, child opt-in, failure and cancellation; integrated in `b18fa21c01` | Standalone smoke does not verify the integrated executable |
+| Integrated `961bb343bc` | [CI 41733981790](https://github.com/SklUpp/omp-rust-termux/actions/runs/41733981790): native tests pass | Host and Android compilation fail: duplicate child history seeding moves `initial_message` before the advisor callback; corrected candidate needs fresh checks |
+| Integrated corrections | Local `cargo check --offline --locked -j1` passes for `pi-agent --lib --tests` and `omp-cli --tests`; correctness and security reviews close advisor/MCP isolation defects | Behavioral regressions, exact-commit CI and downloaded Android runtime acceptance remain open |
 
 No row closes an entire category unless every retained contract below is verified.
 

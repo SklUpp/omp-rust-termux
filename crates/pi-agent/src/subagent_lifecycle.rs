@@ -50,6 +50,34 @@ fn now_ms() -> u64 {
 		.unwrap_or_default()
 }
 
+/// Append one emitted producer event to a live history snapshot.
+///
+/// `MessageEnd` + `ToolEnd` are the authoritative per-message stream and keep
+/// their emission order. `TurnEnd` repeats the same assistant/tool pair and is
+/// ignored so nothing is rendered twice. `UserSteer` is emitted only after the
+/// steering message entered history, and `BackgroundResult` only after the
+/// result was injected, so both are real accepted messages.
+fn record_live_event(messages: &mut Vec<Message>, event: &crate::loop_module::AgentEvent) {
+	match event {
+		crate::loop_module::AgentEvent::MessageEnd { message, .. } => messages.push(message.clone()),
+		crate::loop_module::AgentEvent::ToolEnd { id, name, result, is_error, .. } => {
+			messages.push(Message::tool_with_status(
+				id.clone(),
+				name.clone(),
+				result.clone(),
+				*is_error,
+			));
+		},
+		crate::loop_module::AgentEvent::UserSteer { parts } => {
+			messages.push(Message::user_with_parts(parts.clone()));
+		},
+		crate::loop_module::AgentEvent::BackgroundResult { text, .. } => {
+			messages.push(Message::user(text.clone()));
+		},
+		_ => {},
+	}
+}
+
 /// Lifecycle status exposed by the roster.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LifecycleStatus {
@@ -102,6 +130,21 @@ pub struct LifecycleRow {
 	pub session_file:  PathBuf,
 }
 
+/// Read-only row for the `history://` index and lookup.
+///
+/// Unlike [`LifecycleRow`] this includes tombstoned ids: their transcript stays
+/// readable even though `hub list` no longer shows them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryRow {
+	pub id:            String,
+	pub status:        LifecycleStatus,
+	pub parent_id:     Option<String>,
+	/// Agent definition recorded in the contract, when one is known.
+	pub agent:         Option<String>,
+	pub last_activity: u64,
+	pub session_file:  PathBuf,
+}
+
 struct Entry {
 	display_name:  String,
 	parent_id:     Option<String>,
@@ -127,6 +170,10 @@ struct LifecycleState {
 	entries:    HashMap<String, Entry>,
 	live:       HashMap<String, LiveSession>,
 	tombstones: HashSet<String>,
+	/// Producer-fed message snapshots for live/revived sessions. Owned by the
+	/// manager so `history://` can serve an in-memory view before the JSONL
+	/// flush; dropped when live ownership ends (park/tombstone/finish/adopt).
+	history:    HashMap<String, Arc<Mutex<Vec<Message>>>>,
 }
 
 /// Park/revive owner for one supervisor.
@@ -168,6 +215,7 @@ pub fn attach(
 			entries:    HashMap::new(),
 			live:       HashMap::new(),
 			tombstones: HashSet::new(),
+			history:    HashMap::new(),
 		}),
 	});
 	if let Some(root) = manager.root.clone() {
@@ -224,6 +272,159 @@ impl SubagentLifecycleManager {
 		}
 		let path = transcript_path(self.root.as_deref()?, id);
 		path.is_file().then_some(path)
+	}
+
+	/// Rows the `history://` index and lookup may expose.
+	///
+	/// Includes rows `roster` filters out (tombstoned ids keep a readable
+	/// transcript) and synthesizes a row for a restored tombstone marker whose
+	/// entry is gone. Advisor ids are filtered by the caller, which owns the
+	/// transcript namespace rules.
+	#[must_use]
+	pub fn history_rows(&self) -> Vec<HistoryRow> {
+		let state = lock(&self.state);
+		let mut rows: Vec<HistoryRow> = state
+			.entries
+			.iter()
+			.map(|(id, entry)| HistoryRow {
+				id:            id.clone(),
+				status:        entry.status,
+				parent_id:     entry.parent_id.clone(),
+				agent:         entry
+					.contract
+					.as_ref()
+					.and_then(|contract| contract.agent.clone()),
+				last_activity: entry.last_activity,
+				session_file:  entry.session_file.clone(),
+			})
+			.collect();
+		if let Some(root) = self.root.as_deref() {
+			for id in &state.tombstones {
+				if state.entries.contains_key(id) {
+					continue;
+				}
+				rows.push(HistoryRow {
+					id:            id.clone(),
+					status:        LifecycleStatus::Tombstoned,
+					parent_id:     None,
+					agent:         None,
+					last_activity: 0,
+					session_file:  transcript_path(root, id),
+				});
+			}
+		}
+		rows
+	}
+
+	/// Supervisor child records, for live rows not yet adopted by this manager.
+	#[must_use]
+	pub fn child_records(&self) -> Vec<crate::supervisor::ChildRecord> {
+		self.supervisor
+			.upgrade()
+			.map_or_else(Vec::new, |supervisor| supervisor.children())
+	}
+
+	/// Seed the live snapshot with the exact producer-owned initial message.
+	pub fn seed_live(&self, id: &str, message: Message) {
+		let slot = {
+			let mut state = lock(&self.state);
+			Arc::clone(
+				state
+					.history
+					.entry(id.to_string())
+					.or_insert_with(|| Arc::new(Mutex::new(Vec::new()))),
+			)
+		};
+		lock(&slot).push(message);
+	}
+
+	/// Append one already-accepted message to the live snapshot.
+	pub fn append_live_message(&self, id: &str, message: Message) {
+		let slot = {
+			let state = lock(&self.state);
+			state.history.get(id).cloned()
+		};
+		if let Some(slot) = slot {
+			lock(&slot).push(message);
+		}
+	}
+
+	/// Apply one emitted producer event to the live snapshot.
+	///
+	/// Callers apply the event BEFORE `Supervisor::report_event`, so accounting
+	/// still observes it exactly once.
+	pub fn apply_live_event(&self, id: &str, event: &crate::loop_module::AgentEvent) {
+		let slot = {
+			let state = lock(&self.state);
+			state.history.get(id).cloned()
+		};
+		if let Some(slot) = slot {
+			record_live_event(&mut lock(&slot), event);
+		}
+	}
+
+	/// Replace the live snapshot with the final authoritative state.
+	///
+	/// A no-op when live ownership already ended, so a late reconcile can never
+	/// resurrect a parked/tombstoned view.
+	pub fn replace_live(&self, id: &str, messages: Vec<Message>) {
+		let slot = {
+			let state = lock(&self.state);
+			state.history.get(id).cloned()
+		};
+		if let Some(slot) = slot {
+			*lock(&slot) = messages;
+		}
+	}
+
+	/// Drop the live snapshot when live ownership ends.
+	pub fn drop_live(&self, id: &str) {
+		let mut state = lock(&self.state);
+		state.history.remove(id);
+	}
+
+	/// Read the live snapshot, cloned outside every manager lock.
+	#[must_use]
+	pub fn live_messages(&self, id: &str) -> Option<Vec<Message>> {
+		let slot = {
+			let state = lock(&self.state);
+			state.history.get(id).cloned()
+		};
+		slot.map(|slot| lock(&slot).clone())
+	}
+
+	/// Epoch-scoped variants for the revived actor: a parked/re-revived session
+	/// must never be clobbered by a late event from the previous actor.
+	fn snapshot_for_epoch(&self, id: &str, epoch: u64) -> Option<Arc<Mutex<Vec<Message>>>> {
+		let state = lock(&self.state);
+		state
+			.live
+			.get(id)
+			.filter(|live| live.epoch == epoch)?;
+		state.history.get(id).cloned()
+	}
+
+	pub fn append_live_message_for_epoch(&self, id: &str, epoch: u64, message: Message) {
+		if let Some(slot) = self.snapshot_for_epoch(id, epoch) {
+			lock(&slot).push(message);
+		}
+	}
+
+	pub fn apply_live_event_for_epoch(
+		&self,
+		id: &str,
+		epoch: u64,
+		event: &crate::loop_module::AgentEvent,
+	) {
+		if let Some(slot) = self.snapshot_for_epoch(id, epoch) {
+			record_live_event(&mut lock(&slot), event);
+		}
+	}
+
+	pub fn replace_live_for_epoch(&self, id: &str, epoch: u64, messages: Vec<Message>) {
+		if let Some(slot) = self.snapshot_for_epoch(id, epoch) {
+			*lock(&slot) = messages;
+		}
 	}
 
 	/// Roster rows, newest activity first within each status.
@@ -348,6 +549,7 @@ impl SubagentLifecycleManager {
 			.or_else(|| record.parent_id.clone());
 		let epoch = {
 			let mut state = lock(&self.state);
+			state.history.remove(id);
 			let epoch = state.entries.get(id).map_or(0, |entry| entry.epoch.wrapping_add(1));
 			state.entries.insert(
 				id.to_string(),
@@ -380,6 +582,7 @@ impl SubagentLifecycleManager {
 		if let Some(live) = state.live.remove(id) {
 			live.cancel.cancel();
 		}
+		state.history.remove(id);
 		if let Some(entry) = state.entries.get_mut(id) {
 			entry.epoch = entry.epoch.wrapping_add(1);
 			entry.status = LifecycleStatus::Parked;
@@ -409,6 +612,7 @@ impl SubagentLifecycleManager {
 		if let Some(live) = state.live.remove(id) {
 			live.cancel.cancel();
 		}
+		state.history.remove(id);
 		if let Some(entry) = state.entries.get_mut(id) {
 			entry.epoch = entry.epoch.wrapping_add(1);
 			entry.status = LifecycleStatus::Tombstoned;
@@ -496,6 +700,13 @@ impl SubagentLifecycleManager {
 			id.to_string(),
 			LiveSession { inbound, cancel: cancel.clone(), epoch },
 		);
+		// The revived state IS the real producer state: this snapshot is what
+		// `history://` serves before the actor journals the turn, and the actor
+		// reconciles it with the final state after every turn.
+		state.history.insert(
+			id.to_string(),
+			Arc::new(Mutex::new(revived.state.messages.clone())),
+		);
 		if let Some(entry) = state.entries.get_mut(id) {
 			entry.epoch = epoch;
 			entry.status = LifecycleStatus::Running;
@@ -541,6 +752,7 @@ impl SubagentLifecycleManager {
 		if let Some(live) = state.live.remove(id) {
 			live.cancel.cancel();
 		}
+		state.history.remove(id);
 		if let Some(entry) = state.entries.get_mut(id) {
 			entry.epoch = entry.epoch.wrapping_add(1);
 			entry.status = LifecycleStatus::Parked;
@@ -585,6 +797,7 @@ impl SubagentLifecycleManager {
 		let mut state = lock(&self.state);
 		if state.live.get(id).is_some_and(|live| live.epoch == epoch) {
 			state.live.remove(id);
+			state.history.remove(id);
 		}
 		if let Some(entry) = state.entries.get_mut(id)
 			&& entry.epoch == epoch
@@ -682,15 +895,33 @@ async fn run_actor(
 		let before = state.messages.len();
 		let had_system = state.messages.first().is_some_and(|m| m.role == Role::System);
 		let request = Message::user(text);
+		// The request is a real accepted input; show it before the provider
+		// emits anything. The drain task then applies the loop's events in
+		// emission order, and the reconcile below replaces both with the final
+		// authoritative state (including the error rollback).
+		manager.append_live_message_for_epoch(&id, epoch, request.clone());
+		let (event_tx, mut event_rx) = mpsc::channel(256);
+		let event_manager = Arc::downgrade(&manager);
+		let event_id = id.clone();
+		let event_epoch = epoch;
+		let drain = tokio::spawn(async move {
+			while let Some(event) = event_rx.recv().await {
+				let Some(manager) = event_manager.upgrade() else {
+					break;
+				};
+				manager.apply_live_event_for_epoch(&event_id, event_epoch, &event);
+			}
+		});
 		let turn_result = agent_loop
 			.run_dialog_message_with_cancel(
 				request.clone(),
 				&mut state,
 				None,
-				None,
+				Some(event_tx),
 				cancel.child_token(),
 			)
 			.await;
+		let _ = drain.await;
 		// TS `runSubagentFollowUpTurn`: a follow-up turn rewrites the same
 		// `<outputId>.md` only when it produced a real yield. A hub wake with no
 		// yield leaves the last completion artifact untouched (issue #9518).
@@ -739,6 +970,9 @@ async fn run_actor(
 				state.messages.get(start..).unwrap_or(&[]).iter().collect();
 			append_messages(&path, &appended);
 		}
+		// Authoritative reconcile: covers successful turns, in-turn events, and
+		// the truncation above after a failed/aborted turn.
+		manager.replace_live_for_epoch(&id, epoch, state.messages.clone());
 		if cancel.is_cancelled() {
 			break;
 		}

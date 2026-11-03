@@ -1338,10 +1338,14 @@ async fn read_bounded_artifact(file: &std::fs::File, cap: u64) -> Option<Vec<u8>
 /// Sources with no edit path: hashline anchors would be dead weight, so
 /// `resolve_file_display_mode` drops them while still allowing line numbers.
 /// Mirrors upstream's `immutable` flag for `artifact://`, `agent://`, and
-/// `memory://` reads.
+/// `memory://` reads. `history://` is listed here too: its resource snapshot is
+/// explicitly mutable (a live transcript keeps appending, so the handler
+/// reports `immutable = false`), but there is no writable file behind the URI,
+/// so anchors would be dead weight.
 fn is_immutable_source(raw: &str) -> bool {
-	internal_scheme(raw)
-		.is_some_and(|scheme| matches!(scheme.as_str(), "artifact" | "agent" | "memory"))
+	internal_scheme(raw).is_some_and(|scheme| {
+		matches!(scheme.as_str(), "agent" | "artifact" | "history" | "memory")
+	})
 }
 
 fn internal_scheme(raw: &str) -> Option<String> {
@@ -3447,6 +3451,51 @@ mod display_tests {
 			let details = result.details.expect("details");
 			assert_eq!(details["internalUrl"]["immutable"], json!(true));
 		}
+		assert!(sink.files.lock().expect("files").is_empty());
+	}
+
+	struct MutableCoreHandler(&'static str);
+
+	#[async_trait::async_trait]
+	impl ProtocolHandler for MutableCoreHandler {
+		fn scheme(&self) -> &str {
+			self.0
+		}
+
+		fn immutable(&self) -> bool {
+			false
+		}
+
+		async fn resolve(
+			&self,
+			url: &InternalUrl,
+			_context: &ResolveContext,
+		) -> Result<InternalResource, String> {
+			Ok(InternalResource::text(&url.href, "alpha\nbeta".to_string()))
+		}
+	}
+
+	#[tokio::test]
+	async fn history_reads_suppress_anchors_while_reporting_a_mutable_snapshot() {
+		// `history://` data is append-only and may change between reads
+		// (`immutable = false`), but there is no writable file behind the URI, so
+		// a hashline read must still emit no anchors and record no snapshot.
+		let dir = TempDir::new("history-mutable");
+		let sink = Arc::new(TestSink::default());
+		let router = Arc::new(InternalUrlRouter::new());
+		router
+			.register_core(Arc::new(MutableCoreHandler("history")))
+			.expect("core history handler");
+		let tool = ReadTool::with_snapshot_sink(sink.clone())
+			.with_display_inputs(FileDisplayInputs::new(EditMode::Hashline, true, true))
+			.with_internal_urls(router, Arc::new(UrlScope::default()));
+		let result = read_with(&tool, &dir, "history://x").await;
+		assert!(!result.is_error, "{}", result.content);
+		assert_eq!(result.content, "1|alpha\n2|beta");
+		assert!(!result.content.starts_with('['), "{}", result.content);
+		let details = result.details.expect("details");
+		assert_eq!(details["internalUrl"]["immutable"], json!(false));
+		assert_eq!(details["internalUrl"]["writable"], json!(false));
 		assert!(sink.files.lock().expect("files").is_empty());
 	}
 

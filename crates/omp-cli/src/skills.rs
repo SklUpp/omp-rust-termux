@@ -1249,11 +1249,13 @@ mod tests {
 	#[test]
 	fn provider_toggles_gate_third_party_dirs() {
 		let dir = temp_dir();
-		write(&dir.join(".claude/skills/c/SKILL.md"), &skill("c", "claude project", "body"));
-		write(&dir.join(".agent/skills/a/SKILL.md"), &skill("a", "agent project", "body"));
-		write(&dir.join(".codex/skills/x/SKILL.md"), &skill("x", "codex project", "body"));
+		let project = dir.join("project");
+		write(&project.join(".claude/skills/c/SKILL.md"), &skill("c", "claude project", "body"));
+		write(&project.join(".agent/skills/a/SKILL.md"), &skill("a", "agent project", "body"));
+		write(&project.join(".codex/skills/x/SKILL.md"), &skill("x", "codex project", "body"));
 
 		let mut options = isolated_options(&dir);
+		options.cwd = project.clone();
 		options.enable_claude_project = false;
 		options.enable_agents_project = false;
 		let names: Vec<String> = load_with(&options)
@@ -1265,6 +1267,7 @@ mod tests {
 		assert_eq!(names, ["x"]);
 
 		let mut options = isolated_options(&dir);
+		options.cwd = project;
 		options.enable_agents_project = false;
 		let names: Vec<String> = load_with(&options)
 			.expect("skills")

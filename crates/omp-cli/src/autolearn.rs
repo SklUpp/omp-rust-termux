@@ -213,7 +213,6 @@ fn manage_skill_schema() -> Value {
 /// `learn` with the local (file) memory backend.
 pub struct LocalLearnTool {
 	agent_dir: PathBuf,
-	cwd:       PathBuf,
 	snapshot:  SkillSnapshot,
 	options:   LoadOptions,
 }
@@ -235,7 +234,7 @@ impl LocalLearnTool {
 			return None;
 		}
 		let agent_dir = options.agent_dir.clone().unwrap_or_else(dirs::agent_dir);
-		Some(Self { agent_dir, cwd: options.cwd.clone(), snapshot, options })
+		Some(Self { agent_dir, snapshot, options })
 	}
 
 	#[must_use]
@@ -270,7 +269,7 @@ impl Tool for LocalLearnTool {
 		let cancel = || ctx.cancellation_token.is_cancelled();
 		let result = local_memory::save_learned_lesson(
 			&self.agent_dir,
-			&self.cwd,
+			&ctx.cwd,
 			&SaveInput { content: memory, context },
 			Some(&cancel),
 		)

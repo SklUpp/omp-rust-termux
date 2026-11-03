@@ -68,7 +68,7 @@ impl AdviseTool {
 			.source_text = source;
 	}
 
-	fn execute_note(&self, args: &Value) -> Result<ToolResult, ToolError> {
+	pub(crate) fn execute_note(&self, args: &Value) -> Result<ToolResult, ToolError> {
 		let obj = args
 			.as_object()
 			.ok_or_else(|| ToolError::InvalidArguments("Arguments must be an object".to_string()))?;
@@ -192,6 +192,7 @@ impl Tool for AdviseTool {
 mod tests {
 	use super::*;
 	use std::sync::Mutex as StdMutex;
+	use std::sync::atomic::{AtomicUsize, Ordering};
 
 	fn recorder() -> (AdviceSink, Arc<StdMutex<Vec<Note>>>) {
 		let notes = Arc::new(StdMutex::new(Vec::new()));
@@ -274,12 +275,6 @@ mod tests {
 			.expect_err("invalid severity");
 		assert!(matches!(error, ToolError::InvalidArguments(_)));
 	}
-}
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-	use std::sync::atomic::{AtomicUsize, Ordering};
 
 	fn tool() -> (AdviseTool, Arc<AtomicUsize>) {
 		let count = Arc::new(AtomicUsize::new(0));

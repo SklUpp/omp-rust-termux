@@ -860,7 +860,9 @@ fn run() -> std::result::Result<(), CliError> {
 		};
 		let new_file = session::fork_session(&source_path, Some(&cwd), session_dir.as_deref())
 			.map_err(CliError::usage)?;
-		native_runner.advisor_reset_boundary(None, Some(&new_file));
+		// The fork's new file has no runner scope yet; reset the real source
+		// scope, and let the new scope seed from its first transcript.
+		native_runner.advisor_reset_boundary(None, Some(&source_path), &[]);
 		chosen_file = Some(new_file);
 	} else if let Some(resume_arg) = &cli.resume {
 		if resume_arg.trim().is_empty() {
@@ -2564,6 +2566,14 @@ impl Session<'_> {
 								};
 								match rebuilt {
 									Ok(messages) => {
+										if let Some(runner) = agent::runner() {
+											let (id, file) = self.advisor_scope();
+											runner.advisor_reset_boundary(
+												id.as_deref(),
+												file.as_deref(),
+												&messages,
+											);
+										}
 										decision.rewrite = Some(pi_agent::TurnRewrite::Replace(messages));
 									},
 									// The journal already moved to the rewound branch.
@@ -2582,10 +2592,6 @@ impl Session<'_> {
 								}
 								*rewind_history = Some(applied.history);
 								*parent = store.leaf_id().map(str::to_string);
-								if let Some(runner) = agent::runner() {
-									let (id, file) = self.advisor_scope();
-									runner.advisor_reset_boundary(id.as_deref(), file.as_deref());
-								}
 							},
 							Ok(None) => {},
 							Err(err) => eprintln!("warning: cannot apply rewind: {err}"),
@@ -2594,10 +2600,6 @@ impl Session<'_> {
 						let captured =
 							host.note_unpersisted_tool_results(tool_results, tools, turn_start);
 						if let Some(rewind) = host.apply_pending_rewind_in_memory() {
-							if let Some(runner) = agent::runner() {
-								let (id, file) = self.advisor_scope();
-								runner.advisor_reset_boundary(id.as_deref(), file.as_deref());
-							}
 							decision.rewrite = match in_memory.as_mut() {
 								Some(messages) => {
 									// The mirror is the uncompacted branch; replay it
@@ -2606,9 +2608,27 @@ impl Session<'_> {
 									omp_cli::session_checkpoint::apply_in_memory_rewind(
 										messages, &rewind,
 									);
+									if let Some(runner) = agent::runner() {
+										let (id, file) = self.advisor_scope();
+										runner.advisor_reset_boundary(
+											id.as_deref(),
+											file.as_deref(),
+											messages,
+										);
+									}
 									Some(pi_agent::TurnRewrite::Replace(messages.clone()))
 								},
-								None => Some(pi_agent::TurnRewrite::InMemory(rewind)),
+								None => {
+									if let Some(runner) = agent::runner() {
+										let (id, file) = self.advisor_scope();
+										runner.advisor_reset_boundary(
+											id.as_deref(),
+											file.as_deref(),
+											&[],
+										);
+									}
+									Some(pi_agent::TurnRewrite::InMemory(rewind))
+								},
 							};
 						} else if captured {
 							decision.warning = host.active_notice().map(str::to_string);

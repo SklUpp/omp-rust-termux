@@ -665,6 +665,16 @@ async fn pair_skipped_tool_calls(
 	results
 }
 
+/// C4-specific pre-dispatch gate for one assistant response.
+///
+/// The advisor installs this so a quarantined turn never reaches `run_tools`.
+/// The default loop has no guard, so every other caller keeps the exact
+/// historical behavior. `history` is the provider history before this assistant
+/// message; it already contains the tool results of the current update.
+pub trait AssistantGuard: Send + Sync {
+	fn guard(&self, message: &mut Message, history: &[Message]);
+}
+
 /// Agent execution engine: provider turn, tool batch, repeat.
 pub struct AgentLoop {
 	config: AgentConfig,
@@ -688,6 +698,8 @@ pub struct AgentLoop {
 	/// developer reminder, so no caller message is appended and the first
 	/// request is the policy's one-shot forced choice.
 	continuation: bool,
+	/// Optional C4 assistant-response gate; `None` for every non-advisor caller.
+	assistant_guard: Option<Arc<dyn AssistantGuard>>,
 }
 
 impl AgentLoop {
@@ -710,6 +722,7 @@ impl AgentLoop {
 			plan: None,
 			conflicts: None,
 			continuation: false,
+			assistant_guard: None,
 		}
 	}
 
@@ -733,7 +746,15 @@ impl AgentLoop {
 			plan: None,
 			conflicts: None,
 			continuation: false,
+			assistant_guard: None,
 		}
+	}
+
+	/// Install the C4 pre-dispatch assistant gate for this advisor loop only.
+	#[must_use]
+	pub fn with_assistant_guard(mut self, guard: Option<Arc<dyn AssistantGuard>>) -> Self {
+		self.assistant_guard = guard;
+		self
 	}
 
 	/// Install the session plan-mode guard for this run; it rides on every
@@ -1038,7 +1059,7 @@ impl AgentLoop {
 				}
 			}
 			let mut pending_injections = Vec::new();
-			let assistant = self
+			let mut assistant = self
 				.next_assistant(
 					&active_provider,
 					&state.messages,
@@ -1050,6 +1071,9 @@ impl AgentLoop {
 					&mut pending_injections,
 				)
 				.await?;
+			if let Some(guard) = &self.assistant_guard {
+				guard.guard(&mut assistant, &state.messages);
+			}
 			let turn_start = state.messages.len();
 			state.messages.push(assistant.clone());
 			state.total_turns += 1;

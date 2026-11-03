@@ -1142,7 +1142,7 @@ impl RpcSession {
 		let (id, file) = self.advisor_scope();
 		self
 			.runner
-			.advisor_reset_boundary(id.as_deref(), file.as_deref());
+			.advisor_reset_boundary(id.as_deref(), file.as_deref(), &[]);
 	}
 
 	/// Rendered advisor status for the live scope, if a manager exists.

@@ -576,6 +576,7 @@ impl AdvisorManager {
 	/// Emit every queued aside as one card and stage it for the next request.
 	/// Public so headless/child teardown can flush after its bounded drain.
 	pub fn flush_asides(self: &Arc<Self>) {
+		let _epoch = self.inner.epoch_lock.lock().unwrap_or_else(|poison| poison.into_inner());
 		if self.inner.disposed.load(Ordering::SeqCst) {
 			return;
 		}
@@ -783,6 +784,13 @@ impl AdvisorManager {
 			}
 			let cancelled = cancel.is_cancelled();
 			if cancelled && self.inner.disposed.load(Ordering::SeqCst) {
+				transcript.abandon_turn();
+				let mut state = slot.state.lock().unwrap_or_else(|poison| poison.into_inner());
+				state.transcript = transcript;
+				state.history = history;
+				break;
+			}
+			if self.inner.disposed.load(Ordering::SeqCst) {
 				transcript.abandon_turn();
 				let mut state = slot.state.lock().unwrap_or_else(|poison| poison.into_inner());
 				state.transcript = transcript;
@@ -1008,6 +1016,10 @@ impl AdvisorManager {
 
 	/// Route one accepted note from `slot`.
 	fn route_advice(self: &Arc<Self>, slot: &Arc<AdvisorSlot>, note: Note) {
+		// Serialize with dispose: a card that begins routing after close must not
+		// reach the sink, and one that already routed is queued before the final
+		// take observes it.
+		let _epoch = self.inner.epoch_lock.lock().unwrap_or_else(|poison| poison.into_inner());
 		if self.inner.disposed.load(Ordering::SeqCst) {
 			return;
 		}
@@ -1090,13 +1102,25 @@ impl AdvisorManager {
 	}
 
 	/// Re-prime every advisor after a conversation boundary or history rewrite.
-	pub fn reset(&self, _reason: &str) {
+	/// `transcript` is the exact post-boundary history: the old feed is replaced
+	/// before any advisor can replay it.
+	pub fn reset(&self, _reason: &str, transcript: &[Message]) {
 		let _epoch = self.inner.epoch_lock.lock().unwrap_or_else(|poison| poison.into_inner());
 		self.inner.epoch.fetch_add(1, Ordering::SeqCst);
 		self.inner.aborting.store(false, Ordering::SeqCst);
 		self.inner.auto_resume_suppressed.store(false, Ordering::SeqCst);
 		self.inner.completed_turns.store(0, Ordering::SeqCst);
-		self.inner.needs_seed.store(true, Ordering::SeqCst);
+		let mut feed = self.inner.feed.lock().unwrap_or_else(|poison| poison.into_inner());
+		feed.clear();
+		feed.extend(
+			transcript
+				.iter()
+				.filter(|message| !matches!(message.role, Role::System | Role::Developer))
+				.cloned(),
+		);
+		let prefix: Vec<u64> = feed.iter().map(fingerprint).collect();
+		self.inner.needs_seed.store(transcript.is_empty(), Ordering::SeqCst);
+		drop(feed);
 		*self
 			.inner
 			.immune_start
@@ -1114,7 +1138,7 @@ impl AdvisorManager {
 				cancel.cancel();
 			}
 			state.history.clear();
-			state.seen_prefix.clear();
+			state.seen_prefix = prefix.clone();
 			state.pending.clear();
 			state.backlog = 0;
 			state.seen_context.clear();
@@ -1328,8 +1352,11 @@ impl AdvisorManager {
 		lines.join("\n")
 	}
 
-	/// Stop all work; safe to call twice.
+	/// Stop all work; safe to call twice. Holds the epoch lock so a commit that
+	/// already passed its stale-epoch check cannot write transcript after the
+	/// close.
 	pub fn dispose(&self) {
+		let _epoch = self.inner.epoch_lock.lock().unwrap_or_else(|poison| poison.into_inner());
 		if self.inner.disposed.swap(true, Ordering::SeqCst) {
 			return;
 		}
@@ -1755,6 +1782,34 @@ mod tests {
 	}
 
 	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn reset_replaces_the_feed_with_the_rewound_transcript() {
+		let executor = Arc::new(FakeExecutor {
+			calls: StdMutex::new(Vec::new()),
+			error: StdMutex::new(None),
+		});
+		let manager = manager(executor);
+		manager.begin_primary_run(&[]);
+		manager.push_user(&Message::user("old branch"));
+		manager.reset(
+			"rewind",
+			&[Message::user("kept"), Message::assistant("kept answer")],
+		);
+		let feed = manager.inner.feed.lock().unwrap_or_else(|poison| poison.into_inner());
+		assert_eq!(feed.len(), 2);
+		assert_eq!(feed[0].content, "kept");
+		assert_eq!(feed[1].content, "kept answer");
+		drop(feed);
+		let state = manager.slots[0]
+			.state
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner());
+		assert_eq!(state.seen_prefix.len(), 2);
+		assert!(state.pending.is_empty());
+		drop(state);
+		manager.dispose();
+	}
+
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 	async fn paused_entry_makes_zero_provider_calls() {
 		let executor = Arc::new(FakeExecutor {
 			calls: StdMutex::new(Vec::new()),
@@ -1867,7 +1922,7 @@ mod tests {
 		tokio::time::timeout(Duration::from_secs(1), executor.started.notified())
 			.await
 			.expect("advisor call started");
-		manager.reset("branch switched");
+		manager.reset("branch switched", &[]);
 		executor.release.notify_one();
 		tokio::time::sleep(Duration::from_millis(100)).await;
 		let state = manager.slots[0]
@@ -1903,7 +1958,7 @@ mod tests {
 		manager.push_user(&Message::user("again"));
 		manager.push_turn(&Message::assistant("done again"), &[]);
 		assert_eq!(executor.calls.lock().expect("calls").len(), 1);
-		manager.reset("conversation-boundary");
+		manager.reset("conversation-boundary", &[]);
 		assert_eq!(manager.status_overview()[0].1, RuntimeStatus::Running);
 		manager.begin_primary_run(&[]);
 		manager.push_user(&Message::user("fresh"));

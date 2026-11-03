@@ -1415,12 +1415,12 @@ fn apply_nested_settings(config: &mut Config, value: &Value, path: &Path) -> Res
 		"model.toolCallLoopGuard.threshold",
 	) {
 		match threshold {
-			Value::Int(value) if *value >= 2 => {
+			Value::Int(value) if *value >= 1 => {
 				config.tool_call_loop_guard.threshold = Some(*value as usize);
 			},
 			_ => {
 				eprintln!(
-					"warning: {}: model.toolCallLoopGuard.threshold must be an integer >= 2; ignoring",
+					"warning: {}: model.toolCallLoopGuard.threshold must be an integer >= 1; ignoring",
 					path.display()
 				);
 			},
@@ -1434,7 +1434,7 @@ fn apply_nested_settings(config: &mut Config, value: &Value, path: &Path) -> Res
 		"model.toolCallLoopGuard.exemptTools",
 	) {
 		match exempt {
-			Value::Array(items) => {
+			Value::List(items) => {
 				config.tool_call_loop_guard.exempt_tools = Some(
 					items
 						.iter()
@@ -2612,6 +2612,21 @@ mod tests {
 		assert_eq!(config.tier_anthropic.as_deref(), Some("none"));
 		assert_eq!(config.tier_openai.as_deref(), Some("none"));
 		assert!(config.configured_service_tiers().is_empty());
+	}
+
+	#[test]
+	fn tool_call_loop_guard_parser_accepts_threshold_one_and_yaml_lists() {
+		let config = parse_config(
+			"model:
+  toolCallLoopGuard:
+    threshold: 1
+    exemptTools: [hub, advise]
+",
+		)
+		.expect("loop guard");
+		assert_eq!(config.tool_call_loop_guard.threshold(), 1);
+		assert!(config.tool_call_loop_guard.exempt("advise"));
+		assert!(!config.tool_call_loop_guard.exempt("read"));
 	}
 
 	fn parse_config(text: &str) -> Result<Config> {

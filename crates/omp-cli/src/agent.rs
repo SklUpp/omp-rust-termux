@@ -412,14 +412,15 @@ pub trait AgentRunner: Send + Sync {
 	}
 
 	/// Re-prime every advisor after a conversation boundary (`/new`, branch
-	/// switch, compaction/rewind rewrite). Clears the quota latch and backlog so
-	/// a new conversation starts clean; a scope without a manager is a no-op.
+	/// switch, compaction/rewind rewrite). `history` is the exact post-boundary
+	/// transcript; the old feed is replaced before the next advisor request.
 	fn advisor_reset_boundary(
 		&self,
 		session_id: Option<&str>,
 		session_file: Option<&std::path::Path>,
+		history: &[pi_agent::Message],
 	) {
-		let _ = (session_id, session_file);
+		let _ = (session_id, session_file, history);
 	}
 
 	/// Rendered advisor status for this scope (`None` when the advisor never

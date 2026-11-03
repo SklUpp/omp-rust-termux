@@ -3833,6 +3833,13 @@ async fn run_advisor_call(
 	if turns.is_empty() {
 		return Err("advisor returned no assistant turn".to_string());
 	}
+	let error = turns
+		.iter()
+		.rev()
+		.find(|turn| {
+			turn.message.stop_reason == Some(pi_agent::StopReason::Error)
+		})
+		.map(|turn| turn.message.error_message.clone().unwrap_or_default());
 	let assistant_messages = turns
 		.iter()
 		.map(|turn| turn.message.clone())
@@ -3840,7 +3847,7 @@ async fn run_advisor_call(
 	Ok(crate::advisor_runtime::AdvisorCallResult {
 		history,
 		assistant_messages,
-		error: None,
+		error,
 	})
 }
 

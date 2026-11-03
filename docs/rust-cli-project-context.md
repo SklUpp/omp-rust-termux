@@ -55,9 +55,9 @@ New provider features remain paused. Correctness fixes required by the current b
 
 | Subsystem | Runtime contract | Source |
 |---|---|---|
-| Plan/prewalk | Explicit mode/policy transitions; required-tool reminders; durable model cutover; contained proposal writes | `plan_yolo.rs`, `prewalk.rs`, `acp/plan.rs` |
+| Plan/prewalk | Explicit policy transitions, required-tool reminders, persisted model changes and contained proposal writes | `plan_yolo.rs`, `prewalk.rs`, `acp/plan.rs` |
 | Delegation | Session-owned jobs, park/revive, isolation, background delivery and deduplicated usage | `pi-agent/src/supervisor.rs`, `tools/task.rs`, `hub_park.rs` |
-| Eval | Lazy managed kernels, exact child provider binding, caller-scoped artifacts and tool bridge | `eval_host.rs`, `pi-agent/src/eval/` |
+| Eval | Interpreters started on demand, child-specific provider selection, caller-scoped artifacts and tool calls | `eval_host.rs`, `pi-agent/src/eval/` |
 | Protocols | MCP stdio/HTTP/SSE, LSP and DAP with bounded cancellation/reap | `pi-agent/src/mcp/`, `lsp/`, `dap/` |
 | Security scan | Opt-in local coordinator, restricted worker, persistent journal, once-only bundle publication, read-only `security://` | `security/`, `security_runtime.rs`, `auth/security.rs` |
 | Local learning | Backend-gated lessons, managed skills, caller-scoped snapshots, skill/memory resources and restricted capture | `autolearn.rs`, `local_memory.rs`, `managed_skills.rs`, `skills.rs` |

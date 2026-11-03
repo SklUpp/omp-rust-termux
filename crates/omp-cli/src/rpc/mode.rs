@@ -976,13 +976,16 @@ impl RpcMode {
 				let commands = if session.skill_options.enable_skill_commands {
 					session
 						.skill_snapshot
-						.all_skills()
+						.entries()
 						.into_iter()
-						.map(|skill| json!({
-							"name": format!("skill:{}", skill.name),
-							"description": skill.description,
-							"source": "skill",
-						}))
+						.map(|entry| {
+							let skill = entry.skill;
+							json!({
+								"name": format!("skill:{}", skill.name),
+								"description": skill.description,
+								"source": "skill",
+							})
+						})
 						.collect::<Vec<Value>>()
 				} else {
 					Vec::new()
@@ -1933,9 +1936,9 @@ fn run_turn(
 	};
 	if let Some(result) = capture {
 		let result = result.and_then(|request| {
-			let stream = runner.run(&request).map_err(|error| error.to_string())?;
+			let stream = runner.run(&request)?;
 			for event in stream {
-				event.map_err(|error| error.to_string())?;
+				event?;
 			}
 			Ok(())
 		});

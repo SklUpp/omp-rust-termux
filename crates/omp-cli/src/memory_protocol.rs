@@ -160,7 +160,7 @@ pub fn memory_path(agent_dir: &Path, cwd: &Path, relative: &str) -> PathBuf {
 mod tests {
 	use std::sync::atomic::{AtomicU32, Ordering};
 
-	use pi_agent::tools::internal_urls::ResolveContext;
+	use pi_agent::tools::internal_urls::{ProtocolHandler, ResolveContext};
 
 	use super::*;
 

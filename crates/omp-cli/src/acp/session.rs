@@ -1331,9 +1331,9 @@ impl AcpSession {
 		drop(session);
 		if let Some(result) = capture {
 			let result = result.and_then(|request| {
-				let stream = runner.run(&request).map_err(|error| error.to_string())?;
+				let stream = runner.run(&request)?;
 				for event in stream {
-					event.map_err(|error| error.to_string())?;
+					event?;
 				}
 				Ok(())
 			});

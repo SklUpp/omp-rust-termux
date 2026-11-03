@@ -1358,7 +1358,6 @@ impl AgentRunner for PiAgentRunner {
 		// supervisor shares the same router with every child registry.
 		session.set_internal_urls(request.internal_urls.clone());
 		session.set_url_scope(request.url_scope.clone());
-		session.set_autoload_resolver(request.skill_autoload.resolver());
 		session.set_acp_bridge(request.acp_bridge.as_ref().map(|handle| Arc::clone(&handle.0)));
 		let acp_bridge = session.acp_bridge();
 		// `lsp.shared`/`tools.maxTimeout` are applied before the registry is built
@@ -1564,6 +1563,7 @@ impl AgentRunner for PiAgentRunner {
 				supervisor.subscribe_once(&observer.0);
 			}
 			supervisor.set_internal_urls(request.internal_urls.clone());
+			supervisor.set_autoload_resolver(request.skill_autoload.resolver());
 			if let Some(scope) = &request.url_scope {
 				supervisor.set_url_scope(Arc::clone(scope));
 			}

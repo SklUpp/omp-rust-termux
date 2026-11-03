@@ -216,6 +216,26 @@ fn text_body(text: &str) -> String {
 	)
 }
 
+fn tool_names(request: &serde_json::Value) -> Vec<String> {
+	request
+		.get("tools")
+		.and_then(serde_json::Value::as_array)
+		.map(|tools| {
+			tools
+				.iter()
+				.filter_map(|tool| {
+					tool
+						.get("function")
+						.and_then(|function| function.get("name"))
+						.or_else(|| tool.get("name"))
+						.and_then(serde_json::Value::as_str)
+						.map(str::to_string)
+				})
+				.collect()
+		})
+		.unwrap_or_default()
+}
+
 fn message_text(message: &serde_json::Value) -> String {
 	match message.get("content") {
 		Some(serde_json::Value::String(text)) => text.clone(),
@@ -475,6 +495,11 @@ fn autoload_skills_reach_the_child_conversation_once() {
 				.is_some_and(|system| system.contains("Child marker instructions."))
 		})
 		.expect("child request reached the provider");
+	let child_tools = tool_names(child_request);
+	assert!(
+		!child_tools.iter().any(|name| name == "learn" || name == "manage_skill"),
+		"top-level autolearn tools must not mount for children: {child_tools:?}"
+	);
 	let messages = child_request
 		.get("messages")
 		.and_then(serde_json::Value::as_array)
@@ -526,6 +551,63 @@ fn autoload_skills_reach_the_child_conversation_once() {
 			.count(),
 		1,
 		"autoload body must appear once"
+	);
+}
+
+#[test]
+fn local_autolearn_tools_validate_only_when_mounted() {
+	let server = MockModel::start();
+	let temp = temp_dir("autolearn-tools");
+	let agent_dir = temp.join("agent");
+	let cwd = temp.join("project");
+	let sessions = temp.join("sessions");
+	let share = temp.join("share");
+	let config_dir = temp.join("config");
+	for dir in [&sessions, &share, &config_dir, &cwd] {
+		fs::create_dir_all(dir).expect("fixture dir");
+	}
+	setup_agent_dir(&agent_dir, server.port);
+
+	let run = |tools: &str| {
+		ProcCommand::new(env!("CARGO_BIN_EXE_omp"))
+			.env("PI_CODING_AGENT_DIR", &agent_dir)
+			.env("PI_CONFIG_DIR", &config_dir)
+			.env("OMP_SHARE_DIR", &share)
+			.env("PI_NO_TITLE", "1")
+			.stdin(Stdio::null())
+			.args(["--cwd", cwd.to_str().unwrap()])
+			.args(["--session-dir", sessions.to_str().unwrap()])
+			.args(["--no-session", "--tools", tools, "--yolo"])
+			.args(["--max-time", "20s", "--mode", "text", "-p", "hello"])
+			.output()
+			.expect("run omp")
+	};
+
+	let valid = run("read,learn,manage_skill");
+	assert_eq!(
+		valid.status.code(),
+		Some(0),
+		"{}",
+		String::from_utf8_lossy(&valid.stderr)
+	);
+
+	let config = fs::read_to_string(agent_dir.join("config.yml")).expect("config");
+	fs::write(
+		agent_dir.join("config.yml"),
+		config.replace("backend: local", "backend: off"),
+	)
+	.expect("disable memory");
+	let disabled = run("read,learn,manage_skill");
+	assert_ne!(disabled.status.code(), Some(0), "learn must not validate without local memory");
+	let stderr = String::from_utf8_lossy(&disabled.stderr);
+	assert!(stderr.contains("Unknown tool"), "{stderr}");
+	assert!(stderr.contains("learn"), "{stderr}");
+	let manage_only = run("read,manage_skill");
+	assert_eq!(
+		manage_only.status.code(),
+		Some(0),
+		"manage_skill stays valid without a memory backend: {}",
+		String::from_utf8_lossy(&manage_only.stderr)
 	);
 }
 

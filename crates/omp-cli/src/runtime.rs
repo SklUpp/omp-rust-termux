@@ -4831,6 +4831,30 @@ async fn check_or_prompt_stdio_mcp_launch(
 	}
 }
 
+/// Extra top-level tools that `--tools` may name for this config. `learn` is
+/// only mountable with the local backend and only when `manage_skill` is also
+/// selected; disabled memory keeps it unknown instead of silently mounting.
+fn autolearn_selectable_tool_names(
+	config: &crate::config::Config,
+	requested: &[String],
+) -> Vec<&'static str> {
+	if !config.autolearn.enabled() {
+		return Vec::new();
+	}
+	let mut names = vec![crate::autolearn::MANAGE_SKILL_TOOL_NAME];
+	if requested
+		.iter()
+		.any(|name| name == crate::autolearn::MANAGE_SKILL_TOOL_NAME)
+		&& matches!(
+			config.memory_backend(),
+			crate::autolearn::MemoryBackend::Local
+		)
+	{
+		names.push(crate::autolearn::LEARN_TOOL_NAME);
+	}
+	names
+}
+
 #[derive(Debug, Clone)]
 pub struct McpSpawnResult {
 	pub tools: Vec<McpTool>,
@@ -4876,6 +4900,11 @@ pub async fn filter_and_spawn_mcp_servers_with_paths_detailed(
 		// (`has_goal` or selected), but a restricted `--tools` selection may
 		// always name it (#9444).
 		valid.push(crate::goal_tool::GOAL_TOOL_NAME.to_string());
+		valid.extend(
+			autolearn_selectable_tool_names(config, requested_tools)
+				.iter()
+				.map(|name| (*name).to_string()),
+		);
 		valid.extend(all_server_names.iter().cloned());
 		// MCP tool ids are only enumerable after a server responds; a name that
 		// matches no builtin, no delegation tool, and no configured server cannot
@@ -5054,6 +5083,11 @@ pub async fn filter_and_spawn_mcp_servers_with_paths_detailed(
 		// `goal` likewise mounts only under its own predicate, but `--tools` may
 		// name it so a restricted selection keeps the restored goal manageable.
 		known_tools.push(crate::goal_tool::GOAL_TOOL_NAME.to_string());
+		known_tools.extend(
+			autolearn_selectable_tool_names(config, requested_tools)
+				.iter()
+				.map(|name| (*name).to_string()),
+		);
 		for tool in &unique_tools {
 			known_tools.push(tool.name().to_string());
 		}

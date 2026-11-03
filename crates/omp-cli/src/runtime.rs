@@ -1058,6 +1058,62 @@ impl AgentRunner for Arc<PiAgentRunner> {
 	) {
 		self.reopen_session_scope(session_id, session_file);
 	}
+
+	fn advisor_prepare_headless_drain(
+		&self,
+		session_id: Option<&str>,
+		session_file: Option<&std::path::Path>,
+	) {
+		<PiAgentRunner as AgentRunner>::advisor_prepare_headless_drain(
+			self,
+			session_id,
+			session_file,
+		);
+	}
+
+	fn advisor_wait_catchup(
+		&self,
+		session_id: Option<&str>,
+		session_file: Option<&std::path::Path>,
+		timeout: std::time::Duration,
+	) -> bool {
+		<PiAgentRunner as AgentRunner>::advisor_wait_catchup(
+			self,
+			session_id,
+			session_file,
+			timeout,
+		)
+	}
+
+	fn advisor_dispose(
+		&self,
+		session_id: Option<&str>,
+		session_file: Option<&std::path::Path>,
+	) {
+		<PiAgentRunner as AgentRunner>::advisor_dispose(self, session_id, session_file);
+	}
+
+	fn advisor_reset_boundary(
+		&self,
+		session_id: Option<&str>,
+		session_file: Option<&std::path::Path>,
+		history: &[pi_agent::Message],
+	) {
+		<PiAgentRunner as AgentRunner>::advisor_reset_boundary(
+			self,
+			session_id,
+			session_file,
+			history,
+		);
+	}
+
+	fn advisor_status(
+		&self,
+		session_id: Option<&str>,
+		session_file: Option<&std::path::Path>,
+	) -> Option<String> {
+		<PiAgentRunner as AgentRunner>::advisor_status(self, session_id, session_file)
+	}
 }
 
 struct SignalDispatcher {

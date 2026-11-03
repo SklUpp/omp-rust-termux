@@ -4849,7 +4849,12 @@ mod tests {
 				message.contains("captured sentinel"),
 				"background child must use the captured resolver, got {message}"
 			),
-			other => panic!("expected the captured resolver to fail the spawn, got {other:?}"),
+			Err(_) => panic!(
+				"expected the captured resolver to fail the spawn with its sentinel, got another error"
+			),
+			Ok(_) => panic!(
+				"expected the captured resolver to fail the spawn, got a background outcome"
+			),
 		}
 	}
 }

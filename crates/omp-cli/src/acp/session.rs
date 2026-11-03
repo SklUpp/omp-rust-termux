@@ -471,6 +471,11 @@ impl AcpRuntime {
 				gate.generation = gate.generation.wrapping_add(1);
 			}
 		}
+		// ACP has no custom-message frame. A settled card wakes this per-session
+		// pump, which persists it once and emits the `_meta.advisor` chunk after
+		// the prompt has already been answered. Weak ownership lets the thread
+		// exit when the session drops; no cycle, no join needed.
+		record.start_advisor_card_pump();
 		Ok(record)
 	}
 }
@@ -1455,6 +1460,41 @@ impl AcpSession {
 					"updatedAt": output::iso8601(SystemTime::now()),
 				}));
 			});
+	}
+
+	fn start_advisor_card_pump(self: &Arc<Self>) {
+		let (wake_tx, wake_rx) = mpsc::channel();
+		self.lock().set_advisor_wake(wake_tx);
+		let weak = Arc::downgrade(self);
+		let name = format!("omp-acp-advisor-{}", self.id);
+		let _ = thread::Builder::new().name(name).spawn(move || {
+			while wake_rx.recv().is_ok() {
+				let Some(session) = weak.upgrade() else {
+					break;
+				};
+				session.pump_advisor_cards();
+			}
+		});
+	}
+
+	fn pump_advisor_cards(&self) {
+		if self.is_closed()
+			|| self.runtime.transport.is_closed()
+			|| self.gate.cancel_requested()
+		{
+			return;
+		}
+		let cards = {
+			let mut session = self.lock();
+			session.take_advisor_cards()
+		};
+		for (content, details) in cards {
+			self.emit_update(json!({
+				"sessionUpdate": "agent_message_chunk",
+				"content": { "type": "text", "text": content },
+				"_meta": { "advisor": details },
+			}));
+		}
 	}
 
 	fn emit_update(&self, update: Value) {

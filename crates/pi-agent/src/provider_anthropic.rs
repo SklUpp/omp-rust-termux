@@ -271,6 +271,8 @@ pub struct AnthropicMessagesProvider {
 	http: reqwest::Client,
 	base_url: String,
 	api_key: String,
+	/// Per-request credential callback; `None` uses `api_key`.
+	credential: Option<crate::provider::CredentialCallback>,
 	model: String,
 	/// Model output ceiling; also the default requested `max_tokens`.
 	max_tokens: u32,
@@ -454,6 +456,7 @@ impl AnthropicMessagesProvider {
 			http,
 			base_url: base_url.into(),
 			api_key: api_key.into(),
+			credential: None,
 			model: model.into(),
 			max_tokens: DEFAULT_MAX_TOKENS,
 			thinking: None,
@@ -1724,7 +1727,7 @@ impl ModelProvider for AnthropicMessagesProvider {
 	) -> Result<Message, ProviderError> {
 		self.check_support(messages)?;
 		let body = self.build_request(messages, tools, tool_choice, false)?;
-		let response = self
+		let (response, key) = self
 			.send_with_retry(&body, false, !tools.is_empty())
 			.await?;
 
@@ -1738,7 +1741,7 @@ impl ModelProvider for AnthropicMessagesProvider {
 		if !status.is_success() {
 			return Err(ProviderError::HttpStatus(
 				status.as_u16(),
-				self.redact_snippet(&body.text, body.truncated),
+				self.redact_snippet_with_key(&body.text, key.as_deref(), body.truncated),
 			));
 		}
 		if body.truncated {
@@ -1751,7 +1754,7 @@ impl ModelProvider for AnthropicMessagesProvider {
 		let parsed: AnthropicResponse = serde_json::from_str(&text).map_err(|err| {
 			ProviderError::Protocol(format!(
 				"invalid Anthropic message body: {err}; body: {}",
-				self.redact_snippet(&text, false)
+				self.redact_snippet_with_key(&text, key.as_deref(), false)
 			))
 		})?;
 		Ok(self.from_response(parsed))
@@ -1765,16 +1768,18 @@ impl ModelProvider for AnthropicMessagesProvider {
 	) -> Result<ChunkStream, ProviderError> {
 		self.check_support(messages)?;
 		let body = self.build_request(messages, tools, tool_choice, true)?;
-		let response = self
+		let (response, key) = self
 			.send_with_retry(&body, true, !tools.is_empty())
 			.await?;
 
 		let status = response.status();
 		let response = if status.is_success() {
-			response
+			(response, key)
 		} else {
 			let text = match read_body_bounded(response, ERROR_BODY_BYTES).await {
-				Ok(body) => self.redact_snippet(&body.text, body.truncated),
+				Ok(body) => {
+					self.redact_snippet_with_key(&body.text, key.as_deref(), body.truncated)
+				},
 				Err(err) => format!("<failed to read error body: {err}>"),
 			};
 			// TS `anthropic.ts:2764-2783`: only a priority request whose fast
@@ -1787,25 +1792,32 @@ impl ModelProvider for AnthropicMessagesProvider {
 			}
 			self.fast_mode_disabled.store(true, Ordering::Relaxed);
 			let retry_body = self.build_request(messages, tools, tool_choice, true)?;
-			let retry = self
+			let (retry, retry_key) = self
 				.send_with_retry(&retry_body, true, !tools.is_empty())
 				.await?;
 			let retry_status = retry.status();
 			if !retry_status.is_success() {
 				let retry_text = match read_body_bounded(retry, ERROR_BODY_BYTES).await {
-					Ok(body) => self.redact_snippet(&body.text, body.truncated),
+					Ok(body) => self.redact_snippet_with_key(
+						&body.text,
+						retry_key.as_deref(),
+						body.truncated,
+					),
 					Err(err) => format!("<failed to read error body: {err}>"),
 				};
 				return Err(ProviderError::HttpStatus(retry_status.as_u16(), retry_text));
 			}
-			retry
+			(retry, retry_key)
 		};
-
+		let (response, key) = response;
 		let disabled_features = (self.wants_priority()
 			&& self.fast_mode_disabled.load(Ordering::Relaxed))
 		.then(|| vec!["priority".to_string()]);
 
-		let secrets = self.credential_values();
+		let mut secrets = self.credential_values();
+		if let Some(key) = key.as_deref().filter(|key| !key.is_empty()) {
+			secrets.push(key.to_string());
+		}
 		let body = response
 			.bytes_stream()
 			.map(|item| item.map_err(|err| err.to_string()));
@@ -1859,15 +1871,17 @@ impl ModelProvider for AnthropicMessagesProvider {
 						self.fast_mode_disabled.store(true, Ordering::Relaxed);
 						let retry_body =
 							self.build_request(messages, tools, tool_choice, true)?;
-						let retry = self
+						let (retry, retry_key) = self
 							.send_with_retry(&retry_body, true, !tools.is_empty())
 							.await?;
 						let retry_status = retry.status();
 						if !retry_status.is_success() {
 							let text = match read_body_bounded(retry, ERROR_BODY_BYTES).await {
-								Ok(body) => {
-									self.redact_snippet(&body.text, body.truncated)
-								},
+								Ok(body) => self.redact_snippet_with_key(
+									&body.text,
+									retry_key.as_deref(),
+									body.truncated,
+								),
 								Err(err) => format!("<failed to read error body: {err}>"),
 							};
 							return Err(ProviderError::HttpStatus(
@@ -1875,7 +1889,10 @@ impl ModelProvider for AnthropicMessagesProvider {
 								text,
 							));
 						}
-						let secrets = self.credential_values();
+						let mut secrets = self.credential_values();
+						if let Some(key) = retry_key.as_deref().filter(|key| !key.is_empty()) {
+							secrets.push(key.to_string());
+						}
 						let retry_body = retry
 							.bytes_stream()
 							.map(|item| item.map_err(|err| err.to_string()));
@@ -1912,21 +1929,52 @@ impl AnthropicMessagesProvider {
 		body: &AnthropicMessagesRequest,
 		stream: bool,
 		has_tools: bool,
-	) -> Result<reqwest::Response, ProviderError> {
+	) -> Result<(reqwest::Response, Option<String>), ProviderError> {
 		let mut attempt = 0u32;
+		let mut refreshed = false;
 		loop {
-			let request = self.http_request(body, stream, has_tools)?;
+			// The callback runs before every POST, including 5xx retries, so a
+			// pinned row disabled mid-review stops the next request. Only the
+			// 401/403 invalid-key branch forces one refresh.
+			let key = match &self.credential {
+				Some(callback) => Some(callback(false).map_err(ProviderError::AuthRefresh)?),
+				None => None,
+			};
+			let request = match &key {
+				Some(key) => self.http_request_with_key(body, stream, has_tools, key)?,
+				None => self.http_request(body, stream, has_tools)?,
+			};
 			match request.send().await {
 				Ok(response) => {
 					if response.status().is_success() {
-						return Ok(response);
+						return Ok((response, key));
+					}
+					if matches!(response.status().as_u16(), 401 | 403) {
+						let status = response.status();
+						let body = read_body_bounded(response, ERROR_BODY_BYTES).await?;
+						if !refreshed
+							&& crate::provider::is_invalid_key_body(&body.text)
+							&& let Some(callback) = &self.credential
+						{
+							callback(true).map_err(ProviderError::AuthRefresh)?;
+							refreshed = true;
+							continue;
+						}
+						return Err(ProviderError::HttpStatus(
+							status.as_u16(),
+							self.redact_snippet_with_key(
+								&body.text,
+								key.as_deref(),
+								body.truncated,
+							),
+						));
 					}
 					let Some(delay) = (attempt < self.max_retries
 						&& should_retry_response(&response))
 					.then(|| retry_delay(&response, attempt))
 					.flatten()
 					else {
-						return Ok(response);
+						return Ok((response, key));
 					};
 					drop(response);
 					tokio::time::sleep(delay).await;
@@ -1941,6 +1989,50 @@ impl AnthropicMessagesProvider {
 					tokio::time::sleep(delay).await;
 				},
 			}
+		}
+	}
+
+	/// Install the per-request credential callback (C6 exact OAuth).
+	#[must_use]
+	pub fn with_credential_callback(
+		mut self,
+		callback: Option<crate::provider::CredentialCallback>,
+	) -> Self {
+		self.credential = callback;
+		self
+	}
+
+	fn http_request_with_key(
+		&self,
+		body: &AnthropicMessagesRequest,
+		stream: bool,
+		has_tools: bool,
+		key: &str,
+	) -> Result<reqwest::RequestBuilder, ProviderError> {
+		let mut headers = self.request_headers_for(stream, has_tools)?;
+		let header_value = |value: String| {
+			reqwest::header::HeaderValue::from_str(&value)
+				.map_err(|err| ProviderError::Protocol(format!("invalid credential header: {err}")))
+		};
+		if headers.contains_key(reqwest::header::AUTHORIZATION) {
+			headers.insert(
+				reqwest::header::AUTHORIZATION,
+				header_value(format!("Bearer {key}"))?,
+			);
+		}
+		if headers.contains_key("x-api-key") {
+			headers.insert(
+				reqwest::header::HeaderName::from_static("x-api-key"),
+				header_value(key.to_string())?,
+			);
+		}
+		let request = self.http.post(self.endpoint()).headers(headers);
+		if self.is_oauth() {
+			let serialized = serde_json::to_string(body)?;
+			let patched = patch_cch_placeholder(&serialized).unwrap_or(serialized);
+			Ok(request.body(patched))
+		} else {
+			Ok(request.json(body))
 		}
 	}
 
@@ -1969,6 +2061,22 @@ impl AnthropicMessagesProvider {
 
 	fn redact_snippet(&self, text: &str, truncated: bool) -> String {
 		bounded_redaction(text, &self.credential_values(), truncated)
+	}
+
+	/// Redact a body against the static credential plus the exact token this
+	/// request actually used (including a refreshed callback token, which is
+	/// deliberately absent from `credential_values`).
+	fn redact_snippet_with_key(
+		&self,
+		text: &str,
+		key: Option<&str>,
+		truncated: bool,
+	) -> String {
+		let mut secrets = self.credential_values();
+		if let Some(key) = key.filter(|key| !key.is_empty()) {
+			secrets.push(key.to_string());
+		}
+		bounded_redaction(text, &secrets, truncated)
 	}
 }
 

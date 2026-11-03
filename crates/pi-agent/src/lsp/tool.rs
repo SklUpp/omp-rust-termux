@@ -175,7 +175,12 @@ pub struct LspTool {
 	/// Ownership scope over the process-wide client registry. Root turns share
 	/// the runner's scope (`RunnerSession`), children get their own, so a
 	/// teardown never closes a server another session still uses.
-	session: Arc<LspSession>,
+	session:   Arc<LspSession>,
+	/// Action-level ceiling: when set, `execute` rejects any action outside
+	/// `LSP_READONLY_ACTIONS` before a language server is touched. This is the
+	/// C6 security-scan boundary: an allowlisted tool name must not grant
+	/// rename/rename_file/code-action workspace edits.
+	read_only: bool,
 }
 
 impl Default for LspTool {
@@ -188,7 +193,19 @@ impl LspTool {
 	/// Tool with the default `lsp.shared = true` transport preference.
 	#[must_use]
 	pub fn new() -> Self {
-		Self { session: LspSession::new(true) }
+		Self { session: LspSession::new(true), read_only: false }
+	}
+
+	/// Read-only variant: every mutating action is rejected in-band.
+	#[must_use]
+	pub fn with_shared_read_only(shared_mux: bool, read_only: bool) -> Self {
+		Self { session: LspSession::new(shared_mux), read_only }
+	}
+
+	/// Read-only variant joining an existing ownership scope.
+	#[must_use]
+	pub fn with_session_read_only(session: Arc<LspSession>, read_only: bool) -> Self {
+		Self { session, read_only }
 	}
 
 	/// Tool whose clients prefer (`true`) or avoid (`false`) the broker mux.
@@ -199,7 +216,7 @@ impl LspTool {
 	/// cleanup, so concurrent sessions with different settings stay isolated.
 	#[must_use]
 	pub fn with_shared(shared_mux: bool) -> Self {
-		Self { session: LspSession::new(shared_mux) }
+		Self { session: LspSession::new(shared_mux), read_only: false }
 	}
 
 	/// Tool that joins an existing ownership scope.
@@ -208,7 +225,7 @@ impl LspTool {
 	/// session across turns, exactly like snapshots and the `EditTool` state.
 	#[must_use]
 	pub fn with_session(session: Arc<LspSession>) -> Self {
-		Self { session }
+		Self { session, read_only: false }
 	}
 }
 
@@ -279,6 +296,16 @@ impl Tool for LspTool {
 		let params: LspParams = serde_json::from_value(args.clone())
 			.map_err(|error| ToolError::InvalidArguments(error.to_string()))?;
 		let action = params.action.trim().to_ascii_lowercase();
+		if self.read_only && !crate::lsp::is_readonly_lsp_action(&action) {
+			return Ok(text_result(
+				format!(
+					"Error: lsp action `{action}` is not permitted in this read-only session; allowed actions: {}",
+					crate::lsp::LSP_READONLY_ACTIONS.join(", ")
+				),
+				false,
+				details(&action, false, None, &params),
+			));
+		}
 		let timeout_secs = clamp_timeout(params.timeout);
 		let run = RunGuard::new(&ctx.cancellation_token, timeout_secs);
 		let cwd = ctx.cwd.clone();
@@ -1844,4 +1871,42 @@ async fn execute_command(
 		)
 		.await
 		.map(|_| ())
+}
+
+#[cfg(test)]
+mod readonly_action_tests {
+	use super::*;
+	use crate::state::AgentContext;
+
+	#[tokio::test]
+	async fn read_only_tool_rejects_mutating_actions_before_dispatch() {
+		let tool = LspTool::with_shared_read_only(false, true);
+		let ctx = AgentContext::new(std::env::temp_dir());
+		for action in ["rename", "rename_file", "code_actions", "format", "reload", "request"] {
+			let result = tool
+				.execute(&json!({"action": action, "file": "missing.rs", "new_name": "x"}), &ctx)
+				.await
+				.expect("in-band rejection, not a tool error");
+			assert!(result.is_error, "{action} must be rejected");
+			assert!(
+				result.content.contains("not permitted in this read-only session"),
+				"{action}: {}",
+				result.content
+			);
+		}
+	}
+
+	#[tokio::test]
+	async fn read_write_tool_keeps_mutating_actions() {
+		let tool = LspTool::with_shared_read_only(false, false);
+		let ctx = AgentContext::new(std::env::temp_dir());
+		let result = tool
+			.execute(&json!({"action": "rename", "file": "missing.rs", "new_name": "x"}), &ctx)
+			.await;
+		let rejected = match result {
+			Ok(result) => result.content.contains("not permitted in this read-only session"),
+			Err(error) => error.to_string().contains("not permitted in this read-only session"),
+		};
+		assert!(!rejected, "write-capable tool must not apply the read-only gate");
+	}
 }

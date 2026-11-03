@@ -19,6 +19,29 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Maximum characters of an error response body kept for diagnostics.
 const ERROR_BODY_CHARS: usize = 2048;
 
+/// Per-request credential callback (C6 exact OAuth). Called before every HTTP
+/// request with `force_refresh=false`; called again with `true` only after a
+/// 401/403 whose parsed body is exactly `invalid_key`, and the same request body
+/// is reissued once. `None` keeps the static provider key untouched.
+pub type CredentialCallback =
+	std::sync::Arc<dyn Fn(bool) -> Result<String, String> + Send + Sync>;
+
+/// Exact `invalid_key` classification for an auth-retry decision. Parses the
+/// body; status codes and free-form text alone never trigger a refresh.
+#[must_use]
+pub fn is_invalid_key_body(body: &str) -> bool {
+	let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+		return false;
+	};
+	let error = value.get("error").unwrap_or(&value);
+	["code", "type", "status"].iter().any(|key| {
+		error
+			.get(*key)
+			.and_then(serde_json::Value::as_str)
+			.is_some_and(|value| value == "invalid_key")
+	})
+}
+
 /// Error returned by a model provider or stream processing.
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderError {
@@ -26,6 +49,8 @@ pub enum ProviderError {
 	Network(String),
 	#[error("HTTP status {0}: {1}")]
 	HttpStatus(u16, String),
+	#[error("Credential refresh failed: {0}")]
+	AuthRefresh(String),
 	#[error("Serialization error: {0}")]
 	Serialization(#[from] serde_json::Error),
 	#[error("Stream protocol error: {0}")]
@@ -260,6 +285,8 @@ pub struct OpenAiCompatibleProvider {
 	/// Configured provider id (catalog key) stamped on produced messages so
 	/// signed reasoning is only replayed to the route that issued it.
 	provider_id: Option<String>,
+	/// Per-request credential callback; `None` uses `api_key`.
+	credential: Option<CredentialCallback>,
 }
 
 impl OpenAiCompatibleProvider {
@@ -306,7 +333,15 @@ impl OpenAiCompatibleProvider {
 			force_reasoning_off: false,
 			service_tier: None,
 			provider_id: None,
+			credential: None,
 		}
+	}
+
+	/// Install the per-request credential callback (C6 exact OAuth).
+	#[must_use]
+	pub fn with_credential_callback(mut self, callback: Option<CredentialCallback>) -> Self {
+		self.credential = callback;
+		self
 	}
 
 	/// Stamp the configured provider/catalog id on produced messages.
@@ -467,6 +502,47 @@ impl OpenAiCompatibleProvider {
 	}
 }
 
+impl OpenAiCompatibleProvider {
+	/// Send one request with the per-request credential and the exact auth-retry
+	/// contract: refresh only on 401/403 + parsed `invalid_key`, then reissue the
+	/// same body once. Any other failure is returned unchanged.
+	async fn post_authenticated(
+		&self,
+		body: &OpenAiChatRequest,
+		stream: bool,
+	) -> Result<reqwest::Response, ProviderError> {
+		let mut force_refresh = false;
+		let mut key = match &self.credential {
+			Some(callback) => callback(false).map_err(ProviderError::AuthRefresh)?,
+			None => self.api_key.clone(),
+		};
+		loop {
+			let mut request = self.http.post(self.endpoint()).bearer_auth(&key);
+			if stream {
+				request = request.header(reqwest::header::ACCEPT, "text/event-stream");
+			}
+			let response = request.json(body).send().await.map_err(network_error)?;
+			let status = response.status();
+			if status.is_success() {
+				return Ok(response);
+			}
+			if !force_refresh && matches!(status.as_u16(), 401 | 403) {
+				let text = response.text().await.map_err(network_error)?;
+				if is_invalid_key_body(&text) {
+					if let Some(callback) = &self.credential {
+						key = callback(true).map_err(ProviderError::AuthRefresh)?;
+						force_refresh = true;
+						continue;
+					}
+				}
+				return Err(ProviderError::HttpStatus(status.as_u16(), snippet(&text)));
+			}
+			let text = response.text().await.map_err(network_error)?;
+			return Err(ProviderError::HttpStatus(status.as_u16(), snippet(&text)));
+		}
+	}
+}
+
 #[async_trait]
 impl ModelProvider for OpenAiCompatibleProvider {
 	fn api(&self) -> Option<&str> {
@@ -493,21 +569,9 @@ impl ModelProvider for OpenAiCompatibleProvider {
 	) -> Result<Message, ProviderError> {
 		self.check_support(messages)?;
 		let body = self.request(messages, tools, tool_choice, false)?;
-		let response = self
-			.http
-			.post(self.endpoint())
-			.bearer_auth(&self.api_key)
-			.json(&body)
-			.send()
-			.await
-			.map_err(network_error)?;
+		let response = self.post_authenticated(&body, false).await?;
 
-		let status = response.status();
 		let text = response.text().await.map_err(network_error)?;
-		if !status.is_success() {
-			return Err(ProviderError::HttpStatus(status.as_u16(), snippet(&text)));
-		}
-
 		let parsed: OpenAiChatResponse = serde_json::from_str(&text).map_err(|err| {
 			ProviderError::Protocol(format!(
 				"invalid chat completion body: {err}; body: {}",
@@ -537,26 +601,7 @@ impl ModelProvider for OpenAiCompatibleProvider {
 	) -> Result<ChunkStream, ProviderError> {
 		self.check_support(messages)?;
 		let body = self.request(messages, tools, tool_choice, true)?;
-		let response = self
-			.http
-			.post(self.endpoint())
-			.bearer_auth(&self.api_key)
-			.header(reqwest::header::ACCEPT, "text/event-stream")
-			.json(&body)
-			.send()
-			.await
-			.map_err(network_error)?;
-
-		let status = response.status();
-		if !status.is_success() {
-			// The error body is diagnostics only; a failed read must still surface
-			// the status instead of looking like a transport error.
-			let body = match response.text().await {
-				Ok(text) => snippet(&text),
-				Err(err) => format!("<failed to read error body: {err}>"),
-			};
-			return Err(ProviderError::HttpStatus(status.as_u16(), body));
-		}
+		let response = self.post_authenticated(&body, true).await?;
 
 		let body = response
 			.bytes_stream()
@@ -1786,7 +1831,7 @@ fn network_error(err: reqwest::Error) -> ProviderError {
 	ProviderError::Network(err.to_string())
 }
 
-fn snippet(text: &str) -> String {
+pub(crate) fn snippet(text: &str) -> String {
 	text.chars().take(ERROR_BODY_CHARS).collect()
 }
 

@@ -735,8 +735,17 @@ def phase_rpc(binary: str, mock: MockModel, base: Path) -> None:
         (frame for frame in status if frame.get("command") == "get_advisor_status"), None
     )
     frames = turn + status
-    if not any(
-        frame.get("type") == "message_end"
+    (base / "rpc" / "rpc-frames.json").write_text(
+        json.dumps(frames, indent=2) + "\n"
+    )
+    mock.dump(base / "rpc" / "rpc-mock-requests.json")
+    code = close_stdin(proc)
+    tail = read_lines(proc, lines, 5, lambda _frame: False)
+    frames += tail
+    (base / "rpc" / "rpc-frames.json").write_text(
+        json.dumps(frames, indent=2) + "\n"
+    )
+    if not any(frame.get("type") == "message_end"
         and isinstance(frame.get("message"), dict)
         and frame["message"].get("customType") == "advisor"
         for frame in frames
@@ -747,9 +756,6 @@ def phase_rpc(binary: str, mock: MockModel, base: Path) -> None:
     data = response.get("data") or {}
     if not data.get("configured") or not data.get("status"):
         fail(f"advisor status must report the live roster: {data}")
-    code = close_stdin(proc)
-    tail = read_lines(proc, lines, 5, lambda _frame: False)
-    frames += tail
     if code != 0:
         fail(f"RPC dispose exited {code}")
     print("PASS rpc card + advisor status + dispose")

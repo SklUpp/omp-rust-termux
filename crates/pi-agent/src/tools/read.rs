@@ -3713,26 +3713,26 @@ mod display_tests {
 		let dir = TempDir::new("internal-sel");
 		let tool = fixed_tool("l1\nl2\nl3\nl4\nl5\nl6".to_string());
 
-		let ranged = read_with(&tool, &dir, "artifact://doc:raw:2-3").await;
+		let ranged = read_with(&tool, &dir, "memory://doc:raw:2-3").await;
 		assert!(!ranged.is_error, "{}", ranged.content);
 		assert_eq!(ranged.content, "l2\nl3");
 
-		let raw = read_with(&tool, &dir, "artifact://doc:raw").await;
+		let raw = read_with(&tool, &dir, "memory://doc:raw").await;
 		assert_eq!(raw.content, "l1\nl2\nl3\nl4\nl5\nl6");
 
-		let numbered = read_with(&tool, &dir, "artifact://doc:2-3").await;
+		let numbered = read_with(&tool, &dir, "memory://doc:2-3").await;
 		assert!(numbered.content.contains("2|l2"), "{}", numbered.content);
 		assert!(numbered.content.contains("3|l3"), "{}", numbered.content);
 
-		let multi = read_with(&tool, &dir, "artifact://doc:raw:1-1,4-5").await;
+		let multi = read_with(&tool, &dir, "memory://doc:raw:1-1,4-5").await;
 		assert_eq!(multi.content, "l1\n\n\u{2026}\n\nl4\nl5");
 
 		// A bare `:N` is open-ended (`docs/tools/read.md`), so `:1,4-5` merges
 		// into one 1-EOF range instead of rendering a multi-range body.
-		let open_ended = read_with(&tool, &dir, "artifact://doc:raw:1,4-5").await;
+		let open_ended = read_with(&tool, &dir, "memory://doc:raw:1,4-5").await;
 		assert_eq!(open_ended.content, "l1\nl2\nl3\nl4\nl5\nl6");
 
-		let past_end = read_with(&tool, &dir, "artifact://doc:9").await;
+		let past_end = read_with(&tool, &dir, "memory://doc:9").await;
 		assert!(!past_end.is_error);
 		assert!(past_end.content.contains("beyond end of file"), "{}", past_end.content);
 	}
@@ -3745,7 +3745,7 @@ mod display_tests {
 
 		let many_lines = (0..4000).map(|index| format!("line{index}")).collect::<Vec<_>>().join("\n");
 		let tool = fixed_tool(many_lines);
-		let result = read_with(&tool, &dir, "artifact://doc").await;
+		let result = read_with(&tool, &dir, "memory://doc").await;
 		assert!(!result.is_error, "{}", result.content);
 		let details = result.details.expect("details");
 		assert_eq!(details["truncation"]["truncated"], json!(true));
@@ -3755,7 +3755,7 @@ mod display_tests {
 		let wide = "x".repeat(10_000);
 		let wide_lines = (0..300).map(|_| wide.clone()).collect::<Vec<_>>().join("\n");
 		let tool = fixed_tool(wide_lines);
-		let result = read_with(&tool, &dir, "artifact://doc").await;
+		let result = read_with(&tool, &dir, "memory://doc").await;
 		assert!(!result.is_error, "{}", result.content);
 		let details = result.details.expect("details");
 		assert_eq!(details["truncation"]["truncated"], json!(true));
@@ -3775,7 +3775,7 @@ mod display_tests {
 	#[async_trait::async_trait]
 	impl ProtocolHandler for FixedHandler {
 		fn scheme(&self) -> &str {
-			"artifact"
+			"memory"
 		}
 
 		async fn resolve(

@@ -26,7 +26,7 @@ use futures::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-	provider::{ChunkStream, ModelProvider, ProviderError, StreamChunk, ToolCallDelta, ToolChoice},
+	provider::{ChunkStream, ModelProvider, ProviderError, StreamChunk, ToolCallDelta, ToolChoice, redact_with},
 	state::{
 		CacheTtlUsage, ContentPart, Message, Role, ServerToolUsage, StopReason, TokenUsage, ToolCall,
 	},
@@ -2851,14 +2851,6 @@ fn credential_values(api_key: &str, custom_headers: &[(String, String)]) -> Vec<
 	// Longest first so a bearer token is replaced before a shorter overlap.
 	values.sort_by_key(|value| std::cmp::Reverse(value.len()));
 	values
-}
-
-fn redact_with(text: &str, secrets: &[String]) -> String {
-	let mut redacted = text.to_string();
-	for secret in secrets {
-		redacted = redacted.replace(secret.as_str(), "[redacted]");
-	}
-	redacted
 }
 
 /// Redact before bounding so a credential cut by the character limit cannot

@@ -561,7 +561,17 @@ impl ModelProvider for OpenAiCompatibleProvider {
 		let body = response
 			.bytes_stream()
 			.map(|item| item.map_err(|err| err.to_string()));
-		Ok(sse_stream(Box::pin(body)))
+		let secrets = vec![self.api_key.clone()];
+		Ok(sse_stream(Box::pin(body))
+			.map(move |item| {
+				item.map_err(|error| match error {
+					ProviderError::Protocol(text) => {
+						ProviderError::Protocol(redact_with(&text, &secrets))
+					},
+					other => other,
+				})
+			})
+			.boxed())
 	}
 }
 
@@ -1810,6 +1820,16 @@ fn network_error(err: reqwest::Error) -> ProviderError {
 
 fn snippet(text: &str) -> String {
 	text.chars().take(ERROR_BODY_CHARS).collect()
+}
+
+/// Replace every known credential value in diagnostics. Shared with providers
+/// that echo stream errors so a gateway cannot leak the key it received.
+pub(crate) fn redact_with(text: &str, secrets: &[String]) -> String {
+	let mut redacted = text.to_string();
+	for secret in secrets {
+		redacted = redacted.replace(secret.as_str(), "[redacted]");
+	}
+	redacted
 }
 
 #[cfg(test)]

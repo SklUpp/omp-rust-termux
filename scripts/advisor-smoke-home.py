@@ -99,6 +99,10 @@ class MockModel:
                         'data: {"choices":[],"usage":{"prompt_tokens":19191,'
                         '"completion_tokens":1919,"total_tokens":21110}}\n\n'
                     )
+                    child_usage = (
+                        'data: {"choices":[],"usage":{"prompt_tokens":33333,'
+                        '"completion_tokens":3,"total_tokens":33336}}\n\n'
+                    )
                     if advisor and mock.advisor_error:
                         chunk = (
                             'data: {"error":{"type":"insufficient_quota",'
@@ -159,7 +163,9 @@ class MockModel:
                     elif child:
                         chunk = (
                             'data: {"choices":[{"delta":{"content":"child finished"},'
-                            '"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'
+                            '"finish_reason":"stop"}]}\n\n'
+                            + child_usage
+                            + "data: [DONE]\n\n"
                         )
                     elif mock.child_phase and not has_tool_result:
                         args = json.dumps(
@@ -882,6 +888,7 @@ def phase_child(binary: str, mock: MockModel, base: Path) -> None:
     agent_dir, cwd, sessions, _ = write_config(base / "child", mock.port)
     mock.child_phase = True
     out = child_run(binary, agent_dir, cwd, sessions)
+    mock.dump(base / "child" / "child-mock-requests.json")
     if out.returncode != 0:
         fail(f"child advisor run exited {out.returncode}: {out.stderr}")
     frames = [json.loads(line) for line in out.stdout.splitlines() if line.startswith("{")]
@@ -941,7 +948,7 @@ def phase_child(binary: str, mock: MockModel, base: Path) -> None:
     if not child_logs:
         fail("child session log missing under subagents")
     child_text = "\n".join(path.read_text() for path in child_logs)
-    if "19191" not in child_text:
+    if "33333" not in child_text:
         fail("child provider usage is not recorded in the child session log")
     child_advisors = [
         path for path in sessions.rglob("__advisor*.jsonl")

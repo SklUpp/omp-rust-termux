@@ -1,0 +1,26 @@
+name: Import Rust repository history
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Fetch complete source history
+        run: |
+          git init source
+          git -C source remote add source https://github.com/SklUpp/omp-termux.git
+          git -C source fetch --no-tags source '+refs/heads/*:refs/remotes/source/*'
+      - name: Preserve source branches in destination
+        env:
+          GH_TOKEN: ${{ secrets.MIGRATION_TOKEN }}
+        run: |
+          gh auth setup-git
+          git -C source remote add destination https://github.com/SklUpp/omp-rust-termux.git
+          git -C source push destination 'refs/remotes/source/*:refs/heads/archive/source/*'
+          expected=$(git -C source rev-parse refs/remotes/source/feat/rust-agent-termux-bionic)
+          actual=$(git ls-remote https://github.com/SklUpp/omp-rust-termux.git refs/heads/archive/source/feat/rust-agent-termux-bionic | cut -f1)
+          test "$expected" = "$actual"
+          printf 'Verified Rust source: %s\n' "$actual"

@@ -943,12 +943,32 @@ struct Inner {
 /// readiness: the caller never received a handle, so the spawned child must not
 /// be left running (PTY children especially would otherwise outlive the call).
 /// Synchronous kill only; the generation's normal settle task marks the record.
+///
+/// The guard is bound to the generation this request produced: a stop/restart
+/// of the same name replaces that generation, and an abandoned request must
+/// never signal the replacement. Cross-exit launches (`persist`/`detached`) are
+/// left supervised, because their contract is to outlive the client.
 struct AbandonLaunch {
 	record: Arc<Record>,
+	/// Generation observed before `launch`; equality means `launch` never ran.
+	generation_before: u64,
+	/// Generation produced by this request's `launch`, once it ran.
+	launched: Option<u64>,
 	armed: bool,
 }
 
 impl AbandonLaunch {
+	fn arm(record: &Arc<Record>) -> Self {
+		let generation_before = lock(&record.state).generation;
+		Self { record: Arc::clone(record), generation_before, launched: None, armed: true }
+	}
+
+	/// Bind the generation this launch produced. `launch` has no await points,
+	/// so nothing can replace the generation between it and this call.
+	fn bind_launched(&mut self) {
+		self.launched = Some(lock(&self.record.state).generation);
+	}
+
 	fn disarm(&mut self) {
 		self.armed = false;
 	}
@@ -962,6 +982,31 @@ impl Drop for AbandonLaunch {
 		let (pinned, group_id) = {
 			let mut state = lock(&self.record.state);
 			if is_terminal_state(state.snapshot.state) {
+				return;
+			}
+			let owned = self.launched.unwrap_or(self.generation_before);
+			if state.generation != owned {
+				// A stop/restart replaced this generation; its owner decides.
+				return;
+			}
+			if state.snapshot.persist || state.snapshot.detached {
+				// Cross-exit launches survive the caller by contract.
+				return;
+			}
+			let spawned = state.snapshot.pid.is_some()
+				|| state.killer.is_some()
+				|| state.pinned.is_some()
+				|| state.group_id.is_some();
+			if !spawned {
+				// Aborted while awaiting the lifecycle gate of a fresh record:
+				// no generation ran, so settle the reservation synchronously
+				// instead of leaving a non-terminal record that blocks the name.
+				state.snapshot.state = ProcessState::Exited;
+				state.snapshot.exited_at = Some(now_ms());
+				state.snapshot.ready_pending = None;
+				state.snapshot.exit_reason = Some("launch cancelled".to_string());
+				drop(state);
+				self.record.notify_change();
 				return;
 			}
 			state.stop_requested = true;
@@ -1173,7 +1218,7 @@ impl ProcessManager {
 		// Check-and-insert or check-and-rearm happens under one `records` guard,
 		// so two concurrent `start` calls for the same name can never both spawn:
 		// the winner leaves a non-terminal record before releasing the guard.
-		let record = loop {
+		let (record, mut abandoned) = loop {
 			let existing = {
 				let mut records = lock(&self.inner.records);
 				self.prune(&mut records);
@@ -1238,10 +1283,12 @@ impl ProcessManager {
 					}
 					drop(records);
 					}
+					let mut abandoned = AbandonLaunch::arm(&record);
 					record.notify_change();
 					self.launch(&record).await;
+					abandoned.bind_launched();
 					drop(gate);
-					break record;
+					break (record, abandoned);
 				},
 				None => {
 					// Create + insert under one records guard, hand the Arc out of
@@ -1286,15 +1333,15 @@ impl ProcessManager {
 					records.insert(spec.name.clone(), Arc::clone(&record));
 					record
 					};
+					let mut abandoned = AbandonLaunch::arm(&record);
 					let gate = record.lifecycle.lock().await;
 					self.launch(&record).await;
+					abandoned.bind_launched();
 					drop(gate);
-					break record;
+					break (record, abandoned);
 				},
 			}
 		};
-
-		let mut abandoned = AbandonLaunch { record: Arc::clone(&record), armed: true };
 
 		let mut ready_timed_out = false;
 		if let Some(ready) = spec.ready.as_ref()

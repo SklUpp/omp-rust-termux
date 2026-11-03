@@ -12,13 +12,14 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use pi_agent::process_broker::{
 	client::BrokerClient,
 	protocol::{self, IDLE_GRACE_ENV, PROJECT_DIR_ENV, RUNTIME_DIR_ENV, WORKER_ARG, WaitTarget, WireSpec},
 };
-use pi_agent::tools::process::{LogOptions, ProcessState, RestartPolicy, is_terminal_state};
+use pi_agent::tools::process::{LogOptions, ProcessState, ReadySpec, RestartPolicy, is_terminal_state};
 
 const MARKER: &str = "BROKER_SMOKE_ALIVE";
 const SECRET: &str = "supersecret-value";
@@ -668,4 +669,166 @@ async fn ps_cli_all_enumerates_a_shortened_long_root_scope() {
 	verify.stop("ps-long-smoke", 2_000, None).await.expect("stop");
 	verify.shutdown().await.expect("shutdown broker");
 	assert!(worker.wait_exit().await, "long-root broker worker exits");
+}
+
+fn process_alive(pid: u32) -> bool {
+	std::process::Command::new("kill")
+		.arg("-0")
+		.arg(pid.to_string())
+		.status()
+		.map(|s| s.success())
+		.unwrap_or(false)
+}
+
+async fn wait_for_pid(client: &BrokerClient, name: &str) -> u32 {
+	let deadline = Instant::now() + Duration::from_secs(10);
+	loop {
+		let listed = client.list(None).await.expect("list daemons");
+		if let Some(daemon) = listed.iter().find(|d| d.name == name) {
+			if let Some(pid) = daemon.pid {
+				return pid;
+			}
+		}
+		assert!(Instant::now() < deadline, "daemon {name} never exposed a pid");
+		tokio::time::sleep(Duration::from_millis(25)).await;
+	}
+}
+
+async fn assert_reaped(pid: u32) {
+	let deadline = Instant::now() + Duration::from_secs(5);
+	while process_alive(pid) {
+		assert!(Instant::now() < deadline, "process {pid} still alive after abandonment");
+		tokio::time::sleep(Duration::from_millis(25)).await;
+	}
+}
+
+/// Dropping an in-flight `start` across the broker wire (client disconnect)
+/// must abort the pending launch, reap the PTY child, mark the record
+/// terminal, and release the name in `self.starting` so it can be used again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropped_pending_start_reaps_child_and_releases_name() {
+	let scratch = Scratch::new("cancel-reap");
+	let mut worker = Worker::spawn(&scratch.project, &scratch.runtime);
+	scratch.wait_socket().await;
+
+	let client = Arc::new(
+		BrokerClient::connect_existing(&scratch.project, &scratch.runtime)
+			.await
+			.expect("first client"),
+	);
+	let mut launch = spec("cancelled", "printf 'NO_MATCH_C1D\\n'; exec sleep 120", false, &scratch.project);
+	launch.persist = false;
+	launch.pty = true;
+	launch.ready = Some(ReadySpec {
+		log: Some("NEVER_START_C1D".to_string()),
+		port: None,
+		host: None,
+		timeout_ms: 30_000,
+	});
+
+	let cancel_task = tokio::spawn({
+		let client = Arc::clone(&client);
+		async move { client.start(launch, None).await }
+	});
+	let pid = wait_for_pid(&client, "cancelled").await;
+	cancel_task.abort();
+	let _ = cancel_task.await;
+
+	assert_reaped(pid).await;
+	let settled = client
+		.wait("cancelled", WaitTarget::Exit, None, 5_000, None)
+		.await
+		.expect("wait for settlement");
+	assert!(is_terminal_state(settled.daemon.state));
+
+	// Starting set released: same name can be started again immediately.
+	let restarted = client
+		.start(spec("cancelled", "exec sleep 30", false, &scratch.project), None)
+		.await
+		.expect("name released for new start");
+	assert!(restarted.daemon.pid.is_some());
+	client.stop("cancelled", 2_000, None).await.expect("stop restarted");
+	client.shutdown().await.expect("shutdown");
+	assert!(worker.wait_exit().await, "broker exits cleanly");
+}
+
+/// A refused start (duplicate name of an existing running process) must arm
+/// nothing; client disconnect or abandonment cannot signal the owner.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refused_duplicate_start_cannot_kill_running_process() {
+	let scratch = Scratch::new("dup-safe");
+	let mut worker = Worker::spawn(&scratch.project, &scratch.runtime);
+	scratch.wait_socket().await;
+
+	let client = BrokerClient::connect_existing(&scratch.project, &scratch.runtime)
+		.await
+		.expect("client");
+	let owner = spec("dup", "exec sleep 120", false, &scratch.project);
+	let started = client.start(owner, None).await.expect("start owner");
+	let pid = started.daemon.pid.expect("pid");
+
+	let mut dup = spec("dup", "exec sleep 120", false, &scratch.project);
+	dup.persist = false;
+	dup.ready = Some(ReadySpec {
+		log: Some("NEVER_DUP".to_string()),
+		port: None,
+		host: None,
+		timeout_ms: 30_000,
+	});
+	let err = client.start(dup, None).await.expect_err("refused duplicate");
+	assert!(err.contains("already registered"), "unexpected error: {err}");
+	assert!(process_alive(pid), "refused duplicate must not signal the running owner");
+
+	let list = client.list(None).await.expect("list");
+	let entry = list.iter().find(|d| d.name == "dup").expect("dup present");
+	assert_eq!(entry.pid, Some(pid));
+	assert!(!is_terminal_state(entry.state));
+
+	client.stop("dup", 2_000, None).await.expect("stop");
+	client.shutdown().await.expect("shutdown");
+	assert!(worker.wait_exit().await);
+}
+
+/// Dropping an in-flight `start` whose spec requested `persist` or `detached`
+/// must preserve cross-exit intent: the launch remains supervised, the child
+/// is not killed, and it is discoverable via `describe`/`list`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropped_pending_persist_start_keeps_cross_exit_launch() {
+	let scratch = Scratch::new("persist-keep");
+	let mut worker = Worker::spawn(&scratch.project, &scratch.runtime);
+	scratch.wait_socket().await;
+
+	let client = Arc::new(
+		BrokerClient::connect_existing(&scratch.project, &scratch.runtime)
+			.await
+			.expect("client"),
+	);
+	let mut launch = spec("keep-persist", "printf 'KEEP\\n'; exec sleep 120", false, &scratch.project);
+	launch.persist = true;
+	launch.pty = false;
+	launch.ready = Some(ReadySpec {
+		log: Some("NEVER_KEEP_C1D".to_string()),
+		port: None,
+		host: None,
+		timeout_ms: 30_000,
+	});
+
+	let cancel_task = tokio::spawn({
+		let client = Arc::clone(&client);
+		async move { client.start(launch, None).await }
+	});
+	let pid = wait_for_pid(&client, "keep-persist").await;
+	cancel_task.abort();
+	let _ = cancel_task.await;
+
+	tokio::time::sleep(Duration::from_millis(250)).await;
+	assert!(process_alive(pid), "persist launch must survive when client drops its pending start");
+
+	let described = client.describe("keep-persist", None).await.expect("describe");
+	assert!(!is_terminal_state(described.daemon.state), "persist launch left in a terminal state");
+	assert_eq!(described.daemon.pid, Some(pid));
+
+	client.stop("keep-persist", 2_000, None).await.expect("stop");
+	client.shutdown().await.expect("shutdown");
+	assert!(worker.wait_exit().await);
 }

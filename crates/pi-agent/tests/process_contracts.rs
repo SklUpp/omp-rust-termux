@@ -506,3 +506,42 @@ async fn cancelled_broker_pty_launch_reaps_os_child() {
 		"cancelled broker launch left a live record"
 	);
 }
+
+/// C1d cross-exit preservation: dropping a broker-owned `start` future whose
+/// spec requested `persist` must NOT kill the child; the process remains
+/// supervised and discoverable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_broker_persistent_launch_is_left_supervised() {
+	let dir = TempDir::new("broker-persist-cancel");
+	let manager = Arc::new(ProcessManager::new_keepalive(dir.path.clone()));
+	let mut launch = pty_launch(&dir, "keep", "echo $$ > child.pid; exec sleep 30");
+	launch.persist = true;
+	launch.ready = Some(ReadySpec {
+		log: Some("NEVER_MATCH_THIS".to_string()),
+		port: None,
+		host: None,
+		timeout_ms: 30_000,
+	});
+	let running = Arc::clone(&manager);
+	let task = tokio::spawn(async move { running.start(launch, None).await });
+	let pid_path = dir.path.join("child.pid");
+	let mut child_pid = None;
+	for _ in 0..60 {
+		if let Ok(text) = std::fs::read_to_string(&pid_path) {
+			if let Ok(parsed) = text.trim().parse::<u32>() {
+				child_pid = Some(parsed);
+				break;
+			}
+		}
+		tokio::time::sleep(Duration::from_millis(50)).await;
+	}
+	let child_pid = child_pid.expect("pty child never wrote its pid");
+	assert!(alive(child_pid));
+	task.abort();
+	let _ = task.await;
+	tokio::time::sleep(Duration::from_millis(150)).await;
+	assert!(alive(child_pid), "persistent child must survive future drop");
+	assert!(!terminal(state_of(&manager, "keep").unwrap_or(ProcessState::Exited)));
+	manager.stop("keep", None, 2_000).await.expect("stop");
+	assert_reaped(child_pid).await;
+}

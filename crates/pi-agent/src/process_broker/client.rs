@@ -155,7 +155,11 @@ impl BrokerClient {
 	}
 
 	/// Send one authenticated operation on its own connection and decode the
-	/// result envelope. A timeout/drop retires the whole connection (B5).
+	/// result envelope. A timeout/drop retires the whole connection (B5), which
+	/// the broker treats as abandoning an in-flight `start` (the generation is
+	/// killed unless persist/detached). Callers MUST NOT multiplex operations
+	/// on one socket: each operation opens a dedicated stream so connection
+	/// lifetime acts as the cancellation channel.
 	async fn request(&self, operation: Operation) -> Result<Value, String> {
 		let timeout = operation.timeout();
 		let id = format!("{}-{}", std::process::id(), self.next_id.fetch_add(1, Ordering::Relaxed));

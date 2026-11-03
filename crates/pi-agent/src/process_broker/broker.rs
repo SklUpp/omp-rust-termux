@@ -366,7 +366,7 @@ impl Broker {
 		}
 	}
 
-	async fn dispatch(&self, operation: &Operation) -> Result<Value, String> {
+	async fn dispatch(&self, operation: &Operation, cancel: &CancellationToken) -> Result<Value, String> {
 		use protocol::{
 			DescribeReply, ListReply, LogsReply, PingReply, ShutdownReply, SnapshotReply, StartReply,
 			TimeoutReply, WaitReply,
@@ -391,15 +391,22 @@ impl Broker {
 						return Err(format!("Daemon {} is already starting", spec.name));
 					}
 				}
+				if cancel.is_cancelled() {
+					self.starting.lock().await.remove(&spec.name);
+					return Err("start abandoned: the client disconnected before the request was dispatched".to_string());
+				}
 				if let Err(err) = self.preflight_start(&spec) {
 					self.starting.lock().await.remove(&spec.name);
 					return Err(err);
 				}
-				let result = self
-					.backend
-					.start(spec.into_process_spec(), owner.clone())
-					.await;
+				let result = tokio::select! {
+					result = self.backend.start(spec.into_process_spec(), owner.clone()) => Some(result),
+					_ = cancel.cancelled() => None,
+				};
 				self.starting.lock().await.remove(&spec.name);
+				let Some(result) = result else {
+					return Err("start abandoned: the client disconnected before the reply".to_string());
+				};
 				let outcome = match result {
 					Ok(outcome) => {
 						// Commit the authoritative snapshot (fsynced) before the
@@ -781,6 +788,8 @@ async fn handle_connection(broker: Arc<Broker>, stream: UnixStream) {
 	let mut chunk = vec![0u8; 64 * 1024];
 	let mut authenticated = false;
 
+	let request_cancel = CancellationToken::new();
+
 	'connection: loop {
 		let read = match reader.read(&mut chunk).await {
 			Ok(0) | Err(_) => break,
@@ -829,8 +838,9 @@ async fn handle_connection(broker: Arc<Broker>, stream: UnixStream) {
 			let shutdown_after = request.operation.is_shutdown();
 			let id = request.id.clone();
 			let operation = request.operation;
+			let task_cancel = request_cancel.clone();
 			tokio::spawn(async move {
-				let line = match task_broker.dispatch(&operation).await {
+				let line = match task_broker.dispatch(&operation, &task_cancel).await {
 					Ok(result) => protocol::encode_ok(&id, &result),
 					Err(error) => protocol::encode_error(&id, &error),
 				};
@@ -842,6 +852,7 @@ async fn handle_connection(broker: Arc<Broker>, stream: UnixStream) {
 		}
 	}
 
+	request_cancel.cancel();
 	if authenticated {
 		broker.remove_client();
 	}

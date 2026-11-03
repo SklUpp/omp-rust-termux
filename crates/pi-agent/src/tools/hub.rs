@@ -912,11 +912,14 @@ impl HubTool {
 			detached,
 		};
 		let ready_seconds = spec.ready.as_ref().map_or(30.0, |ready| ready.timeout_ms as f64 / 1_000.0);
-		let outcome = self
-			.processes()
-			.start(spec.clone(), self.backend_owner.clone())
-			.await
-			.map_err(process_tool_error)?;
+		let outcome = tokio::select! {
+			result = self.processes().start(spec.clone(), self.backend_owner.clone()) => {
+				result.map_err(process_tool_error)?
+			},
+			_ = ctx.cancellation_token.cancelled() => {
+				return Err(ToolError::Aborted("hub start was cancelled".to_string()));
+			},
+		};
 		let daemon = outcome.snapshot;
 		let mut lines = vec![format!(
 			"{} {}",

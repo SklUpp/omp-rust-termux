@@ -1940,6 +1940,11 @@ impl Session<'_> {
 		let local_root = session_file
 			.as_deref()
 			.and_then(crate::session::artifacts_directory_for);
+		// Same persisted-session gate as `RpcSession::child_session_root`: child
+		// transcripts live beside the root's artifact store so `hub jobs` and
+		// the task tool can inspect them. In-memory and v1 runs keep `None`
+		// rather than inventing a path.
+		let child_session_root = local_root.as_ref().map(|dir| dir.join("subagents"));
 		let url_scope = pi_agent::tools::internal_urls::UrlScope {
 			session_file: session_file.clone(),
 			local_roots:  local_root
@@ -1981,7 +1986,7 @@ impl Session<'_> {
 			internal_urls: Some(Arc::new(pi_agent::tools::InternalUrlRouter::new())),
 			url_scope: Some(Arc::new(url_scope)),
 			subagent_observer: None,
-			child_session_root: None,
+			child_session_root,
 			goal: Some(Arc::clone(&self.goal)),
 			goal_context,
 			credential_resolver: None,

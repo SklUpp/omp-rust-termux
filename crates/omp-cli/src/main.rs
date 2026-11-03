@@ -962,7 +962,6 @@ fn run() -> std::result::Result<(), CliError> {
 		plan_yolo_tools: None,
 		advisor_cards_tx: Arc::new(std::sync::Mutex::new(advisor_cards_tx)),
 		advisor_cards_rx,
-		advisor_requested: cli.advisor,
 	};
 	if let Some(model) = requested_model.or(default_model) {
 		session.select_model(model);
@@ -1610,9 +1609,6 @@ struct Session<'a> {
 	/// turn settles (or during the headless drain) is never lost.
 	advisor_cards_tx: Arc<std::sync::Mutex<std::sync::mpsc::Sender<(String, serde_json::Value)>>>,
 	advisor_cards_rx: std::sync::mpsc::Receiver<(String, serde_json::Value)>,
-	/// Dedicated `--advisor` opt-in. Kept separately from layered config so a
-	/// later config snapshot cannot silently turn the requested roster off.
-	advisor_requested: bool,
 }
 
 /// Scope selector matching a run request, derived from the live store rather
@@ -2049,10 +2045,6 @@ impl Session<'_> {
 					let _ = tx.send((content.to_string(), details.clone()));
 				}
 			});
-		let mut run_config = self.config.clone();
-		if self.advisor_requested {
-			run_config.advisor.enabled = Some(true);
-		}
 		Ok(RunRequest {
 			prompt,
 			parts,
@@ -2075,7 +2067,7 @@ impl Session<'_> {
 			session_persisted,
 			session_file,
 			session_id: session_persisted.then(|| self.store.id().to_string()),
-			config: run_config,
+			config: self.config.clone(),
 			catalog: Arc::clone(&self.catalog),
 			approvals: self.approvals.clone(),
 			max_time: self.max_time,

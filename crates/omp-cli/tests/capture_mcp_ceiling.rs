@@ -137,7 +137,7 @@ for line in sys.stdin:
     message = json.loads(line)
     method = message.get("method")
     if method == "initialize":
-        result = {"protocolVersion": "2024-11-05", "capabilities": {}, "serverInfo": {"name": "mock", "version": "1"}}
+        result = {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}}, "serverInfo": {"name": "mock", "version": "1"}}
     elif method == "tools/list":
         result = {"tools": [{"name": "echo", "description": "echo", "inputSchema": {"type": "object", "properties": {}}}]}
     else:
@@ -245,12 +245,15 @@ for line in sys.stdin:
 
 	stop.store(true, Ordering::SeqCst);
 	let _ = accept.join();
-	assert_eq!(
-		output.status.code(),
-		Some(0),
-		"{}",
-		String::from_utf8_lossy(&output.stderr)
+	let diagnostics = format!(
+		"stderr:\n{}\nmcp.json:\n{}\nconfig.yml:\n{}\nmarker exists: {}\nmarker:\n{}",
+		String::from_utf8_lossy(&output.stderr),
+		fs::read_to_string(project.join(".omp/mcp.json")).unwrap_or_default(),
+		fs::read_to_string(agent_dir.join("config.yml")).unwrap_or_default(),
+		marker.exists(),
+		fs::read_to_string(&marker).unwrap_or_default(),
 	);
+	assert_eq!(output.status.code(), Some(0), "{diagnostics}");
 
 	let requests = requests.lock().expect("requests").clone();
 	assert!(requests.len() >= 3, "tool turn, continuation and capture calls");

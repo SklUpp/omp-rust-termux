@@ -1991,7 +1991,28 @@ fn settle_background_result(
 			// The loop discarded its turns on cancellation, but every request it
 			// completed was charged: `observed` carries exactly those counters,
 			// and stays `None` when nothing completed (unknown, never zero).
-			supervisor.save_agent_output(&id, &item.name, &salvage.cancelled_output());
+			let output_id =
+				supervisor.save_agent_output(&id, &item.name, &salvage.cancelled_output());
+			if let Err(error) =
+				persist_child_output_id(&supervisor, &id, output_id.as_deref(), false)
+			{
+				let message = format!("saved output metadata unavailable: {error}");
+				let (output, _) = cap_result_text(&message);
+				let envelope = task_result_envelope(
+					&id,
+					&agent,
+					output_id.as_deref(),
+					"failed (durable metadata)",
+					duration_ms,
+					&output,
+					None,
+					observed.as_ref(),
+				);
+				supervisor.mark_failed_with_usage(&id, duration_ms, &envelope, observed);
+				supervisor.enqueue_delivery(&id, envelope);
+				tombstone_aborted_child(&supervisor, &id, &message);
+				return;
+			}
 			supervisor.mark_aborted(&id, "aborted");
 			tombstone_aborted_child(&supervisor, &id, "aborted");
 			fill(observed);
@@ -2002,6 +2023,26 @@ fn settle_background_result(
 			// never returned their turns.
 			let output_id =
 				supervisor.save_agent_output(&id, &item.name, &salvage.raw_output());
+			if let Err(error) =
+				persist_child_output_id(&supervisor, &id, output_id.as_deref(), false)
+			{
+				let message = format!("saved output metadata unavailable: {error}");
+				let (output, _) = cap_result_text(&message);
+				let envelope = task_result_envelope(
+					&id,
+					&agent,
+					output_id.as_deref(),
+					"failed (durable metadata)",
+					duration_ms,
+					&output,
+					None,
+					observed.as_ref(),
+				);
+				supervisor.mark_failed_with_usage(&id, duration_ms, &envelope, observed);
+				supervisor.enqueue_delivery(&id, envelope);
+				tombstone_aborted_child(&supervisor, &id, &message);
+				return;
+			}
 			let envelope = task_result_envelope(
 				&id,
 				&agent,

@@ -12,9 +12,12 @@ use std::{
 };
 
 use async_trait::async_trait;
+use futures::stream;
 use pi_agent::{
 	CancellationToken,
-	provider::{ChunkStream, ModelProvider, ProviderError, ToolChoice},
+	provider::{
+		ChunkStream, ModelProvider, ProviderError, StreamChunk, ToolCallDelta, ToolChoice,
+	},
 	state::{AgentContext, Message, Role, ToolCall, ToolResult, TurnResult},
 	subagent_lifecycle::{
 		DEFAULT_AGENT_IDLE_TTL_MS, DeliveryOutcome, LifecycleStatus, attach,
@@ -36,6 +39,71 @@ use pi_agent::{
 };
 use serde_json::json;
 use tokio::sync::{Notify, Semaphore};
+
+fn stream_text(content: &str) -> StreamChunk {
+	StreamChunk {
+		content: Some(content.to_string()),
+		reasoning: None,
+		tool_call_deltas: Vec::new(),
+		usage: None,
+		is_done: false,
+		content_index: None,
+		signature: None,
+		redacted: None,
+		stop_reason: None,
+		error_message: None,
+		disabled_features: None,
+	}
+}
+
+fn stream_done() -> StreamChunk {
+	StreamChunk {
+		content: None,
+		reasoning: None,
+		tool_call_deltas: Vec::new(),
+		usage: None,
+		is_done: true,
+		content_index: None,
+		signature: None,
+		redacted: None,
+		stop_reason: None,
+		error_message: None,
+		disabled_features: None,
+	}
+}
+
+/// Convert a scripted assistant message into stream chunks. Tool calls use a
+/// complete `arguments_delta`; the loop assembles the same message the
+/// non-streaming path would have returned.
+fn message_chunks(message: &Message) -> Vec<Result<StreamChunk, ProviderError>> {
+	let mut chunks = Vec::new();
+	if !message.content.is_empty() {
+		chunks.push(Ok(stream_text(&message.content)));
+	}
+	for (index, call) in message.tool_calls.iter().enumerate() {
+		chunks.push(Ok(StreamChunk {
+			content: None,
+			reasoning: None,
+			tool_call_deltas: vec![ToolCallDelta {
+				index,
+				id: Some(call.id.clone()),
+				name: Some(call.name.clone()),
+				arguments_delta: Some(call.arguments.to_string()),
+				content_index: None,
+			}],
+			usage: None,
+			is_done: false,
+			content_index: None,
+			signature: None,
+			redacted: None,
+			stop_reason: None,
+			error_message: None,
+			disabled_features: None,
+		}));
+	}
+	chunks.push(Ok(stream_done()));
+	chunks
+}
 
 struct GatedProvider {
 	reply:    String,
@@ -69,11 +137,25 @@ impl ModelProvider for GatedProvider {
 
 	async fn stream(
 		&self,
-		_messages: &[Message],
+		messages: &[Message],
 		_tools: &[serde_json::Value],
 		_tool_choice: &ToolChoice,
 	) -> Result<ChunkStream, ProviderError> {
-		Err(ProviderError::Protocol("revived runs use complete".to_string()))
+		self.captured
+			.lock()
+			.expect("captured")
+			.extend_from_slice(messages);
+		self.calls.fetch_add(1, Ordering::SeqCst);
+		self.entered.notify_one();
+		let _permit = self
+			.gate
+			.acquire()
+			.await
+			.map_err(|_| ProviderError::Protocol("gate closed".to_string()))?;
+		Ok(Box::pin(stream::iter(vec![
+			Ok(stream_text(&self.reply)),
+			Ok(stream_done()),
+		])))
 	}
 }
 
@@ -587,9 +669,13 @@ impl ModelProvider for ScriptProvider {
 		_tools: &[serde_json::Value],
 		_tool_choice: &ToolChoice,
 	) -> Result<ChunkStream, ProviderError> {
-		Err(ProviderError::Protocol(
-			"revived runs use complete".to_string(),
-		))
+		let message = self
+			.replies
+			.lock()
+			.expect("replies")
+			.pop()
+			.ok_or_else(|| ProviderError::Protocol("script exhausted".to_string()))?;
+		Ok(Box::pin(stream::iter(message_chunks(&message))))
 	}
 }
 

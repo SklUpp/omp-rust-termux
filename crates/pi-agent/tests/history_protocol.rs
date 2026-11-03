@@ -7,15 +7,19 @@ use std::{
 	fs,
 	io::Write,
 	path::{Path, PathBuf},
-	sync::Arc,
+	sync::{
+		Arc,
+		atomic::{AtomicUsize, Ordering},
+	},
 	time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use async_trait::async_trait;
+use futures::stream;
 use pi_agent::{
 	CancellationToken,
 	loop_module::AgentEvent,
-	provider::{ChunkStream, ModelProvider, ProviderError, ToolChoice},
+	provider::{ChunkStream, ModelProvider, ProviderError, StreamChunk, ToolCallDelta, ToolChoice},
 	state::{AgentContext, ContentPart, Message, ToolCall, TurnStatus},
 	subagent_lifecycle::{
 		attach, DeliveryOutcome, LifecycleStatus, SubagentLifecycleManager,
@@ -108,12 +112,50 @@ impl ModelProvider for NoopProvider {
 	}
 }
 
-/// Provider that blocks its single reply until the test releases it, so a
-/// history read can observe the live snapshot before the transcript flush.
+fn text_chunk(content: String) -> StreamChunk {
+	StreamChunk {
+		content: Some(content),
+		reasoning: None,
+		tool_call_deltas: Vec::new(),
+		usage: None,
+		is_done: false,
+		content_index: None,
+		signature: None,
+		redacted: None,
+		stop_reason: None,
+		error_message: None,
+		disabled_features: None,
+	}
+}
+
+fn done_chunk() -> StreamChunk {
+	StreamChunk {
+		content: None,
+		reasoning: None,
+		tool_call_deltas: Vec::new(),
+		usage: None,
+		is_done: true,
+		content_index: None,
+		signature: None,
+		redacted: None,
+		stop_reason: None,
+		error_message: None,
+		disabled_features: None,
+	}
+}
+
+/// Provider that can block a streamed request until the test releases it, so
+/// a history read can observe the live snapshot before the transcript flush.
+///
+/// `scripted` emits one assistant turn with `reply` plus a harmless `bash true`
+/// tool call before gating the follow-up request. That keeps the dialog open and
+/// makes the live marker absent from the journal (which only flushes at settle).
 struct GatedProvider {
-	reply:   String,
-	entered: Arc<Notify>,
-	gate:    Arc<Semaphore>,
+	reply:        String,
+	entered:      Arc<Notify>,
+	gate:         Arc<Semaphore>,
+	scripted:     bool,
+	stream_calls: AtomicUsize,
 }
 
 #[async_trait]
@@ -139,17 +181,61 @@ impl ModelProvider for GatedProvider {
 		_tools: &[serde_json::Value],
 		_tool_choice: &ToolChoice,
 	) -> Result<ChunkStream, ProviderError> {
-		Err(ProviderError::Protocol(
-			"revived runs use complete".to_string(),
-		))
+		if self.scripted && self.stream_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+			let delta = ToolCallDelta {
+				index:            0,
+				id:               Some("call-live".to_string()),
+				name:             Some("bash".to_string()),
+				arguments_delta:  Some(r#"{"command":"true"}"#.to_string()),
+				content_index:    None,
+			};
+			let reply = self.reply.clone();
+			return Ok(Box::pin(stream::iter(vec![
+				Ok(StreamChunk {
+					content: Some(reply),
+					reasoning: None,
+					tool_call_deltas: vec![delta],
+					usage: None,
+					is_done: false,
+					content_index: None,
+					signature: None,
+					redacted: None,
+					stop_reason: None,
+					error_message: None,
+					disabled_features: None,
+				}),
+				Ok(done_chunk()),
+			])));
+		}
+		self.entered.notify_one();
+		let _permit = self
+			.gate
+			.acquire()
+			.await
+			.map_err(|_| ProviderError::Protocol("gate closed".to_string()))?;
+		let reply = self.reply.clone();
+		Ok(Box::pin(stream::iter(vec![
+			Ok(text_chunk(reply)),
+			Ok(done_chunk()),
+		])))
 	}
 }
 
 fn gated_provider(reply: &str) -> Arc<GatedProvider> {
+	gated_provider_with_mode(reply, false)
+}
+
+fn gated_scripted_provider(reply: &str) -> Arc<GatedProvider> {
+	gated_provider_with_mode(reply, true)
+}
+
+fn gated_provider_with_mode(reply: &str, scripted: bool) -> Arc<GatedProvider> {
 	Arc::new(GatedProvider {
-		reply:   reply.to_string(),
-		entered: Arc::new(Notify::new()),
-		gate:    Arc::new(Semaphore::new(0)),
+		reply:        reply.to_string(),
+		entered:      Arc::new(Notify::new()),
+		gate:         Arc::new(Semaphore::new(0)),
+		scripted,
+		stream_calls: AtomicUsize::new(0),
 	})
 }
 
@@ -982,7 +1068,7 @@ async fn revived_live_snapshot_precedes_flush_and_survives_idle_until_park() {
 #[tokio::test]
 async fn task_tool_live_snapshot_precedes_flush_then_adopts_to_disk() {
 	let root = TempRoot::new("producer");
-	let provider = gated_provider("child-live-answer");
+	let provider = gated_scripted_provider("child-live-answer");
 	let supervisor = supervisor_with(&root, Arc::clone(&provider));
 	let manager = gated_manager(&supervisor, Arc::clone(&provider));
 	let router = router(&manager);
@@ -1021,6 +1107,16 @@ async fn task_tool_live_snapshot_precedes_flush_then_adopts_to_disk() {
 		.await
 		.expect("live history read");
 	assert!(live.content.contains("LIVE_PROMPT"), "{}", live.content);
+	assert!(
+		live.content.contains("child-live-answer"),
+		"live snapshot must include the producer turn before flush: {}",
+		live.content
+	);
+	assert!(
+		live.content.contains("→ bash(true)"),
+		"scripted child tool call must reach the live view: {}",
+		live.content
+	);
 	assert_eq!(
 		live.notes.expect("notes"),
 		vec!["Source: live session (read-only, running)".to_string()]

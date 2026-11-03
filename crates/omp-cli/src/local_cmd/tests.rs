@@ -688,6 +688,30 @@ fn gc_live_and_breaker_locks_block_and_stale_lock_recovers() {
 }
 
 #[test]
+fn gc_live_breaker_without_main_lock_blocks_acquisition() {
+	let dir = TempDir::new("gc-breaker-only");
+	let agent = dir.path().join("agent");
+	fs::create_dir_all(&agent).expect("agent dir");
+	let breaker = agent.join("gc.lock.break");
+	fs::write(
+		&breaker,
+		format!("{}\n2026-01-01T00:00:00.000Z\n", std::process::id()),
+	)
+	.expect("live breaker");
+	let error = acquire_gc_lock(&agent).expect_err("live breaker without main lock");
+	assert!(error.contains("GC already running"), "{error}");
+	assert!(
+		!agent.join("gc.lock").exists(),
+		"must not create the main lock under a live breaker"
+	);
+	assert!(breaker.exists(), "live breaker must be preserved");
+	fs::remove_file(&breaker).expect("remove breaker");
+	let held = acquire_gc_lock(&agent).expect("breaker cleared");
+	drop(held);
+	assert!(!agent.join("gc.lock").exists(), "lock must be released");
+}
+
+#[test]
 fn gc_wal_apply_failure_is_nonzero_and_releases_lock() {
 	let dir = TempDir::new("gc-wal-apply");
 	let agent = dir.path().join("agent");

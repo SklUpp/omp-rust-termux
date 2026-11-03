@@ -4670,13 +4670,14 @@ fn release_lock_file(lock_path: &Path, file: fs::File) {
 }
 
 fn open_gc_lock(lock_path: &Path) -> std::result::Result<fs::File, String> {
-	if let Some(file) = open_new_gc_lock(lock_path)? {
-		return Ok(file);
-	}
 	// A live TS breaker means TS recovery is in progress; never take over
-	// underneath it. Stale breakers are ignored, and Rust no longer creates one.
+	// underneath it, even when the main lock currently looks absent. Stale
+	// breakers are ignored, and Rust no longer creates one.
 	if gc_breaker_owner_live(lock_path)? {
 		return Err(format!("GC already running: {}", lock_path.display()));
+	}
+	if let Some(file) = open_new_gc_lock(lock_path)? {
+		return Ok(file);
 	}
 	if !remove_stale_gc_lock(lock_path)? {
 		return Err(format!("GC already running: {}", lock_path.display()));

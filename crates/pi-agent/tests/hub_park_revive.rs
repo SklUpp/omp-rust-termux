@@ -3,7 +3,7 @@
 //! and tombstone refusal.
 
 use std::{
-	path::PathBuf,
+	path::{Path, PathBuf},
 	sync::{
 		Arc, Mutex,
 		atomic::{AtomicUsize, Ordering},
@@ -98,6 +98,15 @@ fn session_root(label: &str) -> PathBuf {
 	));
 	std::fs::create_dir_all(&dir).expect("session root");
 	dir
+}
+
+/// Caller scope that explicitly authorizes the manager root.
+fn history_scope(root: &Path) -> UrlScope {
+	let mut scope = UrlScope::default();
+	scope
+		.local_roots
+		.insert("local".to_string(), root.to_path_buf());
+	scope
 }
 
 fn test_supervisor(root: &PathBuf, provider: Arc<GatedProvider>) -> Arc<Supervisor> {
@@ -282,7 +291,7 @@ async fn keep_alive_adopts_parks_revives_replays_and_survives_restart() {
 	let resource = router
 		.resolve(
 			&format!("history://{id}"),
-			&UrlScope::default().resolve_context(&root, &CancellationToken::new()),
+			&history_scope(&root).resolve_context(&root, &CancellationToken::new()),
 		)
 		.await
 		.expect("history readable");
@@ -347,7 +356,7 @@ async fn keep_alive_adopts_parks_revives_replays_and_survives_restart() {
 	let history = router
 		.resolve(
 			&format!("history://{id}"),
-			&UrlScope::default().resolve_context(&root, &CancellationToken::new()),
+			&history_scope(&root).resolve_context(&root, &CancellationToken::new()),
 		)
 		.await
 		.expect("tombstoned transcript readable");
@@ -382,7 +391,7 @@ async fn gone_workspace_is_transcript_only_and_refuses_revive() {
 	let resource = router
 		.resolve(
 			&format!("history://{id}"),
-			&UrlScope::default().resolve_context(&root, &CancellationToken::new()),
+			&history_scope(&root).resolve_context(&root, &CancellationToken::new()),
 		)
 		.await
 		.expect("transcript remains readable");

@@ -237,6 +237,15 @@ impl PersistedChildSession {
 pub fn read_transcript(path: &Path) -> Result<Vec<Message>, String> {
 	let file =
 		fs::File::open(path).map_err(|error| format!("cannot open {}: {error}", path.display()))?;
+	read_transcript_file(file)
+}
+
+/// Parse a transcript from an already-authorized, already-open regular file.
+///
+/// `history://` opens the leaf descriptor-relative with `O_NOFOLLOW` and parses
+/// THAT descriptor, so a path swapped after the scan can never redirect the
+/// read to another file.
+pub fn read_transcript_file(file: fs::File) -> Result<Vec<Message>, String> {
 	let mut messages = Vec::new();
 	for line in BufReader::new(file).lines() {
 		let Ok(line) = line else { continue };

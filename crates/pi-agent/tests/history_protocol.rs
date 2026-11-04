@@ -156,6 +156,9 @@ struct GatedProvider {
 	gate:         Arc<Semaphore>,
 	scripted:     bool,
 	stream_calls: AtomicUsize,
+	/// Shell command the scripted first turn calls; the test uses it to hold the
+	/// loop inside a tool (no turn boundary, so nothing is journaled yet).
+	command:      String,
 }
 
 #[async_trait]
@@ -186,7 +189,9 @@ impl ModelProvider for GatedProvider {
 				index:            0,
 				id:               Some("call-live".to_string()),
 				name:             Some("bash".to_string()),
-				arguments_delta:  Some(r#"{"command":"true"}"#.to_string()),
+				arguments_delta:  Some(
+					serde_json::json!({ "command": self.command }).to_string(),
+				),
 				content_index:    None,
 			};
 			let reply = self.reply.clone();
@@ -225,10 +230,6 @@ fn gated_provider(reply: &str) -> Arc<GatedProvider> {
 	gated_provider_with_mode(reply, false)
 }
 
-fn gated_scripted_provider(reply: &str) -> Arc<GatedProvider> {
-	gated_provider_with_mode(reply, true)
-}
-
 fn gated_provider_with_mode(reply: &str, scripted: bool) -> Arc<GatedProvider> {
 	Arc::new(GatedProvider {
 		reply:        reply.to_string(),
@@ -236,6 +237,21 @@ fn gated_provider_with_mode(reply: &str, scripted: bool) -> Arc<GatedProvider> {
 		gate:         Arc::new(Semaphore::new(0)),
 		scripted,
 		stream_calls: AtomicUsize::new(0),
+		command:      "true".to_string(),
+	})
+}
+
+/// Scripted provider whose first turn calls `command` instead of `true`, so a
+/// test can hold the loop inside the tool call (no turn boundary, no journal
+/// flush) while the live snapshot already has the answer.
+fn gated_scripted_provider_with_command(reply: &str, command: &str) -> Arc<GatedProvider> {
+	Arc::new(GatedProvider {
+		reply:        reply.to_string(),
+		entered:      Arc::new(Notify::new()),
+		gate:         Arc::new(Semaphore::new(0)),
+		scripted:     true,
+		stream_calls: AtomicUsize::new(0),
+		command:      command.to_string(),
 	})
 }
 
@@ -1060,7 +1076,21 @@ async fn revived_live_snapshot_precedes_flush_and_survives_idle_until_park() {
 #[tokio::test]
 async fn task_tool_live_snapshot_precedes_flush_then_hands_over_live() {
 	let root = TempRoot::new("producer");
-	let provider = gated_scripted_provider("child-live-answer");
+	let release = root.path.join("child-tool-release");
+	let started = root.path.join("child-tool-started");
+	// The first turn answers and then calls `bash` with a command that reports it
+	// started and waits for the test. Holding the loop *inside* the tool is what
+	// makes "live snapshot before the journal flush" observable: the journal is
+	// flushed at every turn boundary (before compaction may prune), so only a
+	// blocked tool keeps an accepted answer out of the transcript.
+	let provider = gated_scripted_provider_with_command(
+		"child-live-answer",
+		&format!(
+			"echo started > {}; i=0; while [ ! -e {} ] && [ $i -lt 400 ]; do i=$((i+1)); sleep 0.05; done; true",
+			started.display(),
+			release.display()
+		),
+	);
 	let supervisor = supervisor_with(&root, Arc::clone(&provider));
 	let manager = gated_manager(&supervisor, Arc::clone(&provider));
 	let router = router(&manager);
@@ -1078,27 +1108,44 @@ async fn task_tool_live_snapshot_precedes_flush_then_hands_over_live() {
 		serde_json::from_str(&result.content).expect("task details");
 	let job = details.async_state.expect("background task");
 	assert_eq!(job.state, "running");
-	tokio::time::timeout(Duration::from_secs(5), provider.entered.notified())
-		.await
-		.expect("child provider entered");
-	let id = manager
-		.child_records()
-		.first()
-		.expect("live child record")
-		.id
-		.clone();
+	let mut live_child = None;
+	for _ in 0..500 {
+		if let Some(record) = manager.child_records().first() {
+			live_child = Some(record.id.clone());
+			break;
+		}
+		tokio::time::sleep(Duration::from_millis(10)).await;
+	}
+	let id = live_child.expect("live child record");
+	let mut answered = false;
+	for _ in 0..500 {
+		if started.is_file()
+			&& manager.live_messages(&id).is_some_and(|messages| {
+				messages
+					.iter()
+					.any(|message| message.content.contains("child-live-answer"))
+			})
+		{
+			answered = true;
+			break;
+		}
+		tokio::time::sleep(Duration::from_millis(10)).await;
+	}
+	assert!(
+		answered,
+		"the live snapshot must receive the turn result while the tool is still running"
+	);
+	let transcript = transcript_path(&root.subagents(), &id);
+	let unjournaled = fs::read_to_string(&transcript).unwrap_or_default();
+	assert!(
+		!unjournaled.contains("child-live-answer"),
+		"the answer must still be unjournaled inside the tool; transcript: {unjournaled}"
+	);
 	// A refinement accepted mid-turn: the loop appends it to the child's own
 	// state, so it must also reach the journal and any later revive.
 	supervisor
 		.inject_peer_message(&id, "keep plantdb.toml read-only".to_string())
 		.expect("steering accepted by the running child");
-	let transcript = transcript_path(&root.subagents(), &id);
-	assert!(
-		!fs::read_to_string(&transcript)
-			.unwrap_or_default()
-			.contains("child-live-answer"),
-		"the child answer has not been journaled yet"
-	);
 
 	let live = read(&router, &root, &format!("history://{id}"))
 		.await
@@ -1110,13 +1157,35 @@ async fn task_tool_live_snapshot_precedes_flush_then_hands_over_live() {
 		live.content
 	);
 	assert!(
-		live.content.contains("→ bash(true)"),
+		live.content.contains("→ bash(echo started"),
 		"scripted child tool call must reach the live view: {}",
 		live.content
 	);
 	assert_eq!(
 		live.notes.expect("notes"),
 		vec!["Source: live session (read-only, running)".to_string()]
+	);
+
+	// Release the tool: the next turn boundary journals the accepted turn before
+	// the loop asks the provider again (that follow-up request is the gated one).
+	fs::write(&release, b"go").expect("release the child tool");
+	tokio::time::timeout(Duration::from_secs(10), provider.entered.notified())
+		.await
+		.expect("child follow-up request entered");
+	let mut boundary_journaled = false;
+	for _ in 0..500 {
+		if fs::read_to_string(&transcript)
+			.unwrap_or_default()
+			.contains("child-live-answer")
+		{
+			boundary_journaled = true;
+			break;
+		}
+		tokio::time::sleep(Duration::from_millis(10)).await;
+	}
+	assert!(
+		boundary_journaled,
+		"the turn boundary must journal the accepted answer before the next request"
 	);
 
 	provider.gate.add_permits(1);

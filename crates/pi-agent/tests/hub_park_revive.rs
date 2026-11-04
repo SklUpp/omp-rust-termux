@@ -1478,6 +1478,8 @@ async fn a_failed_first_turn_after_revive_keeps_the_shifted_history() {
 			),
 		)
 		.expect("live adopt");
+	// The fixture seeds the persisted replay; the actor appends after it.
+	let baseline = load_transcript(&transcript_path(&root, &id)).expect("baseline transcript");
 	assert_eq!(
 		manager.send(&id, "first turn".to_string()).expect("wake"),
 		DeliveryOutcome::Woken
@@ -1527,27 +1529,34 @@ async fn a_failed_first_turn_after_revive_keeps_the_shifted_history() {
 		],
 		"history must keep order, drop no replayed message and duplicate nothing"
 	);
-	// The failed turn is never on disk: the accepted tail lands once, in order.
-	let journal = std::fs::read_to_string(transcript_path(&root, &id)).expect("transcript");
-	assert!(
-		!journal.contains("\"role\":\"assistant\""),
-		"an unaccepted partial turn must not be journaled: {journal}"
+	// The failed turn is never on disk: only the accepted tail (the request and
+	// the aside) is appended after the seeded replay, once and in order.
+	wait_for_transcript(&root, &id, baseline.len() + 2).await;
+	let replay = load_transcript(&transcript_path(&root, &id)).expect("replay");
+	assert_eq!(
+		&replay[..baseline.len()],
+		baseline.as_slice(),
+		"the replayed prefix must not be rewritten: {replay:?}"
 	);
-	let users: Vec<String> = journal
-		.lines()
-		.filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-		.filter_map(|value| {
-			let message = value.get("message")?;
-			if message.get("role")?.as_str()? != "user" {
-				return None;
-			}
-			Some(message.get("content")?.as_str()?.to_string())
-		})
+	let tail = &replay[baseline.len()..];
+	assert_eq!(
+		tail.len(),
+		2,
+		"only the request and the aside may be appended: {replay:?}"
+	);
+	assert!(
+		tail.iter().all(|message| message.role != Role::Assistant),
+		"an unaccepted partial turn must not be journaled: {replay:?}"
+	);
+	let users: Vec<&str> = tail
+		.iter()
+		.filter(|message| message.role == Role::User)
+		.map(|message| message.content.as_str())
 		.collect();
 	assert_eq!(
 		users,
-		vec!["first turn".to_string(), "keep this aside".to_string()],
-		"the accepted tail must be journaled exactly once, in order: {journal}"
+		vec!["first turn", "keep this aside"],
+		"the accepted tail must be journaled exactly once, in order: {replay:?}"
 	);
 	manager.shutdown_actors().await;
 	let _ = std::fs::remove_dir_all(&root);
@@ -1592,48 +1601,49 @@ async fn wait_for_transcript(root: &PathBuf, id: &str, expected: usize) {
 	);
 }
 
-/// The file must be exactly the accepted tail (the state minus its replayed
-/// system message): nothing rewritten, no duplicate aside, and a replay that
-/// hands a revive the aside once with its tool pair intact.
+/// The transcript must keep the seeded replay untouched and append exactly the
+/// accepted tail (the state minus its replayed system message): nothing
+/// rewritten, no duplicate aside, and a replay that hands a revive the aside
+/// once with its tool pair intact.
 fn assert_accepted_tail_is_journaled_once(
 	root: &PathBuf,
 	id: &str,
 	state: &[Message],
 	aside: &str,
+	baseline: &[Message],
 ) {
-	let path = transcript_path(root, id);
-	let transcript = std::fs::read_to_string(&path).expect("transcript");
-	let lines: Vec<serde_json::Value> = transcript
-		.lines()
-		.filter_map(|line| serde_json::from_str(line).ok())
-		.collect();
+	let replay = load_transcript(&transcript_path(root, id)).expect("replay");
 	assert_eq!(
-		lines.len(),
-		state.len() - 1,
-		"the journal must hold the accepted tail and nothing else: {transcript}"
+		&replay[..baseline.len()],
+		baseline,
+		"the replayed prefix must not be rewritten: {replay:?}"
 	);
-	let replay = load_transcript(&path).expect("replay");
-	assert_eq!(replay.len(), lines.len());
+	let tail = &replay[baseline.len()..];
 	assert_eq!(
-		replay
+		tail.len(),
+		state.len() - 1,
+		"the journal must hold exactly the accepted tail: {replay:?}"
+	);
+	assert_eq!(
+		tail
 			.iter()
 			.filter(|message| message.content == aside)
 			.count(),
 		1,
-		"a revive must see the accepted aside exactly once: {transcript}"
+		"a revive must see the accepted aside exactly once: {replay:?}"
 	);
 	assert_eq!(
-		replay
+		tail
 			.iter()
 			.filter(|message| message.role == Role::Assistant)
 			.count(),
 		1,
-		"the completed tool step stays on disk once: {transcript}"
+		"the completed tool step stays on disk once: {replay:?}"
 	);
 	assert_eq!(
-		replay.iter().filter(|message| message.role == Role::Tool).count(),
+		tail.iter().filter(|message| message.role == Role::Tool).count(),
 		1,
-		"the tool result stays paired once: {transcript}"
+		"the tool result stays paired once: {replay:?}"
 	);
 }
 
@@ -1654,8 +1664,9 @@ async fn an_aside_accepted_in_the_failing_step_after_a_tool_step_is_journaled_on
 			ToolRegistry::with_builtins(),
 		)),
 	);
-	// One replayed system message keeps the journal base at 1, so the file holds
-	// exactly the accepted tail and its line count proves nothing was rewritten.
+	// The fixture seeds the persisted replay (assignment plus the settled answer):
+	// the actor appends after it, so the file before the turn is the baseline the
+	// assertions compare against.
 	manager
 		.adopt_live(
 			&id,
@@ -1667,6 +1678,7 @@ async fn an_aside_accepted_in_the_failing_step_after_a_tool_step_is_journaled_on
 			),
 		)
 		.expect("live adopt");
+	let baseline = load_transcript(&transcript_path(&root, &id)).expect("baseline transcript");
 	assert_eq!(
 		manager.send(&id, "first turn".to_string()).expect("wake"),
 		DeliveryOutcome::Woken
@@ -1704,8 +1716,8 @@ async fn an_aside_accepted_in_the_failing_step_after_a_tool_step_is_journaled_on
 	assert_eq!(state[2].tool_calls.len(), 1);
 	assert_eq!(state[3].tool_call_id.as_deref(), Some("call-bash"));
 	assert_eq!(state[4].content, "keep this aside");
-	wait_for_transcript(&root, &id, state.len() - 1).await;
-	assert_accepted_tail_is_journaled_once(&root, &id, &state, "keep this aside");
+	wait_for_transcript(&root, &id, baseline.len() + state.len() - 1).await;
+	assert_accepted_tail_is_journaled_once(&root, &id, &state, "keep this aside", &baseline);
 	manager.shutdown_actors().await;
 	let _ = std::fs::remove_dir_all(&root);
 }
@@ -1737,6 +1749,7 @@ async fn an_aside_accepted_in_a_successful_step_is_not_duplicated_by_a_later_fai
 			),
 		)
 		.expect("live adopt");
+	let baseline = load_transcript(&transcript_path(&root, &id)).expect("baseline transcript");
 	assert_eq!(
 		manager.send(&id, "first turn".to_string()).expect("wake"),
 		DeliveryOutcome::Woken
@@ -1769,8 +1782,8 @@ async fn an_aside_accepted_in_a_successful_step_is_not_duplicated_by_a_later_fai
 		"the aside stays after the completed tool step: {state:?}"
 	);
 	assert_eq!(state[4].content, "keep this aside");
-	wait_for_transcript(&root, &id, state.len() - 1).await;
-	assert_accepted_tail_is_journaled_once(&root, &id, &state, "keep this aside");
+	wait_for_transcript(&root, &id, baseline.len() + state.len() - 1).await;
+	assert_accepted_tail_is_journaled_once(&root, &id, &state, "keep this aside", &baseline);
 	manager.shutdown_actors().await;
 	let _ = std::fs::remove_dir_all(&root);
 }

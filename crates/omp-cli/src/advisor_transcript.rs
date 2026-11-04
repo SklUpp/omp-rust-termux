@@ -73,11 +73,13 @@ pub fn priced_usage(
 	let mut usage = crate::session::reported_usage(message)?;
 	let rates = catalog
 		.providers
-		.get(provider)?
-		.get(model)?
-		.cost
-		.as_ref()?
-		.as_object()?;
+		.get(provider)
+		.and_then(|models| models.get(model))
+		.and_then(|model| model.cost.as_ref())
+		.and_then(serde_json::Value::as_object);
+	let Some(rates) = rates else {
+		return Some(usage);
+	};
 	let rate = |key: &str| rates.get(key).and_then(serde_json::Value::as_f64).unwrap_or(0.0);
 	let per_million = |tokens: u64, key: &str| (tokens as f64) * rate(key) / 1_000_000.0;
 	let input = per_million(usage.input, "input");
@@ -501,7 +503,9 @@ mod tests {
 			"mock",
 			"model",
 		);
-		// The identical delta is a retry replay, not new content.
+		// The identical delta is a retry replay, not new content: a retried
+		// attempt rewinds the cursor, so the positional match skips it.
+		transcript.begin_turn();
 		transcript.record(
 			&Message::user("### Session update\n\nuser"),
 			Some(&session_file),

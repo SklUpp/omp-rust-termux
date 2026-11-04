@@ -1763,11 +1763,7 @@ mod tests {
 	#[async_trait::async_trait]
 	impl AdvisorExecutor for FakeExecutor {
 		async fn execute(&self, spec: AdvisorCallSpec) -> AdvisorCallResult {
-			self.calls.lock().expect("calls").push(AdvisorCallSpec {
-				history: Vec::new(),
-				prompt: String::new(),
-				..spec
-			});
+			self.calls.lock().expect("calls").push(spec);
 			if let Some(error) = self.error.lock().expect("error").clone() {
 				return AdvisorCallResult { error: Some(error), ..AdvisorCallResult::default() };
 			}

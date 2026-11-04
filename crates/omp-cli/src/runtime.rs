@@ -4140,8 +4140,7 @@ impl CliChildModelFactory {
 		connection: &crate::config::ProviderConfig,
 	) -> std::result::Result<String, String> {
 		let reuses_root = self.root_provider.as_deref() == Some(provider)
-			&& self.root_base_url.as_deref() == Some(base_url)
-			&& self.credential_resolver.is_none();
+			&& self.root_base_url.as_deref() == Some(base_url);
 		if reuses_root {
 			return Ok(self.api_key.clone().unwrap_or_default());
 		}

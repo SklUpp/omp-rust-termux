@@ -529,7 +529,7 @@ check "journal has tool result" bash -c "grep -q '\"role\":\"toolResult\"' '$JOU
 check "one journal for the scan" \
 	bash -c "test \"\$(find \"\$(dirname '$JOURNAL')\" -name '*.jsonl' | wc -l)\" -eq 1"
 SCAN_ID_FROM_JOURNAL="$(basename "$JOURNAL" .jsonl)"
-SCAN_ID_FROM_OUTPUT="$(grep -o 'secscan_[0-9a-zA-Z]*' "$RUN_OUT" | head -1)"
+SCAN_ID_FROM_OUTPUT="$(grep -o 'secscan_[0-9a-zA-Z]*' "$RUN_OUT" | tail -1)"
 # Session logs are `<file-safe-timestamp>_<id>.jsonl`; the id must be the suffix.
 check "journal is named after the scan" \
 	bash -c "case '$SCAN_ID_FROM_JOURNAL' in *_'$SCAN_ID_FROM_OUTPUT') true;; *) false;; esac"

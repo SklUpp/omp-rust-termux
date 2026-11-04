@@ -417,7 +417,8 @@ def write_config(agent_dir: Path, provider: Provider) -> None:
         "  continuationModes: [interactive]\n"
         "disabledExtensions:\n"
         "  - skill:blocked\n"
-        "tools: [read, goal, learn, manage_skill]\n"
+        "tools: [read, goal, learn, manage_skill, mcp__smoke_echo]\n"
+        "allow: [learn, manage_skill, goal, mcp:smoke]\n"
         "providers:\n"
         "  mock:\n"
         f"    baseUrl: \"{provider.base_url}\"\n"
@@ -451,7 +452,7 @@ def write_mcp(project: Path, marker: Path) -> None:
         "    message = json.loads(line)\n"
         "    method = message.get('method')\n"
         "    if method == 'initialize':\n"
-        "        result = {'protocolVersion': '2024-11-05', 'capabilities': {}, 'serverInfo': {'name': 'mock', 'version': '1'}}\n"
+        "        result = {'protocolVersion': '2024-11-05', 'capabilities': {'tools': {}}, 'serverInfo': {'name': 'mock', 'version': '1'}}\n"
         "    elif method == 'tools/list':\n"
         "        result = {'tools': [{'name': 'echo', 'description': 'echo', 'inputSchema': {'type': 'object', 'properties': {}}}]}\n"
         "    else:\n"
@@ -557,7 +558,7 @@ def main(argv=None) -> int:
         text = bodies_json(provider)
         assert SKILL_BODY_MARKER in text, "skill:// read did not reach the provider"
         prompt_visible = any(
-            "Smoke managed skill" in str(body.get("messages", [{}])[0])
+            "# Skill: captured" in str(body.get("messages", [{}])[0])
             for body in first_body(provider)
         )
         assert prompt_visible, "managed skill must be prompt-visible after the refresh"
@@ -604,8 +605,8 @@ def main(argv=None) -> int:
             for body in capture
         ), "capture must not mount MCP tools"
         after_capture = marker_lines(marker)
-        assert after_capture == 1, (
-            f"exactly one MCP process must start (before={before_normal}, "
+        assert after_capture == before_normal + 1, (
+            f"normal turn must start one MCP process (before={before_normal}, "
             f"after={after_capture}); capture must not spawn another"
         )
 

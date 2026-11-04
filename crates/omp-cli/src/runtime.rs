@@ -3804,8 +3804,9 @@ async fn run_advisor_call(
 	let mut registry = build_registry(&static_names).map_err(|error| error.to_string())?;
 	let advise: Arc<dyn Tool> = spec.advise.clone();
 	registry.register(advise);
-	let approvals: Arc<dyn ToolApprover> =
-		Arc::new(spec.approvals.clone().without_ask());
+	let mut advisor_approvals = spec.approvals.clone().without_ask();
+	advisor_approvals.allow.insert("advise".to_string());
+	let approvals: Arc<dyn ToolApprover> = Arc::new(advisor_approvals);
 	let config = AgentConfig {
 		max_turns: spec.max_turns,
 		context_limit: spec.context_limit,

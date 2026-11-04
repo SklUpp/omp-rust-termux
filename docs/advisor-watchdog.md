@@ -4,6 +4,8 @@ The advisor subsystem attaches one or more optional reviewer models to a session
 
 An advisor does not approve actions or mutate primary session state directly. Its default investigative toolset is `read`, `grep`, and `glob`, but a `WATCHDOG.yml` roster entry may grant any built-in — including mutating tools such as `edit`, `write`, `bash`, `eval`, and `browser`. Those tools run in an isolated advisor `ToolSession`, but they honor the session's normal approval mode and per-tool policies; grant them only when the advisor model and workspace are trusted (see [Tools and isolation](#tools-and-isolation)).
 
+In the Rust runtime, the advisor's internal `advise` tool can deliver notes without an approval prompt. Other tools remain subject to the session's approval policy.
+
 ## Implementation files
 
 - [`src/advisor/runtime.ts`](../packages/coding-agent/src/advisor/runtime.ts)

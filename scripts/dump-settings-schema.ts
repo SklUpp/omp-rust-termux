@@ -32,8 +32,8 @@
 
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
-import * as os from "node:os";
 import { builtinModules } from "node:module";
+import * as os from "node:os";
 import * as path from "node:path";
 
 const ROOT = path.resolve(import.meta.dir, "..");
@@ -260,7 +260,8 @@ function linkExactDependencies(created: string[]): void {
 		const target = path.join(ROOT, "node_modules", ...name.split("/"));
 		if (fs.lstatSync(target, { throwIfNoEntry: false })) {
 			const found = readPackageVersion(target);
-			if (found !== version) missing.push(`${name}@${version} (found ${found ?? "no package.json"} at ${path.relative(ROOT, target)})`);
+			if (found !== version)
+					missing.push(`${name}@${version} (found ${found ?? "no package.json"} at ${path.relative(ROOT, target)})`);
 			continue;
 		}
 		const source = roots

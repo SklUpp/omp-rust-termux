@@ -2142,10 +2142,8 @@ impl RpcSession {
 				.map_err(|err| Error::new(err.to_string()))?;
 			self.in_memory_messages.get_or_insert_with(Vec::new).push(user_message);
 		}
-		// One token per turn: `StreamHandles::drop` cancels the request token when
-		// the provider stream ends, so sharing it across turns would abort the
-		// next queued turn. Run-wide stickiness lives in the RPC command loop's
-		// abort flag, which owns the queue, not in this token.
+		// A fresh token isolates this turn; run-wide abort state belongs to the
+		// RPC command loop that owns the queue.
 		let token = CancellationToken::new();
 		request.cancellation_token = Some(token.clone());
 		let turn_ack = TurnAck::new();

@@ -128,6 +128,8 @@ No running operation <operation-id>.
 
 `details.cancelled` reports whether a request was accepted, and `details.operation` is included when the operation exists. Already-terminal and unknown operations return `false`.
 
+In the Rust runtime, a completed worker stream does not cancel its owning scan. Explicit cancellation still propagates to the worker.
+
 ### `validate`
 
 Requires `scan_id`, `finding_id`, `validation_status`, and a nonblank `validation_summary`. It updates the canonical stored finding and optionally appends generated validation-evidence records:

@@ -1457,7 +1457,15 @@ impl AgentRunner for PiAgentRunner {
 	}
 
 	fn run(&self, request: &RunRequest) -> Result<EventStream> {
-		let cancellation_token = request.cancellation_token.clone().unwrap_or_default();
+		// The request token belongs to the caller's operation, not to this
+		// stream: `StreamHandles::drop` cancels only what the stream owns. A
+		// child token inherits caller cancellation (abort/EOF still propagate
+		// inward) while cancelling it on drop cannot abort the operation that
+		// merely finished consuming a stream.
+		let cancellation_token = match &request.cancellation_token {
+			Some(token) => token.child_token(),
+			None => pi_agent::CancellationToken::new(),
+		};
 		let timed_out = Arc::new(AtomicBool::new(false));
 
 		let (discovery_steering_tx, mut discovery_steering_rx) = tokio::sync::mpsc::channel(4);
@@ -1538,7 +1546,11 @@ impl AgentRunner for PiAgentRunner {
 		}
 
 
-		let plan = match RunPlan::resolve_with_mcp(request, !mcp_spawn.tools.is_empty()) {
+		let plan = match RunPlan::resolve_with_mcp(
+			request,
+			!mcp_spawn.tools.is_empty(),
+			&cancellation_token,
+		) {
 			Ok(plan) => plan,
 			Err(err) => {
 				self.runtime
@@ -1781,14 +1793,14 @@ impl AgentRunner for PiAgentRunner {
 		let credential: Option<pi_agent::provider::CredentialCallback> =
 			request.credential_resolver.as_ref().map(|resolver| {
 				let resolver = std::sync::Arc::clone(&resolver.0);
-				let cancel = match &request.cancellation_token {
-					Some(token) => {
-						let token = token.clone();
-						crate::auth::http::Cancel::with_predicate(std::sync::Arc::new(
-							move || token.is_cancelled(),
-						))
-					},
-					None => crate::auth::http::Cancel::new(),
+				// Stream-owned token: a caller abort propagates into it, while a
+				// deadline or stream drop cancels it without touching the caller's
+				// operation token. A cancelled turn must never fetch a fresh key.
+				let cancel = {
+					let token = cancellation_token.clone();
+					crate::auth::http::Cancel::with_predicate(std::sync::Arc::new(move || {
+						token.is_cancelled()
+					}))
 				};
 				let provider_name = target.provider.to_string();
 				let session_id = request.session_id.clone();
@@ -2511,7 +2523,7 @@ impl AgentRunner for PiAgentRunner {
 
 		let runtime_handle = self.runtime.handle().clone();
 		let handles = Arc::new(StreamHandles {
-			cancellation_token,
+			stream_cancel: cancellation_token,
 			steering_tx,
 			cancel_watcher,
 			dialog_abort,
@@ -2588,7 +2600,10 @@ impl AgentRunner for PiAgentRunner {
 }
 
 struct StreamHandles {
-	cancellation_token: pi_agent::CancellationToken,
+	/// Stream-owned cancellation token: a child of the caller's request token
+	/// when one was supplied. Cancelling it aborts this run's internal work and
+	/// never the caller's operation token.
+	stream_cancel:      pi_agent::CancellationToken,
 	steering_tx:        tokio::sync::mpsc::Sender<SteeringEvent>,
 	cancel_watcher:     tokio::task::JoinHandle<()>,
 	dialog_abort:       tokio::task::AbortHandle,
@@ -2599,7 +2614,7 @@ struct StreamHandles {
 
 impl Drop for StreamHandles {
 	fn drop(&mut self) {
-		self.cancellation_token.cancel();
+		self.stream_cancel.cancel();
 		let _ = self.steering_tx.try_send(SteeringEvent::Interrupt);
 		let dialog_abort = self.dialog_abort.clone();
 		self.runtime_handle.spawn(async move {
@@ -3934,10 +3949,25 @@ struct RunPlan {
 impl RunPlan {
 	#[allow(dead_code, reason = "backwards-compatible resolve helper for tests")]
 	pub fn resolve(request: &RunRequest) -> Result<Self> {
-		Self::resolve_with_mcp(request, false)
+		// Same ownership rule as `run`: an existing request token is honoured
+		// through a child, so a caller that already cancelled it still fails
+		// closed, while nothing here can cancel the caller's token.
+		let cancel = match &request.cancellation_token {
+			Some(token) => token.child_token(),
+			None => pi_agent::CancellationToken::new(),
+		};
+		Self::resolve_with_mcp(request, false, &cancel)
 	}
 
-	pub fn resolve_with_mcp(request: &RunRequest, has_mcp_tools: bool) -> Result<Self> {
+	/// `cancel_token` is the stream-owned turn token: a caller abort reaches it
+	/// through the child relationship, and a deadline/stream drop cancels it
+	/// directly. Root credential lookups must observe exactly that token so a
+	/// slow store refresh cannot outlive the turn that requested it.
+	pub fn resolve_with_mcp(
+		request: &RunRequest,
+		has_mcp_tools: bool,
+		cancel_token: &pi_agent::CancellationToken,
+	) -> Result<Self> {
 		let requested = request
 			.model
 			.clone()
@@ -3976,14 +4006,13 @@ impl RunPlan {
 		let api_key = match request.api_key.clone() {
 			Some(explicit) => explicit,
 			None => {
-				let cancel = match &request.cancellation_token {
-					Some(token) => {
-						let token = token.clone();
-						crate::auth::http::Cancel::with_predicate(std::sync::Arc::new(move || {
-							token.is_cancelled()
-						}))
-					},
-					None => crate::auth::http::Cancel::new(),
+				// Stream-owned token: caller abort, deadline and stream drop all
+				// interrupt the lookup; the caller token alone misses the latter two.
+				let cancel = {
+					let token = cancel_token.clone();
+					crate::auth::http::Cancel::with_predicate(std::sync::Arc::new(move || {
+						token.is_cancelled()
+					}))
 				};
 				let stored_key = match request.credential_resolver.as_ref() {
 					Some(resolver) => resolver
@@ -7151,6 +7180,69 @@ mod tests {
 	}
 
 	#[test]
+	fn run_plan_root_credential_lookup_observes_stream_token() {
+		use crate::{
+			agent::ResolverHandle,
+			auth::{error::AuthError, http::Cancel},
+			rpc::auth::CredentialResolver,
+		};
+
+		struct CancelCheckingResolver;
+
+		impl CredentialResolver for CancelCheckingResolver {
+			fn api_key(
+				&self,
+				provider: &str,
+				_session_id: Option<&str>,
+				cancel: &Cancel,
+			) -> std::result::Result<Option<String>, AuthError> {
+				cancel.check(provider)?;
+				Ok(Some("sk-store".to_string()))
+			}
+
+			fn peek_api_key(&self, _provider: &str) -> std::result::Result<Option<String>, AuthError> {
+				Ok(None)
+			}
+		}
+
+		let mut req = request(yolo());
+		// No explicit/config key: the store lookup is the only credential source.
+		req.config.providers.clear();
+		req.config
+			.providers
+			.insert("local".to_string(), ProviderConfig {
+				base_url: Some("http://127.0.0.1:8080/v1".to_string()),
+				api_key: None,
+				..ProviderConfig::default()
+			});
+		req.credential_resolver = Some(ResolverHandle(
+			Arc::new(CancelCheckingResolver) as Arc<dyn CredentialResolver>
+		));
+
+		let token = pi_agent::CancellationToken::new();
+		let plan = RunPlan::resolve_with_mcp(&req, false, &token).expect("live lookup");
+		assert_eq!(plan.api_key, "sk-store");
+
+		// A deadline or a stream drop cancels the stream-owned token, never the
+		// caller's operation token; the root lookup must still fail closed.
+		token.cancel();
+		let error = RunPlan::resolve_with_mcp(&req, false, &token)
+			.err()
+			.expect("cancelled lookup");
+		assert!(error.to_string().contains("credential lookup failed"), "{error}");
+
+		// The compatibility helper keeps honouring the request token: a caller
+		// that already cancelled it must still fail closed.
+		let request_token = pi_agent::CancellationToken::new();
+		request_token.cancel();
+		req.cancellation_token = Some(request_token);
+		assert!(
+			RunPlan::resolve(&req).is_err(),
+			"resolve must honour a cancelled request token"
+		);
+	}
+
+	#[test]
 	fn child_model_roles_follow_ts_priority_inheritance_and_suffixes() {
 		let factory = |roles: &[(&str, &str)], default: Option<&str>| {
 			let mut config = Config::default();
@@ -7999,6 +8091,179 @@ mod tests {
 		drop(stream);
 		assert!(start.elapsed() < std::time::Duration::from_millis(500));
 		drop(server);
+	}
+
+	#[test]
+	fn completed_stream_drop_leaves_caller_token_live() {
+		use std::io::{Read, Write};
+
+		let (addr_tx, addr_rx) = std::sync::mpsc::channel::<std::net::SocketAddr>();
+
+		std::thread::spawn(move || {
+			let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+			addr_tx.send(listener.local_addr().unwrap()).unwrap();
+			let (mut socket, _) = listener.accept().unwrap();
+			let mut buf = [0u8; 1024];
+			let _ = socket.read(&mut buf).unwrap();
+			socket
+				.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n")
+				.unwrap();
+			socket
+				.write_all(b"data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":null}]}\n\n")
+				.unwrap();
+			socket.write_all(b"data: [DONE]\n\n").unwrap();
+			socket.flush().unwrap();
+			std::thread::sleep(std::time::Duration::from_secs(1));
+		});
+
+		let addr = addr_rx.recv().unwrap();
+		let mut req = request(yolo());
+		req.config
+			.providers
+			.insert("local".to_string(), ProviderConfig {
+				base_url: Some(format!("http://{addr}/v1")),
+				api_key: Some("sk-test".to_string()),
+				..ProviderConfig::default()
+			});
+		// The caller owns this token for its whole operation (a security scan
+		// reuses it across worker turns); one finished stream must not cancel it.
+		let cancel_token = pi_agent::CancellationToken::new();
+		req.cancellation_token = Some(cancel_token.clone());
+
+		let runner = PiAgentRunner::new().expect("runner");
+		let mut stream = runner.run(&req).expect("stream");
+		let mut saw_agent_end = false;
+		for event in &mut stream {
+			if let Ok(Event::AgentEnd { .. }) = event {
+				saw_agent_end = true;
+			}
+		}
+		assert!(saw_agent_end, "stream must reach AgentEnd");
+		drop(stream);
+		assert!(
+			!cancel_token.is_cancelled(),
+			"a normally completed stream must never cancel the caller's token"
+		);
+	}
+
+	#[test]
+	fn stream_deadline_aborts_root_credential_refresh() {
+		use std::io::{Read, Write};
+
+		use crate::{
+			agent::ResolverHandle,
+			auth::{error::AuthError, http::Cancel},
+			rpc::auth::CredentialResolver,
+		};
+
+		struct CancelCheckingResolver {
+			calls:   AtomicUsize,
+			entered: Arc<AtomicBool>,
+		}
+
+		impl CredentialResolver for CancelCheckingResolver {
+			fn api_key(
+				&self,
+				provider: &str,
+				_session_id: Option<&str>,
+				cancel: &Cancel,
+			) -> std::result::Result<Option<String>, AuthError> {
+				let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+				if call >= 3 {
+					// The forced refresh runs synchronously inside the provider
+					// future, so it cannot yield to the steering interrupt: only
+					// the cancel predicate can stop it while it blocks.
+					self.entered.store(true, Ordering::SeqCst);
+					let deadline =
+						std::time::Instant::now() + std::time::Duration::from_secs(3);
+					while std::time::Instant::now() < deadline {
+						cancel.check(provider)?;
+						std::thread::sleep(std::time::Duration::from_millis(5));
+					}
+				}
+				cancel.check(provider)?;
+				Ok(Some("sk-store".to_string()))
+			}
+
+			fn peek_api_key(&self, _provider: &str) -> std::result::Result<Option<String>, AuthError> {
+				Ok(None)
+			}
+		}
+
+		let (addr_tx, addr_rx) = std::sync::mpsc::channel::<std::net::SocketAddr>();
+
+		std::thread::spawn(move || {
+			let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+			addr_tx.send(listener.local_addr().unwrap()).unwrap();
+			let (mut socket, _) = listener.accept().unwrap();
+			let mut buf = [0u8; 4096];
+			let _ = socket.read(&mut buf).unwrap();
+			// Force the refresh path: the provider retries once with a refreshed
+			// key when the body marks the key invalid.
+			socket
+				.write_all(
+					b"HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: 32\r\n\r\n{\"error\":{\"code\":\"invalid_key\"}}",
+				)
+				.unwrap();
+			socket.flush().unwrap();
+			std::thread::sleep(std::time::Duration::from_millis(500));
+		});
+
+		let addr = addr_rx.recv().unwrap();
+		let mut req = request(yolo());
+		req.config
+			.providers
+			.insert("local".to_string(), ProviderConfig {
+				base_url: Some(format!("http://{addr}/v1")),
+				api_key: None,
+				..ProviderConfig::default()
+			});
+		let resolver = Arc::new(CancelCheckingResolver {
+			calls:   AtomicUsize::new(0),
+			entered: Arc::new(AtomicBool::new(false)),
+		});
+		req.credential_resolver = Some(ResolverHandle(
+			Arc::clone(&resolver) as Arc<dyn CredentialResolver>
+		));
+		req.max_time = Some(std::time::Duration::from_secs(2));
+		let cancel_token = pi_agent::CancellationToken::new();
+		req.cancellation_token = Some(cancel_token.clone());
+
+		let runner = PiAgentRunner::new().expect("runner");
+		let stream = runner.run(&req).expect("stream");
+
+		// Handshake: the forced refresh must be inside the store read before the
+		// deadline fires, otherwise the steering interrupt would abort the turn
+		// before the refresh path is exercised at all. This gate is bounded and
+		// fails with a clear message instead of racing the timer.
+		let gate = std::time::Instant::now() + std::time::Duration::from_secs(5);
+		while !resolver.entered.load(Ordering::SeqCst) {
+			assert!(
+				std::time::Instant::now() < gate,
+				"the forced refresh must start before the deadline"
+			);
+			std::thread::sleep(std::time::Duration::from_millis(5));
+		}
+
+		let mut failure = None;
+		for event in stream {
+			if let Err(error) = event {
+				failure = Some(error.to_string());
+				break;
+			}
+		}
+		let failure = failure.expect("a cancelled refresh must end the stream");
+		assert!(failure.contains("Credential refresh failed"), "{failure}");
+		assert!(failure.contains("cancelled"), "{failure}");
+		assert_eq!(
+			resolver.calls.load(Ordering::SeqCst),
+			3,
+			"the refresh must reach the store exactly once"
+		);
+		assert!(
+			!cancel_token.is_cancelled(),
+			"the deadline must not cancel the caller's token"
+		);
 	}
 
 	#[test]

@@ -1984,9 +1984,7 @@ fn run_turn(
 				break;
 			}
 			prepared.reset_for_retry(&input, &request.parts);
-			// The finished attempt's stream cancels its own request token when it
-			// drops (`StreamHandles::drop`), and that must not read as an abort: the
-			// retry gets a fresh token, re-registered so `abort` still reaches it.
+			// Give each retry its own token, re-registered so `abort` still reaches it.
 			let retry_token = CancellationToken::new();
 			request.cancellation_token = Some(retry_token.clone());
 			prepared.token = retry_token.clone();

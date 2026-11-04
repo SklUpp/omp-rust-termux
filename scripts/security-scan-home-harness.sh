@@ -433,6 +433,7 @@ name: advised
 description: "Advisor opt-in child"
 tools: [read]
 advisor: true
+blocking: true
 ---
 Report back and stop.
 MD

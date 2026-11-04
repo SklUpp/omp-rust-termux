@@ -310,7 +310,7 @@ fn advisor_flag_runs_isolated_roster_and_preserves_late_blocker_card() {
 	let files = session_files(&setup.sessions);
 	assert_eq!(files.len(), 1, "one session log: {files:?}");
 	let log = fs::read_to_string(&files[0]).expect("session log");
-	assert!(log.contains("\"kind\":\"custom_message\""), "journal must carry the card");
+	assert!(log.contains("\"type\":\"custom_message\""), "journal must carry the card");
 	assert!(log.contains("\"customType\":\"advisor\""), "journal card type");
 	assert!(log.contains("write target deleted"), "journal card body");
 

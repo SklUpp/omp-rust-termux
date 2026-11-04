@@ -4214,7 +4214,6 @@ mod tests {
 				output_prefix:       None,
 			})
 			.expect("reserve");
-		supervisor.mark_contract_expected(&id);
 		let mut message = Message::assistant("partial answer");
 		message.stop_reason = Some(crate::state::StopReason::Error);
 		message.error_message = Some("upstream failed".to_string());

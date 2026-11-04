@@ -940,6 +940,10 @@ impl AdvisorManager {
 				},
 			}
 		}
+		// Test-only one-shot gate: parks the drain after the loop and before
+		// `busy` clears, so the lost-wakeup window is observable. No locks held.
+		#[cfg(test)]
+		drain_exit_gate::wait_if_armed(std::sync::Arc::as_ptr(&self).cast::<()>() as usize).await;
 		slot.busy.store(false, Ordering::SeqCst);
 		let runnable = {
 			let state = slot.state.lock().unwrap_or_else(|poison| poison.into_inner());
@@ -1758,6 +1762,54 @@ pub(crate) fn loop_guard_step(
 	LoopGuardAction::Redirect(text)
 }
 
+/// One-shot test gate between the drain loop exit and `busy = false`.
+///
+/// A regression test arms it for one manager, holds the drain in the
+/// lost-wakeup window while a reset and a new turn run against a still-busy
+/// slot, then releases it. The gate is taken on first fire and is keyed by the
+/// manager address, so no other drain parks or fires it.
+#[cfg(test)]
+mod drain_exit_gate {
+	use std::sync::Mutex;
+
+	use tokio::sync::oneshot;
+
+	struct Gate {
+		token:   usize,
+		reached: Option<oneshot::Sender<()>>,
+		release: oneshot::Receiver<()>,
+	}
+
+	static GATE: Mutex<Option<Gate>> = Mutex::new(None);
+
+	/// Arm the gate for the manager at `token`; returns the "reached" receiver
+	/// and the release sender.
+	pub(crate) fn arm(token: usize) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+		let (reached_tx, reached_rx) = oneshot::channel();
+		let (release_tx, release_rx) = oneshot::channel();
+		*GATE.lock().unwrap_or_else(|poison| poison.into_inner()) =
+			Some(Gate { token, reached: Some(reached_tx), release: release_rx });
+		(reached_rx, release_tx)
+	}
+
+	pub(crate) async fn wait_if_armed(token: usize) {
+		let gate = {
+			let mut gate = GATE.lock().unwrap_or_else(|poison| poison.into_inner());
+			if gate.as_ref().is_some_and(|gate| gate.token == token) {
+				gate.take()
+			} else {
+				None
+			}
+		};
+		if let Some(gate) = gate {
+			if let Some(reached) = gate.reached {
+				let _ = reached.send(());
+			}
+			let _ = gate.release.await;
+		}
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -2136,6 +2188,58 @@ mod tests {
 			"quota with backlog must still return incomplete after reset"
 		);
 		assert_eq!(executor.calls.lock().expect("calls").len(), 2);
+		manager.dispose();
+	}
+
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn drain_exit_reschedules_a_turn_queued_while_busy() {
+		let executor = Arc::new(FakeExecutor {
+			calls: StdMutex::new(Vec::new()),
+			error: StdMutex::new(Some("429 rate limit exceeded".to_string())),
+		});
+		let manager = manager(executor.clone());
+		let token = std::sync::Arc::as_ptr(&manager).cast::<()>() as usize;
+		let (reached, release) = drain_exit_gate::arm(token);
+		manager.begin_primary_run(&[]);
+		manager.push_user(&Message::user("fix it"));
+		manager.push_turn(&Message::assistant("done"), &[]);
+		tokio::time::timeout(Duration::from_secs(5), reached)
+			.await
+			.expect("first drain must reach the exit gate")
+			.expect("gate sender must be live");
+		// Parked after the loop, before `busy = false`: the exact lost-wakeup
+		// window. The quota latch from the first call is already set.
+		let slot = &manager.slots[0];
+		assert!(slot.busy.load(Ordering::SeqCst), "drain must still hold busy");
+		assert_eq!(executor.calls.lock().expect("calls").len(), 1);
+		{
+			let state = slot.state.lock().unwrap_or_else(|poison| poison.into_inner());
+			assert!(state.quota, "first quota error must have latched");
+		}
+		manager.reset("conversation-boundary", &[]);
+		manager.begin_primary_run(&[]);
+		manager.push_user(&Message::user("fresh"));
+		manager.push_turn(&Message::assistant("done"), &[]);
+		assert_eq!(
+			executor.calls.lock().expect("calls").len(),
+			1,
+			"a queued turn must not start while the drain still holds busy"
+		);
+		release.send(()).expect("parked drain must still listen");
+		let deadline = Instant::now() + Duration::from_secs(5);
+		loop {
+			let calls = executor.calls.lock().expect("calls").len();
+			let quota = slot.state.lock().unwrap_or_else(|poison| poison.into_inner()).quota;
+			if calls >= 2 && quota {
+				break;
+			}
+			assert!(
+				Instant::now() < deadline,
+				"the turn queued in the busy window was never rescheduled (calls={calls}, quota={quota})"
+			);
+			tokio::time::sleep(Duration::from_millis(10)).await;
+		}
+		assert_eq!(manager.status_overview()[0].1, RuntimeStatus::QuotaExhausted);
 		manager.dispose();
 	}
 

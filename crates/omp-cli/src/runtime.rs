@@ -1700,6 +1700,7 @@ impl AgentRunner for PiAgentRunner {
 			catalog: Arc::clone(&request.catalog),
 			explicit_provider: request.provider.clone(),
 			api_key: Some(plan.api_key.clone()),
+			root_key_explicit: request.api_key.is_some(),
 			default_model: request.model.clone(),
 			root_provider: Some(plan.provider.clone()),
 			root_base_url: Some(plan.base_url.clone()),
@@ -1790,32 +1791,26 @@ impl AgentRunner for PiAgentRunner {
 			target.model,
 		)
 		.map(str::to_string);
+		// An explicit root key outranks the credential store, so no callback may
+		// be installed: the transport calls the callback instead of using the
+		// static key and would replace the explicit key before the first request.
 		let credential: Option<pi_agent::provider::CredentialCallback> =
-			request.credential_resolver.as_ref().map(|resolver| {
-				let resolver = std::sync::Arc::clone(&resolver.0);
-				// Stream-owned token: a caller abort propagates into it, while a
-				// deadline or stream drop cancels it without touching the caller's
-				// operation token. A cancelled turn must never fetch a fresh key.
-				let cancel = {
-					let token = cancellation_token.clone();
-					crate::auth::http::Cancel::with_predicate(std::sync::Arc::new(move || {
-						token.is_cancelled()
-					}))
-				};
-				let provider_name = target.provider.to_string();
-				let session_id = request.session_id.clone();
-				std::sync::Arc::new(move |force_refresh: bool| {
-					crate::rpc::auth::CredentialResolver::api_key_force(
-						&*resolver,
-						&provider_name,
-						session_id.as_deref(),
-						force_refresh,
-						&cancel,
+			if request.api_key.is_some() {
+				None
+			} else {
+				request.credential_resolver.as_ref().map(|resolver| {
+					// Stream-owned token: a caller abort propagates into it, while a
+					// deadline or stream drop cancels it without touching the caller's
+					// operation token. A cancelled turn must never fetch a fresh key.
+					credential_refresh_callback(
+						resolver,
+						target.provider.to_string(),
+						request.session_id.clone(),
+						Some(cancellation_token.clone()),
+						plan.api_key.clone(),
 					)
-					.map_err(|error| error.to_string())
-					.map(|key| key.unwrap_or_default())
-				}) as pi_agent::provider::CredentialCallback
-			});
+				})
+			};
 		let provider = wire_provider(
 			&request.catalog,
 			&request.config,
@@ -4069,6 +4064,40 @@ impl RunPlan {
 		})
 	}
 }
+
+/// Store-backed credential callback that keeps the statically resolved key in
+/// play: `Ok(None)` means "no stored credential", so the key this target was
+/// resolved with is returned instead of an empty bearer. Resolver errors stay
+/// errors; a deliberately keyless target still resolves to an empty key.
+fn credential_refresh_callback(
+	resolver: &crate::agent::ResolverHandle,
+	provider: String,
+	session_id: Option<String>,
+	cancel: Option<pi_agent::CancellationToken>,
+	fallback: String,
+) -> pi_agent::provider::CredentialCallback {
+	let resolver = std::sync::Arc::clone(&resolver.0);
+	let cancel = match cancel {
+		Some(token) => {
+			crate::auth::http::Cancel::with_predicate(std::sync::Arc::new(move || {
+				token.is_cancelled()
+			}))
+		},
+		None => crate::auth::http::Cancel::new(),
+	};
+	std::sync::Arc::new(move |force_refresh: bool| {
+		crate::rpc::auth::CredentialResolver::api_key_force(
+			&*resolver,
+			&provider,
+			session_id.as_deref(),
+			force_refresh,
+			&cancel,
+		)
+		.map_err(|error| error.to_string())
+		.map(|key| key.unwrap_or_else(|| fallback.clone()))
+	})
+}
+
 /// Resolves an agent model pattern through config roles, the model catalog, and
 /// `config.yml` connections, then builds a provider for that child only.
 /// The root provider is untouched, so `/model` changes refresh only the
@@ -4080,6 +4109,10 @@ struct CliChildModelFactory {
 	/// Key the root turn actually used (`RunPlan::api_key`). Reused only for
 	/// the root provider **and** base URL; never forwarded to another target.
 	api_key:             Option<String>,
+	/// Whether that key came from an explicit request/CLI key. Only then does
+	/// the matching root endpoint keep the static key: a store callback would
+	/// otherwise replace the explicit key before the first request.
+	root_key_explicit:   bool,
 	default_model:       Option<String>,
 	/// Provider the root run actually selected. The root run key may only be
 	/// reused for this provider; every other child resolves its own credential.
@@ -4203,6 +4236,33 @@ impl CliChildModelFactory {
 		target.api_key = Some(api_key);
 		Ok(target)
 	}
+
+	/// Credential callback for one child target. `None` when the target reuses
+	/// an explicitly supplied root key: the static key must stay authoritative
+	/// instead of being replaced by the store before the first request. Any
+	/// other target gets a store callback whose miss falls back to that target's
+	/// own resolved key, never the root key.
+	fn credential_callback(
+		&self,
+		provider: &str,
+		base_url: &str,
+		fallback: &str,
+	) -> Option<pi_agent::provider::CredentialCallback> {
+		let explicit_root = self.root_key_explicit
+			&& self.root_provider.as_deref() == Some(provider)
+			&& self.root_base_url.as_deref() == Some(base_url);
+		if explicit_root {
+			return None;
+		}
+		let resolver = self.credential_resolver.as_ref()?;
+		Some(credential_refresh_callback(
+			resolver,
+			provider.to_string(),
+			self.session_id.clone(),
+			self.cancel.clone(),
+			fallback.to_string(),
+		))
+	}
 }
 
 impl ChildModelFactory for CliChildModelFactory {
@@ -4250,32 +4310,11 @@ impl ChildModelFactory for CliChildModelFactory {
 				&selection.model,
 			)
 			.map(str::to_string);
-			let credential: Option<pi_agent::provider::CredentialCallback> =
-				self.credential_resolver.as_ref().map(|resolver| {
-					let resolver = std::sync::Arc::clone(&resolver.0);
-					let cancel = match &self.cancel {
-						Some(token) => {
-							let token = token.clone();
-							crate::auth::http::Cancel::with_predicate(std::sync::Arc::new(
-								move || token.is_cancelled(),
-							))
-						},
-						None => crate::auth::http::Cancel::new(),
-					};
-					let provider_name = selection.provider.to_string();
-					let session_id = self.session_id.clone();
-					std::sync::Arc::new(move |force_refresh: bool| {
-						crate::rpc::auth::CredentialResolver::api_key_force(
-							&*resolver,
-							&provider_name,
-							session_id.as_deref(),
-							force_refresh,
-							&cancel,
-						)
-						.map_err(|error| error.to_string())
-						.map(|key| key.unwrap_or_default())
-					}) as pi_agent::provider::CredentialCallback
-				});
+			let credential = self.credential_callback(
+				&target.provider,
+				&target.base_url,
+				target.api_key.as_deref().unwrap_or_default(),
+			);
 			let provider = match wire_provider(
 				&self.catalog,
 				&self.config,
@@ -6977,6 +7016,60 @@ mod tests {
 		Approvals::new(ApprovalMode::Yolo, Vec::new())
 	}
 
+	/// Test credential store returning one fixed key (or a miss).
+	struct StoredKeyResolver(Mutex<Option<&'static str>>);
+
+	impl crate::rpc::auth::CredentialResolver for StoredKeyResolver {
+		fn api_key(
+			&self,
+			provider: &str,
+			_session_id: Option<&str>,
+			cancel: &crate::auth::http::Cancel,
+		) -> std::result::Result<Option<String>, crate::auth::error::AuthError> {
+			cancel.check(provider)?;
+			let key = *self.0.lock().expect("lock");
+			Ok(key.map(str::to_string))
+		}
+
+		fn peek_api_key(
+			&self,
+			_provider: &str,
+		) -> std::result::Result<Option<String>, crate::auth::error::AuthError> {
+			Ok(None)
+		}
+	}
+
+	/// One-connection SSE server that reports the raw request head it received.
+	fn mock_capture_sse() -> (std::net::SocketAddr, std::sync::mpsc::Receiver<String>) {
+		use std::io::{Read, Write};
+		let (addr_tx, addr_rx) = std::sync::mpsc::channel::<std::net::SocketAddr>();
+		let (head_tx, head_rx) = std::sync::mpsc::channel::<String>();
+		std::thread::spawn(move || {
+			let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+			addr_tx.send(listener.local_addr().unwrap()).unwrap();
+			let (mut socket, _) = listener.accept().unwrap();
+			let mut head = Vec::new();
+			let mut buf = [0u8; 4096];
+			while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+				match socket.read(&mut buf) {
+					Ok(0) | Err(_) => break,
+					Ok(read) => head.extend_from_slice(&buf[..read]),
+				}
+			}
+			let _ = head_tx.send(String::from_utf8_lossy(&head).into_owned());
+			socket
+				.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n")
+				.unwrap();
+			socket
+				.write_all(b"data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n")
+				.unwrap();
+			socket.write_all(b"data: [DONE]\n\n").unwrap();
+			socket.flush().unwrap();
+			std::thread::sleep(std::time::Duration::from_millis(300));
+		});
+		(addr_rx.recv().unwrap(), head_rx)
+	}
+
 	#[test]
 	fn excluded_tool_in_tools_selection_reports_the_boundary() {
 		let mut request = request(yolo());
@@ -7256,6 +7349,7 @@ mod tests {
 				catalog: Arc::new(catalog()),
 				explicit_provider: None,
 				api_key: None,
+				root_key_explicit: false,
 				default_model: default.map(str::to_string),
 				root_provider: None,
 				root_base_url: None,
@@ -7344,6 +7438,7 @@ mod tests {
 			catalog: Arc::new(catalog()),
 			explicit_provider: None,
 			api_key: Some("root-session-key".to_string()),
+			root_key_explicit: false,
 			default_model: None,
 			root_provider: Some("rootprov".to_string()),
 			root_base_url: Some("http://127.0.0.1:1".to_string()),
@@ -7422,6 +7517,7 @@ mod tests {
 			catalog: Arc::new(catalog()),
 			explicit_provider: None,
 			api_key: Some("root-store-key".to_string()),
+			root_key_explicit: false,
 			default_model: None,
 			root_provider: Some("rootprov".to_string()),
 			root_base_url: Some("http://127.0.0.1:1".to_string()),
@@ -7452,6 +7548,7 @@ mod tests {
 			catalog: Arc::clone(&factory.catalog),
 			explicit_provider: None,
 			api_key: Some("root-store-key".to_string()),
+			root_key_explicit: false,
 			default_model: None,
 			root_provider: Some("rootprov".to_string()),
 			root_base_url: Some("http://127.0.0.1:1".to_string()),
@@ -7464,6 +7561,136 @@ mod tests {
 		};
 		let error = cancelled.target("childprov/model").err().expect("cancelled lookup");
 		assert!(error.contains("credential lookup failed for provider `childprov`"), "{error}");
+	}
+
+	#[test]
+	fn explicit_root_key_is_never_replaced_by_a_credential_callback() {
+		use crate::{agent::ResolverHandle, rpc::auth::CredentialResolver};
+
+		let (addr, head_rx) = mock_capture_sse();
+		let mut req = request(yolo());
+		req.config
+			.providers
+			.insert("local".to_string(), ProviderConfig {
+				base_url: Some(format!("http://{addr}/v1")),
+				api_key: None,
+				..ProviderConfig::default()
+			});
+		req.api_key = Some("sk-explicit".to_string());
+		req.credential_resolver = Some(ResolverHandle(Arc::new(StoredKeyResolver(Mutex::new(
+			Some("sk-store"),
+		))) as Arc<dyn CredentialResolver>));
+
+		let runner = PiAgentRunner::new().expect("runner");
+		let stream = runner.run(&req).expect("stream");
+		let head = head_rx
+			.recv_timeout(std::time::Duration::from_secs(5))
+			.expect("the provider request must reach the mock");
+		assert!(
+			head.to_ascii_lowercase().contains("authorization: bearer sk-explicit"),
+			"an explicit root key must never be replaced by the store: {head}"
+		);
+		drop(stream);
+	}
+
+	#[test]
+	fn root_credential_callback_falls_back_to_the_resolved_key_on_store_miss() {
+		use crate::{agent::ResolverHandle, rpc::auth::CredentialResolver};
+
+		let (addr, head_rx) = mock_capture_sse();
+		let mut req = request(yolo());
+		req.config
+			.providers
+			.insert("local".to_string(), ProviderConfig {
+				base_url: Some(format!("http://{addr}/v1")),
+				api_key: Some("sk-config".to_string()),
+				..ProviderConfig::default()
+			});
+		req.credential_resolver = Some(ResolverHandle(
+			Arc::new(StoredKeyResolver(Mutex::new(None))) as Arc<dyn CredentialResolver>
+		));
+
+		let runner = PiAgentRunner::new().expect("runner");
+		let stream = runner.run(&req).expect("stream");
+		let head = head_rx
+			.recv_timeout(std::time::Duration::from_secs(5))
+			.expect("the provider request must reach the mock");
+		assert!(
+			head.to_ascii_lowercase().contains("authorization: bearer sk-config"),
+			"a store miss must keep the resolved key, not send an empty bearer: {head}"
+		);
+		drop(stream);
+	}
+
+	#[test]
+	fn child_credential_callback_keeps_explicit_root_and_target_fallback() {
+		use crate::{agent::ResolverHandle, rpc::auth::CredentialResolver};
+
+		let resolver = Arc::new(StoredKeyResolver(Mutex::new(Some("child-store"))));
+		let mut config = Config::default();
+		config.providers.insert(
+			"rootprov".to_string(),
+			ProviderConfig {
+				base_url: Some("http://127.0.0.1:1".to_string()),
+				api_key: None,
+				..ProviderConfig::default()
+			},
+		);
+		config.providers.insert(
+			"childprov".to_string(),
+			ProviderConfig {
+				base_url: Some("http://127.0.0.1:2".to_string()),
+				api_key: Some("child-conn".to_string()),
+				..ProviderConfig::default()
+			},
+		);
+		let factory = CliChildModelFactory {
+			config,
+			catalog: Arc::new(catalog()),
+			explicit_provider: None,
+			api_key: Some("root-explicit".to_string()),
+			root_key_explicit: true,
+			default_model: None,
+			root_provider: Some("rootprov".to_string()),
+			root_base_url: Some("http://127.0.0.1:1".to_string()),
+			credential_resolver: Some(ResolverHandle(
+				resolver.clone() as Arc<dyn CredentialResolver>,
+			)),
+			session_id: Some("session-1".to_string()),
+			cancel: None,
+			service_tier_by_family: Default::default(),
+		};
+
+		// Same provider+endpoint as an explicit root key: no callback, so the
+		// static root key keeps precedence over the store.
+		assert!(
+			factory
+				.credential_callback("rootprov", "http://127.0.0.1:1", "root-explicit")
+				.is_none(),
+			"an explicit root key must not be replaced by a store callback"
+		);
+
+		// Any other target resolves its own store credential.
+		let child = factory
+			.credential_callback("childprov", "http://127.0.0.1:2", "child-conn")
+			.expect("child callback");
+		assert_eq!(child(false).expect("store key"), "child-store");
+
+		// A store miss falls back to that target's own key, never the root key.
+		*resolver.0.lock().expect("lock") = None;
+		assert_eq!(child(false).expect("target fallback"), "child-conn");
+
+		// A store-derived root key keeps the callback for the same endpoint.
+		let store_rooted = CliChildModelFactory {
+			root_key_explicit: false,
+			..factory
+		};
+		assert!(
+			store_rooted
+				.credential_callback("rootprov", "http://127.0.0.1:1", "root-store")
+				.is_some(),
+			"only an explicit root key suppresses the same-endpoint callback"
+		);
 	}
 
 	#[test]
@@ -9864,6 +10091,7 @@ mod tests {
 			catalog: Arc::new(catalog),
 			explicit_provider: None,
 			api_key: Some("root-session-key".to_string()),
+			root_key_explicit: false,
 			default_model: None,
 			root_provider: Some("rootprov".to_string()),
 			root_base_url: Some("http://127.0.0.1:1".to_string()),
@@ -10039,6 +10267,7 @@ mod tests {
 			catalog: Arc::new(catalog),
 			explicit_provider: None,
 			api_key: None,
+			root_key_explicit: false,
 			default_model: None,
 			root_provider: None,
 			root_base_url: None,
@@ -10393,6 +10622,7 @@ mod process_scope_tests {
 			catalog: std::sync::Arc::new(catalog),
 			explicit_provider: None,
 			api_key: None,
+			root_key_explicit: false,
 			default_model: None,
 			root_provider: None,
 			root_base_url: None,

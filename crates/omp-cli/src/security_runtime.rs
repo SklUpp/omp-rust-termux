@@ -8,8 +8,11 @@
 //! - `execution_root` is the worker cwd; it is **never** used for the journal.
 //! - The scan journal lives under the security store's `sessions` directory
 //!   (`SecurityStore::open(plan.repository_root, host.state_root())`).
-//! - Keys come from `request.resolver.api_key_for(..., false, ...)` per request;
-//!   `force_refresh` is reserved for the transport's auth-retry call.
+//! - Keys come only through the exact resolver adapter: plan resolution asks
+//!   `api_key_for(..., false, ...)` once, and the transport's per-request
+//!   callback owns `force_refresh` after a `401/403 invalid_key`. The worker
+//!   never passes a pinned token as an explicit `api_key`, because that would
+//!   disable the transport refresh.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -203,7 +206,11 @@ impl SecurityRunSession {
 		})
 	}
 
-	fn request(&self, text: &str, force_refresh: bool) -> Result<RunRequest, String> {
+	/// The worker never hands the pinned OAuth token to the explicit-key
+	/// channel: `api_key: None` keeps the exact resolver in charge of both the
+	/// initial key (plan lookup) and the transport's forced refresh after a
+	/// 401/403 `invalid_key`. An explicit key here would disable that refresh.
+	fn request(&self, text: &str) -> Result<RunRequest, String> {
 		let prompts = crate::prompts::resolve(
 			None,
 			None,
@@ -217,15 +224,6 @@ impl SecurityRunSession {
 		append.push_str(COORDINATOR_PROMPT.trim());
 		let provider = self.request.model.provider.clone();
 		let model_id = self.request.model.model_id.clone();
-		let api_key = self
-			.request
-			.resolver
-			.api_key_for(
-				&provider,
-				force_refresh,
-				&crate::security::host::auth_cancel(&self.request.cancel),
-			)
-			.map_err(|error| error.to_string())?;
 		let router = pi_agent::tools::internal_urls::InternalUrlRouter::new();
 		pi_agent::tools::internal_urls::register_security(
 			&router,
@@ -250,7 +248,8 @@ impl SecurityRunSession {
 			output_mode: OutputMode::Text,
 			model: Some(model_id),
 			provider: Some(provider),
-			api_key,
+			// Resolver-owned: never the explicit-key channel (see `request`).
+			api_key: None,
 			provider_session_id: Some(format!("security:{}", self.request.scan_id)),
 			prompt_cache_key: None,
 			system_prompt: prompts.system,
@@ -310,15 +309,11 @@ impl SecurityRunSession {
 		// No worker-level replay: a scan may have already published or mutated
 		// artifacts before a late auth failure. The transport owns auth retry so
 		// only the failed HTTP request is reissued.
-		self.run_once(text, false)
+		self.run_once(text)
 	}
 
-	fn run_once(
-		&self,
-		text: &str,
-		force_refresh: bool,
-	) -> Result<Option<SecurityScanStats>, String> {
-		let request = self.request(text, force_refresh)?;
+	fn run_once(&self, text: &str) -> Result<Option<SecurityScanStats>, String> {
+		let request = self.request(text)?;
 		let stream = self.runner.run(&request).map_err(|error| error.to_string())?;
 		let mut journal = self
 			.journal
@@ -606,7 +601,21 @@ impl crate::rpc::auth::CredentialResolver for ExactResolverAdapter {
 
 #[cfg(test)]
 mod tests {
+	use crate::agent::EventStream;
+
 	use super::*;
+
+	/// Runner fixture for worker-request construction: the run path is never
+	/// exercised, only `SecurityRunSession::request`.
+	struct NoopRunner;
+
+	impl AgentRunner for NoopRunner {
+		fn run(&self, _request: &RunRequest) -> crate::Result<EventStream> {
+			Err(crate::Error::new("noop runner"))
+		}
+	}
+
+	static NOOP_RUNNER: NoopRunner = NoopRunner;
 
 	fn host(active: Option<&str>) -> RuntimeSecurityHost {
 		RuntimeSecurityHost {
@@ -673,5 +682,159 @@ mod tests {
 		let on = RuntimeSecurityHost { config, ..off };
 		assert!(on.security_enabled());
 		assert_eq!(on.config_snapshot(), serde_json::json!({"securityEnabled": true}));
+	}
+
+	/// The worker must let the exact resolver own the pinned token. Putting it
+	/// in `RunRequest.api_key` marks it explicit and the runtime then installs
+	/// no credential callback, which disables the transport's forced refresh.
+	#[test]
+	fn worker_request_keeps_the_exact_resolver_in_charge_of_the_key() {
+		use std::sync::Arc;
+
+		use crate::auth::AuthBackend;
+		use crate::auth::security::{ExactSecurityOAuthResolver, SecurityOAuthAccount};
+		use crate::security::types::{
+			SecurityKnowledgeBaseRef, SecurityOutputPlan, SecurityTarget,
+		};
+		use crate::security::SecurityScanPlan;
+
+		let root = std::env::temp_dir().join(format!(
+			"omp-security-worker-{}-{}",
+			std::process::id(),
+			crate::output::session_id()
+		));
+		std::fs::create_dir_all(&root).expect("temp root");
+		let root_text = root.to_string_lossy().to_string();
+		let model = SecurityModelRef {
+			provider:       "mock".to_string(),
+			model_id:       "primary".to_string(),
+			thinking_level: None,
+		};
+		let plan = SecurityScanPlan {
+			document_type:   "security-scan-plan".to_string(),
+			schema_version:  "1".to_string(),
+			id:              "secplan_test1".to_string(),
+			created_at:      "2026-01-01T00:00:00.000Z".to_string(),
+			repository_root: root_text.clone(),
+			target:          SecurityTarget {
+				kind:            "repository".to_string(),
+				repository_root: root_text,
+				display_name:    "test".to_string(),
+				revision:        None,
+				base_revision:   None,
+				head_revision:   None,
+				include_paths:   Vec::new(),
+				exclude_paths:   Vec::new(),
+				tree_digest:     String::new(),
+			},
+			knowledge_bases: Vec::<SecurityKnowledgeBaseRef>::new(),
+			output:          SecurityOutputPlan {
+				root:             root.join("out").to_string_lossy().to_string(),
+				archive_existing: false,
+				existing_state:   "absent".to_string(),
+			},
+			model:               model.clone(),
+			account:             crate::security::SecurityAccountRef {
+				provider:          "mock".to_string(),
+				credential_id:     1,
+				account_id:        None,
+				email:             None,
+				organization_id:   None,
+				organization_name: None,
+			},
+			config_fingerprint:   "config".to_string(),
+			workflow_fingerprint: "workflow".to_string(),
+			fingerprint:          "fingerprint".to_string(),
+		};
+		let resolver = Arc::new(ExactSecurityOAuthResolver::new(
+			Arc::new(std::sync::Mutex::new(
+				AuthBackend::in_memory().expect("in-memory auth store"),
+			)),
+			SecurityOAuthAccount {
+				provider:      "mock".to_string(),
+				credential_id: 1,
+				account_id:    None,
+				email:         None,
+				org_id:        None,
+				org_name:      None,
+			},
+		));
+		let runner: &'static dyn AgentRunner = &NOOP_RUNNER;
+		let session = SecurityRunSession::new(
+			SecurityScanRequest {
+				plan,
+				scan_id: "secscan_test1".to_string(),
+				execution_root: root.clone(),
+				model,
+				publication_tool: Arc::new(pi_agent::ReadTool::new()),
+				cancel: pi_agent::CancellationToken::new(),
+				resolver,
+			},
+			runner,
+			Config::default(),
+			Arc::new(Catalog::default()),
+			Approvals::new(crate::approve::ApprovalMode::Yolo, std::iter::empty::<String>()),
+			Some(root.join("state")),
+			std::collections::BTreeMap::new(),
+		)
+		.expect("worker session");
+
+		let built = session.request("scan the repository").expect("worker request");
+		assert!(
+			built.api_key.is_none(),
+			"the pinned OAuth token belongs to the resolver, not the explicit-key channel"
+		);
+		assert!(
+			built.credential_resolver.is_some(),
+			"the transport needs the exact-resolver callback for forced refresh"
+		);
+		assert_eq!(built.provider.as_deref(), Some("mock"));
+		assert!(built.security_worker);
+
+		drop(session);
+		let _ = std::fs::remove_dir_all(&root);
+	}
+
+	/// Offline edge of the exact refresh contract: the adapter forwards
+	/// `force_refresh` to the pinned resolver, which never crosses providers and
+	/// returns a typed error (not a fallback key) when the pinned row is absent.
+	#[test]
+	fn exact_adapter_keeps_force_refresh_pinned_and_fail_closed() {
+		use crate::auth::AuthBackend;
+		use crate::auth::security::{ExactSecurityOAuthResolver, SecurityOAuthAccount};
+		use crate::rpc::auth::CredentialResolver;
+
+		let resolver = ExactSecurityOAuthResolver::new(
+			Arc::new(std::sync::Mutex::new(
+				AuthBackend::in_memory().expect("in-memory auth store"),
+			)),
+			SecurityOAuthAccount {
+				provider:      "openai-codex".to_string(),
+				credential_id: 7,
+				account_id:    None,
+				email:         None,
+				org_id:        None,
+				org_name:      None,
+			},
+		);
+		let adapter = ExactResolverAdapter {
+			resolver: Arc::new(resolver),
+			cancel:   pi_agent::CancellationToken::new(),
+		};
+		let cancel = Cancel::new();
+		let mismatch = adapter
+			.api_key("other", None, &cancel)
+			.expect_err("provider mismatch");
+		assert!(mismatch.to_string().contains("provider mismatch"), "{mismatch}");
+		let forced = adapter
+			.api_key_force("other", None, true, &cancel)
+			.expect_err("forced provider mismatch");
+		assert!(forced.to_string().contains("provider mismatch"), "{forced}");
+		// The pinned row does not exist in this store: the forced-refresh path
+		// fails closed instead of returning an unaligned credential.
+		let missing = adapter
+			.api_key_force("openai-codex", None, true, &cancel)
+			.expect_err("absent pinned row");
+		assert!(missing.to_string().contains("unavailable"), "{missing}");
 	}
 }

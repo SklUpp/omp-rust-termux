@@ -2570,7 +2570,7 @@ fn advisor_card_is_published_by_the_rpc_pump_before_eof() {
 	catalog.providers.insert("local".to_string(), models);
 	launch.catalog = Arc::new(catalog);
 	let harness = Harness::start(launch);
-	harness.send(json!({"type": "prompt", "prompt": "check it"}));
+	harness.send(json!({"type": "prompt", "message": "check it"}));
 	harness.wait_for(
 		|frames| {
 			frames.iter().any(|frame| {

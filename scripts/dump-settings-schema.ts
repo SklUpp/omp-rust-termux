@@ -261,7 +261,7 @@ function linkExactDependencies(created: string[]): void {
 		if (fs.lstatSync(target, { throwIfNoEntry: false })) {
 			const found = readPackageVersion(target);
 			if (found !== version)
-					missing.push(`${name}@${version} (found ${found ?? "no package.json"} at ${path.relative(ROOT, target)})`);
+				missing.push(`${name}@${version} (found ${found ?? "no package.json"} at ${path.relative(ROOT, target)})`);
 			continue;
 		}
 		const source = roots

@@ -1837,7 +1837,7 @@ mod tests {
 		assert!(calls[0].prompt.contains("### Session update"));
 		assert!(calls[0].prompt.contains("fix it"));
 		assert_eq!(calls[0].provider_session_id.len(), 36);
-		assert_ne!(calls[0].provider_session_id, calls[0].prompt_cache_key);
+		assert_eq!(calls[0].provider_session_id, calls[0].prompt_cache_key);
 		manager.dispose();
 	}
 

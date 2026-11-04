@@ -156,7 +156,26 @@ in-memory and process-scoped, owned by `Supervisor`:
   same lock `send` uses, every message a racing send already accepted is
   drained and journaled before the actor stops (never a `woken` receipt for a
   dropped message), and later sends/revivals are refused while `history://`
-  stays readable.
+  stays readable. That includes an aside the loop had already absorbed into an
+  interrupted provider request, and the aside a soft tool requirement kept
+  waiting for when its escalation budget ran out: both are handed back to the
+  state before the error surfaces, so the hub's `injected` receipt is never a
+  lie about acceptance. A failed turn is not rewritten at all. The loop only
+  appends accepted messages (the request before its first await, the asides it
+  absorbed, and complete tool steps), and the step-boundary observer journals
+  each completed step at its boundary — before the next provider request, and
+  therefore before that next request can fail — so a successful assistant/tool
+  pair is already on disk when a later step errors. Shortening the state would
+  put the cursor past those written steps, so a later flush could skip an
+  accepted aside or claim a durability the file does not have. Because the state
+  stays as the loop left it, the flush after the failure appends exactly the
+  unwritten accepted messages (the asides and the request of the failed step),
+  once and in order; if a shrunk conversation ever appears anyway, the journal
+  refuses durability (and therefore any compaction) instead of pretending the
+  tail is on disk.
+  The journal is incremental and retried from the unwritten index: an I/O failure is
+  never reported as durability — the transcript stays partial until a later
+  flush succeeds, and compaction is refused in the meantime.
 - The durable part of a cancel is the tombstone marker: file content and the
   session-root directory entry are both fsynced before `cancelled` is reported.
   If the marker cannot be created/synced, the receipt is `cancel_unconfirmed`,

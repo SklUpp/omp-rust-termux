@@ -885,9 +885,10 @@ impl TaskTool {
 			// Final flush here, before the live bundle can be published: the
 			// adopted actor's next turn appends to the same file, so this tail
 			// must already be on disk or the next append would land out of order.
-			if outcome.is_ok() {
-				journal.flush(&child_state.messages, None);
-			}
+			// A failed or interrupted run is flushed too: the loop keeps the
+			// request and every steering message the hub already receipted as
+			// `injected`, and a later revive replays them.
+			journal.flush(&child_state.messages, None);
 			// Hand the final authoritative state back for the post-drain
 			// reconcile (successful or rolled back).
 			*final_messages_task

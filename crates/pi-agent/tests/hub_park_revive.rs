@@ -22,7 +22,8 @@ use pi_agent::{
 	},
 	state::{AgentContext, AgentState, Message, Role, ToolCall, ToolResult, TurnResult},
 	subagent_lifecycle::{
-		DEFAULT_AGENT_IDLE_TTL_MS, DeliveryOutcome, LifecycleStatus, attach,
+		DEFAULT_AGENT_IDLE_TTL_MS, DeliveryOutcome, LifecycleStatus,
+		SubagentLifecycleManager, attach,
 	},
 	supervisor::{CancelAttempt, ChildSpawn, DelegationLimits, Supervisor},
 	task_persisted_revive::{
@@ -40,7 +41,7 @@ use pi_agent::{
 	},
 };
 use serde_json::json;
-use tokio::sync::{Notify, Semaphore};
+use tokio::sync::{Notify, Semaphore, mpsc};
 
 fn stream_text(content: &str) -> StreamChunk {
 	StreamChunk {
@@ -171,6 +172,153 @@ fn gated_provider(reply: &str) -> Arc<GatedProvider> {
 	})
 }
 
+/// Provider that lets the test observe the in-flight request and then fails it,
+/// so a revive turn ends with `Err` (not a cancel) and the actor keeps running
+/// with its reconciled state.
+struct FailingProvider {
+	captured: Arc<Mutex<Vec<Message>>>,
+	entered:  Arc<Notify>,
+	gate:     Arc<Semaphore>,
+}
+
+impl FailingProvider {
+	fn new() -> Arc<Self> {
+		Arc::new(Self {
+			captured: Arc::new(Mutex::new(Vec::new())),
+			entered:  Arc::new(Notify::new()),
+			gate:     Arc::new(Semaphore::new(0)),
+		})
+	}
+
+	async fn record_and_wait(
+		&self,
+		messages: &[Message],
+	) -> Result<tokio::sync::SemaphorePermit<'_>, ProviderError> {
+		self
+			.captured
+			.lock()
+			.expect("captured")
+			.extend_from_slice(messages);
+		self.entered.notify_one();
+		self
+			.gate
+			.acquire()
+			.await
+			.map_err(|_| ProviderError::Protocol("gate closed".to_string()))
+	}
+}
+
+#[async_trait]
+impl ModelProvider for FailingProvider {
+	async fn complete(
+		&self,
+		messages: &[Message],
+		_tools: &[serde_json::Value],
+		_tool_choice: &ToolChoice,
+	) -> Result<Message, ProviderError> {
+		let _permit = self.record_and_wait(messages).await?;
+		Err(ProviderError::Protocol(
+			"scripted provider failure".to_string(),
+		))
+	}
+
+	async fn stream(
+		&self,
+		messages: &[Message],
+		_tools: &[serde_json::Value],
+		_tool_choice: &ToolChoice,
+	) -> Result<ChunkStream, ProviderError> {
+		let _permit = self.record_and_wait(messages).await?;
+		Err(ProviderError::Protocol(
+			"scripted provider failure".to_string(),
+		))
+	}
+}
+
+/// Provider whose first call answers with one real tool step and whose later
+/// calls fail once the test releases them. The test sees each call start, so an
+/// aside can be accepted in the successful step or in the failing one.
+struct ToolStepProvider {
+	captured: Arc<Mutex<Vec<Message>>>,
+	arrived:  mpsc::UnboundedSender<()>,
+	gate:     Arc<Semaphore>,
+	calls:    AtomicUsize,
+}
+
+impl ToolStepProvider {
+	fn new() -> (Arc<Self>, mpsc::UnboundedReceiver<()>) {
+		let (arrived, calls) = mpsc::unbounded_channel();
+		let provider = Arc::new(Self {
+			captured: Arc::new(Mutex::new(Vec::new())),
+			arrived,
+			gate: Arc::new(Semaphore::new(0)),
+			calls: AtomicUsize::new(0),
+		});
+		(provider, calls)
+	}
+
+	/// Record the request, tell the test this call started, and wait for it to
+	/// be released; returns the zero-based call index.
+	async fn step(&self, messages: &[Message]) -> Result<usize, ProviderError> {
+		self
+			.captured
+			.lock()
+			.expect("captured")
+			.extend_from_slice(messages);
+		let call = self.calls.fetch_add(1, Ordering::SeqCst);
+		let _ = self.arrived.send(());
+		self
+			.gate
+			.acquire()
+			.await
+			.map_err(|_| ProviderError::Protocol("gate closed".to_string()))?
+			.forget();
+		Ok(call)
+	}
+
+	fn answer() -> Message {
+		Message::assistant_with_tools(
+			"step one",
+			vec![ToolCall {
+				id:        "call-bash".to_string(),
+				name:      "bash".to_string(),
+				arguments: json!({ "command": "true" }),
+			}],
+		)
+	}
+}
+
+#[async_trait]
+impl ModelProvider for ToolStepProvider {
+	async fn complete(
+		&self,
+		messages: &[Message],
+		_tools: &[serde_json::Value],
+		_tool_choice: &ToolChoice,
+	) -> Result<Message, ProviderError> {
+		match self.step(messages).await? {
+			0 => Ok(Self::answer()),
+			_ => Err(ProviderError::Protocol(
+				"provider failed after the tool step".to_string(),
+			)),
+		}
+	}
+
+	async fn stream(
+		&self,
+		messages: &[Message],
+		_tools: &[serde_json::Value],
+		_tool_choice: &ToolChoice,
+	) -> Result<ChunkStream, ProviderError> {
+		match self.step(messages).await? {
+			0 => Ok(Box::pin(stream::iter(message_chunks(&Self::answer())))),
+			_ => Err(ProviderError::Protocol(
+				"provider failed after the tool step".to_string(),
+			)),
+		}
+	}
+}
+
 fn session_root(label: &str) -> PathBuf {
 	let nanos = SystemTime::now()
 		.duration_since(UNIX_EPOCH)
@@ -193,7 +341,7 @@ fn history_scope(root: &Path) -> UrlScope {
 	scope
 }
 
-fn test_supervisor(root: &PathBuf, provider: Arc<GatedProvider>) -> Arc<Supervisor> {
+fn test_supervisor(root: &PathBuf, provider: Arc<dyn ModelProvider>) -> Arc<Supervisor> {
 	let supervisor = Supervisor::new(
 		ToolRegistry::with_builtins(),
 		provider,
@@ -271,7 +419,7 @@ fn reserved_child_with_parent(
 
 /// Build the still-live loop/state a finished child hands to `adopt_live`.
 fn live_child(
-	provider: Arc<GatedProvider>,
+	provider: Arc<dyn ModelProvider>,
 	root: &Path,
 	contract: PersistedChildSession,
 	messages: Vec<Message>,
@@ -1294,6 +1442,340 @@ async fn broadcast_reaches_a_live_keep_alive_child() {
 }
 
 #[tokio::test]
+async fn a_failed_first_turn_after_revive_keeps_the_shifted_history() {
+	let root = session_root("failed-first-turn");
+	let provider = FailingProvider::new();
+	let supervisor: Arc<Supervisor> = Supervisor::new(
+		ToolRegistry::with_builtins(),
+		provider.clone(),
+		None,
+		DelegationLimits::default(),
+	);
+	supervisor.set_child_session_root(Some(root.clone()));
+	let (id, contract) = adoptable_child(&supervisor, &root);
+	let manager = attach(
+		&supervisor,
+		DEFAULT_AGENT_IDLE_TTL_MS,
+		Arc::new(DefaultPersistedReviverFactory::new(
+			provider.clone(),
+			ToolRegistry::with_builtins(),
+		)),
+	);
+	// A revived state without a system prompt: the loop inserts one at index 0, so
+	// every index after it shifts; a failure must still keep every replayed
+	// message and the accepted aside in order, with the request echoed once.
+	manager
+		.adopt_live(
+			&id,
+			live_child(
+				provider.clone(),
+				&root,
+				contract,
+				vec![
+					Message::user("autoload"),
+					Message::assistant("prior-answer"),
+				],
+			),
+		)
+		.expect("live adopt");
+	assert_eq!(
+		manager.send(&id, "first turn".to_string()).expect("wake"),
+		DeliveryOutcome::Woken
+	);
+	tokio::time::timeout(Duration::from_secs(5), provider.entered.notified())
+		.await
+		.expect("the revived turn reached the provider");
+	assert_eq!(
+		manager
+			.send(&id, "keep this aside".to_string())
+			.expect("aside"),
+		DeliveryOutcome::Injected
+	);
+	// The provider fails: the turn is interrupted after the loop already absorbed
+	// the aside, and the reconciled state must keep the replayed history plus it
+	// without rewriting anything.
+	provider.gate.add_permits(1);
+	let mut state = None;
+	for _ in 0..500 {
+		// The reconciled state starts with the system prompt the loop inserted;
+		// an intermediate live event (the absorbed aside) has no system yet, so its
+		// arrival alone must not end the wait.
+		if let Some(live) = manager.live_messages(&id)
+			&& live.first().is_some_and(|message| message.role == Role::System)
+			&& live
+				.iter()
+				.any(|message| message.content == "keep this aside")
+		{
+			state = Some(live);
+			break;
+		}
+		tokio::time::sleep(Duration::from_millis(10)).await;
+	}
+	let state = state.expect("the failed turn must reconcile the live state");
+	let rendered: Vec<(Role, String)> = state
+		.iter()
+		.map(|message| (message.role, message.content.clone()))
+		.collect();
+	assert_eq!(
+		rendered,
+		vec![
+			(Role::System, "child system prompt".to_string()),
+			(Role::User, "autoload".to_string()),
+			(Role::Assistant, "prior-answer".to_string()),
+			(Role::User, "first turn".to_string()),
+			(Role::User, "keep this aside".to_string()),
+		],
+		"history must keep order, drop no replayed message and duplicate nothing"
+	);
+	// The failed turn is never on disk: the accepted tail lands once, in order.
+	let journal = std::fs::read_to_string(transcript_path(&root, &id)).expect("transcript");
+	assert!(
+		!journal.contains("\"role\":\"assistant\""),
+		"an unaccepted partial turn must not be journaled: {journal}"
+	);
+	let users: Vec<String> = journal
+		.lines()
+		.filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+		.filter_map(|value| {
+			let message = value.get("message")?;
+			if message.get("role")?.as_str()? != "user" {
+				return None;
+			}
+			Some(message.get("content")?.as_str()?.to_string())
+		})
+		.collect();
+	assert_eq!(
+		users,
+		vec!["first turn".to_string(), "keep this aside".to_string()],
+		"the accepted tail must be journaled exactly once, in order: {journal}"
+	);
+	manager.shutdown_actors().await;
+	let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Poll the reconciled live snapshot: it starts with the loop's system prompt
+/// (an intermediate live event is not the authoritative state) and ends with
+/// the aside the hub receipted.
+async fn reconciled_after_aside(
+	manager: &SubagentLifecycleManager,
+	id: &str,
+	aside: &str,
+) -> Vec<Message> {
+	for _ in 0..500 {
+		if let Some(live) = manager.live_messages(id)
+			&& live.first().is_some_and(|message| message.role == Role::System)
+			&& live.last().is_some_and(|message| message.content == aside)
+		{
+			return live;
+		}
+		tokio::time::sleep(Duration::from_millis(10)).await;
+	}
+	panic!("the failed turn must reconcile the live state");
+}
+
+/// Bounded wait for the transcript to reach `expected` lines. The actor writes
+/// the file before it publishes the reconciled state, so this only covers the
+/// observation itself; the exact line count is still asserted afterwards.
+async fn wait_for_transcript(root: &PathBuf, id: &str, expected: usize) {
+	for _ in 0..500 {
+		let lines = std::fs::read_to_string(transcript_path(root, id))
+			.map(|transcript| transcript.lines().count())
+			.unwrap_or_default();
+		if lines >= expected {
+			return;
+		}
+		tokio::time::sleep(Duration::from_millis(10)).await;
+	}
+	panic!(
+		"the transcript did not reach {expected} lines: {:?}",
+		std::fs::read_to_string(transcript_path(root, id))
+	);
+}
+
+/// The file must be exactly the accepted tail (the state minus its replayed
+/// system message): nothing rewritten, no duplicate aside, and a replay that
+/// hands a revive the aside once with its tool pair intact.
+fn assert_accepted_tail_is_journaled_once(
+	root: &PathBuf,
+	id: &str,
+	state: &[Message],
+	aside: &str,
+) {
+	let path = transcript_path(root, id);
+	let transcript = std::fs::read_to_string(&path).expect("transcript");
+	let lines: Vec<serde_json::Value> = transcript
+		.lines()
+		.filter_map(|line| serde_json::from_str(line).ok())
+		.collect();
+	assert_eq!(
+		lines.len(),
+		state.len() - 1,
+		"the journal must hold the accepted tail and nothing else: {transcript}"
+	);
+	let replay = load_transcript(&path).expect("replay");
+	assert_eq!(replay.len(), lines.len());
+	assert_eq!(
+		replay
+			.iter()
+			.filter(|message| message.content == aside)
+			.count(),
+		1,
+		"a revive must see the accepted aside exactly once: {transcript}"
+	);
+	assert_eq!(
+		replay
+			.iter()
+			.filter(|message| message.role == Role::Assistant)
+			.count(),
+		1,
+		"the completed tool step stays on disk once: {transcript}"
+	);
+	assert_eq!(
+		replay.iter().filter(|message| message.role == Role::Tool).count(),
+		1,
+		"the tool result stays paired once: {transcript}"
+	);
+}
+
+/// P1: the step-boundary observer journals the completed tool pair, so a state
+/// that later fails must not be rewritten shorter — the cursor already covers
+/// it. The aside accepted by the failing step is appended after the pair.
+#[tokio::test]
+async fn an_aside_accepted_in_the_failing_step_after_a_tool_step_is_journaled_once() {
+	let root = session_root("aside-in-failing-step");
+	let (provider, mut arrived) = ToolStepProvider::new();
+	let supervisor = test_supervisor(&root, provider.clone());
+	let (id, contract) = adoptable_child(&supervisor, &root);
+	let manager = attach(
+		&supervisor,
+		DEFAULT_AGENT_IDLE_TTL_MS,
+		Arc::new(DefaultPersistedReviverFactory::new(
+			provider.clone(),
+			ToolRegistry::with_builtins(),
+		)),
+	);
+	// One replayed system message keeps the journal base at 1, so the file holds
+	// exactly the accepted tail and its line count proves nothing was rewritten.
+	manager
+		.adopt_live(
+			&id,
+			live_child(
+				provider.clone(),
+				&root,
+				contract,
+				vec![Message::system("child system prompt")],
+			),
+		)
+		.expect("live adopt");
+	assert_eq!(
+		manager.send(&id, "first turn".to_string()).expect("wake"),
+		DeliveryOutcome::Woken
+	);
+	// Step one answers with a real tool call; bash runs and the next boundary
+	// journals the pair.
+	arrived.recv().await.expect("first provider call");
+	provider.gate.add_permits(1);
+	// Step two starts after the tool result and fails; the aside is accepted
+	// while it is in flight, so the hub receipts `injected` and the loop hands
+	// it back on its error path.
+	arrived.recv().await.expect("second provider call");
+	assert_eq!(
+		manager
+			.send(&id, "keep this aside".to_string())
+			.expect("aside"),
+		DeliveryOutcome::Injected
+	);
+	provider.gate.add_permits(1);
+	let state = reconciled_after_aside(&manager, &id, "keep this aside").await;
+	let roles: Vec<Role> = state.iter().map(|message| message.role).collect();
+	assert_eq!(
+		roles,
+		vec![
+			Role::System,
+			Role::User,
+			Role::Assistant,
+			Role::Tool,
+			Role::User,
+		],
+		"the completed tool step stays and the aside lands last: {state:?}"
+	);
+	assert_eq!(state[1].content, "first turn");
+	assert_eq!(state[2].content, "step one");
+	assert_eq!(state[2].tool_calls.len(), 1);
+	assert_eq!(state[3].tool_call_id.as_deref(), Some("call-bash"));
+	assert_eq!(state[4].content, "keep this aside");
+	wait_for_transcript(&root, &id, state.len() - 1).await;
+	assert_accepted_tail_is_journaled_once(&root, &id, &state, "keep this aside");
+	manager.shutdown_actors().await;
+	let _ = std::fs::remove_dir_all(&root);
+}
+
+/// An aside accepted by the *successful* step is journaled by the next boundary;
+/// the failing step that follows must not write it again.
+#[tokio::test]
+async fn an_aside_accepted_in_a_successful_step_is_not_duplicated_by_a_later_failure() {
+	let root = session_root("aside-in-successful-step");
+	let (provider, mut arrived) = ToolStepProvider::new();
+	let supervisor = test_supervisor(&root, provider.clone());
+	let (id, contract) = adoptable_child(&supervisor, &root);
+	let manager = attach(
+		&supervisor,
+		DEFAULT_AGENT_IDLE_TTL_MS,
+		Arc::new(DefaultPersistedReviverFactory::new(
+			provider.clone(),
+			ToolRegistry::with_builtins(),
+		)),
+	);
+	manager
+		.adopt_live(
+			&id,
+			live_child(
+				provider.clone(),
+				&root,
+				contract,
+				vec![Message::system("child system prompt")],
+			),
+		)
+		.expect("live adopt");
+	assert_eq!(
+		manager.send(&id, "first turn".to_string()).expect("wake"),
+		DeliveryOutcome::Woken
+	);
+	// The aside arrives while the first step is in flight and rides with its
+	// successful result.
+	arrived.recv().await.expect("first provider call");
+	assert_eq!(
+		manager
+			.send(&id, "keep this aside".to_string())
+			.expect("aside"),
+		DeliveryOutcome::Injected
+	);
+	provider.gate.add_permits(1);
+	// The next step fails after the aside is already on disk: appending nothing
+	// is the only correct outcome.
+	arrived.recv().await.expect("second provider call");
+	provider.gate.add_permits(1);
+	let state = reconciled_after_aside(&manager, &id, "keep this aside").await;
+	let roles: Vec<Role> = state.iter().map(|message| message.role).collect();
+	assert_eq!(
+		roles,
+		vec![
+			Role::System,
+			Role::User,
+			Role::Assistant,
+			Role::Tool,
+			Role::User,
+		],
+		"the aside stays after the completed tool step: {state:?}"
+	);
+	assert_eq!(state[4].content, "keep this aside");
+	wait_for_transcript(&root, &id, state.len() - 1).await;
+	assert_accepted_tail_is_journaled_once(&root, &id, &state, "keep this aside");
+	manager.shutdown_actors().await;
+	let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
 async fn an_undurable_journal_blocks_destructive_compaction() {
 	let root = session_root("durable-gate");
 	let provider = gated_provider("turn-reply");
@@ -1414,12 +1896,12 @@ async fn retention_keeps_a_live_actor_record_and_its_journal() {
 				output_prefix:       None,
 			})
 			.expect("reserve filler");
+		supervisor.unregister_active_child(&filler);
 		supervisor.mark_completed(&filler, 1, "done");
-		if index % 8 == 7 {
-			// Consume settled deliveries so the admission cap never blocks the
-			// churn that must reach the record cap instead.
-			let _ = supervisor.take_results_for(None);
-		}
+		// Free the admission slot: a settled filler with no delivery still counts
+		// toward `MAX_OUTSTANDING_RESULTS` until it is consumed, so churn without
+		// this stops at the admission cap instead of reaching the record cap.
+		supervisor.consume_results(std::slice::from_ref(&filler));
 	}
 	assert!(
 		supervisor.children().iter().any(|record| record.id == id),

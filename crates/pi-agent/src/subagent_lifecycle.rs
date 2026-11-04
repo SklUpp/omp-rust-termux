@@ -42,7 +42,11 @@
 //!   pairs plus accepted steering/asides), written at every turn boundary
 //!   before compaction can prune, so a revive replays the same context. When a
 //!   flush is not fully durable the loop skips compaction instead of dropping
-//!   an unwritten turn.
+//!   an unwritten turn. The actor never rewrites that state after a failed turn
+//!   — each completed step is journaled at its boundary, before the next request
+//!   can fail, and shortening the conversation would put the cursor past it —
+//!   so the append-only log stays in step with the cursor; a shrunk
+//!   conversation refuses durability rather than claim a line is on disk.
 //!
 //! The manager holds only a [`Weak<Supervisor>`]; all state it needs comes from
 //! the supervisor's existing read accessors plus its own files. The supervisor's
@@ -331,9 +335,24 @@ impl TranscriptJournal {
 		}
 		let start = match *cursor {
 			None => crate::tools::task::journal_start(messages, self.base, self.had_system),
-			// A shorter conversation than the cursor is a rolled-back turn, not a
-			// compaction: nothing new to append, and the offsets stay aligned.
-			Some(written) => written.min(messages.len()),
+			Some(written) if written <= messages.len() => written,
+			// The conversation is shorter than this append-only log already wrote.
+			// Everything below the old cursor is on disk, but the memory tail
+			// cannot be placed after it without duplicating the superseded lines,
+			// so the journal cannot claim the conversation is durable: report it
+			// and keep the cursor so every later flush refuses a compaction that
+			// would drop a message. The owner never rewrites the tail (`subagent_
+			// lifecycle` journals the state exactly as the loop left it), so this
+			// is an invariant violation, not a routine path.
+			Some(written) => {
+				eprintln!(
+					"warning: child transcript for {} was rewritten shorter ({} < {written}); \
+					 refusing compaction: the journal cannot represent the new tail",
+					self.child_id,
+					messages.len()
+				);
+				return false;
+			},
 		};
 		if start < messages.len() {
 			let appended: Vec<&Message> = messages[start..].iter().collect();
@@ -1247,12 +1266,13 @@ impl SubagentLifecycleManager {
 		// Restore the record BEFORE the reviver builds the registry: without it
 		// `url_scope_for(Some(child))` falls back to the parent's URL scope, and
 		// the child's `read`/`write` would hold the parent's `local://` root.
-		// Fail closed: no verified record, no revive.
+		// Fail closed: a record restored from disk must come from the contract
+		// verified inside this root, never from a live claim. A record that already
+		// owns the transcript needs no restore, and the reviver stays the authority
+		// on whether the spawn is still usable (e.g. a gone workspace), so its
+		// precise refusal is not masked here.
 		let root = self.root.as_deref().ok_or_else(|| {
 			format!("cannot revive agent \"{id}\": the session has no persisted root.")
-		})?;
-		let verified = PersistedChildSession::load(root, id).ok_or_else(|| {
-			format!("cannot revive agent \"{id}\": its persisted contract is unavailable.")
 		})?;
 		if session_file.parent() != Some(root) {
 			return Err(format!(
@@ -1260,6 +1280,9 @@ impl SubagentLifecycleManager {
 			));
 		}
 		if !supervisor.owns_session_file(id, &session_file) {
+			let verified = PersistedChildSession::load(root, id).ok_or_else(|| {
+				format!("cannot revive agent \"{id}\": its persisted contract is unavailable.")
+			})?;
 			supervisor.restore_child_record(
 				id,
 				verified.display_name.as_deref().unwrap_or(id),
@@ -1665,7 +1688,7 @@ async fn run_actor(
 		// The request is a real accepted input; show it before the provider
 		// emits anything. The drain task then applies the loop's events in
 		// emission order, and the reconcile below replaces both with the final
-		// authoritative state (including the error rollback).
+		// authoritative state.
 		manager.append_live_message_for_epoch(&id, epoch, request.clone());
 		let (event_tx, mut event_rx) = mpsc::channel(256);
 		let event_manager = Arc::downgrade(&manager);
@@ -1729,27 +1752,33 @@ async fn run_actor(
 			}
 		}
 		if let Err(error) = turn_result {
-			// The hub receipt already reported this session as `revived`.
-			// A failed turn is real information, not a silent success: report
-			// it instead of dropping the error. Drop the partial turn too (it
-			// can end in `tool_calls` without results, which the next provider
-			// request would reject) but keep the request so a later send can
-			// retry a valid conversation.
+			// The hub receipt already reported this session as `revived`. A
+			// failed turn is real information, not a silent success: report it
+			// instead of dropping the error.
+			//
+			// Nothing is rewritten here, and no partial turn was journaled: the
+			// transcript is an append-only log addressed by the journal cursor,
+			// and the loop only appends accepted messages — the request before
+			// its first await (this actor's loop is never a continuation), the
+			// asides it absorbed (`next_assistant` hands them back on its error
+			// path), and complete tool steps. Splitting the state here would
+			// shorten the conversation below the cursor, because the step
+			// boundary already wrote the completed pair; a later flush would then
+			// either skip an accepted aside or claim durability the file does not
+			// have. Keeping the state monotonic makes the flush below append
+			// exactly the unwritten accepted messages, once and in order.
 			eprintln!("warning: revived agent \"{id}\" turn failed: {error}");
-			if let Some(journal) = journal.as_ref() {
-				// Journal the accepted tail (including the partial turn) before
-				// the rollback drops it; the replay sanitizer discards the
-				// orphaned turn, nothing is lost twice.
-				journal.flush(&state.messages, None);
-			}
-			state.messages.truncate(before);
-			state.messages.push(request);
+			debug_assert!(
+				state.messages.len() > before,
+				"the loop echoes the request before its first await"
+			);
 		}
 		if let Some(journal) = journal.as_ref() {
 			journal.flush(&state.messages, None);
 		}
-		// Authoritative reconcile: covers successful turns, in-turn events, and
-		// the truncation above after a failed/aborted turn.
+		// Authoritative reconcile: replaces the request echo and the drained
+		// events with the state the loop actually accepted, including a failed
+		// turn's absorbed asides.
 		manager.replace_live_for_epoch(&id, epoch, state.messages.clone());
 		if cancel.is_cancelled() {
 			break;

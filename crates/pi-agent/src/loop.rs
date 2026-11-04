@@ -1024,13 +1024,16 @@ impl AgentLoop {
 		while state.total_turns < self.config.max_turns {
 			if let Some(rx) = steering_rx.as_deref_mut() {
 				let steering = Steering::drain(rx);
-				if steering.interrupted {
-					cancellation_token.cancel();
-					return Err(AgentError::Interrupted);
-				}
+				// Accepted sends were already receipted: hand them to the state
+				// before an interrupt can end the dialog, or they would be lost
+				// while their `injected` receipt stands.
 				for parts in steering.injections {
 					announce_user_steer(&events, &parts).await;
 					state.messages.push(Message::user_with_parts(parts));
+				}
+				if steering.interrupted {
+					cancellation_token.cancel();
+					return Err(AgentError::Interrupted);
 				}
 			}
 			// Results that settled while the previous assistant turn ran land
@@ -1108,7 +1111,7 @@ impl AgentLoop {
 				}
 			}
 			let mut pending_injections = Vec::new();
-			let mut assistant = self
+			let mut assistant = match self
 				.next_assistant(
 					&active_provider,
 					&state.messages,
@@ -1119,7 +1122,20 @@ impl AgentLoop {
 					steering_rx.as_deref_mut(),
 					&mut pending_injections,
 				)
-				.await?;
+				.await
+			{
+				Ok(assistant) => assistant,
+				Err(error) => {
+					// The hub receipted these sends as `injected`; a turn that dies
+					// mid-request must still hand them to the caller's state instead
+					// of dropping them with this frame.
+					for parts in pending_injections {
+						announce_user_steer(&events, &parts).await;
+						state.messages.push(Message::user_with_parts(parts));
+					}
+					return Err(error);
+				},
+			};
 			if let Some(guard) = &self.assistant_guard {
 				guard.guard(&mut assistant, &state.messages);
 			}
@@ -1219,6 +1235,22 @@ impl AgentLoop {
 					soft.force_next = false;
 				} else {
 					if exhausted {
+						// The assistant turn is already in `state`: pair every call
+						// with a synthetic result (a replay must not see a dangling
+						// tool call) and keep the asides this request absorbed, whose
+						// `injected` receipts are already out, before aborting.
+						pair_skipped_tool_calls(
+							&assistant,
+							"requirement",
+							None,
+							events.as_ref(),
+							&mut state.messages,
+						)
+						.await;
+						for parts in pending_injections {
+							announce_user_steer(&events, &parts).await;
+							state.messages.push(Message::user_with_parts(parts));
+						}
 						return Err(AgentError::Internal(format!(
 							"Soft tool requirement '{}' was not satisfied after \
 							 {limit} forced turns; aborting to avoid an unbounded force loop.",

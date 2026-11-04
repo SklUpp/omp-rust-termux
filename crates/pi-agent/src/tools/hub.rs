@@ -11,8 +11,10 @@
 //! scoped to the caller's own children, while messaging has a flat namespace —
 //! siblings may message each other. Process visibility hides other agents'
 //! processes from a child; root sees everything, and stdin/signals/stop/
-//! restart are owner-scoped. Parked and idle lifecycle rows are revived through
-//! [`super::hub_park`], so receipts report `injected`, `revived`, or `failed`.
+//! restart are owner-scoped. Idle lifecycle rows are woken on their live
+//! session, parked ones are revived through [`super::hub_park`], and receipts
+//! report the real state before the send: `injected` (busy aside), `woken`
+//! (idle live actor), `revived` (rebuilt from disk), or `failed`.
 
 use std::{collections::HashSet, sync::Arc, time::Duration};
 
@@ -113,11 +115,33 @@ impl HubTool {
 			.collect()
 	}
 
-	/// All agents known to be running: supervisor children plus mailbox presence
-	/// (root `Main` turns, child loops, hub waiters). Sorted and deduplicated.
-	fn live_agent_ids(&self) -> Vec<String> {
+	/// Peers actively executing a turn: TS `isRunning` (status `running` with a
+	/// live streaming session). Idle and parked peers are excluded, so they never
+	/// hold a `wait` open until its timeout.
+	fn running_peer_ids(&self) -> Vec<String> {
 		let mut ids = self.supervisor.running_agent_ids();
 		ids.extend(self.supervisor.mailbox().active_agents());
+		if let Some(manager) = crate::subagent_lifecycle::lookup(&self.supervisor) {
+			ids.extend(manager.running_ids());
+		}
+		ids.sort_unstable();
+		ids.dedup();
+		ids
+	}
+
+	/// Alive peers (`running | idle`), the TS `listVisibleTo` roster a broadcast
+	/// fans out to. Flat namespace: messaging is not owner-scoped (only jobs and
+	/// cancel are), so any live peer in this session is a target — including a
+	/// keep-alive child with no job and no mailbox presence.
+	fn live_agent_ids(&self) -> Vec<String> {
+		let mut ids = self.running_peer_ids();
+		// The root session is a peer even when it is idle between turns (TS
+		// `listVisibleTo` includes Main's `idle` ref); its mailbox drains at the
+		// next root turn.
+		ids.push(MAIN_AGENT_ID.to_string());
+		if let Some(manager) = crate::subagent_lifecycle::lookup(&self.supervisor) {
+			ids.extend(manager.live_ids());
+		}
 		ids.sort_unstable();
 		ids.dedup();
 		ids
@@ -131,17 +155,49 @@ impl HubTool {
 			.collect()
 	}
 
+	/// Whether `id` is executing a turn right now (`wait` liveness).
 	fn agent_running(&self, id: &str) -> bool {
 		if id == MAIN_AGENT_ID {
 			return self.supervisor.mailbox().is_agent_active(MAIN_AGENT_ID);
 		}
-		self.live_agent_ids().iter().any(|live| live == id)
+		self.running_peer_ids().iter().any(|live| live == id)
 	}
 
 	fn peer_available(&self, sender: &str, from: Option<&str>) -> bool {
 		match from {
 			Some(from) => from != sender && self.agent_running(from),
-			None => !self.live_peers(sender).is_empty(),
+			None => self.running_peer_ids().iter().any(|id| id != sender),
+		}
+	}
+
+	/// Whether an awaited `target` can no longer reply.
+	///
+	/// TS `awaitTarget` settles on the peer's terminal `agent_end` (a newer end
+	/// than the send's), on an aborted/cancelled registration, or once the peer is
+	/// gone. Merely idle/parked/woken is not an end: the send just woke or revived
+	/// it, so the waiter keeps waiting for that turn to finish.
+	fn target_ended(&self, target: &str, ends: u64) -> bool {
+		if target == MAIN_AGENT_ID {
+			return !self.supervisor.mailbox().is_agent_active(MAIN_AGENT_ID);
+		}
+		if self.supervisor.agent_end_seq(target) > ends {
+			return true;
+		}
+		let manager = crate::subagent_lifecycle::lookup(&self.supervisor);
+		match self.supervisor.child_status(target) {
+			None => true,
+			Some(ChildStatus::Aborted) => true,
+			Some(ChildStatus::Running) => false,
+			// A settled job has ended. A settled keep-alive child has not: its live
+			// session was just woken and still owes a turn — unless it was cancelled.
+			Some(_) => {
+				let lifecycle = manager.as_ref().is_some_and(|manager| manager.is_live(target));
+				if lifecycle {
+					manager.is_some_and(|manager| manager.is_tombstoned(target))
+				} else {
+					true
+				}
+			},
 		}
 	}
 
@@ -416,6 +472,14 @@ fn cancelled_outcome(id: &str, attempt: CancelAttempt) -> HubCancelOutcome {
 		CancelAttempt::AlreadyCompleted => (
 			"already_completed",
 			format!("Background job {id} is already settled."),
+		),
+		CancelAttempt::TombstoneFailed(error) => (
+			"cancel_unconfirmed",
+			format!(
+				"Cancelled background job {id} in process, but its durable tombstone could not \
+				 be written: {error}. A restart may revive it; repeat `cancel` to retry once the \
+				 session root is writable."
+			),
 		),
 	};
 	HubCancelOutcome { id: id.to_string(), status: status.to_string(), message }
@@ -1642,6 +1706,9 @@ impl HubTool {
 			vec![to.to_string()]
 		};
 
+		// TS subscribes the awaited target before it delivers, so an end that races
+		// the send still counts; capture the counter here, never after delivery.
+		let await_ends = self.supervisor.agent_end_seq(to);
 		let mut receipts = Vec::with_capacity(targets.len());
 		for target in &targets {
 			let msg = IrcMessage::new(sender.clone(), target.clone(), message)
@@ -1685,20 +1752,27 @@ impl HubTool {
 								},
 							}
 						} else {
-							// Failed live hand-off: buffer only when a later drain is
-							// actually reachable (root turn boundary or a still-running
-							// child waiting on `wait`/`inbox`). A terminal child cannot
-							// be revived, so leave no unreachable mail behind.
+							// No live hand-off, but a later drain is reachable (a root
+							// turn for Main, or a running child's own `wait`/`inbox`).
+							// Buffer there and report the queued delivery; a terminal
+							// child cannot be revived, so it keeps the failure and leaves
+							// no unreachable mail behind.
 							let reachable = known
 								&& (target == MAIN_AGENT_ID
 									|| self.agent_running(target));
 							if reachable {
 								mailbox.buffer(msg);
-							}
-							IrcDeliveryReceipt {
-								to: target.clone(),
-								outcome: "failed".to_string(),
-								error: Some(error),
+								IrcDeliveryReceipt {
+									to: target.clone(),
+									outcome: "injected".to_string(),
+									error: None,
+								}
+							} else {
+								IrcDeliveryReceipt {
+									to: target.clone(),
+									outcome: "failed".to_string(),
+									error: Some(error),
+								}
 							}
 						}
 					},
@@ -1733,7 +1807,10 @@ impl HubTool {
 				.and_then(Value::as_u64)
 				.unwrap_or(DEFAULT_IRC_TIMEOUT_MS);
 			let target = to.to_string();
-			match self.await_reply(&sender, &target, timeout, ctx).await? {
+			match self
+				.await_reply(&sender, &target, timeout, await_ends, ctx)
+				.await?
+			{
 				ReplyWait::Reply(message) => {
 					lines.push(String::new());
 					lines.push(format!("Reply from {}:", message.from));
@@ -1786,11 +1863,17 @@ impl HubTool {
 		})
 	}
 
+	/// Wait for a reply to an awaited send.
+	///
+	/// `ends` is the target's end counter captured before delivery; a newer value
+	/// is its terminal `agent_end` (TS `awaitTarget`). Merely idle, parked or
+	/// just-woken is not an end.
 	async fn await_reply(
 		&self,
 		sender: &str,
 		target: &str,
 		timeout: u64,
+		ends: u64,
 		ctx: &AgentContext,
 	) -> Result<ReplyWait, ToolError> {
 		let mailbox = self.supervisor.mailbox();
@@ -1806,10 +1889,10 @@ impl HubTool {
 		let mut presence = mailbox.presence();
 		presence.borrow_and_update();
 		loop {
-			if !self.agent_running(target) {
-				if let Some(message) = mailbox.take(sender, Some(target)) {
-					return Ok(ReplyWait::Reply(message));
-				}
+			if let Some(message) = mailbox.take(sender, Some(target)) {
+				return Ok(ReplyWait::Reply(message));
+			}
+			if self.target_ended(target, ends) {
 				return Ok(ReplyWait::Stopped);
 			}
 			let receive = waiter.recv();

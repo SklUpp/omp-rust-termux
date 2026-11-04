@@ -147,7 +147,81 @@ in-memory and process-scoped, owned by `Supervisor`:
 - `cancel` first cancels the child's cancellation token and interrupts its loop,
   waiting up to 5 s for in-flight tools to clean up; only then is the task
   aborted. An unknown or foreign id is `not_found`; a settled child is
-  `already_completed`.
+  `already_completed`, unless its keep-alive session is still running a follow-up
+  turn — that live actor is cancelled and reported as `cancelled`. A cancel whose
+  durable marker could not be written reports `cancel_unconfirmed` (actor
+  stopped in process, restart guarantee withheld; repeat `cancel` to retry).
+- Cancelling a live keep-alive session is terminal for the id, matching TS
+  `cancelAgentRegistration` (abort + release): the actor is cancelled under the
+  same lock `send` uses, every message a racing send already accepted is
+  drained and journaled before the actor stops (never a `woken` receipt for a
+  dropped message), and later sends/revivals are refused while `history://`
+  stays readable.
+- The durable part of a cancel is the tombstone marker: file content and the
+  session-root directory entry are both fsynced before `cancelled` is reported.
+  If the marker cannot be created/synced, the receipt is `cancel_unconfirmed`,
+  not `cancelled`: the in-process stop still happened, but a restart could
+  revive the transcript, so the durable promise is withheld.
+  Recovery is a repeated `cancel` — it retries the marker even after the actor
+  is gone, and reports `cancelled` only once the write is confirmed. Without any
+  writable session root no restart-proof cancel can exist; that limit is stated
+  rather than papered over.
+- A settled record whose keep-alive actor is still registered is exempt from
+  the five-minute retention: it owns the journal path and the cancel handle, so
+  evicting it would silently stop persistence and strand a running follow-up.
+  A revive from persisted state restores that record (status `completed`,
+  settled now) from the contract verified inside the session root, so journaling,
+  owner-scoped `cancel` and `history://` work after a restart; an existing
+  record is never overwritten and ownership is never taken from a live claim.
+  The restore happens **before** the reviver builds the child registry: the
+  registry's `local://` root is taken from that record, so restoring later would
+  hand the child the parent's URL scope. A missing contract, a transcript outside
+  the session root, or a failed ownership check refuses the revive (no fallback
+  to the parent scope, no actor).
+- Cancellation is linearized against actor publication: `cancel` bumps an
+  owner-visible generation *before* it decides its receipt, and a revive claims
+  the actor under the same lock with the generation captured when it took its
+  record reservation. A cancel that lands between "record restored" and "actor
+  published" therefore refuses the revive — the claim fails, no live slot is
+  published and the actor is withdrawn, so no turn ever starts — instead of
+  reporting `already_completed` after the actor went live.
+- `send await: true` settles on the awaited peer's terminal turn end
+  (`agent_end`), not on a "running" poll: the counter is captured **before**
+  delivery, so a peer that is idle, parked, or woken-but-not-yet-started is not
+  reported `stopped`. A turn that ends without a reply — or a job that settles —
+  returns `stopped without replying` immediately, and only a peer that never
+  ends waits to the timeout.
+- Rosters mirror TS: broadcasts (`to: "all"`) fan out to every alive peer
+  (`running | idle`, TS `listVisibleTo`), caller excluded — flat namespace,
+  because messaging is not owner-scoped (only `jobs` and `cancel` are), so a
+  keep-alive child anywhere in the session is a target. The root session is a
+  peer even when idle between turns: its body is buffered for the next root turn
+  and receipted `injected`, not `failed`. `wait` and its "is anyone running" gate
+  use the strict running set (`running` jobs, mailbox turns, keep-alive sessions
+  mid-turn): an idle peer never holds a wait open until the timeout.
+- A revive holds a supervisor reservation from before the record restore or
+  re-read until the actor claim, so retention cannot evict the record while the
+  reviver binds the child registry (the record decides the child's `local://`
+  root). The claim is atomic with the cancel generation and the reservation and
+  runs **before** the live slot is published: no send can read a slot whose
+  actor was never claimed. A per-id gate makes the revive single-flight (TS
+  coalesces): a send that arrives mid-revive waits for the winner and then
+  delivers into the published session (`woken`/`injected`) instead of starting a
+  second actor, failing, or dropping its own text.
+- An aborted child's tombstone is best effort at the call site: if the marker
+  cannot be written a warning names the id, because a restart could re-adopt the
+  transcript until the write succeeds.
+- The transcript journal is incremental and is flushed before every compaction.
+  If that flush does not fully succeed, compaction is skipped for that step and
+  retried at the next boundary: a destructive prune never drops an accepted
+  message the transcript does not hold.
+- Every keep-alive actor derives its cancellation from the supervisor's session
+  token and is registered with it, so scope teardown cancels the actor and waits
+  for it to stop before the session's provider/registry/tools are released.
+- A send that reaches a session already cancelling (`cancel`, teardown) is
+  refused with an explicit error instead of a `woken`/`injected` receipt: its
+  actor would exit before draining the queue. A closing session refuses every
+  send the same way.
 - A child still queued for a concurrency permit is reserved with its own token:
   `cancel` cancels that reservation so the child never starts, and the job
   settles as `aborted`.

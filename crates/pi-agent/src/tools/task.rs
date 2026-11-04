@@ -26,10 +26,12 @@ use super::{
 	},
 };
 use crate::{
+	compaction::CompactionReport,
 	loop_module::{AgentError, AgentEvent, AgentLoop, SteeringEvent},
 	state::{AgentConfig, AgentContext, AgentState, Message, TokenUsage, ToolResult, TurnResult},
+	subagent_lifecycle::TranscriptJournal,
 	supervisor::{ChildGuard, ChildSpawn, Supervisor, cap_result_text},
-	task_persisted_revive::{PersistedChildSession, turn_journal_messages},
+	task_persisted_revive::{PersistedChildSession, RevivedChild},
 };
 
 #[derive(Clone)]
@@ -771,7 +773,7 @@ impl TaskTool {
 
 		let child_approver = self.supervisor.child_approver();
 
-		let (steering_tx, steering_rx) = tokio::sync::mpsc::channel(16);
+		let (steering_tx, mut steering_rx) = tokio::sync::mpsc::channel(16);
 		let assignment = if let Some(context) = &item.context {
 			format!("{context}\n\n{}", item.task)
 		} else {
@@ -822,7 +824,27 @@ impl TaskTool {
 		let child_plan = ctx.plan.clone();
 		let final_messages = Arc::new(Mutex::new(None::<Vec<Message>>));
 		let final_messages_task = Arc::clone(&final_messages);
+		// Keep-alive handover data for the still-live child. TS
+		// `finalizeSubagentLifecycle` keeps the session itself and flips it to
+		// `idle`; the eval bridge and isolated children have no revivable session.
+		let live_keep_alive = invocation_task && isolation.is_none();
+		let live_supervisor = Arc::clone(&self.supervisor);
+		let live_child_id = child_id.clone();
+		let live_agent = item.agent.clone();
 		let mut task_handle = tokio::spawn(async move {
+			let autoload_len = autoload_msgs.len();
+			let had_system = autoload_msgs
+				.first()
+				.is_some_and(|message| message.role == crate::state::Role::System);
+			// The journal must already hold every accepted message when
+			// compaction prunes, so the loop reports each turn boundary and the
+			// owner appends there; the final flush below covers the last step.
+			let journal = Arc::new(TranscriptJournal::new(
+				Arc::clone(&live_supervisor),
+				live_child_id.clone(),
+				autoload_len.saturating_add(1),
+				had_system,
+			));
 			let child_loop = match child_approver {
 				Some(approver) => AgentLoop::with_approver(
 					child_config,
@@ -832,23 +854,66 @@ impl TaskTool {
 				),
 				None => AgentLoop::new(child_config, child_provider, child_registry),
 			}
-			.with_plan(child_plan);
+			.with_plan(child_plan)
+			// Mail that could not be handed to the closing run is buffered by the
+			// hub; the adopted actor drains it here at its next turn boundary, so
+			// a send that raced the hand-off is not stranded.
+			.with_peer_inbox(live_supervisor.mailbox(), live_child_id.clone())
+			.with_turn_observer(Some({
+				let journal = Arc::clone(&journal);
+				Arc::new(
+					move |messages: &[Message], prune: Option<CompactionReport>| {
+						journal.flush(messages, prune)
+					},
+				) as crate::loop_module::TurnObserver
+			}));
 			let mut child_state = AgentState { messages: autoload_msgs, total_turns: 0 };
+			let child_cancelled = child_cancel_for_loop.clone();
 			let outcome = child_loop
 				.run_dialog_message_with_cancel(
 					Message::user(full_prompt),
 					&mut child_state,
-					Some(steering_rx),
+					Some(&mut steering_rx),
 					Some(event_tx),
 					child_cancel_for_loop,
 				)
 				.await;
+			// Close the runner's steering channel now: nothing reads it after this
+			// point, so a supervisor hand-off must fail into the hub's buffered
+			// path instead of into a channel nobody drains.
+			drop(steering_rx);
+			// Final flush here, before the live bundle can be published: the
+			// adopted actor's next turn appends to the same file, so this tail
+			// must already be on disk or the next append would land out of order.
+			if outcome.is_ok() {
+				journal.flush(&child_state.messages, None);
+			}
 			// Hand the final authoritative state back for the post-drain
 			// reconcile (successful or rolled back).
 			*final_messages_task
 				.lock()
 				.unwrap_or_else(std::sync::PoisonError::into_inner) = Some(child_state.messages.clone());
-			outcome
+			// The still-live loop/state goes back to the caller, which publishes
+			// the actor only after it has decided the terminal state. A failed,
+			// aborted or cancelled run keeps no live bundle: its tail is partial
+			// and must go through the cold replay sanitizer instead.
+			let live = match &outcome {
+				Ok(turns)
+					if live_keep_alive
+						&& !child_cancelled.is_cancelled()
+						&& !summarize_turns(turns).1 =>
+				{
+					live_child_bundle(
+						&live_supervisor,
+						&live_child_id,
+						&live_agent,
+						child_loop,
+						child_state,
+					)
+				},
+				_ => None,
+			};
+			(outcome, live)
 		});
 
 		if !self.supervisor.register_active_child(
@@ -929,14 +994,14 @@ impl TaskTool {
 			res = &mut task_handle => Some(join_dialog_result(res)),
 		};
 		// Await outside the select so only one branch borrows the handle.
-		let outcome = match outcome {
+		let (outcome, mut live_child) = match outcome {
 			Some(outcome) => outcome,
 			None => match tokio::time::timeout(CHILD_CANCEL_GRACE, &mut task_handle).await {
 				Ok(joined) => join_dialog_result(joined),
 				Err(_) => {
 					guard.handle.abort();
 					let _ = task_handle.await;
-					Err(AgentError::Interrupted)
+					(Err(AgentError::Interrupted), None)
 				},
 			},
 		};
@@ -955,6 +1020,7 @@ impl TaskTool {
 			hook.on_child_end(&context, child_aborted).await;
 		}
 		if let Some(manager) = crate::subagent_lifecycle::lookup(&self.supervisor)
+			&& !manager.is_live(&child_id)
 			&& let Some(messages) = final_messages
 				.lock()
 				.unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -979,14 +1045,9 @@ impl TaskTool {
 		let mut metadata_confirmed = true;
 		let mut result = match outcome {
 			Ok(turn_results) => {
-				// Journal the whole turn tail (assistant + tool results): a
-				// replay that omits the results emits dangling `tool_calls`
-				// and the revived child's first request is rejected.
-				let journaled = turn_journal_messages(&turn_results);
-				let journaled_refs: Vec<&Message> = journaled.iter().collect();
-				self
-					.supervisor
-					.append_child_transcript(&child_id, &journaled_refs);
+				// The turn tail was journaled by the child runner before it handed
+				// the live loop to the lifecycle owner; journaling again here would
+				// duplicate the replay.
 				let requests = turn_results.len();
 				let base_output = turn_results
 					.iter()
@@ -1250,6 +1311,7 @@ impl TaskTool {
 							&self.supervisor,
 							&outstanding_id,
 							result.isolation.is_some(),
+							&mut live_child,
 						);
 					}
 				},
@@ -1262,6 +1324,7 @@ impl TaskTool {
 							&self.supervisor,
 							&outstanding_id,
 							result.isolation.is_some(),
+							&mut live_child,
 						);
 					}
 				},
@@ -1641,11 +1704,13 @@ impl TaskTool {
 }
 
 /// Owned outcome of a detached child, including the isolation report that must
-/// be attached before the record settles.
+/// be attached before the record settles, and the still-live loop/state the
+/// caller may publish once the terminal state is decided.
 struct BackgroundOutcome {
 	turns: Vec<TurnResult>,
 	isolation: Option<IsolationFinalize>,
 	cancelled: bool,
+	live: Option<RevivedChild>,
 }
 
 /// Streamed assistant output captured from the child event channel.
@@ -1756,7 +1821,7 @@ async fn run_background_child(
 	child_id: String,
 	item: TaskItemSpec,
 	cwd: std::path::PathBuf,
-	steering_rx: tokio::sync::mpsc::Receiver<SteeringEvent>,
+	mut steering_rx: tokio::sync::mpsc::Receiver<SteeringEvent>,
 	steering_tx: tokio::sync::mpsc::Sender<SteeringEvent>,
 	cancel: CancellationToken,
 	child_ctx: ChildContext,
@@ -1864,6 +1929,26 @@ async fn run_background_child(
 	let child_loop = child_loop
 		.with_background_results(supervisor.owner_results_sink(Some(&child_id)))
 		.with_peer_inbox(supervisor.mailbox(), child_id.clone());
+	let autoload_len = autoload_msgs.len();
+	let had_system = autoload_msgs
+		.first()
+		.is_some_and(|message| message.role == crate::state::Role::System);
+	// Journal every turn boundary before compaction may prune, so an accepted
+	// message is never only in memory when the head is rewritten.
+	let journal = Arc::new(TranscriptJournal::new(
+		Arc::clone(&supervisor),
+		child_id.clone(),
+		autoload_len.saturating_add(1),
+		had_system,
+	));
+	let child_loop = child_loop.with_turn_observer(Some({
+		let journal = Arc::clone(&journal);
+		Arc::new(
+			move |messages: &[Message], prune: Option<CompactionReport>| {
+				journal.flush(messages, prune)
+			},
+		) as crate::loop_module::TurnObserver
+	}));
 	let (event_tx, event_rx) = tokio::sync::mpsc::channel(256);
 	if let Some(hook) = supervisor.child_advisor_hook() {
 		let session_file = supervisor.child_session_file(&child_id);
@@ -1894,11 +1979,15 @@ async fn run_background_child(
 		.run_dialog_message_with_cancel(
 			Message::user(full_prompt),
 			&mut child_state,
-			Some(steering_rx),
+			Some(&mut steering_rx),
 			Some(event_tx),
 			cancel,
 		)
 		.await;
+	// Nothing reads this channel after the dialog; closing it now makes a
+	// supervisor hand-off fail into the lifecycle manager instead of buffering
+	// into a receiver nobody drains (the actor gets its own channels).
+	drop(steering_rx);
 	// Drain the forwarder before the caller settles the record, so no event is
 	// emitted after the terminal lifecycle frame.
 	let _ = events.await;
@@ -1918,8 +2007,13 @@ async fn run_background_child(
 		manager.replace_live(&child_id, child_state.messages.clone());
 	}
 	let turns = outcome?;
+	// Final flush before any live handover: the adopted actor appends its next
+	// turn to the same file, and a replay that omits tool results emits dangling
+	// `tool_calls`.
+	journal.flush(&child_state.messages, None);
 	let (base, aborted, _) = summarize_turns(&turns);
 	let succeeded = !aborted && !finalize_output(&item, &turns, &base, false).failed;
+	let adoptable = isolation.is_none();
 	let isolation = match isolation {
 		Some((sandbox, baseline, policy)) => {
 			let artifacts_dir = supervisor
@@ -1943,10 +2037,19 @@ async fn run_background_child(
 		None => None,
 	};
 	let cancelled = cancel_for_finalize.is_cancelled();
+	// A cancelled or yield-aborted child is settled as aborted (tombstone) by the
+	// caller, so it never gets a wakeable actor; everything else keeps its real
+	// loop/state, which the caller publishes only after the terminal decision.
+	let live = if adoptable && !cancelled && !aborted {
+		live_child_bundle(&supervisor, &child_id, &item.agent, child_loop, child_state)
+	} else {
+		None
+	};
 	Ok(BackgroundOutcome {
 		turns,
 		isolation,
 		cancelled,
+		live,
 	})
 }
 
@@ -2111,10 +2214,11 @@ fn settle_background_result(
 			turns,
 			isolation,
 			cancelled,
+			live: live_bundle,
 		}) => {
-			let journaled = turn_journal_messages(&turns);
-			let journaled_refs: Vec<&Message> = journaled.iter().collect();
-			supervisor.append_child_transcript(&id, &journaled_refs);
+			let mut live = live_bundle;
+			// The runner journaled the turn tail before handing a live actor over;
+			// journaling again here would duplicate the replay.
 			let (base, aborted, reason) = summarize_turns(&turns);
 			let finalized = finalize_output(&item, &turns, &base, aborted);
 			let artifact = if aborted {
@@ -2194,7 +2298,7 @@ fn settle_background_result(
 				);
 				supervisor.mark_failed_with_usage(&id, duration_ms, &envelope, usage);
 				supervisor.enqueue_delivery(&id, envelope);
-				adopt_keep_alive_child(&supervisor, &id, isolation.is_some());
+				adopt_keep_alive_child(&supervisor, &id, isolation.is_some(), &mut live);
 				return;
 			}
 			let output = if finalized.stderr.is_empty() {
@@ -2218,7 +2322,7 @@ fn settle_background_result(
 			);
 			supervisor.mark_completed_with_usage(&id, duration_ms, &envelope, usage);
 			supervisor.enqueue_delivery(&id, envelope);
-			adopt_keep_alive_child(&supervisor, &id, isolation.is_some());
+			adopt_keep_alive_child(&supervisor, &id, isolation.is_some(), &mut live);
 		},
 		Err(AgentError::Interrupted) => {
 			// The loop discarded its turns on cancellation, but every request it
@@ -2523,16 +2627,25 @@ impl Drop for SettlementGuard {
 /// (the shell's own graceful-kill window) before it is hard-aborted.
 const CHILD_CANCEL_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
-fn join_dialog_result(
-	joined: Result<Result<Vec<crate::state::TurnResult>, AgentError>, tokio::task::JoinError>,
-) -> Result<Vec<crate::state::TurnResult>, AgentError> {
+/// Live hand-off bundle: the loop/state a finished child still owns, or `None`
+/// when the run ended without an authoritative state.
+type LiveChild = Option<RevivedChild>;
+
+/// Outcome of the spawned child run plus its late hand-off bundle.
+type DialogOutcome = (Result<Vec<crate::state::TurnResult>, AgentError>, LiveChild);
+
+/// Join the child run and keep the still-live loop/state for a late hand-off.
+///
+/// The bundle is `Some` only when the loop returned normally; a panic or an
+/// aborted join has no authoritative state to continue from.
+fn join_dialog_result(joined: Result<DialogOutcome, tokio::task::JoinError>) -> DialogOutcome {
 	match joined {
-		Ok(dialog_res) => dialog_res,
+		Ok(result) => result,
 		Err(join_err) => {
 			if join_err.is_cancelled() {
-				Err(AgentError::Interrupted)
+				(Err(AgentError::Interrupted), None)
 			} else {
-				Err(AgentError::Internal(join_err.to_string()))
+				(Err(AgentError::Internal(join_err.to_string())), None)
 			}
 		},
 	}
@@ -2773,6 +2886,49 @@ fn contract_expected(supervisor: &Arc<Supervisor>, child_id: &str) -> bool {
 	supervisor.child_contract_expected(child_id)
 }
 
+/// Assemble the still-live pieces of a finished child for `adopt_live`.
+///
+/// The contract is read from disk as written at spawn time; the settle path
+/// persists `output_id` afterwards, and the actor re-reads it before rewriting a
+/// saved output. `None` when the child has no transcript/contract to pin the
+/// row to (the caller then falls back to the cold adopt path).
+fn live_child_bundle(
+	supervisor: &Arc<Supervisor>,
+	child_id: &str,
+	agent: &AgentDefinition,
+	agent_loop: AgentLoop,
+	state: AgentState,
+) -> Option<RevivedChild> {
+	let root = supervisor
+		.child_session_file(child_id)
+		.and_then(|path| path.parent().map(std::path::Path::to_path_buf))?;
+	let contract = PersistedChildSession::load(&root, child_id)?;
+	Some(RevivedChild { agent_loop, state, agent: Some(agent.clone()), contract })
+}
+
+/// Append the messages the child loop actually accepted to its transcript.
+///
+/// The journal must be the real conversation, not a `TurnResult`
+/// reconstruction: the loop appends accepted steering and injected background
+/// results to `state.messages` mid-turn, and a replay that dropped them would
+/// resume without an instruction the child already acted on.
+///
+/// The [`TranscriptJournal`](crate::subagent_lifecycle::TranscriptJournal) flushes
+/// at every turn boundary the loop reports, before compaction can prune, and once
+/// after the dialog. Compaction therefore only ever drops messages already on
+/// disk, and the cursor resumes after the prune notice instead of a stale index.
+pub(crate) fn journal_start(messages: &[Message], base: usize, had_system: bool) -> usize {
+	let mut start = base;
+	if !had_system
+		&& messages
+			.first()
+			.is_some_and(|message| message.role == crate::state::Role::System)
+	{
+		start += 1;
+	}
+	start
+}
+
 fn persist_child_output_id(
 	supervisor: &Arc<Supervisor>,
 	child_id: &str,
@@ -2802,15 +2958,35 @@ fn persist_child_output_id(
 		.map_err(|error| format!("cannot persist child contract for {child_id}: {error}"))
 }
 
-/// Hand a finished, non-isolated child to the lifecycle manager (`idle`), so
-/// hub can list it as parked after the idle TTL and revive it on send.
-fn adopt_keep_alive_child(supervisor: &Arc<Supervisor>, child_id: &str, isolated: bool) {
+/// Hand a finished, non-isolated child to the lifecycle manager (`idle`).
+///
+/// A bundle is published **live** when the run ended cleanly; the caller invokes
+/// this only after settling the terminal state, so an aborted, cancelled or
+/// metadata-failed child never exposes an actor. Without a bundle the row is
+/// restored from disk exactly as before live adoption existed.
+fn adopt_keep_alive_child(
+	supervisor: &Arc<Supervisor>,
+	child_id: &str,
+	isolated: bool,
+	live: &mut LiveChild,
+) {
 	if isolated {
 		return;
 	}
 	let Some(manager) = crate::subagent_lifecycle::lookup(supervisor) else {
 		return;
 	};
+	if manager.is_live(child_id) {
+		return;
+	}
+	if let Some(child) = live.take() {
+		match manager.adopt_live(child_id, child) {
+			Ok(()) => return,
+			Err(error) => {
+				eprintln!("warning: cannot adopt live keep-alive child {child_id}: {error}");
+			},
+		}
+	}
 	let Some(root) = supervisor
 		.child_session_file(child_id)
 		.and_then(|path| path.parent().map(std::path::Path::to_path_buf))
@@ -2834,8 +3010,15 @@ fn adopt_keep_alive_child(supervisor: &Arc<Supervisor>, child_id: &str, isolated
 /// eval bridge (`run_eval_agent` runs the foreground path with
 /// `invocation_task = false`).
 fn tombstone_aborted_child(supervisor: &Arc<Supervisor>, child_id: &str, reason: &str) {
-	if let Some(manager) = crate::subagent_lifecycle::lookup(supervisor) {
-		manager.tombstone(child_id, reason);
+	if let Some(manager) = crate::subagent_lifecycle::lookup(supervisor)
+		&& !manager.tombstone(child_id, reason)
+	{
+		// The in-memory tombstone still refuses this id for the rest of the
+		// process; until the marker is written a restart could re-adopt the
+		// transcript. `tombstone` already reported the I/O error.
+		eprintln!(
+			"warning: aborted child {child_id} has no durable tombstone; a restart may revive it"
+		);
 	}
 }
 
@@ -3783,6 +3966,25 @@ mod tests {
 		supervisor::DelegationLimits,
 	};
 
+	/// The first journal start keeps the pre-run prefix intact; only a system
+	/// message the loop inserts at index 0 shifts it. Post-compaction indices are
+	/// remapped from `CompactionReport`, never derived from this index.
+	#[test]
+	fn journal_start_keeps_the_prefix_and_shifts_for_an_inserted_system() {
+		use crate::state::{Message, Role};
+		let plain = vec![
+			Message::system("child system prompt"),
+			Message::user("autoload"),
+			Message::user("assignment"),
+			Message::assistant("answer"),
+		];
+		assert_eq!(journal_start(&plain, 2, true), 2);
+		// A loop-inserted system message at index 0 shifts the prefix by one.
+		assert_eq!(journal_start(&plain, 2, false), 3);
+		assert!(plain[0].role == Role::System);
+		assert_eq!(journal_start(&[], 0, true), 0);
+	}
+
 	/// TS `finalizeSubprocessOutput` abort body: the error key is only present
 	/// when the yield carried a message, and serialization is pretty JSON.
 	#[test]
@@ -4042,6 +4244,7 @@ mod tests {
 				turns: background_turns,
 				isolation: None,
 				cancelled: true,
+				live: None,
 			}),
 			TaskItemSpec {
 				name: "Saved".to_string(),
@@ -4145,6 +4348,7 @@ mod tests {
 				turns: Vec::new(),
 				isolation: None,
 				cancelled: false,
+				live: None,
 			}),
 			TaskItemSpec {
 				name: "bg-failure".to_string(),
@@ -4236,6 +4440,7 @@ mod tests {
 				turns,
 				isolation: None,
 				cancelled: false,
+				live: None,
 			}),
 			TaskItemSpec {
 				name: "bg-provider-error".to_string(),

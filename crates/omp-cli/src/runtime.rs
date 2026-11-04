@@ -680,6 +680,15 @@ impl PiAgentRunner {
 			let teardown = std::thread::spawn(move || {
 				if let Some(supervisor) = supervisor {
 					supervisor.shutdown();
+					// Live keep-alive actors own their own provider/registry and are
+					// not in `active`; cancel + join them before the session
+					// resources below are released, so no follow-up turn can run
+					// after this scope closed.
+					if let Some(manager) =
+						pi_agent::subagent_lifecycle::lookup(&supervisor)
+					{
+						handle.block_on(manager.shutdown_actors());
+					}
 					// Children are cancelled by now, so every usage their completed
 					// requests reported is settled in the ledger: queue it before the
 					// session log closes, or a resumed log would lose it.
@@ -835,8 +844,14 @@ impl PiAgentRunner {
 			}
 			(closing, sessions, supervisors)
 		};
+		let mut actors = Vec::new();
 		for (supervisor, goal) in supervisors {
 			supervisor.shutdown();
+			// Live keep-alive actors are not in `active`; keep the manager so the
+			// teardown thread can join them before session resources are released.
+			if let Some(manager) = pi_agent::subagent_lifecycle::lookup(&supervisor) {
+				actors.push(manager);
+			}
 			// Same post-shutdown drain as an explicit scope close: what the
 			// cancelled children's completed requests reported still reaches goal
 			// accounting, and the host writes it before the log closes.
@@ -847,7 +862,7 @@ impl PiAgentRunner {
 		// The plain teardown thread owns every published close handle and all
 		// remaining session releases, even when `sessions` is empty; `LatchFinish`
 		// runs only after both sets are done. Runtime callers never join a worker.
-		if closing.is_empty() && sessions.is_empty() {
+		if closing.is_empty() && sessions.is_empty() && actors.is_empty() {
 			self.shutdown_latch.finish();
 			return;
 		}
@@ -857,6 +872,12 @@ impl PiAgentRunner {
 			let _finish = LatchFinish(latch);
 			for scoped in closing {
 				let _ = scoped.join();
+			}
+			// Actor tokens were cancelled with their supervisor above; wait for
+			// the actors to leave before any session resource is released, so no
+			// follow-up turn can run against a closed backend.
+			for manager in actors {
+				handle.block_on(manager.shutdown_actors());
 			}
 			if !sessions.is_empty() {
 				handle.block_on(async move {
@@ -3851,7 +3872,7 @@ async fn run_advisor_call(
 	let agent = AgentLoop::with_approver(config, provider, registry, approvals)
 		.with_assistant_guard(Some(assistant_guard));
 	let loop_config = spec.config.tool_call_loop_guard.clone();
-	let (steer_tx, steer_rx) = tokio::sync::mpsc::channel(16);
+	let (steer_tx, mut steer_rx) = tokio::sync::mpsc::channel(16);
 	let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(256);
 	let guard_cancel = spec.cancel.clone();
 	let guard = tokio::spawn(async move {
@@ -3883,7 +3904,7 @@ async fn run_advisor_call(
 		.run_dialog_message_with_cancel(
 			pi_agent::Message::user(spec.prompt.clone()),
 			&mut state,
-			Some(steer_rx),
+			Some(&mut steer_rx),
 			Some(event_tx),
 			spec.cancel.clone(),
 		)

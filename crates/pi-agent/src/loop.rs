@@ -5,7 +5,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-	compaction::Compactor,
+	compaction::{CompactionReport, Compactor},
 	mailbox::{Mailbox, format_incoming},
 	provider::{ModelProvider, ProviderError, StreamAssembler, ToolChoice},
 	state::{
@@ -700,7 +700,22 @@ pub struct AgentLoop {
 	continuation: bool,
 	/// Optional C4 assistant-response gate; `None` for every non-advisor caller.
 	assistant_guard: Option<Arc<dyn AssistantGuard>>,
+	/// Host hook invoked with the live conversation at every turn boundary and,
+	/// after a prune, with the index mapping it applied. Owners journal there,
+	/// so a compaction can only drop turns that are already on disk.
+	turn_observer: Option<TurnObserver>,
 }
+
+/// Host hook for [`AgentLoop::with_turn_observer`].
+///
+/// `prune` is `Some` only for the call right after [`Compactor::compact_report`]
+/// rewrote the conversation: the messages are the compacted ones and the owner
+/// must remap its write cursor with [`CompactionReport::remap`].
+///
+/// The return value is durability: `false` means accepted messages are not yet
+/// on disk, so the loop must not compact (an unwritten turn would be lost).
+pub type TurnObserver =
+	Arc<dyn Fn(&[Message], Option<CompactionReport>) -> bool + Send + Sync>;
 
 impl AgentLoop {
 	pub fn new(
@@ -723,6 +738,7 @@ impl AgentLoop {
 			conflicts: None,
 			continuation: false,
 			assistant_guard: None,
+			turn_observer: None,
 		}
 	}
 
@@ -747,6 +763,7 @@ impl AgentLoop {
 			conflicts: None,
 			continuation: false,
 			assistant_guard: None,
+			turn_observer: None,
 		}
 	}
 
@@ -806,6 +823,16 @@ impl AgentLoop {
 	#[must_use]
 	pub fn with_peer_inbox(mut self, mailbox: Arc<Mailbox>, agent_id: impl Into<String>) -> Self {
 		self.peer_inbox = Some((mailbox, agent_id.into()));
+		self
+	}
+
+	/// Install a host hook called with the live conversation at every turn
+	/// boundary and, after a prune, with the index mapping it applied. The owner
+	/// journals accepted messages there, so every turn compaction removes is
+	/// already durable and the cursor can be remapped exactly.
+	#[must_use]
+	pub fn with_turn_observer(mut self, observer: Option<TurnObserver>) -> Self {
+		self.turn_observer = observer;
 		self
 	}
 
@@ -929,14 +956,14 @@ impl AgentLoop {
 		&self,
 		user_message: Message,
 		state: &mut AgentState,
-		steering_rx: Option<mpsc::Receiver<SteeringEvent>>,
+		mut steering_rx: Option<mpsc::Receiver<SteeringEvent>>,
 		events: Option<mpsc::Sender<AgentEvent>>,
 	) -> Result<Vec<TurnResult>, AgentError> {
 		self
 			.run_dialog_message_with_cancel(
 				user_message,
 				state,
-				steering_rx,
+				steering_rx.as_mut(),
 				events,
 				CancellationToken::new(),
 			)
@@ -945,11 +972,16 @@ impl AgentLoop {
 
 	/// Like [`Self::run_dialog_message`], but with a caller-owned cancellation
 	/// token so a supervisor can stop the loop (and its in-flight tools) directly.
+	///
+	/// The steering receiver is borrowed, not moved: a long-lived owner (the
+	/// revived child actor) keeps it across dialogs, so a message that missed
+	/// its last step boundary is still readable instead of being dropped with
+	/// the channel.
 	pub async fn run_dialog_message_with_cancel(
 		&self,
 		user_message: Message,
 		state: &mut AgentState,
-		mut steering_rx: Option<mpsc::Receiver<SteeringEvent>>,
+		mut steering_rx: Option<&mut mpsc::Receiver<SteeringEvent>>,
 		events: Option<mpsc::Sender<AgentEvent>>,
 		cancellation_token: CancellationToken,
 	) -> Result<Vec<TurnResult>, AgentError> {
@@ -990,7 +1022,7 @@ impl AgentLoop {
 		let mut context_limit = self.config.context_limit;
 
 		while state.total_turns < self.config.max_turns {
-			if let Some(rx) = &mut steering_rx {
+			if let Some(rx) = steering_rx.as_deref_mut() {
 				let steering = Steering::drain(rx);
 				if steering.interrupted {
 					cancellation_token.cancel();
@@ -1025,8 +1057,25 @@ impl AgentLoop {
 				state.messages.push(requirement.reminder.clone());
 			}
 
-			state.messages =
-				Compactor::compact(&state.messages, context_limit, MIN_RECENT_MESSAGES);
+			// Durable before destructive: the owner journals everything accepted
+			// so far. If that write failed, the prune below is skipped — dropping
+			// a turn the transcript does not hold would lose it silently. The next
+			// boundary retries, and the run keeps every message meanwhile.
+			let durable = self
+				.turn_observer
+				.as_ref()
+				.is_none_or(|observer| observer(&state.messages, None));
+			if durable {
+				let (compacted, report) =
+					Compactor::compact_report(&state.messages, context_limit, MIN_RECENT_MESSAGES);
+				state.messages = compacted;
+				// The rewrite is destructive even though its input is durable: the
+				// owner must remap its write cursor to the new index space, never
+				// infer the rewrite from lengths (they can match again).
+				if let (Some(observer), Some(report)) = (&self.turn_observer, report) {
+					observer(&state.messages, Some(report));
+				}
+			}
 
 			if cancellation_token.is_cancelled() {
 				return Err(AgentError::Interrupted);
@@ -1067,7 +1116,7 @@ impl AgentLoop {
 					&tool_choice,
 					events.as_ref(),
 					&cancellation_token,
-					steering_rx.as_mut(),
+					steering_rx.as_deref_mut(),
 					&mut pending_injections,
 				)
 				.await?;
@@ -1403,7 +1452,7 @@ impl AgentLoop {
 			}
 
 			let mut outcome = self
-				.run_tools(&assistant.tool_calls, &ctx, &cancellation_token, steering_rx.as_mut())
+				.run_tools(&assistant.tool_calls, &ctx, &cancellation_token, steering_rx.as_deref_mut())
 				.await;
 			let image_parts = tool_image_parts(&mut outcome.results);
 

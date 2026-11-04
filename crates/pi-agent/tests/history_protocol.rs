@@ -1058,7 +1058,7 @@ async fn revived_live_snapshot_precedes_flush_and_survives_idle_until_park() {
 
 
 #[tokio::test]
-async fn task_tool_live_snapshot_precedes_flush_then_adopts_to_disk() {
+async fn task_tool_live_snapshot_precedes_flush_then_hands_over_live() {
 	let root = TempRoot::new("producer");
 	let provider = gated_scripted_provider("child-live-answer");
 	let supervisor = supervisor_with(&root, Arc::clone(&provider));
@@ -1087,6 +1087,11 @@ async fn task_tool_live_snapshot_precedes_flush_then_adopts_to_disk() {
 		.expect("live child record")
 		.id
 		.clone();
+	// A refinement accepted mid-turn: the loop appends it to the child's own
+	// state, so it must also reach the journal and any later revive.
+	supervisor
+		.inject_peer_message(&id, "keep plantdb.toml read-only".to_string())
+		.expect("steering accepted by the running child");
 	let transcript = transcript_path(&root.subagents(), &id);
 	assert!(
 		!fs::read_to_string(&transcript)
@@ -1126,15 +1131,16 @@ async fn task_tool_live_snapshot_precedes_flush_then_adopts_to_disk() {
 	assert!(delivered, "background task must deliver its result");
 	let mut settled = false;
 	for _ in 0..500 {
-		if manager.status(&id) == Some(LifecycleStatus::Idle)
-			&& manager.live_messages(&id).is_none()
-		{
+		if manager.status(&id) == Some(LifecycleStatus::Idle) && manager.is_live(&id) {
 			settled = true;
 			break;
 		}
 		tokio::time::sleep(Duration::from_millis(10)).await;
 	}
-	assert!(settled, "adopt must settle the live row onto disk");
+	assert!(
+		settled,
+		"keep-alive adoption must leave a live idle row (TS keeps the session)"
+	);
 	let mut journaled = false;
 	let mut transcript_body = String::new();
 	for _ in 0..500 {
@@ -1146,15 +1152,55 @@ async fn task_tool_live_snapshot_precedes_flush_then_adopts_to_disk() {
 		tokio::time::sleep(Duration::from_millis(10)).await;
 	}
 	assert!(journaled, "final answer must be journaled: {transcript_body}");
+	assert!(
+		transcript_body.contains("keep plantdb.toml read-only"),
+		"accepted steering must be journaled with the turn it joined: {transcript_body}"
+	);
 
+	// The live row is still the authoritative view until the idle TTL parks it.
+	let live_idle = read(&router, &root, &format!("history://{id}"))
+		.await
+		.expect("live idle read");
+	assert!(live_idle.content.contains("child-live-answer"));
+	assert_eq!(
+		live_idle.notes.expect("notes"),
+		vec!["Source: live session (read-only, idle)".to_string()]
+	);
+
+	// Park drops the actor: the transcript file takes over from here.
+	manager.park(&id);
 	let disk = read(&router, &root, &format!("history://{id}"))
 		.await
 		.expect("disk fallback read");
 	assert!(disk.content.contains("child-live-answer"), "{}", disk.content);
 	assert_eq!(
 		disk.notes.expect("notes"),
-		vec!["Source: transcript file (read-only, idle)".to_string()]
+		vec!["Source: transcript file (read-only, parked)".to_string()]
 	);
+	assert!(
+		disk.content.contains("keep plantdb.toml read-only"),
+		"accepted steering must survive park on disk: {}",
+		disk.content
+	);
+
+	// Revive replays that journal: the instruction is still in context.
+	assert_eq!(
+		manager.send(&id, "continue".to_string()).expect("revive"),
+		DeliveryOutcome::Revived
+	);
+	tokio::time::timeout(Duration::from_secs(5), provider.entered.notified())
+		.await
+		.expect("revived turn entered provider");
+	let revived = manager.live_messages(&id).expect("revived snapshot");
+	assert!(
+		revived
+			.iter()
+			.any(|message| message.content.contains("keep plantdb.toml read-only")),
+		"revived state must include the accepted steering"
+	);
+	provider.gate.add_permits(1);
+	manager.shutdown_actors().await;
+	assert!(!manager.is_live(&id));
 }
 
 #[tokio::test]

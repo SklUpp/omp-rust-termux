@@ -1,7 +1,8 @@
 use std::{
+	cell::Cell,
 	collections::{BTreeMap, HashMap, HashSet, VecDeque},
 	io::Write,
-	path::PathBuf,
+	path::{Path, PathBuf},
 	sync::{
 		Arc, Mutex, MutexGuard, Weak,
 		atomic::{AtomicBool, AtomicU64, Ordering},
@@ -465,6 +466,24 @@ struct SupervisorState {
 	/// Cancellation tokens for children that are reserved but still waiting for
 	/// a concurrency permit. Cancelling one prevents the child from starting.
 	reservations: HashMap<String, CancellationToken>,
+	/// Live keep-alive actors (`subagent_lifecycle`) that outlive their spawn:
+	/// `id -> (epoch, token)`. They are not in `active` because their original
+	/// task already settled, so `hub cancel` and `shutdown` reach them here.
+	lifecycle_actors: HashMap<String, (u64, CancellationToken)>,
+	/// Bumped by every owner-scoped cancel attempt for an id. A revive captures
+	/// this before it restores the record and claims its actor with the same
+	/// value, so a cancel that lands anywhere in between aborts the revive
+	/// instead of silently missing the actor.
+	cancel_generation: HashMap<String, u64>,
+	/// Ids currently being revived (`id -> reservation token`). The record must
+	/// outlive the registry bind inside the reviver — the child's `local://` root
+	/// is read from it — so retention skips a reserved id, and a successful actor
+	/// claim consumes the reservation.
+	revive_reservations: HashMap<String, u64>,
+	/// Monotonic count of finished turns per agent. `send await` captures it after
+	/// delivery and stops on a newer value: the target's terminal `agent_end`, not
+	/// an idle transition.
+	agent_end_seq: HashMap<String, u64>,
 	/// Background results not yet handed to their owner or a hub snapshot.
 	pending: VecDeque<PendingDelivery>,
 	/// Jobs whose result was already delivered or recovered by a snapshot.
@@ -487,6 +506,37 @@ struct SupervisorState {
 	/// scope that tracks nothing collects nothing instead of accumulating spend
 	/// nobody reads.
 	track_usage: bool,
+}
+
+/// One pinned revive window for a settled child.
+///
+/// Held from before the record is restored or re-read until the actor claim: the
+/// reviver binds the child registry from that record, and a retention eviction
+/// in between would silently fall back to the parent's `local://` scope. Drop
+/// releases the pin; a successful [`Supervisor::claim_lifecycle_actor`] consumes
+/// it, so a failed revive never keeps the record alive.
+pub struct ReviveReservation {
+	supervisor: Arc<Supervisor>,
+	id:         String,
+	token:      u64,
+	/// Owner-cancel generation seen at reservation time.
+	generation: u64,
+	consumed:   Cell<bool>,
+}
+
+impl ReviveReservation {
+	#[must_use]
+	pub fn id(&self) -> &str {
+		&self.id
+	}
+}
+
+impl Drop for ReviveReservation {
+	fn drop(&mut self) {
+		if !self.consumed.get() {
+			self.supervisor.end_revive(&self.id, self.token);
+		}
+	}
 }
 
 pub struct Supervisor {
@@ -557,8 +607,14 @@ pub struct Supervisor {
 	/// Runner-unique prefix for backend-visible process owners. UI ids such as
 	/// `task-1` repeat across concurrent CLIs; process scoping must not.
 	process_owner_ns: String,
+	/// Parent token every live keep-alive actor derives from. Cancelled by
+	/// [`Supervisor::shutdown`] so a follow-up turn can never outlive its scope.
+	lifecycle_cancel: CancellationToken,
 	state: Mutex<SupervisorState>,
 	seq: AtomicU64,
+	/// Token source for [`Supervisor::reserve_revive`]; unique per reservation so
+	/// a stale guard can never release a newer revive's pin.
+	revive_seq: AtomicU64,
 	/// Wakes `cancel_child`, `hub jobs`, and `hub wait` waiters whenever a child
 	/// reaches a terminal status or a delivery is consumed.
 	settle: Notify,
@@ -587,11 +643,14 @@ pub struct Supervisor {
 }
 
 /// Result of a scoped `hub` cancellation attempt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CancelAttempt {
 	Cancelled,
 	NotFound,
 	AlreadyCompleted,
+	/// The live actor was stopped, but the durable tombstone could not be
+	/// written, so a restart may revive the id. Never reported as a clean cancel.
+	TombstoneFailed(String),
 }
 
 /// Append one child's own usage to the accounting ledger, write-once per result
@@ -705,11 +764,16 @@ impl Supervisor {
 					.join(format!("omp-agent-processes-{}-{scope}", std::process::id()))
 			},
 			process_owner_ns: owner_namespace(scope),
+			lifecycle_cancel: CancellationToken::new(),
 			state: Mutex::new(SupervisorState {
 				records: HashMap::new(),
 				order: Vec::new(),
 				active: HashMap::new(),
 				reservations: HashMap::new(),
+				lifecycle_actors: HashMap::new(),
+				cancel_generation: HashMap::new(),
+				revive_reservations: HashMap::new(),
+				agent_end_seq: HashMap::new(),
 				pending: VecDeque::new(),
 				consumed: HashSet::new(),
 				settled_at: HashMap::new(),
@@ -720,6 +784,7 @@ impl Supervisor {
 				track_usage: false,
 			}),
 			seq: AtomicU64::new(0),
+			revive_seq: AtomicU64::new(0),
 			settle: Notify::new(),
 			observers: Mutex::new(Vec::new()),
 			observer_seq: AtomicU64::new(0),
@@ -907,15 +972,25 @@ impl Supervisor {
 
 	/// Evict settled records that are older than [`RECORD_RETENTION_MS`] or
 	/// beyond [`MAX_SETTLED_RECORDS`], keeping running work, queued
-	/// reservations, and undelivered results. Mirrors the TypeScript job
-	/// manager's five-minute retention while bounding the long-lived runner.
+	/// reservations, undelivered results, and records with a registered
+	/// keep-alive actor (the actor's journal path and cancel handle). Mirrors
+	/// the TypeScript job manager's five-minute retention while bounding the
+	/// long-lived runner.
 	fn prune_state(state: &mut SupervisorState) {
 		let now = now_ms();
 		let pending: HashSet<&str> =
 			state.pending.iter().map(|delivery| delivery.id.as_str()).collect();
 		let mut candidates: Vec<(u64, String)> = Vec::new();
 		for id in &state.order {
-			if state.active.contains_key(id) || state.reservations.contains_key(id) {
+			// A settled record whose keep-alive actor is still registered owns a
+			// live session and the journal path (`child_session_file`), and it is
+			// the only handle `hub cancel`/owner scoping can reach. Evicting it
+			// would silently stop journaling and make the actor unstoppable.
+			if state.active.contains_key(id)
+				|| state.reservations.contains_key(id)
+				|| state.lifecycle_actors.contains_key(id)
+				|| state.revive_reservations.contains_key(id)
+			{
 				continue;
 			}
 			let Some(record) = state.records.get(id) else { continue };
@@ -949,9 +1024,13 @@ impl Supervisor {
 			state.records.remove(id);
 			state.settled_at.remove(id);
 			state.consumed.remove(id);
+			// The id is gone, so a stale cancellation generation of a future
+			// same-named spawn must not refuse its actor claim.
+			state.cancel_generation.remove(id);
 			// An evicted child's real usage stays in the ledger; only the
 			// observation cache goes.
 			state.observed_usage.remove(id);
+			state.agent_end_seq.remove(id);
 		}
 	}
 
@@ -1448,20 +1527,187 @@ impl Supervisor {
 		already
 	}
 
+	/// Cancellation token a lifecycle actor must derive from.
+	///
+	/// The token is a child of the session token, so scope teardown cancels it
+	/// even if the actor was not registered yet.
+	#[must_use]
+	pub fn lifecycle_token(&self) -> CancellationToken {
+		self.lifecycle_cancel.child_token()
+	}
+
+	/// Pin `id` against record retention and capture its cancel generation.
+	///
+	/// The reviver binds the child registry from the record (`child_session_file`
+	/// decides the child's `local://` root), so the record must not be pruned
+	/// between the restore and that bind. The guard is dropped at the end of the
+	/// revive; a successful claim consumes it.
+	#[must_use]
+	pub fn reserve_revive(self: &Arc<Self>, id: &str) -> ReviveReservation {
+		let token = self.revive_seq.fetch_add(1, Ordering::Relaxed) + 1;
+		let mut state = self.state.lock().unwrap();
+		state.revive_reservations.insert(id.to_string(), token);
+		let generation = state.cancel_generation.get(id).copied().unwrap_or(0);
+		drop(state);
+		ReviveReservation {
+			supervisor: Arc::clone(self),
+			id: id.to_string(),
+			token,
+			generation,
+			consumed: Cell::new(false),
+		}
+	}
+
+	/// Release a revive pin unless the claim already consumed it.
+	fn end_revive(&self, id: &str, token: u64) {
+		let mut state = self.state.lock().unwrap();
+		if state.revive_reservations.get(id) == Some(&token) {
+			state.revive_reservations.remove(id);
+		}
+	}
+
+	/// Publish a live actor for `reservation`'s id, atomically with both the
+	/// cancel generation and the reservation.
+	///
+	/// Runs under the same lock as the generation bump in [`Self::cancel_child`],
+	/// so a cancel and this claim have a single order: either the cancel sees the
+	/// actor (and cancels it) or the claim sees the newer generation (and refuses
+	/// to publish, aborting the revive). A second claim for an id whose actor is
+	/// still registered at the same or a newer epoch is refused as well, so two
+	/// concurrent revives cannot overwrite each other's cancel handle. Success
+	/// consumes the reservation, so the record is only pinned while the revive is
+	/// actually in flight.
+	pub fn claim_lifecycle_actor(
+		&self,
+		reservation: &ReviveReservation,
+		epoch: u64,
+		token: CancellationToken,
+	) -> bool {
+		let id = reservation.id();
+		let mut state = self.state.lock().unwrap();
+		if state.revive_reservations.get(id) != Some(&reservation.token) {
+			return false;
+		}
+		if state.cancel_generation.get(id).copied().unwrap_or(0) != reservation.generation {
+			return false;
+		}
+		if state.lifecycle_actors.get(id).is_some_and(|(existing, _)| *existing >= epoch) {
+			return false;
+		}
+		state.lifecycle_actors.insert(id.to_string(), (epoch, token));
+		state.revive_reservations.remove(id);
+		reservation.consumed.set(true);
+		true
+	}
+
+	/// Whether `id`'s settled record owns exactly `session_file`. Revives use it
+	/// to fail closed when the record is missing or points elsewhere, so a child
+	/// session cannot inherit the parent's URL scope (or another transcript).
+	#[must_use]
+	pub fn owns_session_file(&self, id: &str, session_file: &Path) -> bool {
+		let state = self.state.lock().unwrap();
+		state
+			.records
+			.get(id)
+			.and_then(|record| record.session_file.as_deref())
+			== Some(session_file)
+	}
+
+	/// Recreate the record a persisted keep-alive child needs after a restart or
+	/// a retention eviction: the actor journals through `child_session_file` and
+	/// `hub cancel`/owner scoping read the record.
+	///
+	/// Ownership is taken only from the verified persisted contract the caller
+	/// loaded from this session root — never from a live claim — and an existing
+	/// record is never overwritten, so a running spawn keeps its own identity and
+	/// no foreign owner gains access. The restored record is settled and becomes
+	/// retention-managed from now.
+	pub fn restore_child_record(
+		&self,
+		id: &str,
+		name: &str,
+		agent: Option<&str>,
+		parent_id: Option<&str>,
+		session_file: &Path,
+		published_output_id: Option<&str>,
+	) -> bool {
+		let mut state = self.state.lock().unwrap();
+		if state.records.contains_key(id) {
+			return false;
+		}
+		let record = ChildRecord {
+			id: id.to_string(),
+			result_key: self.result_key(id),
+			name: name.to_string(),
+			index: state.order.len(),
+			agent: agent.unwrap_or("task").to_string(),
+			task: String::new(),
+			status: ChildStatus::Completed,
+			parent_id: parent_id.map(str::to_string),
+			started_at: None,
+			duration_ms: None,
+			output: None,
+			error: None,
+			aborted: None,
+			abort_reason: None,
+			output_id: published_output_id.map(str::to_string),
+			output_published: published_output_id.is_some(),
+			contract_expected: true,
+			session_file: Some(session_file.to_path_buf()),
+			agent_source: "restored".to_string(),
+			parent_tool_call_id: None,
+			detached: true,
+			usage: None,
+			accounted: false,
+		};
+		state.order.push(id.to_string());
+		state.records.insert(id.to_string(), record);
+		state.settled_at.insert(id.to_string(), now_ms());
+		true
+	}
+
+	/// Drop the registration only when the finishing actor still owns the epoch.
+	pub fn unregister_lifecycle_actor(&self, id: &str, epoch: u64) {
+		let mut state = self.state.lock().unwrap();
+		if state
+			.lifecycle_actors
+			.get(id)
+			.is_some_and(|(registered, _)| *registered == epoch)
+		{
+			state.lifecycle_actors.remove(id);
+		}
+	}
+
 	/// Cancel queued reservations and abort every live child. Runtime owners
 	/// call this when the runner is dropped: background tasks hold their own
 	/// `Arc<Supervisor>`, so relying on `Drop` alone would let them outlive the
-	/// runner. Safe to call more than once.
+	/// runner. Live keep-alive actors are cancelled through the session token
+	/// and then awaited by the manager before resources are released. Safe to
+	/// call more than once.
 	pub fn shutdown(&self) {
-		let (reservations, active) = {
+		// Cancel the parent token first: every live actor (including one that
+		// registered in the same instant) derives from it, so none can start or
+		// continue a follow-up turn after this point.
+		self.lifecycle_cancel.cancel();
+		let (reservations, active, actors) = {
 			let mut state = match self.state.lock() {
 				Ok(state) => state,
 				Err(poisoned) => poisoned.into_inner(),
 			};
 			state.pending.clear();
-			(state.reservations.drain().map(|(_, token)| token).collect::<Vec<_>>(),
-			 state.active.drain().collect::<Vec<_>>())
+			(
+				state.reservations.drain().map(|(_, token)| token).collect::<Vec<_>>(),
+				state.active.drain().collect::<Vec<_>>(),
+				state
+					.lifecycle_actors
+					.drain()
+					.map(|(_, (_, token))| token)
+					.collect::<Vec<_>>(),
+			)
 		};
+		for actor in actors {
+			actor.cancel();
+		}
 		for reservation in reservations {
 			reservation.cancel();
 		}
@@ -1486,6 +1732,33 @@ impl Supervisor {
 	/// True when `id` names a supervisor child or the root agent id.
 	pub fn is_known_agent(&self, id: &str) -> bool {
 		id == crate::mailbox::MAIN_AGENT_ID || self.state.lock().unwrap().records.contains_key(id)
+	}
+
+	/// Current status of `id`, or `None` once the record is gone.
+	#[must_use]
+	pub fn child_status(&self, id: &str) -> Option<ChildStatus> {
+		let state = self.state.lock().unwrap();
+		state.records.get(id).map(|record| record.status)
+	}
+
+	/// Monotonic count of finished turns for `id`.
+	#[must_use]
+	pub fn agent_end_seq(&self, id: &str) -> u64 {
+		let state = self.state.lock().unwrap();
+		state.agent_end_seq.get(id).copied().unwrap_or(0)
+	}
+
+	/// Record that `id` finished a turn (its terminal `agent_end`).
+	///
+	/// `send await` stops on a newer value instead of polling "is running": an
+	/// idle or just-woken peer has not ended, and a peer that finished without
+	/// replying must settle the waiter immediately rather than at the timeout.
+	pub fn note_agent_end(&self, id: &str) {
+		{
+			let mut state = self.state.lock().unwrap();
+			*state.agent_end_seq.entry(id.to_string()).or_default() += 1;
+		}
+		self.settle.notify_waiters();
 	}
 
 	pub fn running_agent_ids(&self) -> Vec<String> {
@@ -1649,7 +1922,7 @@ impl Supervisor {
 	/// we wait for the loop to settle so in-flight tools can terminate their
 	/// subprocesses. Aborting the task is only the bounded fallback.
 	pub async fn cancel_child(&self, id: &str, owner: Option<&str>) -> CancelAttempt {
-		let (active, reservation) = {
+		let (active, reservation, actor, settled_no_actor) = {
 			let mut state = self.state.lock().unwrap();
 			let (visible, status) = match state.records.get(id) {
 				Some(record) => (
@@ -1661,19 +1934,75 @@ impl Supervisor {
 			if !visible {
 				return CancelAttempt::NotFound;
 			}
+			// Published before the cancel decides anything: a revive that captured
+			// the previous generation can no longer claim an actor, so a cancel
+			// running anywhere between record restore and actor publication is
+			// never missed (`AlreadyCompleted` would otherwise let it start).
+			*state.cancel_generation.entry(id.to_string()).or_default() += 1;
 			if status != ChildStatus::Running {
-				return CancelAttempt::AlreadyCompleted;
+				// Settled work normally has nothing to cancel, but a keep-alive
+				// child can still be running a follow-up turn in its lifecycle
+				// actor. That actor is not in `active`, so reach it through the
+				// lifecycle registry instead of claiming the job completed while
+				// its provider/tool work is still in flight.
+				let actor = state
+					.lifecycle_actors
+					.get(id)
+					.map(|(_, token)| token.clone());
+				let settled = actor.is_none();
+				(None, None, actor, settled)
+			} else {
+				let active = state.active.get(id).cloned();
+				let reservation = state.reservations.get(id).cloned();
+				if active.is_none() && reservation.is_none() {
+					return CancelAttempt::AlreadyCompleted;
+				}
+				if let Some(record) = state.records.get_mut(id) {
+					record.abort_reason = Some("cancelled by hub".to_string());
+				}
+				(active, reservation, None, false)
 			}
-			let active = state.active.get(id).cloned();
-			let reservation = state.reservations.get(id).cloned();
-			if active.is_none() && reservation.is_none() {
-				return CancelAttempt::AlreadyCompleted;
-			}
-			if let Some(record) = state.records.get_mut(id) {
-				record.abort_reason = Some("cancelled by hub".to_string());
-			}
-			(active, reservation)
 		};
+
+		// A settled id with no registered actor can still be an explicit cancel
+		// whose durable marker failed earlier: the in-memory tombstone forbids
+		// revival now, and this retry is the recovery path once the session root
+		// is writable again. Only a tombstoned id is retried — an ordinary
+		// settled job keeps reporting `already_completed`.
+		if settled_no_actor {
+			if let Some(manager) = crate::subagent_lifecycle::lookup(self)
+				&& manager.is_tombstoned(id)
+			{
+				return match manager.ensure_tombstone(id, "cancelled by hub") {
+					Ok(()) => CancelAttempt::Cancelled,
+					Err(error) => CancelAttempt::TombstoneFailed(error),
+				};
+			}
+			return CancelAttempt::AlreadyCompleted;
+		}
+
+		if let Some(token) = actor {
+			// Only cancels the follow-up turn: the finished assignment keeps its
+			// terminal status and transcript.
+			//
+			// Cancel through the lifecycle owner first: it shares the manager lock
+			// with `send`, so no message can be accepted into this actor after the
+			// live slot is dropped, and a message a racing send already queued is
+			// drained and journaled by the actor before it stops. TS
+			// `cancelAgentRegistration` releases the registration without a revive
+			// path; the manager persists the tombstone for the same reason.
+			//
+			// The actor is stopped either way; a failed durable marker is reported
+			// instead of being reported as a clean cancel (a restart could revive
+			// the child).
+			let durable = crate::subagent_lifecycle::lookup(self)
+				.map(|manager| manager.cancel_live(id, "cancelled by hub"));
+			token.cancel();
+			return match durable {
+				Some(Err(error)) => CancelAttempt::TombstoneFailed(error),
+				_ => CancelAttempt::Cancelled,
+			};
+		}
 
 		if let Some(active) = active {
 			active.cancellation_token.cancel();
@@ -2058,9 +2387,16 @@ impl Supervisor {
 	///
 	/// The path comes from the child's record — never a guess — and a write
 	/// failure is reported on stderr rather than replacing the child result.
-	pub fn append_child_transcript(&self, id: &str, messages: &[&Message]) {
+	/// Append messages to a child's transcript and return how many reached the
+	/// file. A missing record or a failed write stops the count at the last
+	/// durable message, so an incremental journal never advances past data the
+	/// file does not hold.
+	pub fn append_child_transcript(&self, id: &str, messages: &[&Message]) -> usize {
 		let Some(path) = self.child_session_file(id) else {
-			return;
+			eprintln!(
+				"warning: no child session file for {id}; transcript append skipped"
+			);
+			return 0;
 		};
 		let mut file = match std::fs::OpenOptions::new()
 			.create(true)
@@ -2073,22 +2409,31 @@ impl Supervisor {
 					"warning: cannot open child transcript {}: {error}",
 					path.display()
 				);
-				return;
+				return 0;
 			},
 		};
+		let mut written = 0;
 		for message in messages {
-			let Ok(message) = serde_json::to_value(message) else {
-				continue;
+			let line = match serde_json::to_value(message) {
+				Ok(message) => serde_json::json!({ "type": "message", "message": message }),
+				Err(error) => {
+					// A message that cannot serialize is unrecoverable by retrying:
+					// report it and keep going so the rest of the tail lands.
+					eprintln!("warning: cannot serialize child transcript message: {error}");
+					written += 1;
+					continue;
+				},
 			};
-			let line = serde_json::json!({ "type": "message", "message": message });
 			if let Err(error) = writeln!(file, "{line}") {
 				eprintln!(
 					"warning: cannot append child transcript {}: {error}",
 					path.display()
 				);
-				return;
+				return written;
 			}
+			written += 1;
 		}
+		written
 	}
 
 	fn allocate_child_session(&self, id: &str) -> Option<PathBuf> {

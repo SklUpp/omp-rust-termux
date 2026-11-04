@@ -5,8 +5,10 @@
 //!
 //! - `roster` merges persisted parked/idle rows into `hub list` (including rows
 //!   restored after a process restart).
-//! - `delegate_send` hands a message to a parked/idle agent, reviving it when
-//!   needed and reporting `revived`/`injected` honestly.
+//! - `delegate_send` hands a message to a lifecycle-managed agent: an idle
+//!   live actor is woken on its own state (`woken`), a running one gets a
+//!   non-interrupting aside (`injected`), and a parked row is revived when
+//!   needed (`revived`).
 //!
 //! `history://` is the read-only transcript surface (upstream
 //! `internal-urls/history-protocol.ts`):

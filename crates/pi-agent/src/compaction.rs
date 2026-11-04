@@ -3,9 +3,53 @@ use crate::{
 	tokenizer::Tokenizer,
 };
 
+/// Prefix of the system notice [`Compactor::compact`] inserts when it prunes the
+/// head. Callers that journal a conversation by index use it to find the new
+/// start: after compaction the old indices name different messages.
+pub const COMPACTION_NOTICE_PREFIX: &str = "[System notice: ";
+
+/// Whether `message` is the prune notice inserted by [`Compactor::compact`].
+pub fn is_compaction_notice(message: &Message) -> bool {
+	message.role == Role::System && message.content.starts_with(COMPACTION_NOTICE_PREFIX)
+}
+
 /// Compactor preserves system prompt and recent turns while pruning older messages
 /// when estimated token count exceeds the budget.
 pub struct Compactor;
+
+/// What [`Compactor::compact`] dropped, for owners that journal incrementally.
+///
+/// `kept_from` is the old index where the retained conversation resumes, and
+/// `kept_at` is that same message's index after the rewrite (right after the
+/// prune notice). An owner remaps its write cursor with [`Self::remap`] instead
+/// of guessing from lengths: lengths can match again after new messages and
+/// then silently skip or duplicate accepted turns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompactionReport {
+	/// Conversation length before the rewrite.
+	pub old_len:    usize,
+	/// Old index of the first retained conversation message (after the leading
+	/// system messages and the pruned prefix).
+	pub kept_from:  usize,
+	/// Index of that first retained message in the compacted conversation.
+	pub kept_at:    usize,
+}
+
+impl CompactionReport {
+	/// Translate a cursor in the old index space into the compacted one.
+	///
+	/// A cursor at or before the pruned prefix resumes at the first kept
+	/// message; a later cursor keeps its distance from the kept boundary, so
+	/// everything after it stays unwritten and nothing old is appended twice.
+	#[must_use]
+	pub fn remap(&self, written: usize) -> usize {
+		if written <= self.kept_from {
+			self.kept_at
+		} else {
+			self.kept_at + (written - self.kept_from)
+		}
+	}
+}
 
 impl Compactor {
 	/// Compact messages slice to fit within token_budget.
@@ -15,13 +59,22 @@ impl Compactor {
 	/// 3. Older user/assistant/tool messages are pruned or summarized.
 	/// 4. Never orphan Tool messages: keeps assistant message with tool_calls together with its Tool response messages.
 	pub fn compact(messages: &[Message], token_budget: usize, min_recent: usize) -> Vec<Message> {
+		Self::compact_report(messages, token_budget, min_recent).0
+	}
+
+	/// [`Self::compact`] plus the index mapping it applied, when it pruned.
+	pub fn compact_report(
+		messages: &[Message],
+		token_budget: usize,
+		min_recent: usize,
+	) -> (Vec<Message>, Option<CompactionReport>) {
 		if messages.is_empty() {
-			return Vec::new();
+			return (Vec::new(), None);
 		}
 
 		let total_tokens = Tokenizer::count_messages(messages);
 		if total_tokens <= token_budget {
-			return messages.to_vec();
+			return (messages.to_vec(), None);
 		}
 
 		// Partition system messages at the start
@@ -42,7 +95,7 @@ impl Compactor {
 		let remaining_budget = token_budget.saturating_sub(system_tokens);
 
 		if conversation.is_empty() {
-			return system_messages;
+			return (system_messages, None);
 		}
 
 		// We need to keep the most recent messages from conversation
@@ -75,16 +128,25 @@ impl Compactor {
 
 		let pruned_count = conversation.len().saturating_sub(kept_reverse.len());
 
+		let leading = system_messages.len();
 		let mut result = system_messages;
 		if pruned_count > 0 {
 			let summary_notice = format!(
-				"[System notice: {} earlier turn(s) were pruned to fit the context limit]",
+				"{COMPACTION_NOTICE_PREFIX}{} earlier turn(s) were pruned to fit the context limit]",
 				pruned_count
 			);
 			result.push(Message::system(summary_notice));
 		}
 		result.extend(kept_reverse);
-		result
+		if pruned_count == 0 {
+			return (result, None);
+		}
+		let report = CompactionReport {
+			old_len:   messages.len(),
+			kept_from: leading + pruned_count,
+			kept_at:   leading + 1,
+		};
+		(result, Some(report))
 	}
 }
 
@@ -121,6 +183,41 @@ mod tests {
 				.iter()
 				.any(|m| m.content.contains("earlier turn(s) were pruned"))
 		);
+	}
+
+	/// The report must describe exactly where the retained conversation starts:
+	/// new length = kept_at + (old_len - kept_from). Owners remap their journal
+	/// cursor with it, so a length that later matches the old one cannot hide
+	/// accepted turns or re-append journaled ones.
+	#[test]
+	fn compaction_report_maps_the_retained_tail() {
+		let mut msgs = vec![Message::system("System prompt")];
+		for i in 0..20 {
+			msgs.push(Message::user(format!("Turn {i} question with some length")));
+			msgs.push(Message::assistant(format!("Turn {i} response with some length")));
+		}
+		let (compacted, report) = Compactor::compact_report(&msgs, 150, 4);
+		let report = report.expect("over-budget compaction always reports");
+		assert_eq!(report.old_len, msgs.len());
+		assert_eq!(report.kept_at, 2, "system prompt + prune notice");
+		assert_eq!(
+			compacted.len(),
+			report.kept_at + (report.old_len - report.kept_from),
+			"every retained message maps one to one"
+		);
+		// The first retained message is the one the report points at.
+		assert_eq!(compacted[report.kept_at].content, msgs[report.kept_from].content);
+	}
+
+	/// A cursor inside the pruned prefix resumes at the first kept message; a
+	/// cursor past it keeps its distance, so nothing old is appended twice.
+	#[test]
+	fn compaction_report_remaps_cursors_on_both_sides_of_the_prune() {
+		let report = CompactionReport { old_len: 12, kept_from: 7, kept_at: 2 };
+		assert_eq!(report.remap(0), 2);
+		assert_eq!(report.remap(7), 2);
+		assert_eq!(report.remap(8), 3);
+		assert_eq!(report.remap(12), 7);
 	}
 
 	#[test]

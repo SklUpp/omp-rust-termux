@@ -35,6 +35,7 @@ Do not add a `session` subcommand. Use existing resume/fork/continue flags and R
 | C4 advisor | Pinned `170345d12b` binary passed CLI text/JSON, RPC, ACP, child opt-in, failure and cancellation; integrated in `b18fa21c01` | Standalone smoke does not verify the integrated executable |
 | Integrated `961bb343bc` | [CI 41733981790](https://github.com/SklUpp/omp-rust-termux/actions/runs/41733981790): native tests pass | Host and Android compilation fail: duplicate child history seeding moves `initial_message` before the advisor callback; corrected candidate needs fresh checks |
 | Integrated corrections | Local `cargo check --offline --locked -j1` passes for `pi-agent --lib --tests` and `omp-cli --tests`; correctness and security reviews close advisor/MCP isolation defects | Behavioral regressions, exact-commit CI and downloaded Android runtime acceptance remain open |
+| Integrated `937abd6a6b` | [Rust CI 41767764302](https://github.com/SklUpp/omp-rust-termux/actions/runs/41767764302) passes host, native and Android; downloaded Android binary SHA-256 `cad6a7a9460601ec9951be6051d94e3f5326ae0e4323a4629b9fc925a58f6763` passes advisor, local learning, security publication and in-flight cancellation smoke | Local mock services, not live accounts; remaining category contracts stay open |
 
 No row closes an entire category unless every retained contract below is verified.
 

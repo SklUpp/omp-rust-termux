@@ -941,6 +941,15 @@ impl AdvisorManager {
 			}
 		}
 		slot.busy.store(false, Ordering::SeqCst);
+		let runnable = {
+			let state = slot.state.lock().unwrap_or_else(|poison| poison.into_inner());
+			!state.pending.is_empty() && !state.quota && !state.halted
+		};
+		if runnable && !self.inner.disposed.load(Ordering::SeqCst)
+			&& !matches!(*slot.status.lock().unwrap_or_else(|poison| poison.into_inner()), RuntimeStatus::Paused)
+		{
+			self.schedule(&slot);
+		}
 		self.notify();
 	}
 

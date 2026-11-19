@@ -1,0 +1,130 @@
+name: Rust agent
+
+# Builds the standalone Rust `omp` binary and runs its tests entirely with
+# rustup + cargo. Bun/Node are deliberately absent: the point of this workflow
+# is proving the Rust runtime has no Bun/Node dependency at build or run time.
+on:
+  push:
+    branches: [main, feat/rust-agent-termux-bionic]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: rust-agent-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('{0}-{1}', github.ref_name, github.event_name) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test-host:
+    name: Host tests (linux x86_64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust toolchain
+        uses: ./.github/actions/ensure-rust-toolchain
+        with:
+          toolchain: nightly-2026-08-08
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: rust-agent-host
+      - name: Check agent workspace members
+        run: cargo check --locked -p pi-agent -p omp-cli
+      - name: Test agent core and CLI
+        run: cargo test --locked -p pi-agent -p omp-cli
+      # Read-only evidence capture after a real suite failure. This step never
+      # installs, warms caches, retries the suite or changes its verdict. It
+      # records Julia provenance, host load, and the one measurement the paired
+      # `julia -e exit(0)` probes cannot make: how far the native staged runner
+      # bootstraps (init, then prelude) on a fresh cwd and the filtered eval env
+      # before the 15s kernel startup timer fires. scripts/julia-bootstrap-
+      # diagnostic.py owns the bounds and the report; the minimal probes it also
+      # runs come after that measurement and are labelled as post-failure
+      # diagnostics, not as a cold-boot proof.
+      - name: Julia bootstrap diagnostics (read-only, bounded)
+        if: failure()
+        timeout-minutes: 5
+        run: python3 scripts/julia-bootstrap-diagnostic.py
+      # None of the support crates are dependencies of pi-agent/omp-cli, so the
+      # two steps above never compile or run their tests. Isolation, parsing,
+      # walking and shell keep their own suites here, or they stay dark.
+      - name: Test support crates
+        run: cargo test --locked -p pi-iso -p pi-ast -p pi-walker -p pi-shell
+
+  test-native-grep:
+    name: Native grep and matcher tests (linux x86_64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust toolchain
+        uses: ./.github/actions/ensure-rust-toolchain
+        with:
+          toolchain: nightly-2026-08-08
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: rust-agent-native-grep
+      - name: Test grep pattern matcher
+        run: cargo test --locked -p pi-grep-pattern
+      - name: Test native grep
+        run: cargo test --locked -p pi-natives grep
+
+  build-android:
+    name: Android arm64 binary (bionic)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Load Android manifest environment
+        run: grep -v '^#' android/versions.env >> "$GITHUB_ENV"
+      - name: Install pinned Rust toolchain with Android target
+        uses: ./.github/actions/ensure-rust-toolchain
+        with:
+          toolchain: nightly-2026-08-08
+          target: aarch64-linux-android
+      - name: Install NDK ${{ env.NDK_VERSION }}
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: ${{ env.NDK_VERSION }}
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: rust-agent-android
+      - name: Build omp for aarch64-linux-android
+        env:
+          NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          set -euo pipefail
+          API="${ANDROID_API:-24}"
+          TOOLCHAIN="$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          export CC_aarch64_linux_android="$TOOLCHAIN/aarch64-linux-android${API}-clang"
+          export AR_aarch64_linux_android="$TOOLCHAIN/llvm-ar"
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$CC_aarch64_linux_android"
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_AR="$AR_aarch64_linux_android"
+          # ring and other cc-rs consumers read the unprefixed target vars.
+          export TARGET_CC="$CC_aarch64_linux_android"
+          export TARGET_AR="$AR_aarch64_linux_android"
+          export RUSTFLAGS="-C opt-level=3 -C debuginfo=0 -C strip=symbols -C link-arg=-fuse-ld=lld"
+          cargo build --release --locked -p omp-cli --target aarch64-linux-android
+          BIN="target/aarch64-linux-android/release/omp"
+          "$TOOLCHAIN/llvm-strip" "$BIN"
+          file -b "$BIN" | tee /dev/stderr | grep -q 'ELF 64-bit.*aarch64'
+          ls -lh "$BIN"
+          sha256sum "$BIN" > "$BIN.sha256"
+      - name: Upload Android binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: omp-aarch64-linux-android
+          path: |
+            target/aarch64-linux-android/release/omp
+            target/aarch64-linux-android/release/omp.sha256
+          if-no-files-found: error

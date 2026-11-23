@@ -16,11 +16,11 @@ pub use pi_builtins::ProcessStatus;
 
 use crate::cancel::CancelToken;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 mod platform {
+	use std::{collections::HashSet, fs};
+	#[cfg(not(target_os = "android"))]
 	use std::{
-		collections::HashSet,
-		fs,
 		os::fd::{AsFd, AsRawFd, OwnedFd},
 		sync::Arc,
 	};
@@ -29,10 +29,13 @@ mod platform {
 
 	use super::ProcessStatus;
 
-	/// Stable Linux process reference backed by a pidfd.
+	/// Stable process reference. On Linux identity is pinned by a pidfd; on
+	/// Android — where `pidfd_open` may be blocked by seccomp (SIGSYS) — it is
+	/// pinned by the `/proc/<pid>/stat` start time instead.
 	#[derive(Clone)]
 	pub struct Process {
 		pid:        i32,
+		#[cfg(not(target_os = "android"))]
 		pidfd:      Arc<OwnedFd>,
 		start_time: u64,
 	}
@@ -42,9 +45,17 @@ mod platform {
 			if pid <= 0 {
 				return None;
 			}
+			#[cfg(not(target_os = "android"))]
 			let pidfd = Arc::new(sys::open_pidfd(pid)?);
 			let start_time = sys::start_time(pid)?;
-			Some(Self { pid, pidfd, start_time })
+			#[cfg(not(target_os = "android"))]
+			{
+				Some(Self { pid, pidfd, start_time })
+			}
+			#[cfg(target_os = "android")]
+			{
+				Some(Self { pid, start_time })
+			}
 		}
 
 		pub const fn pid(&self) -> i32 {
@@ -148,7 +159,23 @@ mod platform {
 		}
 
 		pub fn kill(&self, signal: i32) -> bool {
-			sys::pidfd_send_signal(self.pidfd.as_fd(), signal)
+			#[cfg(target_os = "android")]
+			{
+				// Android seccomp can SIGSYS-kill the pidfd syscalls, so signal
+				// through `kill(2)` after re-validating the pinned start time.
+				// That closes the recycled-pid window except for the instant
+				// between check and call, which `kill(2)` alone cannot avoid.
+				if !self.live_identity() {
+					return false;
+				}
+				// SAFETY: `kill` takes integer identifiers by value and does not
+				// access caller-owned memory.
+				unsafe { libc::kill(self.pid, signal) == 0 }
+			}
+			#[cfg(not(target_os = "android"))]
+			{
+				sys::pidfd_send_signal(self.pidfd.as_fd(), signal)
+			}
 		}
 
 		pub fn group_id(&self) -> Option<i32> {
@@ -156,52 +183,79 @@ mod platform {
 				return None;
 			}
 
-			// SAFETY: `self.pid` names the process currently referenced by
-			// `self.pidfd` unless it exits concurrently. If it exits, `getpgid`
-			// reports failure rather than dereferencing caller-owned memory.
+			// SAFETY: `self.pid` names the process currently referenced unless
+			// it exits concurrently. If it exits, `getpgid` reports failure
+			// rather than dereferencing caller-owned memory.
 			let pgid = unsafe { libc::getpgid(self.pid) };
 			if pgid > 0 { Some(pgid) } else { None }
 		}
 
 		pub fn status(&self) -> ProcessStatus {
-			loop {
-				let mut pollfd =
-					libc::pollfd { fd: self.pidfd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
-				// SAFETY: `pollfd` points to one initialized `pollfd` element, and
-				// the pidfd remains open for the duration of the call. Timeout
-				// zero makes this a non-blocking readiness probe.
-				let ready = unsafe { libc::poll(&raw mut pollfd, 1, 0) };
-				if ready < 0 {
-					// Retry on EINTR; for any other transient poll error treat the
-					// pidfd as still running. The pidfd is still owned and the
-					// kernel has not reported the process gone — a spurious
-					// `Exited` here makes every downstream signal/kill fall
-					// through silently.
-					if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
-						continue;
+			#[cfg(target_os = "android")]
+			{
+				// No pidfd: a live process still reports the pinned start time.
+				// A recycled pid carries a new one.
+				if sys::start_time(self.pid) == Some(self.start_time) {
+					ProcessStatus::Running
+				} else {
+					ProcessStatus::Exited
+				}
+			}
+			#[cfg(not(target_os = "android"))]
+			{
+				loop {
+					let mut pollfd =
+						libc::pollfd { fd: self.pidfd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+					// SAFETY: `pollfd` points to one initialized `pollfd` element, and
+					// the pidfd remains open for the duration of the call. Timeout
+					// zero makes this a non-blocking readiness probe.
+					let ready = unsafe { libc::poll(&raw mut pollfd, 1, 0) };
+					if ready < 0 {
+						// Retry on EINTR; for any other transient poll error treat the
+						// pidfd as still running. The pidfd is still owned and the
+						// kernel has not reported the process gone — a spurious
+						// `Exited` here makes every downstream signal/kill fall
+						// through silently.
+						if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+							continue;
+						}
+						return ProcessStatus::Running;
+					}
+					if ready == 0 {
+						return ProcessStatus::Running;
+					}
+					if (pollfd.revents
+						& (libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL))
+						!= 0
+					{
+						return ProcessStatus::Exited;
 					}
 					return ProcessStatus::Running;
 				}
-				if ready == 0 {
-					return ProcessStatus::Running;
-				}
-				if (pollfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL))
-					!= 0
-				{
-					return ProcessStatus::Exited;
-				}
-				return ProcessStatus::Running;
 			}
 		}
 
-		/// Resolves once the process exits: its pidfd becomes readable then.
+		/// Resolves once the process exits: its pidfd becomes readable then, or
+		/// on Android the pinned start time stops matching (polled).
 		pub async fn exited(&self) -> std::io::Result<()> {
-			let pidfd = tokio::io::unix::AsyncFd::with_interest(
-				self.pidfd.try_clone()?,
-				tokio::io::Interest::READABLE,
-			)?;
-			let _ready = pidfd.readable().await?;
-			Ok(())
+			#[cfg(target_os = "android")]
+			{
+				// 50 ms matches the poll fallback used elsewhere for platforms
+				// without an exit-notification primitive.
+				while sys::start_time(self.pid) == Some(self.start_time) {
+					tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+				}
+				Ok(())
+			}
+			#[cfg(not(target_os = "android"))]
+			{
+				let pidfd = tokio::io::unix::AsyncFd::with_interest(
+					self.pidfd.try_clone()?,
+					tokio::io::Interest::READABLE,
+				)?;
+				let _ready = pidfd.readable().await?;
+				Ok(())
+			}
 		}
 
 		/// Walk the descendant tree in post-order (leaves first), de-duplicating
